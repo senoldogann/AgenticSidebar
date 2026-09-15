@@ -6,6 +6,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let mainWindowController = MainWindowController()
     let capturePrivacyController = CapturePrivacyController()
 
+    var managedShutdown: (@MainActor () async -> Void)?
+    var terminationReply: @MainActor (NSApplication, Bool) -> Void = { application, shouldTerminate in
+        application.reply(toApplicationShouldTerminate: shouldTerminate)
+    }
+
+    private var terminationTask: Task<Void, Never>?
+
     private let logger = Logger(
         subsystem: AppIdentity.bundleIdentifier,
         category: "AppLifecycle"
@@ -31,5 +38,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let managedShutdown else {
+            return .terminateNow
+        }
+
+        if terminationTask == nil {
+            terminationTask = Task { @MainActor [weak self] in
+                await managedShutdown()
+                guard let self else {
+                    return
+                }
+                self.terminationReply(sender, true)
+            }
+        }
+
+        return .terminateLater
     }
 }

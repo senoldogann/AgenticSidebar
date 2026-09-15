@@ -396,6 +396,12 @@ final class AgentSessionService {
         switch error {
         case .missingCredential:
             .missingCredential
+        case .executableUnavailable:
+            .backendExecutableUnavailable
+        case .startupFailure:
+            .backendStartupFailure
+        case .authenticationFailure:
+            .authenticationFailure
         case .unavailable:
             .providerUnavailable
         case .transport:

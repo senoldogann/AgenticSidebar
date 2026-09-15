@@ -2,6 +2,9 @@ import Foundation
 
 enum ProviderRuntimeError: Error, Equatable, Sendable {
     case missingCredential
+    case executableUnavailable
+    case startupFailure
+    case authenticationFailure
     case unavailable
     case transport
     case unexpectedResponse

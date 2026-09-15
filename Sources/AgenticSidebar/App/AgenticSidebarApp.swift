@@ -4,18 +4,55 @@ import SwiftUI
 struct AgenticSidebarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
-    @State private var settingsStore = SettingsStore()
-    @State private var openAICredentialSettings = OpenAICredentialSettings(
-        credentialStore: KeychainCredentialStore()
-    )
-    @State private var sessionService = AgentSessionService(
-        runtimes: [
-            OpenAIProviderRuntime(
-                transport: URLSessionOpenAITransport.shared(),
-                credentialStore: KeychainCredentialStore()
+    @State private var settingsStore: SettingsStore
+    @State private var openAICredentialSettings: OpenAICredentialSettings
+    @State private var openCodeSettings: OpenCodeSettings
+    @State private var sessionService: AgentSessionService
+
+    init() {
+        let credentialStore = KeychainCredentialStore()
+        let openCodeServerManager = ManagedOpenCodeServerManager.live(
+            credentialStore: credentialStore
+        )
+        let openCodeTransport = URLSessionOpenCodeTransport.shared()
+
+        _settingsStore = State(initialValue: SettingsStore())
+        _openAICredentialSettings = State(
+            initialValue: OpenAICredentialSettings(
+                credentialStore: credentialStore
             )
-        ]
-    )
+        )
+        _openCodeSettings = State(
+            initialValue: OpenCodeSettings(
+                executableLocator: SystemOpenCodeExecutableLocator.current(),
+                serverManager: openCodeServerManager,
+                clientFactory: { connection in
+                    OpenCodeClient(
+                        transport: openCodeTransport,
+                        connection: connection
+                    )
+                }
+            )
+        )
+        _sessionService = State(
+            initialValue: AgentSessionService(
+                runtimes: [
+                    OpenAIProviderRuntime(
+                        transport: URLSessionOpenAITransport.shared(),
+                        credentialStore: credentialStore
+                    ),
+                    OpenCodeProviderRuntime.live(
+                        serverManager: openCodeServerManager,
+                        transport: openCodeTransport
+                    )
+                ]
+            )
+        )
+
+        appDelegate.managedShutdown = {
+            await openCodeServerManager.stop()
+        }
+    }
 
     var body: some Scene {
         WindowGroup(AppIdentity.name, id: "main") {
@@ -31,8 +68,14 @@ struct AgenticSidebarApp: App {
             SettingsView(
                 settingsStore: settingsStore,
                 openAICredentialSettings: openAICredentialSettings,
+                openCodeSettings: openCodeSettings,
                 capturePrivacyCapabilities: appDelegate.capturePrivacyController.capabilities,
                 onOpenAICredentialChange: {
+                    Task {
+                        await sessionService.refreshCapabilities()
+                    }
+                },
+                onOpenCodeChange: {
                     Task {
                         await sessionService.refreshCapabilities()
                     }

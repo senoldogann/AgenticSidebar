@@ -211,6 +211,9 @@ final class AgentSessionServiceTests: XCTestCase {
     func testProviderRuntimeErrorsMapToSessionErrors() async throws {
         let mappings: [(ProviderRuntimeError, AgentSessionError)] = [
             (.missingCredential, .missingCredential),
+            (.executableUnavailable, .backendExecutableUnavailable),
+            (.startupFailure, .backendStartupFailure),
+            (.authenticationFailure, .authenticationFailure),
             (.unavailable, .providerUnavailable),
             (.transport, .transportFailure),
             (.unexpectedResponse, .unexpectedBackendResponse)

@@ -50,6 +50,39 @@ cat >"$INFO_PLIST" <<PLIST
 </plist>
 PLIST
 
+sign_app() {
+  local identity="${AGENTIC_SIDEBAR_CODESIGN_IDENTITY:-}"
+
+  if [[ -z "$identity" ]]; then
+    identity="$(
+      /usr/bin/security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F '"' '/"Apple Development:/{print $2; exit}'
+    )"
+  fi
+
+  if [[ -n "$identity" ]]; then
+    echo "Signing $APP_NAME with Apple Development identity: $identity"
+    /usr/bin/codesign \
+      --force \
+      --sign "$identity" \
+      --identifier "$BUNDLE_ID" \
+      --timestamp=none \
+      "$APP_BUNDLE"
+  else
+    echo "warning: no Apple Development signing identity found; using ad-hoc signing. Keychain access may prompt after rebuilds." >&2
+    /usr/bin/codesign \
+      --force \
+      --sign - \
+      --identifier "$BUNDLE_ID" \
+      --timestamp=none \
+      "$APP_BUNDLE"
+  fi
+
+  /usr/bin/codesign --verify --strict "$APP_BUNDLE"
+}
+
+sign_app
+
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
 }

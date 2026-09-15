@@ -1,7 +1,8 @@
 import Foundation
 
-enum CredentialKey: String, Sendable {
+enum CredentialKey: String, Hashable, Sendable {
     case openAIAPIKey = "openai.api-key"
+    case openCodeServerPassword = "opencode.server-password"
 }
 
 protocol CredentialStore: Sendable {
