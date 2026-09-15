@@ -8,9 +8,21 @@ struct ComposerView: View {
     var body: some View {
         GlassEffectContainer(spacing: 10) {
             HStack(alignment: .bottom, spacing: 10) {
-                TextField("Ask AgenticSidebar…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...5)
+                ZStack(alignment: .topLeading) {
+                    ComposerTextEditor(
+                        text: $draft,
+                        submissionAvailability: submissionAvailability,
+                        onSubmit: sendDraft
+                    )
+
+                    if draft.isEmpty {
+                        Text("Ask AgenticSidebar…")
+                            .foregroundStyle(.tertiary)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .frame(minHeight: 22, maxHeight: 104)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 11)
                     .glassEffect(
@@ -31,18 +43,13 @@ struct ComposerView: View {
                     .help("Cancel the active turn")
                 } else {
                     Button {
-                        if sessionService.submit(draft) != nil {
-                            draft = ""
-                        }
+                        sendDraft()
                     } label: {
                         Image(systemName: "arrow.up")
                             .frame(width: 18, height: 18)
                     }
                     .buttonStyle(.glassProminent)
-                    .disabled(
-                        draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            || !sessionService.canSubmit
-                    )
+                    .disabled(submissionAvailability == .unavailable)
                     .help(sendButtonHelp)
                 }
             }
@@ -56,6 +63,22 @@ struct ComposerView: View {
             "A provider adapter is required before sending messages"
         } else {
             "Send message"
+        }
+    }
+
+    private var submissionAvailability: ComposerSubmissionAvailability {
+        let hasContent = !draft
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+
+        return hasContent && sessionService.canSubmit
+            ? .available
+            : .unavailable
+    }
+
+    private func sendDraft() {
+        if sessionService.submit(draft) != nil {
+            draft = ""
         }
     }
 }
