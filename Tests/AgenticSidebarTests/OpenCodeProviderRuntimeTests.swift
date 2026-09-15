@@ -101,10 +101,10 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_remote","messageID":"msg_1","partID":"prt_text","field":"text","delta":"Hello"}}"#
         )
         linePair.continuation.yield(
-            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"prt_tool","sessionID":"ses_remote","messageID":"msg_1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"prt_tool","sessionID":"ses_remote","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
         )
         linePair.continuation.yield(
-            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"prt_tool","sessionID":"ses_remote","messageID":"msg_1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"completed","input":{},"output":"ok","title":"done","metadata":{},"time":{"start":1,"end":2}}},"time":2}}"#
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"prt_tool","sessionID":"ses_remote","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{},"output":"ok","title":"done","metadata":{},"time":{"start":1,"end":2}}},"time":2}}"#
         )
         linePair.continuation.yield(
             #"data: {"type":"session.status","properties":{"sessionID":"ses_remote","status":{"type":"idle"}}}"#
@@ -127,8 +127,16 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             events,
             [
                 .assistantTextDelta("Hello"),
-                .toolStarted("bash"),
-                .toolFinished,
+                .activityStarted(
+                    ProviderActivityDescriptor(
+                        id: ProviderActivityID("prt_tool"),
+                        kind: .read
+                    )
+                ),
+                .activityFinished(
+                    ProviderActivityID("prt_tool"),
+                    outcome: .completed
+                ),
                 .completed
             ]
         )

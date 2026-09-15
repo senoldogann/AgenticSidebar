@@ -49,6 +49,11 @@ struct ConversationDetailView: View {
                                 .transition(
                                     .opacity.combined(with: .move(edge: .bottom))
                                 )
+
+                            if let activityGroup = activityGroup(after: message.id) {
+                                AgentActivityTimelineView(group: activityGroup)
+                                    .transition(.opacity)
+                            }
                         }
                     }
                     .padding(20)
@@ -141,6 +146,12 @@ struct ConversationDetailView: View {
             "No provider adapter is available yet. Direct OpenAI and OpenCode adapters are added in later milestones."
         } else {
             "Choose a provider configuration and send a message below."
+        }
+    }
+
+    private func activityGroup(after messageID: UUID) -> AgentTurnActivityGroup? {
+        sessionService.state.activityGroups.first {
+            $0.anchorMessageID == messageID
         }
     }
 }

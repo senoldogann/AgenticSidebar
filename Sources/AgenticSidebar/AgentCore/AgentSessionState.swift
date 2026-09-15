@@ -31,6 +31,7 @@ struct AgentSessionState: Equatable, Sendable {
     var error: AgentSessionError?
     var startedAt: Date?
     var completedAt: Date?
+    var activityGroups: [AgentTurnActivityGroup] = []
 
     init(
         id: UUID = UUID(),

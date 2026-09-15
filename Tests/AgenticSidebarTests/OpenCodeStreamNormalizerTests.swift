@@ -53,15 +53,47 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
+                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
             ),
-            [.toolStarted("bash")]
+            [
+                .activityStarted(
+                    ProviderActivityDescriptor(
+                        id: ProviderActivityID("prt_tool"),
+                        kind: .read
+                    )
+                )
+            ]
         )
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"bash","state":{"status":"completed","input":{},"output":"ok","title":"done","metadata":{},"time":{"start":1,"end":2}}},"time":2}}"#
+                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{},"output":"ok","title":"done","metadata":{},"time":{"start":1,"end":2}}},"time":2}}"#
             ),
-            [.toolFinished]
+            [
+                .activityFinished(
+                    ProviderActivityID("prt_tool"),
+                    outcome: .completed
+                )
+            ]
+        )
+    }
+
+    func testToolErrorMapsToFailedActivityOutcome() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        _ = try normalizer.consume(
+            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
+        )
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"error","input":{},"error":"backend detail","time":{"start":1,"end":2}}},"time":2}}"#
+            ),
+            [
+                .activityFinished(
+                    ProviderActivityID("prt_tool"),
+                    outcome: .failed
+                )
+            ]
         )
     }
 

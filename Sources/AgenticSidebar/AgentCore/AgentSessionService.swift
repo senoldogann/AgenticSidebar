@@ -203,9 +203,8 @@ final class AgentSessionService {
             return nil
         }
 
-        state.messages.append(
-            ChatMessage(role: .user, text: trimmedPrompt)
-        )
+        let userMessage = ChatMessage(role: .user, text: trimmedPrompt)
+        state.messages.append(userMessage)
         state.status = .streaming
         state.error = nil
         state.startedAt = Date()
@@ -213,12 +212,26 @@ final class AgentSessionService {
         discardPendingAssistantText()
         activeAssistantMessageID = nil
 
+        let turnID = UUID()
+        state.activityGroups.append(
+            AgentTurnActivityGroup(
+                id: turnID,
+                anchorMessageID: userMessage.id,
+                activities: [
+                    AgentActivity(
+                        id: thinkingActivityID(turnID: turnID),
+                        kind: .thinking,
+                        phase: .running
+                    )
+                ]
+            )
+        )
+
         let request = ProviderRequest(
             sessionID: state.id,
             configuration: configuration,
             messages: state.messages
         )
-        let turnID = UUID()
         activeTurnID = turnID
 
         let task = Task { [weak self] in
@@ -291,14 +304,21 @@ final class AgentSessionService {
 
                 switch event {
                 case let .assistantTextDelta(delta):
+                    finishThinkingActivity(turnID: turnID)
                     enqueueAssistantText(delta, turnID: turnID)
 
-                case let .toolStarted(toolName):
+                case let .activityStarted(activity):
                     flushPendingAssistantText(turnID: turnID)
-                    state.status = .runningTool(toolName)
+                    finishThinkingActivity(turnID: turnID)
+                    startActivity(activity, turnID: turnID)
 
-                case .toolFinished:
+                case let .activityFinished(activityID, outcome):
                     flushPendingAssistantText(turnID: turnID)
+                    finishActivity(
+                        activityID,
+                        outcome: outcome,
+                        turnID: turnID
+                    )
                     state.status = .streaming
 
                 case .waiting:
@@ -307,6 +327,10 @@ final class AgentSessionService {
 
                 case .completed:
                     flushPendingAssistantText(turnID: turnID)
+                    finishRunningActivities(
+                        turnID: turnID,
+                        phase: .completed
+                    )
                     didComplete = true
                 }
 
@@ -329,6 +353,7 @@ final class AgentSessionService {
                 state.status = .completed
                 state.completedAt = Date()
             } else {
+                finishRunningActivities(turnID: turnID, phase: .failed)
                 state.status = .failed
                 state.error = .streamInterrupted
                 state.completedAt = Date()
@@ -339,6 +364,7 @@ final class AgentSessionService {
             }
 
             flushPendingAssistantText(turnID: turnID)
+            finishRunningActivities(turnID: turnID, phase: .cancelled)
             state.status = .cancelled
             state.completedAt = Date()
         } catch let error as ProviderRuntimeError {
@@ -347,6 +373,7 @@ final class AgentSessionService {
             }
 
             flushPendingAssistantText(turnID: turnID)
+            finishRunningActivities(turnID: turnID, phase: .failed)
             state.status = .failed
             state.error = sessionError(for: error)
             state.completedAt = Date()
@@ -356,6 +383,7 @@ final class AgentSessionService {
             }
 
             flushPendingAssistantText(turnID: turnID)
+            finishRunningActivities(turnID: turnID, phase: .failed)
             state.status = .failed
             state.error = .transportFailure
             state.completedAt = Date()
@@ -432,6 +460,95 @@ final class AgentSessionService {
         streamingTextFlushTask?.cancel()
         streamingTextFlushTask = nil
         streamingTextAccumulator = .empty
+    }
+
+    private func thinkingActivityID(turnID: UUID) -> ProviderActivityID {
+        ProviderActivityID("turn-\(turnID.uuidString)-thinking")
+    }
+
+    private func finishThinkingActivity(turnID: UUID) {
+        guard let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }) else {
+            return
+        }
+
+        guard let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
+            where: { $0.kind == .thinking && $0.phase == .running }
+        ) else {
+            return
+        }
+
+        state.activityGroups[groupIndex].activities[activityIndex].phase = .completed
+    }
+
+    private func startActivity(
+        _ descriptor: ProviderActivityDescriptor,
+        turnID: UUID
+    ) {
+        guard let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }) else {
+            return
+        }
+
+        if let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
+            where: { $0.id == descriptor.id }
+        ) {
+            state.activityGroups[groupIndex].activities[activityIndex].phase = .running
+        } else {
+            state.activityGroups[groupIndex].activities.append(
+                AgentActivity(
+                    id: descriptor.id,
+                    kind: descriptor.kind,
+                    phase: .running
+                )
+            )
+        }
+
+        state.status = .runningTool(
+            AgentActivityPresentation(kind: descriptor.kind).runningStatusName
+        )
+    }
+
+    private func finishActivity(
+        _ activityID: ProviderActivityID,
+        outcome: ProviderActivityOutcome,
+        turnID: UUID
+    ) {
+        guard
+            let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }),
+            let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
+                where: { $0.id == activityID }
+            )
+        else {
+            return
+        }
+
+        state.activityGroups[groupIndex].activities[activityIndex].phase = switch outcome {
+        case .completed:
+            .completed
+        case .failed:
+            .failed
+        }
+    }
+
+    private func finishRunningActivities(
+        turnID: UUID,
+        phase: AgentActivityPhase
+    ) {
+        guard let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }) else {
+            return
+        }
+
+        let activities = state.activityGroups[groupIndex].activities
+        state.activityGroups[groupIndex].activities = activities.map { activity in
+            guard activity.phase == .running else {
+                return activity
+            }
+
+            return AgentActivity(
+                id: activity.id,
+                kind: activity.kind,
+                phase: phase
+            )
+        }
     }
 
     private func normalizeConfiguration() {

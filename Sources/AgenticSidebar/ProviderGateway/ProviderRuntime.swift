@@ -12,8 +12,11 @@ enum ProviderRuntimeError: Error, Equatable, Sendable {
 
 enum ProviderEvent: Equatable, Sendable {
     case assistantTextDelta(String)
-    case toolStarted(String)
-    case toolFinished
+    case activityStarted(ProviderActivityDescriptor)
+    case activityFinished(
+        ProviderActivityID,
+        outcome: ProviderActivityOutcome
+    )
     case waiting
     case completed
 }

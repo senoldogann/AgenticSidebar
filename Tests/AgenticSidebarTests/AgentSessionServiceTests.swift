@@ -99,6 +99,53 @@ final class AgentSessionServiceTests: XCTestCase {
         XCTAssertNotNil(service.state.completedAt)
     }
 
+    func testActivitiesAreAnchoredSanitizedAndCompletedWithTheirTurn() async throws {
+        let activityID = ProviderActivityID("part-read")
+        let runtime = TestProviderRuntime(
+            id: ProviderID("alpha"),
+            displayName: "Alpha",
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("alpha-1"),
+                    displayName: "Alpha 1",
+                    variants: []
+                )
+            ],
+            streamFactory: { _ in
+                let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+                pair.continuation.yield(
+                    .activityStarted(
+                        ProviderActivityDescriptor(
+                            id: activityID,
+                            kind: .read
+                        )
+                    )
+                )
+                pair.continuation.yield(
+                    .activityFinished(
+                        activityID,
+                        outcome: .completed
+                    )
+                )
+                pair.continuation.yield(.assistantTextDelta("Done"))
+                pair.continuation.yield(.completed)
+                pair.continuation.finish()
+                return ProviderStream(events: pair.stream)
+            }
+        )
+        let service = AgentSessionService(runtimes: [runtime])
+        await service.refreshCapabilities()
+
+        let task = try XCTUnwrap(service.submit("Read the project"))
+        await task.value
+
+        let userMessage = try XCTUnwrap(service.state.messages.first)
+        let group = try XCTUnwrap(service.state.activityGroups.first)
+        XCTAssertEqual(group.anchorMessageID, userMessage.id)
+        XCTAssertEqual(group.activities.map(\.kind), [.thinking, .read])
+        XCTAssertTrue(group.activities.allSatisfy { $0.phase == .completed })
+    }
+
     func testCancellationCancelsProviderStreamAndRejectsStaleEvents() async throws {
         let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
         let cancellationProbe = CancellationProbe()

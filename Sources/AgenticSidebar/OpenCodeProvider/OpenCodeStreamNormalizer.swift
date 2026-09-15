@@ -127,12 +127,34 @@ struct OpenCodeStreamNormalizer: Sendable {
             switch status {
             case "running":
                 if runningToolParts.insert(partID).inserted {
-                    return [.toolStarted(tool)]
+                    return [
+                        .activityStarted(
+                            ProviderActivityDescriptor.sanitizedTool(
+                                id: ProviderActivityID(partID),
+                                toolName: tool
+                            )
+                        )
+                    ]
                 }
                 return []
-            case "completed", "error":
+            case "completed":
                 if runningToolParts.remove(partID) != nil {
-                    return [.toolFinished]
+                    return [
+                        .activityFinished(
+                            ProviderActivityID(partID),
+                            outcome: .completed
+                        )
+                    ]
+                }
+                return []
+            case "error":
+                if runningToolParts.remove(partID) != nil {
+                    return [
+                        .activityFinished(
+                            ProviderActivityID(partID),
+                            outcome: .failed
+                        )
+                    ]
                 }
                 return []
             default:
