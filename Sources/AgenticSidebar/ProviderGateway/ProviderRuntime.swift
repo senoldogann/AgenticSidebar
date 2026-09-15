@@ -1,5 +1,12 @@
 import Foundation
 
+enum ProviderRuntimeError: Error, Equatable, Sendable {
+    case missingCredential
+    case unavailable
+    case transport
+    case unexpectedResponse
+}
+
 enum ProviderEvent: Equatable, Sendable {
     case assistantTextDelta(String)
     case toolStarted(String)

@@ -5,7 +5,17 @@ struct AgenticSidebarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     @State private var settingsStore = SettingsStore()
-    @State private var sessionService = AgentSessionService(runtimes: [])
+    @State private var openAICredentialSettings = OpenAICredentialSettings(
+        credentialStore: KeychainCredentialStore()
+    )
+    @State private var sessionService = AgentSessionService(
+        runtimes: [
+            OpenAIProviderRuntime(
+                transport: URLSessionOpenAITransport.shared(),
+                credentialStore: KeychainCredentialStore()
+            )
+        ]
+    )
 
     var body: some Scene {
         WindowGroup(AppIdentity.name, id: "main") {
@@ -20,7 +30,13 @@ struct AgenticSidebarApp: App {
         Settings {
             SettingsView(
                 settingsStore: settingsStore,
-                capturePrivacyCapabilities: appDelegate.capturePrivacyController.capabilities
+                openAICredentialSettings: openAICredentialSettings,
+                capturePrivacyCapabilities: appDelegate.capturePrivacyController.capabilities,
+                onOpenAICredentialChange: {
+                    Task {
+                        await sessionService.refreshCapabilities()
+                    }
+                }
             )
         }
 

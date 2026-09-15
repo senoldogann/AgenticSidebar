@@ -198,6 +198,50 @@ final class AgentSessionServiceTests: XCTestCase {
         XCTAssertEqual(service.state.messages.last?.text, "Partial")
     }
 
+    func testMissingCredentialCapabilityFailureIsPreserved() async {
+        let runtime = FailingCapabilitiesRuntime(error: ProviderRuntimeError.missingCredential)
+        let service = AgentSessionService(runtimes: [runtime])
+
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.state.status, .failed)
+        XCTAssertEqual(service.state.error, .missingCredential)
+    }
+
+    func testProviderRuntimeErrorsMapToSessionErrors() async throws {
+        let mappings: [(ProviderRuntimeError, AgentSessionError)] = [
+            (.missingCredential, .missingCredential),
+            (.unavailable, .providerUnavailable),
+            (.transport, .transportFailure),
+            (.unexpectedResponse, .unexpectedBackendResponse)
+        ]
+
+        for (runtimeError, expectedError) in mappings {
+            let runtime = TestProviderRuntime(
+                id: ProviderID("alpha"),
+                displayName: "Alpha",
+                models: [
+                    ProviderModelCapability(
+                        id: ProviderModelID("alpha-1"),
+                        displayName: "Alpha 1",
+                        variants: []
+                    )
+                ],
+                streamFactory: { _ in
+                    throw runtimeError
+                }
+            )
+            let service = AgentSessionService(runtimes: [runtime])
+            await service.refreshCapabilities()
+
+            let task = try XCTUnwrap(service.submit("Hi"))
+            await task.value
+
+            XCTAssertEqual(service.state.status, .failed)
+            XCTAssertEqual(service.state.error, expectedError)
+        }
+    }
+
     private func makeRuntime(
         id: String,
         modelID: String,
@@ -222,9 +266,23 @@ final class AgentSessionServiceTests: XCTestCase {
     }
 }
 
+private struct FailingCapabilitiesRuntime: ProviderRuntime {
+    let id = ProviderID("failing")
+    let error: ProviderRuntimeError
+
+    func capabilities() async throws -> ProviderCapabilities {
+        throw error
+    }
+
+    func startStream(for request: ProviderRequest) async throws -> ProviderStream {
+        throw error
+    }
+}
+
 private struct SensitiveProviderError: Error, Sendable {
     let message: String
 }
+
 private actor CancellationProbe {
     private var cancellationCount = 0
 

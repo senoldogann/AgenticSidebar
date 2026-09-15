@@ -73,6 +73,7 @@ final class AgentSessionService {
         }
 
         var loadedProviders: [ProviderCapabilities] = []
+        var capabilityErrors: [AgentSessionError] = []
 
         for runtime in runtimes {
             do {
@@ -81,7 +82,10 @@ final class AgentSessionService {
                     continue
                 }
                 loadedProviders.append(capabilities)
+            } catch let error as ProviderRuntimeError {
+                capabilityErrors.append(sessionError(for: error))
             } catch {
+                capabilityErrors.append(.providerUnavailable)
                 continue
             }
         }
@@ -98,7 +102,10 @@ final class AgentSessionService {
         guard !loadedProviders.isEmpty else {
             state.configuration = nil
             state.status = .failed
-            state.error = .providerUnavailable
+            state.error = capabilityErrors.count == runtimes.count
+                && capabilityErrors.allSatisfy { $0 == .missingCredential }
+                ? .missingCredential
+                : .providerUnavailable
             return
         }
 
@@ -325,6 +332,14 @@ final class AgentSessionService {
 
             state.status = .cancelled
             state.completedAt = Date()
+        } catch let error as ProviderRuntimeError {
+            guard activeTurnID == turnID else {
+                return
+            }
+
+            state.status = .failed
+            state.error = sessionError(for: error)
+            state.completedAt = Date()
         } catch {
             guard activeTurnID == turnID else {
                 return
@@ -375,5 +390,18 @@ final class AgentSessionService {
 
     private func runtime(for providerID: ProviderID) -> (any ProviderRuntime)? {
         runtimes.first { $0.id == providerID }
+    }
+
+    private func sessionError(for error: ProviderRuntimeError) -> AgentSessionError {
+        switch error {
+        case .missingCredential:
+            .missingCredential
+        case .unavailable:
+            .providerUnavailable
+        case .transport:
+            .transportFailure
+        case .unexpectedResponse:
+            .unexpectedBackendResponse
+        }
     }
 }

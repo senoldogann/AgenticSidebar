@@ -12,6 +12,7 @@ enum AgentSessionStatus: Equatable, Sendable {
 }
 
 enum AgentSessionError: Error, Equatable, Sendable {
+    case missingCredential
     case providerUnavailable
     case unsupportedCapability
     case transportFailure
