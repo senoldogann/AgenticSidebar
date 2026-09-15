@@ -3,7 +3,7 @@ import SwiftUI
 struct RootChatView: View {
     @Environment(\.openWindow) private var openWindow
 
-    let sessionStore: SessionPresentationStore
+    let sessionService: AgentSessionService
     let mainWindowController: MainWindowController
     let capturePrivacyController: CapturePrivacyController
 
@@ -11,7 +11,7 @@ struct RootChatView: View {
         NavigationSplitView {
             ConversationSidebarView()
         } detail: {
-            ConversationDetailView(sessionStore: sessionStore)
+            ConversationDetailView(sessionService: sessionService)
         }
         .navigationSplitViewStyle(.balanced)
         .frame(minWidth: 760, minHeight: 520)
@@ -26,6 +26,9 @@ struct RootChatView: View {
             mainWindowController.setReopenAction {
                 openWindow(id: "main")
             }
+        }
+        .task {
+            await sessionService.refreshCapabilities()
         }
     }
 }

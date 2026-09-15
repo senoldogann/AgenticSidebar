@@ -1,6 +1,8 @@
 import SwiftUI
 
 struct ComposerView: View {
+    let sessionService: AgentSessionService
+
     @State private var draft = ""
 
     var body: some View {
@@ -16,17 +18,44 @@ struct ComposerView: View {
                         in: RoundedRectangle(cornerRadius: 18, style: .continuous)
                     )
 
-                Button {
-                } label: {
-                    Image(systemName: "arrow.up")
-                        .frame(width: 18, height: 18)
+                if sessionService.isBusy {
+                    Button {
+                        Task {
+                            await sessionService.cancel()
+                        }
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .help("Cancel the active turn")
+                } else {
+                    Button {
+                        if sessionService.submit(draft) != nil {
+                            draft = ""
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .disabled(
+                        draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || !sessionService.canSubmit
+                    )
+                    .help(sendButtonHelp)
                 }
-                .buttonStyle(.glassProminent)
-                .disabled(true)
-                .help("Agent runtime wiring follows the application shell milestone")
             }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 16)
+    }
+
+    private var sendButtonHelp: String {
+        if sessionService.providers.isEmpty {
+            "A provider adapter is required before sending messages"
+        } else {
+            "Send message"
+        }
     }
 }

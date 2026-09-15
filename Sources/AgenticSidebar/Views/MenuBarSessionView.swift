@@ -2,21 +2,25 @@ import AppKit
 import SwiftUI
 
 struct MenuBarSessionView: View {
-    let sessionStore: SessionPresentationStore
+    let sessionService: AgentSessionService
     let mainWindowController: MainWindowController
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { context in
+            let presentationState = SessionPresentationState(
+                agentSessionState: sessionService.state
+            )
+
             VStack(alignment: .leading, spacing: 12) {
                 Label(
-                    sessionStore.state.statusTitle,
-                    systemImage: sessionStore.state.symbolName
+                    presentationState.statusTitle,
+                    systemImage: presentationState.symbolName
                 )
                 .font(.headline)
 
                 Text(
                     ElapsedTimeFormatter.string(
-                        seconds: sessionStore.state.elapsed(at: context.date)
+                        seconds: presentationState.elapsed(at: context.date)
                     )
                 )
                 .monospacedDigit()

@@ -5,7 +5,10 @@ enum SessionPhase: Equatable, Sendable {
     case thinking
     case runningTool(String)
     case waiting
+    case cancelling
+    case cancelled
     case completed
+    case failed
 }
 
 struct SessionPresentationState: Equatable, Sendable {
@@ -23,6 +26,30 @@ struct SessionPresentationState: Equatable, Sendable {
         self.completedAt = completedAt
     }
 
+    init(agentSessionState: AgentSessionState) {
+        switch agentSessionState.status {
+        case .idle:
+            phase = .idle
+        case .streaming:
+            phase = .thinking
+        case let .runningTool(toolName):
+            phase = .runningTool(toolName)
+        case .waiting:
+            phase = .waiting
+        case .cancelling:
+            phase = .cancelling
+        case .completed:
+            phase = .completed
+        case .cancelled:
+            phase = .cancelled
+        case .failed:
+            phase = .failed
+        }
+
+        startedAt = agentSessionState.startedAt
+        completedAt = agentSessionState.completedAt
+    }
+
     var statusTitle: String {
         switch phase {
         case .idle:
@@ -33,8 +60,14 @@ struct SessionPresentationState: Equatable, Sendable {
             "Running \(toolName)"
         case .waiting:
             "Waiting"
+        case .cancelling:
+            "Cancelling"
+        case .cancelled:
+            "Cancelled"
         case .completed:
             "Completed"
+        case .failed:
+            "Failed"
         }
     }
 
@@ -48,8 +81,14 @@ struct SessionPresentationState: Equatable, Sendable {
             "wrench.and.screwdriver"
         case .waiting:
             "hourglass"
+        case .cancelling:
+            "stop.circle"
+        case .cancelled:
+            "xmark.circle"
         case .completed:
             "checkmark.circle.fill"
+        case .failed:
+            "exclamationmark.triangle"
         }
     }
 

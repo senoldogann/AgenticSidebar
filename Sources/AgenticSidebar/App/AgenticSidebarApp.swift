@@ -5,12 +5,12 @@ struct AgenticSidebarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     @State private var settingsStore = SettingsStore()
-    @State private var sessionStore = SessionPresentationStore()
+    @State private var sessionService = AgentSessionService(runtimes: [])
 
     var body: some Scene {
         WindowGroup(AppIdentity.name, id: "main") {
             RootChatView(
-                sessionStore: sessionStore,
+                sessionService: sessionService,
                 mainWindowController: appDelegate.mainWindowController,
                 capturePrivacyController: appDelegate.capturePrivacyController
             )
@@ -30,7 +30,7 @@ struct AgenticSidebarApp: App {
             isInserted: menuBarSessionBinding
         ) {
             MenuBarSessionView(
-                sessionStore: sessionStore,
+                sessionService: sessionService,
                 mainWindowController: appDelegate.mainWindowController
             )
         }
