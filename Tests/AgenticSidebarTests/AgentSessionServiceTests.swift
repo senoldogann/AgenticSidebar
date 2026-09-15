@@ -128,7 +128,7 @@ final class AgentSessionServiceTests: XCTestCase {
 
         pair.continuation.yield(.assistantTextDelta("Partial"))
         for _ in 0..<100 where service.state.messages.last?.text != "Partial" {
-            await Task.yield()
+            try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertEqual(service.state.messages.last?.text, "Partial")
 

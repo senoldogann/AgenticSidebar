@@ -16,6 +16,17 @@ final class AgentSessionService {
     @ObservationIgnored
     private var activeTurnID: UUID?
 
+    @ObservationIgnored
+    private var activeAssistantMessageID: UUID?
+
+    @ObservationIgnored
+    private var streamingTextAccumulator = StreamingTextAccumulator.empty
+
+    @ObservationIgnored
+    private var streamingTextFlushTask: Task<Void, Never>?
+
+    private static let streamingTextUpdateInterval = Duration.milliseconds(40)
+
     private(set) var providers: [ProviderCapabilities] = []
     private(set) var state: AgentSessionState
 
@@ -199,6 +210,8 @@ final class AgentSessionService {
         state.error = nil
         state.startedAt = Date()
         state.completedAt = nil
+        discardPendingAssistantText()
+        activeAssistantMessageID = nil
 
         let request = ProviderRequest(
             sessionID: state.id,
@@ -267,7 +280,6 @@ final class AgentSessionService {
             }
 
             activeStream = stream
-            var assistantMessageID: UUID?
             var didComplete = false
 
             for try await event in stream.events {
@@ -279,28 +291,22 @@ final class AgentSessionService {
 
                 switch event {
                 case let .assistantTextDelta(delta):
-                    if
-                        let assistantMessageID,
-                        let index = state.messages.firstIndex(where: { $0.id == assistantMessageID })
-                    {
-                        state.messages[index].text += delta
-                    } else {
-                        let message = ChatMessage(role: .assistant, text: delta)
-                        assistantMessageID = message.id
-                        state.messages.append(message)
-                    }
-                    state.status = .streaming
+                    enqueueAssistantText(delta, turnID: turnID)
 
                 case let .toolStarted(toolName):
+                    flushPendingAssistantText(turnID: turnID)
                     state.status = .runningTool(toolName)
 
                 case .toolFinished:
+                    flushPendingAssistantText(turnID: turnID)
                     state.status = .streaming
 
                 case .waiting:
+                    flushPendingAssistantText(turnID: turnID)
                     state.status = .waiting
 
                 case .completed:
+                    flushPendingAssistantText(turnID: turnID)
                     didComplete = true
                 }
 
@@ -317,6 +323,8 @@ final class AgentSessionService {
                 return
             }
 
+            flushPendingAssistantText(turnID: turnID)
+
             if didComplete {
                 state.status = .completed
                 state.completedAt = Date()
@@ -330,6 +338,7 @@ final class AgentSessionService {
                 return
             }
 
+            flushPendingAssistantText(turnID: turnID)
             state.status = .cancelled
             state.completedAt = Date()
         } catch let error as ProviderRuntimeError {
@@ -337,6 +346,7 @@ final class AgentSessionService {
                 return
             }
 
+            flushPendingAssistantText(turnID: turnID)
             state.status = .failed
             state.error = sessionError(for: error)
             state.completedAt = Date()
@@ -345,6 +355,7 @@ final class AgentSessionService {
                 return
             }
 
+            flushPendingAssistantText(turnID: turnID)
             state.status = .failed
             state.error = .transportFailure
             state.completedAt = Date()
@@ -354,7 +365,73 @@ final class AgentSessionService {
             activeTask = nil
             activeStream = nil
             activeTurnID = nil
+            activeAssistantMessageID = nil
+            discardPendingAssistantText()
         }
+    }
+
+    private func enqueueAssistantText(
+        _ delta: String,
+        turnID: UUID
+    ) {
+        guard activeTurnID == turnID else {
+            return
+        }
+
+        let appendResult = streamingTextAccumulator.appending(delta)
+        streamingTextAccumulator = appendResult.accumulator
+
+        guard appendResult.shouldScheduleFlush else {
+            return
+        }
+
+        streamingTextFlushTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: Self.streamingTextUpdateInterval)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            self?.flushPendingAssistantText(turnID: turnID)
+        }
+    }
+
+    private func flushPendingAssistantText(turnID: UUID) {
+        guard activeTurnID == turnID else {
+            return
+        }
+
+        streamingTextFlushTask?.cancel()
+        streamingTextFlushTask = nil
+
+        let drainResult = streamingTextAccumulator.draining()
+        streamingTextAccumulator = drainResult.accumulator
+
+        guard let text = drainResult.text else {
+            return
+        }
+
+        if
+            let activeAssistantMessageID,
+            let index = state.messages.firstIndex(where: { $0.id == activeAssistantMessageID })
+        {
+            state.messages[index].text += text
+        } else {
+            let message = ChatMessage(role: .assistant, text: text)
+            activeAssistantMessageID = message.id
+            state.messages.append(message)
+        }
+        state.status = .streaming
+    }
+
+    private func discardPendingAssistantText() {
+        streamingTextFlushTask?.cancel()
+        streamingTextFlushTask = nil
+        streamingTextAccumulator = .empty
     }
 
     private func normalizeConfiguration() {

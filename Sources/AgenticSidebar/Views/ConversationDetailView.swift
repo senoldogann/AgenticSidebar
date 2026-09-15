@@ -46,9 +46,16 @@ struct ConversationDetailView: View {
                     LazyVStack(spacing: 12) {
                         ForEach(sessionService.state.messages) { message in
                             ChatMessageRow(message: message)
+                                .transition(
+                                    .opacity.combined(with: .move(edge: .bottom))
+                                )
                         }
                     }
                     .padding(20)
+                    .animation(
+                        .easeOut(duration: 0.18),
+                        value: sessionService.state.messages.count
+                    )
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
