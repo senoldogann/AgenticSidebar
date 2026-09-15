@@ -1,0 +1,152 @@
+schema_version: 1.0.0
+revision: 1
+scope: agentic-sidebar-macos-first-milestone
+architecture_style: native-modular-monolith-with-provider-ports
+quality_attributes:
+  - name: native-macos-integration
+    priority: 1
+    rationale: Core product value depends on native window, menu-bar, shortcut, and Liquid Glass behavior.
+    measurable_signal: Window, menu-bar, Dock, shortcut, and appearance behaviors pass host-level acceptance checks on the target macOS SDK.
+  - name: credential-safety
+    priority: 2
+    rationale: The application handles user-supplied API credentials.
+    measurable_signal: Direct OpenAI credentials are stored only in Keychain and secret values are absent from UserDefaults, logs, fixtures, and source control.
+  - name: session-lifecycle-correctness
+    priority: 3
+    rationale: Sessions must continue while the UI is hidden and expose accurate live state.
+    measurable_signal: Hiding and restoring the UI does not cancel active work; cancellation, completion, and reconnect states are covered by tests.
+  - name: provider-extensibility
+    priority: 4
+    rationale: OpenAI and OpenCode must coexist without duplicating presentation logic.
+    measurable_signal: Chat presentation depends on provider-neutral protocols and both adapters pass shared contract tests.
+  - name: verifiability
+    priority: 5
+    rationale: Features will be expanded iteratively only after concrete verification.
+    measurable_signal: Each milestone records build, unit, integration, and host-behavior verification separately.
+components:
+  - id: app-shell
+    responsibility: Own macOS application lifecycle, window visibility, menu-bar presence, settings scenes, activation policy, and global shortcut coordination.
+    owns_data: []
+    public_interfaces:
+      - app-visibility-control
+      - menu-bar-session-presentation
+  - id: chat-presentation
+    responsibility: Render conversation state, composer, provider/model/effort controls, and user-visible execution state.
+    owns_data: []
+    public_interfaces:
+      - chat-user-intents
+  - id: agent-core
+    responsibility: Own provider-neutral session state, message flow, cancellation, streaming normalization, and backend selection.
+    owns_data:
+      - active-session-state
+    public_interfaces:
+      - agent-session-service
+  - id: provider-port
+    responsibility: Define provider-neutral discovery, capability, session, streaming, and cancellation interfaces.
+    owns_data: []
+    public_interfaces:
+      - provider-runtime
+  - id: openai-adapter
+    responsibility: Integrate direct OpenAI model discovery/capabilities and Responses streaming.
+    owns_data: []
+    public_interfaces:
+      - provider-runtime
+  - id: opencode-adapter
+    responsibility: Manage and communicate with a loopback OpenCode server, normalize provider/model/session/event APIs, and forward supported credential updates.
+    owns_data: []
+    public_interfaces:
+      - provider-runtime
+  - id: credential-store
+    responsibility: Persist and retrieve application-owned secrets using macOS Keychain.
+    owns_data:
+      - direct-openai-credential
+      - managed-opencode-server-credential
+    public_interfaces:
+      - credential-access
+  - id: settings-store
+    responsibility: Persist non-secret user preferences such as menu-bar visibility, preferred backend, model selection, and shortcut configuration.
+    owns_data:
+      - user-preferences
+    public_interfaces:
+      - settings-access
+  - id: capture-privacy
+    responsibility: Apply availability-checked best-effort capture-protection techniques and report unsupported guarantees accurately.
+    owns_data: []
+    public_interfaces:
+      - capture-privacy-control
+external_boundaries:
+  - id: openai-responses-api
+    responsibility: Execute direct OpenAI requests and stream results.
+  - id: opencode-local-server
+    responsibility: Provide OpenCode provider discovery, auth, sessions, asynchronous prompts, statuses, and server-sent events over loopback HTTP.
+  - id: macos-keychain
+    responsibility: Securely persist application-owned credentials.
+  - id: macos-windowing-and-menu-bar
+    responsibility: Provide AppKit and SwiftUI lifecycle, window, activation, shortcut, and MenuBarExtra behavior.
+dependency_rules:
+  - source: chat-presentation
+    target: agent-core
+    policy: allow-via-interface
+    via_interface: agent-session-service
+    rationale: Presentation sends user intents through the provider-neutral session service.
+  - source: agent-core
+    target: provider-port
+    policy: allow-via-interface
+    via_interface: provider-runtime
+    rationale: Core session logic may depend on provider capabilities but not concrete transport implementations.
+  - source: agent-core
+    target: openai-adapter
+    policy: deny
+    rationale: Core logic must not depend directly on a concrete provider implementation.
+  - source: agent-core
+    target: opencode-adapter
+    policy: deny
+    rationale: Core logic must not depend directly on a concrete provider implementation.
+  - source: openai-adapter
+    target: openai-responses-api
+    policy: allow
+    rationale: The OpenAI adapter owns direct network communication with OpenAI.
+  - source: opencode-adapter
+    target: opencode-local-server
+    policy: allow
+    rationale: The OpenCode adapter owns loopback OpenCode process and HTTP integration.
+  - source: openai-adapter
+    target: credential-store
+    policy: allow-via-interface
+    via_interface: credential-access
+    rationale: Direct OpenAI credentials are resolved through Keychain-backed storage.
+  - source: opencode-adapter
+    target: credential-store
+    policy: allow-via-interface
+    via_interface: credential-access
+    rationale: Managed OpenCode server authentication credentials are resolved through Keychain-backed storage.
+  - source: app-shell
+    target: macos-windowing-and-menu-bar
+    policy: allow
+    rationale: The shell owns native application lifecycle integration.
+  - source: app-shell
+    target: capture-privacy
+    policy: allow-via-interface
+    via_interface: capture-privacy-control
+    rationale: Capture policy is applied at window boundaries without entering chat/session logic.
+required_practices:
+  - Derive model-specific effort or variant choices from backend capabilities; do not expose invalid combinations.
+  - Use structured concurrency for request, stream, cancellation, and process-lifecycle tasks.
+  - Keep secrets out of logs and non-secret preference storage.
+  - Bind managed OpenCode only to loopback and require server authentication.
+  - Verify macOS-specific behavior on the real host separately from unit tests.
+prohibited_practices:
+  - Do not claim guaranteed invisibility from all screenshots or screen recorders.
+  - Do not embed provider API keys in source, fixtures, UserDefaults, or analytics.
+  - Do not make SwiftUI presentation import concrete OpenAI or OpenCode transport code.
+  - Do not silently download or execute a new OpenCode binary in the first milestone.
+decision_ids:
+  - ADR-001
+  - ADR-002
+  - ADR-003
+unresolved_questions:
+  - id: Q-001
+    question: What exact macOS deployment target and Xcode/Swift language mode are available on the user's implementation host?
+    decision_impact: Determines availability guards and the minimum set of compatibility code, but does not change the approved architecture.
+    critical: false
+    answer: Verify from xcodebuild and swift before scaffolding the host project.
