@@ -260,47 +260,54 @@ struct ConversationDetailView: View {
 
     /// One transcript entry: the message, then the timeline of the turn it
     /// started.
+    ///
+    /// İkisi açık bir `VStack` içinde durur: çıplak `@ViewBuilder` iki görünümü
+    /// aynı satır hücresinde üst üste bindirir, kullanıcı balonu timeline
+    /// satırlarının üzerine biner ve yarı saydam kartların altından yazılar
+    /// görünür.
     @ViewBuilder
     private func transcriptRow(
         for message: ChatMessage,
         preset: AppThemePreset,
         isDark: Bool
     ) -> some View {
-        ChatMessageRow(
-            message: message,
-            preset: preset,
-            isDark: isDark,
-            contrast: settingsStore.contrast,
-            isPlanAwaitingApproval: isPlanAwaitingApproval(for: message),
-            canResend: !sessionService.isBusy,
-            onApprovePlan: approvePlan,
-            onRestore: { writeAgain(message) },
-            onImageTap: { path in
-                previewImagePath = path
-            }
-        )
-        .modifier(
-            PromptOffsetProbe(
-                messageID: message.id,
-                isUserMessage: message.role == .user,
-                space: Self.transcriptSpace,
-                onOffset: { messageID, offset in
-                    reportPromptOffset(offset, for: messageID)
+        VStack(alignment: .leading, spacing: 8) {
+            ChatMessageRow(
+                message: message,
+                preset: preset,
+                isDark: isDark,
+                contrast: settingsStore.contrast,
+                isPlanAwaitingApproval: isPlanAwaitingApproval(for: message),
+                canResend: !sessionService.isBusy,
+                onApprovePlan: approvePlan,
+                onRestore: { writeAgain(message) },
+                onImageTap: { path in
+                    previewImagePath = path
                 }
             )
-        )
+            .modifier(
+                PromptOffsetProbe(
+                    messageID: message.id,
+                    isUserMessage: message.role == .user,
+                    space: Self.transcriptSpace,
+                    onOffset: { messageID, offset in
+                        reportPromptOffset(offset, for: messageID)
+                    }
+                )
+            )
+
+            if let activityGroup = activityGroup(after: message.id) {
+                // Kontrol listesi yalnız composer'ın üstündeki panelde durur;
+                // transkriptte her turun üstünde yinelenmiyordu artık.
+                AgentActivityTimelineView(
+                    group: activityGroup,
+                    isTurnActive: isTurnActive(for: activityGroup)
+                )
+                .transition(.opacity)
+            }
+        }
         .id(message.id)
         .transition(.opacity.combined(with: .move(edge: .bottom)))
-
-        if let activityGroup = activityGroup(after: message.id) {
-            // Kontrol listesi yalnız composer'ın üstündeki panelde durur;
-            // transkriptte her turun üstünde yinelenmiyordu artık.
-            AgentActivityTimelineView(
-                group: activityGroup,
-                isTurnActive: isTurnActive(for: activityGroup)
-            )
-            .transition(.opacity)
-        }
     }
 
     private var emptyStateTitle: String {
