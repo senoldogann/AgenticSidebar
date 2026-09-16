@@ -95,7 +95,14 @@ final class ComputerUseFilesTests: XCTestCase {
         let instructions = ComputerUseFiles.instructionsMarkdown()
 
         XCTAssertTrue(instructions.contains("Admin authority lease"))
-        XCTAssertTrue(instructions.contains("approved by the user"))
+        XCTAssertTrue(instructions.contains("Full access answers without a prompt"))
+        XCTAssertTrue(instructions.contains("Ask and Approve for me may require user approval"))
         XCTAssertTrue(instructions.contains("--personal-admin") == false)
+    }
+
+    func testInstructionsUseTheSupportedComputerOpenAppTimeout() {
+        let instructions = ComputerUseFiles.instructionsMarkdown()
+        XCTAssertTrue(instructions.contains("`timeoutMs` up to 5000"))
+        XCTAssertFalse(instructions.contains("`timeoutMs` up to 60000"))
     }
 }

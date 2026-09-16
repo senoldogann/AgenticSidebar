@@ -56,9 +56,13 @@ The composer's mode menu mirrors the speed menu: **Build** is the agentic defaul
 **Plan** asks the assistant to investigate read-only and answer with a single `plan`
 block. That block is rendered as a document card rather than chat prose, and the only
 way forward is the **Approve & Build** bar under it, which flips the session back to
-Build mode and hands the plan back as an ordinary user turn. Plan mode is enforced by
-instruction, not by a tool-permission change, so the provider's own workflow is left
-alone.
+Build mode and hands the plan back as an ordinary user turn. OpenCode Plan turns
+select a dedicated `agenticsidebar-readonly` backend agent: its generated permission
+rules deny tools by default and allow only named read-only capabilities. The plan
+instruction still controls the answer's format. The direct OpenAI path has no tool
+execution in this app and uses the plan instruction. The approval bar controls the
+app workflow; it is not an operating-system permission boundary. The OpenCode agent
+selection and generated rules are covered by tests, not by a live inference probe.
 
 A message sent while a turn is running is queued instead of being refused: queued
 prompts keep the speed and mode they were sent with, appear as a strip above the
@@ -212,10 +216,11 @@ deletes its own throwaway item in the login keychain.
   control in the composer and on a waiting approval card:
   - **Ask** — reads and in-folder edits run; every shell command, every path
     outside the working folder and every network call waits for your decision.
-  - **Approve for me** — safe inspection (`git status`, `ls`, `rg`, `cat` …) and
-    this project's own `swift build`/`swift test`/`npm test` commands run
-    unattended; anything that can change state, leave the folder or reach the
-    network asks.
+  - **Approve for me** — a short list of exact inspection commands (`git status`,
+    `git diff`, `ls`, `pwd` and selected fixed variants) and exact build/test
+    commands run unattended within the working folder. Other commands, including
+    arbitrary flags, commands that can change state, external paths and network
+    access, require approval.
   - **Full access** — nothing asks. **This is the default**, matching how the app
     behaved before the level existed; two stricter levels are one click away.
     It answers the requests the agent raises; a `deny` in the user's own
@@ -232,12 +237,15 @@ deletes its own throwaway item in the login keychain.
   only runs unattended when it is a *single* simple command whose paths stay
   inside the working folder — a trusted prefix chained with `&&`, `;`, `|` or a
   redirect asks instead.
-- **Audit trail**: every approval the app answers — tool, command or path,
-  whether a level, an earlier "Always allow", or you answered it — is appended to
+- **Audit trail**: permission decisions and observed tool execution events are
+  distinct JSONL records in
   `~/Library/Application Support/AgenticSidebar/OpenCode/audit.jsonl` (rotated at
-  20 MB, kept 5 files, mode `0600`) and shown under Settings → AI & Models →
-  Recent tool decisions. With no prompt in the loop on Full access, this file is
-  the record of what actually ran.
+  20 MB, kept 5 files, mode `0600`). Settings → AI & Models → Recent tool
+  activity displays both. Decisions record why a request was answered, but a
+  decision does not prove execution. Execution records mark observed starts and
+  completions, including tools that required no permission prompt. They record
+  session/activity identifiers and tool kinds, not command arguments, file
+  contents or tool output; this trail cannot reconstruct every command or path.
 - **Computer Use**: opt-in in Settings → Computer Use. The app registers the
   local [`chatgpt-system`](https://github.com/senoldogann/chatgpt-system) MCP
   server with the managed OpenCode server (`POST /mcp`) and starts it with

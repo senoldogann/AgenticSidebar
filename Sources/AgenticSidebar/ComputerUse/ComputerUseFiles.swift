@@ -118,10 +118,12 @@ enum ComputerUseFiles {
            - When opening applications with `\(serverName)_computer_open_app`, always prefer
              providing `bundleIdentifier` (e.g., `com.apple.Safari`, `com.google.Chrome`,
              `com.apple.calculator`, `com.apple.TextEdit`) for instant resolution.
-           - You may specify `timeoutMs` up to 60000.
+           - You may specify `timeoutMs` up to 5000.
         6. Approvals & Safety:
-           - Each computer action program is approved by the user before it runs.
-           - Batching multiple actions inside `computer_run` requires only ONE user approval.
+           - The selected tool approval level applies to each request. Full access answers without a prompt.
+           - Ask and Approve for me may require user approval, depending on the tool and its arguments.
+           - Batching actions inside `computer_run` generates at most one permission request for the program,
+             not one per action; Full access answers it automatically when a request is raised.
            - Never try to work around a denied action; explain what you need instead.
            - If `COMPUTER_USER_TAKEOVER` occurs, stop immediately and yield control.
         """
