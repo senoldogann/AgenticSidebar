@@ -152,9 +152,9 @@ struct AgentActivityTimelineView: View {
                 .padding(.vertical, 3)
                 .padding(.horizontal, 4)
                 .contentShape(Rectangle())
+                .interactiveHoverPill(cornerRadius: 6)
             }
             .buttonStyle(.plain)
-            .pointingHandCursor()
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
@@ -225,9 +225,9 @@ struct AgentActivityTimelineView: View {
                 .padding(.vertical, 3)
                 .padding(.horizontal, 4)
                 .contentShape(Rectangle())
+                .interactiveHoverPill(cornerRadius: 6)
             }
             .buttonStyle(.plain)
-            .pointingHandCursor()
 
             // Inline Expanded Content (Terminal Box or File Detail)
             if isExpanded {
@@ -262,6 +262,11 @@ struct AgentActivityTimelineView: View {
                 .frame(width: 16)
         case .webSearch:
             Image(systemName: "globe")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+        case .todo:
+            Image(systemName: "checklist")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 16)
@@ -308,12 +313,14 @@ struct AgentActivityTimelineView: View {
     @ViewBuilder
     private func thinkingRowLabel(thinking: AgentActivity) -> some View {
         let hasRunningChildren = group.activities.contains { $0.id != thinking.id && $0.phase == .running }
+        let turnEndedAt = group.activities.compactMap(\.completedAt).max()
 
         if thinking.phase == .running || hasRunningChildren {
             TimelineView(.periodic(from: .now, by: 1.0)) { context in
                 Text(
                     thinkingText(
                         thinking: thinking,
+                        turnEndedAt: turnEndedAt,
                         hasRunningChildren: hasRunningChildren,
                         at: context.date
                     )
@@ -326,6 +333,7 @@ struct AgentActivityTimelineView: View {
             Text(
                 thinkingText(
                     thinking: thinking,
+                    turnEndedAt: turnEndedAt,
                     hasRunningChildren: false,
                     at: Date()
                 )
@@ -338,12 +346,14 @@ struct AgentActivityTimelineView: View {
     /// Ölçüm görünümün dışında, saf bir fonksiyonda durur.
     private func thinkingText(
         thinking: AgentActivity,
+        turnEndedAt: Date?,
         hasRunningChildren: Bool,
         at date: Date
     ) -> String {
         ThinkingDurationPresentation.text(
             startedAt: thinking.startedAt,
             completedAt: thinking.completedAt,
+            turnEndedAt: turnEndedAt,
             isRunning: thinking.phase == .running,
             hasRunningChildren: hasRunningChildren,
             now: date

@@ -10,9 +10,8 @@ struct ComposerView: View {
 
     @Environment(SettingsStore.self) private var settingsStore
     @Environment(ExtensionStore.self) private var extensionStore
-    /// The approval level's long explanation lives in Settings; the one-line
-    /// control here links to it.
-    @Environment(SettingsWindowController.self) private var settingsWindowController: SettingsWindowController?
+    /// "Write this again" on an earlier message puts its text back in this field.
+    @Environment(ComposerDraftCenter.self) private var draftCenter: ComposerDraftCenter?
     @Environment(\.colorScheme) private var systemColorScheme
 
     /// Taslaklar oturuma göre saklanır.
@@ -22,6 +21,10 @@ struct ComposerView: View {
     /// etiketler için de aynısı geçerliydi.
     @State private var draftsBySession: [UUID: ComposerDraft] = [:]
     @State private var isTargetedForDrop = false
+    /// Escape ya da panelin kapatma düğmesiyle reddedilen token. Aynı token
+    /// yazılmaya devam ettiği sürece öneri paneli geri açılmaz; taslaktan
+    /// trigger tümüyle çıkınca silinir.
+    @State private var dismissedSuggestionToken: String?
 
     /// Yazılmakta olan mesajın tamamı: metin, ekler ve etiketler.
     private struct ComposerDraft: Equatable {
@@ -78,35 +81,82 @@ struct ComposerView: View {
     }
 
     var body: some View {
-        composerBox
-            // The suggestion list floats *above* the input box instead of living
-            // inside it. Inside, every name the agent could reach made the field
-            // the user is typing in taller and pushed the text down; out here it is
-            // a panel over the transcript, and the input keeps its height.
-            .overlay(alignment: .top) {
-                if let trigger = activeTrigger {
-                    extensionSuggestions(for: trigger)
-                        .padding(.bottom, 8)
-                        // Its own bottom edge sits on the box's top edge.
-                        .alignmentGuide(.top) { $0[.bottom] }
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+        // The panels that belong to the composer *area* but not to the composer
+        // box: the queued messages and the `/`/`@` suggestions. Both are siblings
+        // above the input in the layout, so neither is an overlay on the box —
+        // there is no shared edge, no shared background and nothing of the input
+        // underneath them. They also have their own surface, border and shadow, so
+        // each reads as a panel of its own rather than a part of the field.
+        VStack(spacing: 8) {
+            if !sessionService.queuedPrompts.isEmpty {
+                floatingPanel {
+                    queuedPromptsStrip
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 10)
                 }
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
-            .zIndex(1)
-            .animation(.easeOut(duration: 0.14), value: activeTrigger)
-            .frame(maxWidth: 820)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .center)
+
+            // Ajanın görev listesi composer'ın üstünde ayrı bir panel olarak da
+            // durur: transkriptteki kart turun altına gömülür ve kaydırınca
+            // kaybolur, oysa bu panel o anki oturumun listesini çalışırken
+            // açılır-kapanır gösterir.
+            if AgentTodoPlacement.shouldShow(
+                todos: sessionService.todos,
+                isTurnRunning: sessionService.isBusy
+            ) {
+                AgentTodoChecklistView(
+                    todos: sessionService.todos,
+                    preset: currentTheme,
+                    isDark: isDarkMode
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            if let trigger = visibleTrigger {
+                floatingPanel {
+                    extensionSuggestions(for: trigger)
+                }
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+
+            composerBox
+        }
+        .animation(.easeOut(duration: 0.14), value: visibleTrigger)
+        .animation(.easeOut(duration: 0.14), value: sessionService.queuedPrompts.isEmpty)
+        .animation(.easeOut(duration: 0.14), value: sessionService.todos.count)
+        .frame(maxWidth: 820)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .center)
+    }
+
+    /// The chrome every panel above the input shares: its own surface, border and
+    /// shadow, so it is never read as part of the composer box below it.
+    private func floatingPanel<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .background(
+                currentTheme.surface(isDark: isDarkMode).opacity(0.96),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(
+                        currentTheme.border(isDark: isDarkMode).opacity(settingsStore.contrast),
+                        lineWidth: 1
+                    )
+            )
+            .shadow(color: Color.black.opacity(isDarkMode ? 0.30 : 0.08), radius: 8, y: 3)
     }
 
     /// The input box itself: what the user types, and the controls under it.
+    ///
+    /// Nothing that merely *reports* something lives in here: the queue and the
+    /// suggestions are panels above the box, and the box keeps one job.
     private var composerBox: some View {
         VStack(spacing: 8) {
-            if !sessionService.queuedPrompts.isEmpty {
-                queuedPromptsStrip
-            }
-
             if !selectedTags.isEmpty {
                 selectedTagsRow
             }
@@ -127,7 +177,8 @@ struct ComposerView: View {
                 ComposerTextEditor(
                     text: draftBinding,
                     submissionAvailability: submissionAvailability,
-                    onSubmit: sendDraft
+                    onSubmit: sendDraft,
+                    onCancelSuggestions: dismissVisibleSuggestions
                 )
 
                 if draft.isEmpty {
@@ -143,7 +194,7 @@ struct ComposerView: View {
                         .accessibilityHidden(true)
                 }
             }
-            .frame(minHeight: 28, maxHeight: 110)
+            .frame(minHeight: 26, maxHeight: 96)
             .padding(.horizontal, 2)
 
             HStack(alignment: .center, spacing: 6) {
@@ -158,7 +209,7 @@ struct ComposerView: View {
             .padding(.top, 2)
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 11)
+        .padding(.vertical, 8)
         .background(
             currentTheme.composerBackground(isDark: isDarkMode)
                 .opacity(settingsStore.glassOpacity),
@@ -219,6 +270,47 @@ struct ComposerView: View {
         }
         .onChange(of: sessionService.activeSessionID) { _, _ in
             discardDraftsOfRemovedSessions()
+            applyPendingRestore()
+        }
+        .onChange(of: draft) { _, _ in
+            // Trigger taslaktan tümüyle çıkınca kapanış kaydı da düşer: aynı
+            // token sonra yeniden yazılırsa panel yine açılmalı.
+            if activeTrigger == nil {
+                dismissedSuggestionToken = nil
+            }
+        }
+        .onAppear {
+            applyPendingRestore()
+        }
+        .onChange(of: draftCenter?.pending) { _, _ in
+            applyPendingRestore()
+        }
+    }
+
+    /// Puts a message the user asked to write again back into the field.
+    ///
+    /// The text is appended rather than swapped in, and the request is only
+    /// consumed once it has been applied: a restore for another conversation
+    /// stays pending until that conversation is the one on screen, because a
+    /// draft belongs to the session it was written in.
+    private func applyPendingRestore() {
+        guard
+            let draftCenter,
+            let request = draftCenter.pending,
+            request.sessionID == sessionService.activeSessionID
+        else {
+            return
+        }
+
+        _ = draftCenter.consumePending()
+        draft = ComposerDraftPlacement.merged(existing: draft, restored: request.text)
+
+        let alreadyAttached = Set(attachedURLs.map(\.path))
+        for path in request.attachmentPaths
+        where !alreadyAttached.contains(path) && FileManager.default.fileExists(atPath: path) {
+            // An attachment whose file is gone would be sent as a path the agent
+            // cannot read, so it is left out rather than restored as a warning.
+            attachedURLs.append(URL(fileURLWithPath: path))
         }
     }
 
@@ -283,27 +375,19 @@ struct ComposerView: View {
     /// The level names are kept to a word each ("Ask", "Approve", "Full access")
     /// and the explanation is not repeated here: a composer that recited two
     /// sentences per state would push the input field out of the place it is being
-    /// typed into. "More info" opens the card in Settings that does explain it.
+    /// typed into. There is no "More info" link either — the card in Settings
+    /// explains the levels, and a control row that points at its own explanation
+    /// reads as part of the decision when it is not.
     private var approvalLevelSection: some View {
         let policy = settingsStore.toolApprovalPolicy
         let pendingCount = permissionApprovalCenter.pending.count
 
         return HStack(spacing: 2) {
-            Menu {
-                ForEach(ToolApprovalPolicy.allCases) { candidate in
-                    Button {
-                        chooseApprovalLevel(candidate)
-                    } label: {
-                        Label(
-                            candidate.compactName,
-                            systemImage: candidate == policy
-                                ? "checkmark"
-                                : candidate.symbolName
-                        )
-                    }
-                    .help(candidate.summary)
-                }
-            } label: {
+            ComposerDropdown(
+                isEnabled: true,
+                helpText: "Tool approvals: \(policy.summary)",
+                accessibilityText: "Tool approvals: \(policy.displayName)"
+            ) {
                 HStack(spacing: 4) {
                     Image(systemName: policy.symbolName)
                         .font(.system(size: 10.5, weight: .semibold))
@@ -329,26 +413,23 @@ struct ComposerView: View {
                 .padding(.horizontal, 9)
                 .padding(.vertical, 5)
                 .interactiveHoverPill(cornerRadius: 6)
+            } content: {
+                ForEach(ToolApprovalPolicy.allCases) { candidate in
+                    ComposerDropdownRow(
+                        title: candidate.displayName,
+                        isSelected: candidate == policy,
+                        helpText: candidate.summary
+                    ) {
+                        chooseApprovalLevel(candidate)
+                    } icon: {
+                        Image(systemName: candidate.symbolName)
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(
+                                candidate.isUnrestricted ? Color.orange : .secondary
+                            )
+                    }
+                }
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .accessibilityLabel("Tool approvals: \(policy.displayName)")
-            .help("Tool approvals: \(policy.summary)")
-
-            Button {
-                settingsWindowController?.show(tab: .ai, anchor: .toolApprovals)
-            } label: {
-                Text("More info")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 5)
-                    .interactiveHoverPill(cornerRadius: 6)
-            }
-            .buttonStyle(.plain)
-            .pointingHandCursor()
-            .accessibilityLabel("More info about tool approvals")
-            .help("Open Settings → AI & Models at the tool approvals section")
         }
         .padding(.trailing, 4)
     }
@@ -369,22 +450,11 @@ struct ComposerView: View {
     private var agentModeMenuSection: some View {
         let mode = settingsStore.agentMode
 
-        return Menu {
-            ForEach(AgentMode.allCases) { candidate in
-                Button {
-                    settingsStore.agentMode = candidate
-                } label: {
-                    HStack {
-                        Image(systemName: candidate.symbolName)
-                        Text(candidate.displayName)
-                        if candidate == mode {
-                            Image(systemName: "checkmark")
-                        }
-                    }
-                }
-                .help(candidate.helpText)
-            }
-        } label: {
+        return ComposerDropdown(
+            isEnabled: true,
+            helpText: mode.helpText,
+            accessibilityText: "Agent mode"
+        ) {
             HStack(spacing: 4) {
                 AgentModeGlyph(
                     mode: mode,
@@ -405,90 +475,64 @@ struct ComposerView: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .interactiveHoverPill(cornerRadius: 6)
+        } content: {
+            ForEach(AgentMode.allCases) { candidate in
+                ComposerDropdownRow(
+                    title: candidate.displayName,
+                    isSelected: candidate == mode,
+                    helpText: candidate.helpText
+                ) {
+                    settingsStore.agentMode = candidate
+                } icon: {
+                    // Pill'deki çizilmiş işaretin kendisi: menüde sistem
+                    // sembolüne düşüyordu ve Plan satırı ikonsuz kalıyordu.
+                    AgentModeGlyph(
+                        mode: candidate,
+                        size: 11,
+                        tint: candidate == mode
+                            ? (currentTheme.accentGradient.first ?? .secondary)
+                            : .secondary
+                    )
+                }
+            }
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .accessibilityLabel("Agent mode")
-        .help(mode.helpText)
     }
 
     /// Messages that arrived while a turn was running, in the order they will be
-    /// sent. They stay here rather than in the transcript: a queued prompt has
-    /// not been answered yet, so it is not part of the conversation.
+    /// sent. They stay above the composer rather than in the transcript: a queued
+    /// prompt has not been answered yet, so it is not part of the conversation.
     private var queuedPromptsStrip: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Image(systemName: "list.bullet.indent")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.secondary)
-
-                Text("Queued (\(sessionService.queuedPrompts.count))")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-
-                Text("sent in order when this turn finishes")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-
-                Spacer(minLength: 8)
-
-                Button("Clear") {
-                    sessionService.clearQueuedPrompts()
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .pointingHandCursor()
-                .help("Discard every queued message")
+        QueuedPromptsStrip(
+            prompts: sessionService.queuedPrompts,
+            onEditInComposer: { id in
+                editQueuedPromptInComposer(id)
+            },
+            onMove: { id, index in
+                sessionService.moveQueuedPrompt(id, to: index)
+            },
+            onRemove: { id in
+                sessionService.removeQueuedPrompt(id)
+            },
+            onClear: {
+                sessionService.clearQueuedPrompts()
             }
+        )
+    }
 
-            ForEach(
-                Array(sessionService.queuedPrompts.enumerated()),
-                id: \.element.id
-            ) { index, prompt in
-                HStack(spacing: 6) {
-                    Text("\(index + 1)")
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 14, alignment: .trailing)
-
-                    Text(prompt.text)
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-
-                    if !prompt.attachmentPaths.isEmpty {
-                        Image(systemName: "paperclip")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer(minLength: 6)
-
-                    Button {
-                        sessionService.removeQueuedPrompt(prompt.id)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .padding(3)
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                    .help("Remove this message from the queue")
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    Color.primary.opacity(0.05),
-                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                )
-            }
+    /// Kalem satırı yerinde açmıyor: kuyruk girdisini oradan çıkarıp metnini ve
+    /// eklerini "Write again" ile aynı yoldan composer girdisine taşır, kullanıcı
+    /// düzenlemeyi tam boy alanda yapar ve normal gönderir.
+    private func editQueuedPromptInComposer(_ id: UUID) {
+        guard let prompt = sessionService.queuedPrompts.first(where: { $0.id == id }) else {
+            return
         }
-        .padding(.horizontal, 4)
+
+        sessionService.removeQueuedPrompt(id)
+        draftCenter?.requestRestore(
+            text: prompt.text,
+            attachmentPaths: prompt.attachmentPaths,
+            sessionID: sessionService.activeSessionID
+        )
     }
 
     private var placeholderText: String {
@@ -505,23 +549,11 @@ struct ComposerView: View {
     }
 
     private var modelMenuSection: some View {
-        Menu {
-            ForEach(sessionService.availableModels, id: \.id) { model in
-                Button {
-                    try? sessionService.selectModel(model.id)
-                } label: {
-                    // A menu row can only draw text and a system image: a custom
-                    // view in a `Label`'s icon slot is dropped, which left the
-                    // rows nameless. The drawn provider marks live where they can
-                    // actually render — the chip below and the Settings rows.
-                    if model.id == selectedModelID {
-                        Label("\(model.displayName) — current", systemImage: "checkmark")
-                    } else {
-                        Text(model.displayName)
-                    }
-                }
-            }
-        } label: {
+        ComposerDropdown(
+            isEnabled: !sessionService.isBusy,
+            helpText: "Select the model for this conversation",
+            accessibilityText: "Model"
+        ) {
             HStack(spacing: 4) {
                 // The provider's drawn mark belongs here, on a label SwiftUI
                 // renders as a view, rather than inside the menu.
@@ -557,10 +589,25 @@ struct ComposerView: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .interactiveHoverPill(cornerRadius: 6)
+        } content: {
+            ForEach(sessionService.availableModels, id: \.id) { model in
+                ComposerDropdownRow(
+                    title: model.displayName,
+                    isSelected: model.id == selectedModelID,
+                    helpText: nil
+                ) {
+                    try? sessionService.selectModel(model.id)
+                } icon: {
+                    ProviderLogoView(
+                        logo: ProviderLogo.matching(model.id.rawValue),
+                        size: 11,
+                        tint: model.id == selectedModelID
+                            ? (currentTheme.accentGradient.first ?? .secondary)
+                            : .secondary
+                    )
+                }
+            }
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .disabled(sessionService.isBusy)
     }
 
     /// Reasoning effort and fast mode in one control.
@@ -572,49 +619,14 @@ struct ComposerView: View {
         let variantID = selectedVariantID
         let isFast = settingsStore.responseSpeedMode == .fast
 
-        return Menu {
-            Section("Reasoning") {
-                effortRow(
-                    title: "Default",
-                    isSelected: variantID == nil,
-                    isDefault: true,
-                    help: "Whatever the model ships with"
-                ) {
-                    try? sessionService.selectVariant(nil)
-                }
-
-                ForEach(sessionService.availableVariants, id: \.id) { variant in
-                    effortRow(
-                        title: variant.displayName,
-                        isSelected: variant.id == variantID,
-                        isDefault: false,
-                        help: nil
-                    ) {
-                        try? sessionService.selectVariant(variant.id)
-                    }
-                }
-            }
-
-            Section("Fast Mode") {
-                effortRow(
-                    title: ResponseSpeedMode.fast.displayName,
-                    isSelected: isFast,
-                    isDefault: false,
-                    help: ResponseSpeedMode.fast.helpText
-                ) {
-                    settingsStore.responseSpeedMode = .fast
-                }
-
-                effortRow(
-                    title: ResponseSpeedMode.normal.displayName,
-                    isSelected: !isFast,
-                    isDefault: true,
-                    help: ResponseSpeedMode.normal.helpText
-                ) {
-                    settingsStore.responseSpeedMode = .normal
-                }
-            }
-        } label: {
+        return ComposerDropdown(
+            isEnabled: true,
+            helpText: "How hard the model should think about this turn",
+            accessibilityText: ReasoningEffortPresentation.summary(
+                variantName: selectedVariantName,
+                isFast: isFast
+            )
+        ) {
             HStack(spacing: 4) {
                 Image(systemName: isFast ? "bolt.fill" : "brain")
                     .font(.system(size: 10, weight: isFast ? .bold : .medium))
@@ -632,16 +644,64 @@ struct ComposerView: View {
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .interactiveHoverPill(cornerRadius: 6)
+        } content: {
+            ComposerDropdownSectionHeader(title: "Reasoning")
+
+            ComposerDropdownRow(
+                title: ReasoningEffortPresentation.rowTitle("Default", isDefault: true),
+                isSelected: variantID == nil,
+                helpText: "Whatever the model ships with"
+            ) {
+                try? sessionService.selectVariant(nil)
+            } icon: {
+                Image(systemName: "brain")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            ForEach(sessionService.availableVariants, id: \.id) { variant in
+                ComposerDropdownRow(
+                    title: variant.displayName,
+                    isSelected: variant.id == variantID,
+                    helpText: nil
+                ) {
+                    try? sessionService.selectVariant(variant.id)
+                } icon: {
+                    Image(systemName: "brain")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            ComposerDropdownSectionHeader(title: "Fast Mode")
+
+            ComposerDropdownRow(
+                title: ResponseSpeedMode.fast.displayName,
+                isSelected: isFast,
+                helpText: ResponseSpeedMode.fast.helpText
+            ) {
+                settingsStore.responseSpeedMode = .fast
+            } icon: {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            ComposerDropdownRow(
+                title: ReasoningEffortPresentation.rowTitle(
+                    ResponseSpeedMode.normal.displayName,
+                    isDefault: true
+                ),
+                isSelected: !isFast,
+                helpText: ResponseSpeedMode.normal.helpText
+            ) {
+                settingsStore.responseSpeedMode = .normal
+            } icon: {
+                Image(systemName: "bolt.slash")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .accessibilityLabel(
-            ReasoningEffortPresentation.summary(
-                variantName: selectedVariantName,
-                isFast: isFast
-            )
-        )
-        .help("How hard the model should think about this turn")
     }
 
     private func effortLabel(isFast: Bool) -> String {
@@ -649,32 +709,6 @@ struct ComposerView: View {
             variantName: selectedVariantName,
             isFast: isFast
         )
-    }
-
-    /// A menu row. The word “Default” rides with the title because a SwiftUI menu
-    /// flattens its labels: a badge view would simply be dropped.
-    @ViewBuilder
-    private func effortRow(
-        title: String,
-        isSelected: Bool,
-        isDefault: Bool,
-        help: String?,
-        action: @escaping () -> Void
-    ) -> some View {
-        let labelled = ReasoningEffortPresentation.rowTitle(title, isDefault: isDefault)
-        let button = Button(action: action) {
-            if isSelected {
-                Label(labelled, systemImage: "checkmark")
-            } else {
-                Text(labelled)
-            }
-        }
-
-        if let help {
-            button.help(help)
-        } else {
-            button
-        }
     }
 
     private var attachmentButton: some View {
@@ -749,6 +783,9 @@ struct ComposerView: View {
                         .offset(x: 11, y: -11)
                 }
             }
+            // The opaque accent circle hides a highlight drawn *behind* it, so
+            // the hover signal is an outline on the shape itself.
+            .interactiveHoverOutlineCircle()
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
@@ -774,6 +811,7 @@ struct ComposerView: View {
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.white)
             }
+            .interactiveHoverOutlineCircle()
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
@@ -879,6 +917,29 @@ struct ComposerView: View {
         ExtensionTrigger.detected(in: draft)
     }
 
+    /// Panelin gerçekten gösterileceği trigger: kullanıcı aynı token'ı Escape ya
+    /// da kapatma düğmesiyle reddettiyse bir daha açılmaz.
+    private var visibleTrigger: ExtensionTrigger? {
+        guard let trigger = activeTrigger else { return nil }
+        return suggestionToken(of: trigger) == dismissedSuggestionToken ? nil : trigger
+    }
+
+    private func suggestionToken(of trigger: ExtensionTrigger) -> String {
+        String(draft[trigger.tokenRange])
+    }
+
+    private func dismissSuggestions(_ trigger: ExtensionTrigger) {
+        dismissedSuggestionToken = suggestionToken(of: trigger)
+    }
+
+    /// Escape yolu: kapatılacak bir panel yoksa `false` döner ve tuş metin
+    /// görünümünün varsayılanına bırakılır.
+    private func dismissVisibleSuggestions() -> Bool {
+        guard let trigger = visibleTrigger else { return false }
+        dismissSuggestions(trigger)
+        return true
+    }
+
     private func suggestions(for trigger: ExtensionTrigger) -> [ExtensionSuggestion] {
         extensionStore.registry
             .suggestions(matching: trigger.query)
@@ -915,6 +976,20 @@ struct ComposerView: View {
                     .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
                 }
+
+                Button {
+                    dismissSuggestions(trigger)
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8.5, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .padding(3)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .help("Close suggestions")
+                .accessibilityLabel("Close suggestions")
             }
             .padding(.horizontal, 6)
 
@@ -930,18 +1005,6 @@ struct ComposerView: View {
             .frame(maxHeight: Self.maximumSuggestionPanelHeight)
         }
         .padding(6)
-        .background(
-            currentTheme.surface(isDark: isDarkMode).opacity(0.96),
-            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(
-                    currentTheme.border(isDark: isDarkMode).opacity(settingsStore.contrast),
-                    lineWidth: 1
-                )
-        )
-        .shadow(color: Color.black.opacity(isDarkMode ? 0.30 : 0.08), radius: 8, y: 3)
     }
 
     private static let maximumSuggestionRows = 6

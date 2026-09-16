@@ -259,6 +259,75 @@ final class OpenCodeSettingsTests: XCTestCase {
             password: "server-password"
         )
     }
+
+    // MARK: Computer Use registration
+
+    /// The settings window can be opened while the server is already running —
+    /// by the app's own launch, or by anything outside it. The registration row
+    /// used to say "Server stopped" in that case, because the client was only
+    /// built on the start path.
+    func testComputerUseRegistrationIsReadFromARunningServerEvenWithoutAStart() async {
+        let client = SettingsOpenCodeClient(
+            mcpStatuses: [
+                ComputerUseConfiguration.serverName: OpenCodeMCPServerStatus(
+                    status: "connected",
+                    error: nil
+                )
+            ]
+        )
+        let settings = OpenCodeSettings(
+            executableLocator: SettingsOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            serverManager: SettingsOpenCodeServerManager(connection: makeConnection()),
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
+        )
+
+        await settings.refreshComputerUseStatus()
+
+        XCTAssertEqual(settings.computerUseRegistration, .registered)
+        XCTAssertNil(settings.computerUseErrorMessage)
+    }
+
+    func testComputerUseRegistrationReportsTheServersOwnFailureReason() async {
+        let client = SettingsOpenCodeClient(
+            mcpStatuses: [
+                ComputerUseConfiguration.serverName: OpenCodeMCPServerStatus(
+                    status: "failed",
+                    error: "spawn node ENOENT"
+                )
+            ]
+        )
+        let settings = OpenCodeSettings(
+            executableLocator: SettingsOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            serverManager: SettingsOpenCodeServerManager(connection: makeConnection()),
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
+        )
+
+        await settings.refreshComputerUseStatus()
+
+        XCTAssertEqual(settings.computerUseRegistration, .failed(message: "spawn node ENOENT"))
+        XCTAssertEqual(settings.computerUseErrorMessage, "spawn node ENOENT")
+    }
+
+    func testComputerUseRegistrationWithAStoppedServerSaysSoWithoutAsking() async {
+        let settings = OpenCodeSettings(
+            executableLocator: SettingsOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            serverManager: SettingsOpenCodeServerManager(connection: nil),
+            clientFactory: { _ in SettingsOpenCodeClient() },
+            computerUseProvider: { .disabled }
+        )
+
+        await settings.refreshComputerUseStatus()
+
+        XCTAssertEqual(settings.computerUseRegistration, .serverStopped)
+    }
 }
 
 private struct SettingsOpenCodeExecutableLocator: OpenCodeExecutableLocating {
@@ -322,15 +391,18 @@ private struct SettingsMCPRegistration: Equatable, Sendable {
 private actor SettingsOpenCodeClient: OpenCodeClientProtocol {
     private let methodSet: [String: [OpenCodeAuthMethod]]
     private let setAPIKeyError: Error?
+    private let statuses: [String: OpenCodeMCPServerStatus]
     private var recordedSubmissions: [SettingsOpenCodeSubmission] = []
     private var recordedMCPRegistrations: [SettingsMCPRegistration] = []
 
     init(
         authMethods: [String: [OpenCodeAuthMethod]] = [:],
-        setAPIKeyError: Error? = nil
+        setAPIKeyError: Error? = nil,
+        mcpStatuses: [String: OpenCodeMCPServerStatus] = [:]
     ) {
         self.methodSet = authMethods
         self.setAPIKeyError = setAPIKeyError
+        self.statuses = mcpStatuses
     }
 
     func capabilities() async throws -> ProviderCapabilities {
@@ -371,8 +443,12 @@ private actor SettingsOpenCodeClient: OpenCodeClientProtocol {
 
     func replyPermission(requestID: String, reply: String) async throws {}
 
+    func sessionTodos(sessionID: String) async throws -> [AgentTodo] {
+        []
+    }
+
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {
-        [:]
+        statuses
     }
 
     func addMCPServer(

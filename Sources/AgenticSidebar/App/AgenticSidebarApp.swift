@@ -12,6 +12,9 @@ struct AgenticSidebarApp: App {
     @State private var screenshotMonitor: ScreenshotMonitorService
     @State private var permissionApprovalCenter: PermissionApprovalCenter
     @State private var extensionStore: ExtensionStore
+    /// Shared by the transcript (which asks for a message to be written again)
+    /// and the composer (which owns the draft it lands in).
+    @State private var composerDraftCenter = ComposerDraftCenter()
 
     init() {
         let credentialStore = KeychainCredentialStore()
@@ -221,6 +224,7 @@ struct AgenticSidebarApp: App {
             )
             .environment(appDelegate.settingsWindowController)
             .environment(extensionStore)
+            .environment(composerDraftCenter)
             .preferredColorScheme(settingsStore.colorSchemeMode.preferredColorScheme)
             // Yetenek keşfi yalnızca burada yapılır; `RootChatView` de çağırdığında
             // her açılışta iki kez /provider ve /models isteği gidiyordu.

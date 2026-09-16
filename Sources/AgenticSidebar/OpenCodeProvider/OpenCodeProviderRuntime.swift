@@ -58,6 +58,20 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         return try await clientFactory(connection).capabilities()
     }
 
+    func sessionTodos(sessionID: UUID) async -> [AgentTodo]? {
+        guard
+            let remoteSessionID = remoteSessionIDs[sessionID],
+            let connection = await serverManager.currentConnection()
+        else {
+            return nil
+        }
+
+        // A missing list is not an error worth surfacing: an older backend has no
+        // such endpoint, and the checklist is an addition to the transcript, not
+        // part of the turn.
+        return try? await clientFactory(connection).sessionTodos(sessionID: remoteSessionID)
+    }
+
     func startStream(for request: ProviderRequest) async throws -> ProviderStream {
         guard request.configuration.providerID == id else {
             throw ProviderRuntimeError.unexpectedResponse

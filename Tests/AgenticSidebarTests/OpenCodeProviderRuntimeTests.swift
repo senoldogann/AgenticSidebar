@@ -566,6 +566,10 @@ private actor RuntimeMockOpenCodeClient: OpenCodeClientProtocol {
         recordedCalls.append(.replyPermission(requestID: requestID, reply: reply))
     }
 
+    func sessionTodos(sessionID: String) async throws -> [AgentTodo] {
+        []
+    }
+
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {
         [:]
     }

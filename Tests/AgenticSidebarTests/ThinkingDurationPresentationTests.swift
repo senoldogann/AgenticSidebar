@@ -10,6 +10,7 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ThinkingDurationPresentation.text(
                 startedAt: startedAt,
                 completedAt: nil,
+                turnEndedAt: nil,
                 isRunning: true,
                 hasRunningChildren: false,
                 now: startedAt.addingTimeInterval(7)
@@ -23,6 +24,7 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ThinkingDurationPresentation.text(
                 startedAt: startedAt,
                 completedAt: startedAt.addingTimeInterval(4),
+                turnEndedAt: nil,
                 isRunning: false,
                 hasRunningChildren: false,
                 now: startedAt.addingTimeInterval(600)
@@ -37,6 +39,7 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ThinkingDurationPresentation.text(
                 startedAt: startedAt,
                 completedAt: startedAt.addingTimeInterval(4),
+                turnEndedAt: nil,
                 isRunning: false,
                 hasRunningChildren: true,
                 now: startedAt.addingTimeInterval(11)
@@ -50,6 +53,7 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ThinkingDurationPresentation.text(
                 startedAt: startedAt,
                 completedAt: startedAt.addingTimeInterval(0.2),
+                turnEndedAt: nil,
                 isRunning: false,
                 hasRunningChildren: false,
                 now: startedAt
@@ -61,6 +65,7 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ThinkingDurationPresentation.text(
                 startedAt: startedAt,
                 completedAt: nil,
+                turnEndedAt: nil,
                 isRunning: true,
                 hasRunningChildren: false,
                 now: startedAt.addingTimeInterval(-30)
@@ -75,11 +80,26 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ThinkingDurationPresentation.text(
                 startedAt: startedAt,
                 completedAt: nil,
+                turnEndedAt: nil,
                 isRunning: false,
                 hasRunningChildren: false,
                 now: startedAt.addingTimeInterval(9)
             ),
             "Thought for 9s"
+        )
+    }
+
+    func testAFinishedTurnReportsTotalWorkBeyondThinking() {
+        XCTAssertEqual(
+            ThinkingDurationPresentation.text(
+                startedAt: startedAt,
+                completedAt: startedAt.addingTimeInterval(3),
+                turnEndedAt: startedAt.addingTimeInterval(252),
+                isRunning: false,
+                hasRunningChildren: false,
+                now: startedAt.addingTimeInterval(600)
+            ),
+            "Thought for 3s · Worked 4m 12s"
         )
     }
 }

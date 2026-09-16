@@ -32,15 +32,45 @@ final class ScreenshotMonitorService {
     /// accepted, so those screenshots were invisible).
     nonisolated static let screenshotFileExtensions = ["png", "jpg", "jpeg", "heic", "tiff"]
 
+    /// Whether the file is even an image macOS would write a screenshot as.
+    ///
+    /// Checked *before* anything else, including before Spotlight is asked: the
+    /// scan runs over the whole screenshots folder once a second, and asking
+    /// about every PDF, folder and text file on the Desktop was the expensive
+    /// half of it.
+    nonisolated static func hasScreenshotExtension(_ fileName: String) -> Bool {
+        let lowered = fileName.lowercased()
+        return screenshotFileExtensions.contains { lowered.hasSuffix("." + $0) }
+    }
+
     /// Whether a file name looks like a screenshot on this system.
     nonisolated static func hasScreenshotName(_ fileName: String) -> Bool {
-        let lowered = fileName.lowercased()
-        let hasKnownExtension = screenshotFileExtensions.contains { lowered.hasSuffix("." + $0) }
-        guard hasKnownExtension else {
+        guard hasScreenshotExtension(fileName) else {
             return false
         }
 
+        let lowered = fileName.lowercased()
         return localizedScreenshotNameFragments.contains { lowered.contains($0) }
+    }
+
+    /// Whether a file is a screenshot: its name, or — only for an image whose
+    /// name says nothing — Spotlight's answer.
+    ///
+    /// `metadataProbe` is called only when the name did not already answer, so a
+    /// folder of screenshots costs no Spotlight queries at all and a folder of
+    /// other files costs none either.
+    nonisolated static func isScreenshotCandidate(
+        fileURL: URL,
+        metadataProbe: (URL) -> Bool?
+    ) -> Bool {
+        let fileName = fileURL.lastPathComponent
+        guard hasScreenshotExtension(fileName) else {
+            return false
+        }
+        if hasScreenshotName(fileName) {
+            return true
+        }
+        return metadataProbe(fileURL) ?? false
     }
 
     /// Spotlight's own answer, when the volume is indexed.
@@ -80,7 +110,8 @@ final class ScreenshotMonitorService {
         .appendingPathComponent(AppIdentity.name, isDirectory: true)
         .appendingPathComponent("Screenshots", isDirectory: true)
 
-    private static let recentFileWindow: TimeInterval = 60
+    /// Read by ``scanRecentScreenshots``, which runs off the main actor.
+    nonisolated private static let recentFileWindow: TimeInterval = 60
     private static let temporaryScreenshotLifetime: TimeInterval = 24 * 60 * 60
     private static let maximumTrackedPaths = 256
 
@@ -102,6 +133,8 @@ final class ScreenshotMonitorService {
     private var trackedFilePathSet: Set<String> = []
     private var pendingSubmissions: [PendingSubmission] = []
     private var timer: Timer?
+    /// Whether a tick is still running; see ``tick()``.
+    private var isTicking = false
 
     init(
         sessionService: AgentSessionService,
@@ -125,7 +158,13 @@ final class ScreenshotMonitorService {
         lastPasteboardChangeCount = pasteboard.snapshot().changeCount
         pendingSubmissions = []
         trackedFilePaths = []
-        trackedFilePathSet = Set(recentScreenshotFileURLs().map(\.path))
+        // Startup seeding is the one scan that stays synchronous: it happens
+        // once, and it is what stops a folder full of yesterday's screenshots
+        // from being analysed on the first tick.
+        trackedFilePathSet = Set(Self.scanRecentScreenshots(
+            in: screenshotsDirectoryURL,
+            now: Date()
+        ).map(\.path))
         Self.removeStaleTemporaryScreenshots(in: temporaryDirectoryURL)
 
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -152,7 +191,16 @@ final class ScreenshotMonitorService {
             return
         }
 
-        for fileURL in recentScreenshotFileURLs()
+        // One tick at a time. The scan and the OCR are awaited, and a second
+        // timer firing inside them would only repeat the same work on the same
+        // list of files.
+        guard !isTicking else {
+            return
+        }
+        isTicking = true
+        defer { isTicking = false }
+
+        for fileURL in await scannedRecentScreenshotFileURLs()
         where !trackedFilePathSet.contains(fileURL.path) {
             // Mark before awaiting so a slow analysis cannot re-process the file.
             track(fileURL.path)
@@ -294,27 +342,39 @@ final class ScreenshotMonitorService {
         }
     }
 
-    private func recentScreenshotFileURLs() -> [URL] {
-        let fileManager = FileManager.default
+    /// The per-second scan, off the main actor.
+    private func scannedRecentScreenshotFileURLs() async -> [URL] {
+        let directoryURL = screenshotsDirectoryURL
+        let now = Date()
+        return await Task.detached(priority: .utility) {
+            Self.scanRecentScreenshots(in: directoryURL, now: now)
+        }.value
+    }
 
+    /// One walk of the screenshots folder, filtered to the files that appeared in
+    /// the last minute.
+    ///
+    /// `nonisolated` and static so the per-second caller can run it off the main
+    /// actor: enumerating a Desktop with thousands of entries and reading every
+    /// file's modification date is the most expensive thing this service does.
+    nonisolated static func scanRecentScreenshots(
+        in directoryURL: URL,
+        now: Date,
+        fileManager: FileManager = .default
+    ) -> [URL] {
         guard let contents = try? fileManager.contentsOfDirectory(
-            at: screenshotsDirectoryURL,
+            at: directoryURL,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else {
             return []
         }
 
-        let now = Date()
         return contents.filter { url in
-            let fileName = url.lastPathComponent
-            let looksLikeAScreenshot = Self.hasScreenshotName(fileName)
-                // The metadata check runs only when the name did not already
-                // answer, so a localized system does not pay for Spotlight on
-                // every file in the folder.
-                || (Self.isScreenCaptureByMetadata(url) ?? false)
-
-            guard looksLikeAScreenshot else {
+            guard isScreenshotCandidate(
+                fileURL: url,
+                metadataProbe: isScreenCaptureByMetadata
+            ) else {
                 return false
             }
 
@@ -323,7 +383,7 @@ final class ScreenshotMonitorService {
                 return false
             }
 
-            return now.timeIntervalSince(modDate) < Self.recentFileWindow
+            return now.timeIntervalSince(modDate) < recentFileWindow
         }
     }
 

@@ -51,6 +51,21 @@ struct ExtensionRegistry: Codable, Equatable, Sendable {
         }
     }
 
+    /// The MCP servers that are switched off, definitions and all.
+    ///
+    /// They are handed to the configuration so it can declare them
+    /// `enabled: false`. Without that, OpenCode starts every server it knows about
+    /// — the tools being silenced keeps them out of the context window but not out
+    /// of memory, so an unused server was still a node or python process at every
+    /// launch.
+    var disabledMCPDefinitions: [String: MCPDefinition] {
+        mcpServers
+            .filter { !$0.isEnabled && $0.definition.isRunnable }
+            .reduce(into: [:]) { result, record in
+                result[record.name] = record.definition
+            }
+    }
+
     /// Tool patterns that switch off every known-but-inactive MCP server.
     ///
     /// This is the context gate. OpenCode registers an MCP server's tools whether

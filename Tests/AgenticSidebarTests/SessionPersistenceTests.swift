@@ -618,6 +618,99 @@ final class SessionPersistenceTests: XCTestCase {
         )
     }
 
+    func testCustomTitleAndPinSurviveARelaunch() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let runtime = makeRuntime()
+        let service = AgentSessionService(runtimes: [runtime], archiveStore: store)
+        await service.refreshCapabilities()
+
+        let turn = try XCTUnwrap(service.submit("Remember this"))
+        await turn.value
+        let id = service.activeSessionID
+        service.renameSession(id, to: "My pinned talk")
+        service.setSessionPinned(id, pinned: true)
+        await service.saveNow()
+
+        let relaunched = AgentSessionService(runtimes: [runtime], archiveStore: store)
+        XCTAssertEqual(relaunched.sessionList.first?.customTitle, "My pinned talk")
+        XCTAssertEqual(relaunched.sessionList.first?.displayTitle, "My pinned talk")
+        XCTAssertTrue(relaunched.sessionList.first?.isPinned ?? false)
+        XCTAssertEqual(relaunched.activeSessionTitle, "My pinned talk")
+    }
+
+    func testLegacyArchiveWithoutTitleOrPinDecodesWithDefaults() throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let sessionID = UUID()
+        let legacyJSON = """
+        {
+          "version": 2,
+          "activeSessionID": "\(sessionID.uuidString)",
+          "sessions": [
+            {
+              "id": "\(sessionID.uuidString)",
+              "createdAt": "2023-11-14T22:13:20Z",
+              "messages": [
+                {
+                  "id": "\(UUID().uuidString)",
+                  "role": "user",
+                  "text": "hello",
+                  "attachmentPaths": [],
+                  "createdAt": "2023-11-14T22:13:20Z"
+                }
+              ]
+            }
+          ]
+        }
+        """
+
+        try FileManager.default.createDirectory(
+            at: store.fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data(legacyJSON.utf8).write(to: store.fileURL)
+
+        let archive = try XCTUnwrap(store.load())
+        XCTAssertNil(archive.sessions.first?.customTitle)
+        XCTAssertEqual(archive.sessions.first?.isPinned, false)
+    }
+
+    func testEmptyButPinnedSessionIsPreserved() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let runtime = makeRuntime()
+        let service = AgentSessionService(runtimes: [runtime], archiveStore: store)
+        await service.refreshCapabilities()
+
+        let id = service.activeSessionID
+        service.setSessionPinned(id, pinned: true)
+        await service.saveNow()
+
+        let relaunched = AgentSessionService(runtimes: [runtime], archiveStore: store)
+        XCTAssertEqual(relaunched.sessions.count, 1)
+        XCTAssertTrue(relaunched.sessionList.first?.isPinned ?? false)
+    }
+
+    func testPinnedSessionsAreDroppedLast() throws {
+        let active = makeSnapshot(text: "active", createdAt: 300)
+        var pinnedOld = makeSnapshot(text: "pinned", createdAt: 50)
+        pinnedOld.isPinned = true
+        let middle = makeSnapshot(text: "middle", createdAt: 200)
+        let archive = SessionArchive(
+            version: SessionArchive.currentVersion,
+            activeSessionID: active.id,
+            sessions: [active, middle, pinnedOld]
+        )
+
+        let reduced = try XCTUnwrap(archive.droppingOldestStoredContent())
+        XCTAssertTrue(reduced.sessions.contains { $0.id == pinnedOld.id })
+        XCTAssertFalse(reduced.sessions.contains { $0.id == middle.id })
+    }
+
     private func makeSnapshot(text: String, createdAt: TimeInterval) -> SessionSnapshot {
         SessionSnapshot(
             id: UUID(),

@@ -202,22 +202,33 @@ final class OpenCodeSettings {
     }
 
     /// `GET /mcp` durumunu tazeler; kart yeniden açıldığında çağrılır.
+    ///
+    /// Bağlantı buradan da kurulur: sunucu ayakta ama oturum durumu henüz
+    /// okunmamışsa (uygulama yeni açıldı ya da sunucu dışarıdan yeniden
+    /// başlatıldı) istemci `nil` kalırdı ve kayıt "Server stopped" görünürdü —
+    /// yani çalışan bir sunucu için yanlış cevap.
     func refreshComputerUseStatus() async {
         serverStatus = await serverManager.status()
 
-        guard case .running = serverStatus else {
+        guard
+            case .running = serverStatus,
+            let connection = await serverManager.currentConnection()
+        else {
             runningComputerUseEnabled = false
             computerUseRegistration = .serverStopped
             return
         }
 
-        guard let client else {
-            computerUseRegistration = .serverStopped
-            return
+        let resolvedClient: any OpenCodeClientProtocol
+        if let client {
+            resolvedClient = client
+        } else {
+            resolvedClient = clientFactory(connection)
+            client = resolvedClient
         }
 
         do {
-            let statuses = try await client.mcpServerStatuses()
+            let statuses = try await resolvedClient.mcpServerStatuses()
             if let status = statuses[ComputerUseConfiguration.serverName] {
                 computerUseRegistration = status.isConnected
                     ? .registered

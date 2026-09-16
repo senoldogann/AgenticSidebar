@@ -35,6 +35,10 @@ struct AgentActivityPresentation: Equatable, Sendable {
             title = "Searching the web"
             runningStatusName = "Web Search"
             symbolName = "globe"
+        case .todo:
+            title = "Updating the task list"
+            runningStatusName = "To-dos"
+            symbolName = "checklist"
         case .tool:
             title = "Using a tool"
             runningStatusName = "Tool"

@@ -182,7 +182,9 @@ extension SettingsView {
                 .buttonStyle(.plain)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(currentTheme.accentGradient.first ?? .accentColor)
-                .pointingHandCursor()
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .interactiveHoverPill(cornerRadius: 5)
                 .help("Run this server's OAuth flow in your browser")
             }
 
@@ -193,9 +195,11 @@ extension SettingsView {
                     Image(systemName: "trash")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
+                        .padding(4)
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .pointingHandCursor()
+                .interactiveHoverCircle()
                 .help("Remove this server from the app")
             }
         }
@@ -384,7 +388,7 @@ extension SettingsView {
                         )
                 }
                 .buttonStyle(.plain)
-                .pointingHandCursor()
+                .interactiveHoverOutlineCircle()
                 .help("Install \(entry.name)")
             }
         }
@@ -431,9 +435,11 @@ extension SettingsView {
                 Image(systemName: "trash")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .padding(4)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .pointingHandCursor()
+            .interactiveHoverCircle()
         }
         .padding(10)
         .background(
@@ -502,7 +508,9 @@ extension SettingsView {
                         .buttonStyle(.plain)
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(currentTheme.accentGradient.first ?? .accentColor)
-                        .pointingHandCursor()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .interactiveHoverPill(cornerRadius: 5)
                     }
                     .padding(9)
                     .background(
@@ -584,9 +592,11 @@ extension SettingsView {
                 Image(systemName: record.isManaged ? "trash" : "eye.slash")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
+                    .padding(4)
+                    .contentShape(Circle())
             }
             .buttonStyle(.plain)
-            .pointingHandCursor()
+            .interactiveHoverCircle()
             .help(record.isManaged ? "Delete this skill" : "Hide this skill from the agent")
         }
         .padding(10)

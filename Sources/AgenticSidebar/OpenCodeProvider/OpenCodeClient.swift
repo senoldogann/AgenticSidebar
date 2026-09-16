@@ -74,6 +74,8 @@ protocol OpenCodeClientProtocol: Sendable {
     func abort(sessionID: String) async throws
     func eventStream() async throws -> OpenCodeLineStream
     func replyPermission(requestID: String, reply: String) async throws
+    /// The tasks the agent is tracking for a session, as the backend keeps them.
+    func sessionTodos(sessionID: String) async throws -> [AgentTodo]
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus]
     func addMCPServer(
         name: String,
@@ -237,6 +239,15 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             body: PermissionReplyBody(reply: reply)
         )
         _ = try await send(request)
+    }
+
+    func sessionTodos(sessionID: String) async throws -> [AgentTodo] {
+        let request = makeRequest(
+            pathComponents: ["session", sessionID, "todo"],
+            method: "GET"
+        )
+        let response = try await send(request)
+        return try decode([AgentTodo].self, from: response.data)
     }
 
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {

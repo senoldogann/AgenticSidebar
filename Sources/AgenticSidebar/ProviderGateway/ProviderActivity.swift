@@ -29,6 +29,10 @@ enum ProviderActivityKind: String, Equatable, Codable, Sendable {
     case update
     case edit
     case webSearch
+    /// The agent's own task list. It is a tool call like any other, but it is the
+    /// one whose *result* the transcript shows as a checklist, so it is worth
+    /// recognising rather than filing under a generic tool.
+    case todo
     case tool
 }
 
@@ -113,6 +117,17 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
                 .split { !$0.isLetter && !$0.isNumber }
                 .map(String.init)
         )
+
+        // Checked first: a task-list tool's name can contain a word the other
+        // groups also claim (`todo_write` reads as a write), and a task list filed
+        // as a file change would be the wrong icon and would miss the checklist
+        // refresh. Matched as a substring as well as a token, because the name the
+        // backend sends is often one word (`todowrite`).
+        if normalizedName.contains("todo")
+            || !tokens.isDisjoint(with: ["todo", "todos", "task", "tasks"])
+        {
+            return .todo
+        }
 
         if !tokens.isDisjoint(with: ["bash", "sh", "terminal", "exec", "command", "run"]) {
             return .command

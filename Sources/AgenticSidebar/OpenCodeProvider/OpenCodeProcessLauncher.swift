@@ -370,12 +370,35 @@ private actor FoundationOpenCodeProcessHandle: OpenCodeProcessHandling {
         return process.processIdentifier
     }
 
+    /// Ends the child **and everything it started**.
+    ///
+    /// The child is a backend that spawns a process per configured MCP server, so
+    /// stopping it used to leave a node/python tree behind — invisible, holding
+    /// memory, and (after a crash or a signal the app never saw) adding a second
+    /// copy of itself on the next launch.
     func terminate() async {
-        guard process.isRunning else {
+        let pid = process.processIdentifier
+        guard pid > 0 else {
             return
         }
 
-        process.terminate()
+        // Collected before anything is signalled: once the child exits, its
+        // children are re-parented to `launchd` and can no longer be found by
+        // walking down from it. So the tree is asked to stop *first*, while it can
+        // still be enumerated, and the list is refreshed once more before the root
+        // goes — a child that is shutting down can spawn on its way out.
+        var knownDescendants = OpenCodeProcessTree.descendants(of: pid)
+        for descendant in knownDescendants {
+            kill(descendant, SIGTERM)
+        }
+
+        try? await Task.sleep(for: .milliseconds(100))
+        knownDescendants.append(contentsOf: OpenCodeProcessTree.descendants(of: pid))
+
+        if process.isRunning {
+            process.terminate()
+        }
+
         for _ in 0..<20 where process.isRunning {
             try? await Task.sleep(for: .milliseconds(50))
         }
@@ -384,7 +407,11 @@ private actor FoundationOpenCodeProcessHandle: OpenCodeProcessHandling {
             AppLog.openCode.error(
                 "OpenCode child did not exit after SIGTERM; sending SIGKILL"
             )
-            kill(process.processIdentifier, SIGKILL)
+            kill(pid, SIGKILL)
+        }
+
+        for descendant in Set(knownDescendants) where OpenCodeProcessTree.isAlive(descendant) {
+            kill(descendant, SIGKILL)
         }
     }
 }

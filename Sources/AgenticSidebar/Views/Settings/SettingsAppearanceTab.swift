@@ -8,11 +8,19 @@ extension SettingsView {
         @Bindable var settings = settingsStore
 
         settingsCard(
+            title: "Preview",
+            subtitle: "How your current choices look together.",
+            icon: "eye.fill"
+        ) {
+            appearancePreviewCard()
+        }
+
+        settingsCard(
             title: "Color Scheme",
-            subtitle: "Select your preferred visual appearance mode.",
+            subtitle: "Light for daytime, dark for night, system to follow macOS.",
             icon: "sun.max.fill"
         ) {
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
                 ForEach(ColorSchemeMode.allCases) { mode in
                     colorSchemeCard(mode: mode, selected: settings.colorSchemeMode == mode) {
                         settings.colorSchemeMode = mode
@@ -47,6 +55,11 @@ extension SettingsView {
                 // Contrast
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
+                        Image(systemName: "circle.lefthalf.striped.horizontal")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+
                         Text("Border & Contrast")
                             .font(.system(size: 13, weight: .medium))
 
@@ -56,8 +69,11 @@ extension SettingsView {
                             Image(systemName: "arrow.uturn.backward")
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundStyle(.tertiary)
+                                .padding(4)
+                                .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
+                        .interactiveHoverCircle()
                         .help("Reset contrast to 110%")
 
                         Spacer()
@@ -72,6 +88,22 @@ extension SettingsView {
                     Slider(value: $settings.contrast, in: 0.80...1.50, step: 0.05)
                         .tint(currentTheme.accentGradient.first ?? .accentColor)
 
+                    HStack(spacing: 8) {
+                        ForEach([0.90, 1.10, 1.30], id: \.self) { preset in
+                            Button("\(Int(preset * 100))%") {
+                                settings.contrast = preset
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .pointingHandCursor()
+                            .help("Set contrast to \(Int(preset * 100))%")
+                        }
+
+                        Text("Softer · Default · Bolder")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+
                     Text("Enhance visibility and border emphasis across all cards and text elements.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -82,6 +114,11 @@ extension SettingsView {
                 // Glass opacity
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
+                        Image(systemName: "sparkles")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+
                         Text("Glass Opacity")
                             .font(.system(size: 13, weight: .medium))
 
@@ -91,8 +128,11 @@ extension SettingsView {
                             Image(systemName: "arrow.uturn.backward")
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundStyle(.tertiary)
+                                .padding(4)
+                                .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
+                        .interactiveHoverCircle()
                         .help("Reset glass opacity to 100%")
 
                         Spacer()
@@ -117,6 +157,11 @@ extension SettingsView {
                 // Window Opacity
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
+                        Image(systemName: "macwindow")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+
                         Text("Window Transparency")
                             .font(.system(size: 13, weight: .medium))
 
@@ -190,9 +235,12 @@ extension SettingsView {
                                             lineWidth: isSelected ? 1.5 : 1
                                         )
                                 )
+                                .interactiveHoverOutline(RoundedRectangle(cornerRadius: 8, style: .continuous))
                             }
                             .buttonStyle(.plain)
                             .pointingHandCursor()
+                            .help("Use \(family.displayName) for chat text")
+                            .accessibilityLabel("\(family.displayName) font\(isSelected ? ", selected" : "")")
                         }
                     }
                 }
@@ -355,6 +403,133 @@ extension SettingsView {
                 }
             }
         }
+
+        settingsCard(
+            title: "Reset Appearance",
+            subtitle: "Contrast, opacity and typography back to defaults. Theme and color scheme stay as they are.",
+            icon: "arrow.uturn.backward"
+        ) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Tuning & typography defaults")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("Contrast 110% · Glass 100% · Window 95% · System font · Default sizes")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                secondaryActionButton(
+                    title: "Reset",
+                    icon: "arrow.uturn.backward",
+                    isDisabled: false
+                ) {
+                    settings.contrast = 1.10
+                    settings.glassOpacity = 1.00
+                    settings.windowOpacity = 0.95
+                    settings.fontFamily = .system
+                    settings.fontSize = .regular
+                    settings.codeFontSize = .standard
+                    settings.codeWordWrap = false
+                    settings.lineSpacing = .normal
+                }
+            }
+        }
+    }
+
+    /// Seçilen tema, mod ve yazı tipinin birlikte durduğu küçük önizleme.
+    @ViewBuilder
+    func appearancePreviewCard() -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: currentTheme.accentGradient,
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 30, height: 30)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.3), lineWidth: 1)
+                    )
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(currentTheme.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary)
+
+                    Text("\(settingsStore.colorSchemeMode.displayName) · \(settingsStore.fontFamily.displayName) · \(settingsStore.fontSize.displayName)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Text("Aa")
+                    .font(.system(size: 22, weight: .semibold, design: settingsStore.fontFamily.fontDesign))
+                    .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
+            }
+
+            HStack(spacing: 8) {
+                Text("Looks great with your settings")
+                    .font(.system(size: settingsStore.fontSize.pointSize - 1, weight: .regular, design: settingsStore.fontFamily.fontDesign))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        Color.primary.opacity(0.06),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    )
+
+                Spacer(minLength: 0)
+
+                Text("Send")
+                    .font(.system(size: settingsStore.fontSize.pointSize - 1, weight: .semibold, design: settingsStore.fontFamily.fontDesign))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(
+                        LinearGradient(
+                            colors: currentTheme.accentGradient,
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        ),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    )
+            }
+        }
+        .padding(12)
+        .background(
+            Color.primary.opacity(0.03),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    /// Mod simgesi ve kısa açıklaması.
+    func colorSchemeIconName(_ mode: ColorSchemeMode) -> String {
+        switch mode {
+        case .system: "desktopcomputer"
+        case .light: "sun.max.fill"
+        case .dark: "moon.fill"
+        }
+    }
+
+    /// Mod kartının altındaki tek satırlık ipucu.
+    func colorSchemeHint(_ mode: ColorSchemeMode) -> String {
+        switch mode {
+        case .system: "Follows macOS"
+        case .light: "Bright daytime"
+        case .dark: "Easy on eyes"
+        }
     }
 
     @ViewBuilder
@@ -365,7 +540,7 @@ extension SettingsView {
     ) -> some View {
         Button(action: onSelect) {
             VStack(spacing: 8) {
-                ZStack {
+                ZStack(alignment: .topTrailing) {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(Color(white: 0.15))
                         .frame(height: 60)
@@ -399,13 +574,33 @@ extension SettingsView {
                             .frame(width: 42, height: 4)
                     }
                     .padding(.horizontal, 8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+
+                    if selected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .background(Circle().fill(currentTheme.accentGradient.first ?? .accentColor))
+                            .padding(5)
+                    }
                 }
 
-                Text(mode.displayName)
-                    .font(.caption.weight(selected ? .semibold : .regular))
-                    .foregroundStyle(selected ? .primary : .secondary)
+                HStack(spacing: 4) {
+                    Image(systemName: colorSchemeIconName(mode))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(selected ? (currentTheme.accentGradient.first ?? .primary) : .secondary)
+
+                    Text(mode.displayName)
+                        .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? .primary : .secondary)
+                }
+
+                Text(colorSchemeHint(mode))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
-            .padding(6)
+            .frame(maxWidth: .infinity)
+            .padding(8)
             .background(
                 Color.primary.opacity(selected ? 0.08 : 0.02),
                 in: RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -417,9 +612,12 @@ extension SettingsView {
                         lineWidth: selected ? 2 : 1
                     )
             )
+            .interactiveHoverOutline(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
+        .help("Use \(mode.displayName.lowercased()) appearance")
+        .accessibilityLabel("\(mode.displayName) appearance\(selected ? ", selected" : "")")
     }
 
     @ViewBuilder
@@ -484,8 +682,11 @@ extension SettingsView {
                         lineWidth: isSelected ? 1.5 : 1
                     )
             )
+            .interactiveHoverOutline(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
+        .help("Use the \(preset.displayName) theme")
+        .accessibilityLabel("\(preset.displayName) theme\(isSelected ? ", selected" : "")")
     }
 }

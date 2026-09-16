@@ -62,4 +62,61 @@ final class ScreenshotNamingTests: XCTestCase {
 
         XCTAssertNil(ScreenshotMonitorService.isScreenCaptureByMetadata(missing))
     }
+
+    /// The scan runs over the whole screenshots folder once a second, so a file
+    /// that cannot be a screenshot must be rejected without asking Spotlight:
+    /// every PDF, folder and text file on the Desktop used to cost a query.
+    func testSpotlightIsOnlyAskedAboutImagesWhoseNameSaysNothing() {
+        var queries: [String] = []
+        let probe: (URL) -> Bool? = { url in
+            queries.append(url.lastPathComponent)
+            return nil
+        }
+
+        let folder = URL(fileURLWithPath: "/Users/tester/Desktop", isDirectory: true)
+        let candidates = [
+            "Screen Shot 2026-09-16 at 13.15.40.png",
+            "holiday.png",
+            "invoice.pdf",
+            "notes.txt",
+            "projects",
+            "archive.zip",
+            "Screenshot 2026.png.bak"
+        ]
+
+        let matched = candidates.filter { name in
+            ScreenshotMonitorService.isScreenshotCandidate(
+                fileURL: folder.appendingPathComponent(name),
+                metadataProbe: probe
+            )
+        }
+
+        XCTAssertEqual(
+            matched,
+            ["Screen Shot 2026-09-16 at 13.15.40.png"],
+            "Only the file whose name matched is reported without help"
+        )
+        XCTAssertEqual(
+            queries,
+            ["holiday.png"],
+            "The one image with a silent name is the only file Spotlight is asked about"
+        )
+    }
+
+    /// An image whose name says nothing is still a screenshot when Spotlight says
+    /// so — that fallback is what makes a differently-named system work.
+    func testSpotlightsAnswerIsUsedWhenTheNameSaysNothing() {
+        let url = URL(fileURLWithPath: "/Users/tester/Desktop/IMG_0001.png")
+
+        XCTAssertTrue(
+            ScreenshotMonitorService.isScreenshotCandidate(fileURL: url) { _ in true }
+        )
+        XCTAssertFalse(
+            ScreenshotMonitorService.isScreenshotCandidate(fileURL: url) { _ in false }
+        )
+        XCTAssertFalse(
+            ScreenshotMonitorService.isScreenshotCandidate(fileURL: url) { _ in nil },
+            "A file Spotlight cannot answer for is left alone"
+        )
+    }
 }

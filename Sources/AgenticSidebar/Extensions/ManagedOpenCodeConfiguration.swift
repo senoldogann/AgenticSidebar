@@ -6,6 +6,13 @@ import Foundation
 struct ExtensionRuntimeSnapshot: Equatable, Sendable {
     /// The servers whose tools should reach the model.
     var mcpServers: [String: MCPDefinition]
+    /// The servers the user switched off, with their definitions intact.
+    ///
+    /// Silencing a server's tools is not enough to keep it from costing anything:
+    /// OpenCode starts every server it knows about, so an off server still became
+    /// a node or python process at every backend launch. Declaring it
+    /// `enabled: false` keeps it from being started at all.
+    var disabledMCPServers: [String: MCPDefinition]
     /// `"<server>_*": false` for every known server the user did not enable —
     /// the tool that keeps an unused MCP server out of the context window.
     var silencedToolPatterns: [String: Bool]
@@ -15,6 +22,7 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
 
     static let empty = ExtensionRuntimeSnapshot(
         mcpServers: [:],
+        disabledMCPServers: [:],
         silencedToolPatterns: [:],
         plugins: [],
         deniedSkills: []
@@ -22,11 +30,13 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
 
     init(
         mcpServers: [String: MCPDefinition],
+        disabledMCPServers: [String: MCPDefinition] = [:],
         silencedToolPatterns: [String: Bool],
         plugins: [String],
         deniedSkills: [String]
     ) {
         self.mcpServers = mcpServers
+        self.disabledMCPServers = disabledMCPServers
         self.silencedToolPatterns = silencedToolPatterns
         self.plugins = plugins
         self.deniedSkills = deniedSkills
@@ -35,6 +45,7 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
     init(registry: ExtensionRegistry) {
         self.init(
             mcpServers: registry.enabledMCPDefinitions,
+            disabledMCPServers: registry.disabledMCPDefinitions,
             silencedToolPatterns: registry.silencedMCPToolPatterns,
             plugins: registry.enabledPlugins.map(\.module),
             deniedSkills: registry.deniedSkillNames
@@ -43,6 +54,7 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
 
     var isEmpty: Bool {
         mcpServers.isEmpty
+            && disabledMCPServers.isEmpty
             && silencedToolPatterns.isEmpty
             && plugins.isEmpty
             && deniedSkills.isEmpty
@@ -110,10 +122,19 @@ enum ManagedOpenCodeConfiguration {
             )
         }
 
+        // A name can only be registered once: an enabled server wins, and the
+        // disabled map is only there for the ones the registry did not hand over
+        // as enabled.
+        let enabledNames = Set(extensions.mcpServers.keys)
         let mcp = JSONValue.object(
-            extensions.mcpServers
-                .sorted { $0.key < $1.key }
-                .map { JSONValue.Member($0.key, mcpValue($0.value)) }
+            (
+                extensions.mcpServers.map { ($0.key, $0.value, true) }
+                    + extensions.disabledMCPServers
+                    .filter { !enabledNames.contains($0.key) }
+                    .map { ($0.key, $0.value, false) }
+            )
+            .sorted { $0.0 < $1.0 }
+            .map { JSONValue.Member($0.0, mcpValue($0.1, isEnabled: $0.2)) }
         )
         if !mcp.isEmptyCollection {
             members.append(("mcp", mcp))
@@ -183,8 +204,24 @@ enum ManagedOpenCodeConfiguration {
 
     /// An MCP entry is rendered from the same payload the runtime `POST /mcp`
     /// call sends, so the two can never drift apart.
-    private static func mcpValue(_ definition: MCPDefinition) -> JSONValue {
-        JSONValue(encoding: definition.openCodePayload)
+    ///
+    /// A disabled entry keeps its whole definition and adds `enabled: false`: the
+    /// definition makes the entry valid on its own (so it still overrides the same
+    /// server in the user's own configuration, which the app never edits), and the
+    /// flag is what stops OpenCode from starting the process behind it.
+    private static func mcpValue(
+        _ definition: MCPDefinition,
+        isEnabled: Bool = true
+    ) -> JSONValue {
+        let payload = JSONValue(encoding: definition.openCodePayload)
             ?? JSONValue.object([JSONValue.Member]())
+
+        guard !isEnabled, case .object(var members) = payload else {
+            return payload
+        }
+
+        members.removeAll { $0.key == "enabled" }
+        members.append(JSONValue.Member("enabled", .bool(false)))
+        return .object(members)
     }
 }
