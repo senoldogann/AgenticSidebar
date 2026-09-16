@@ -1,6 +1,6 @@
 import Foundation
 
-struct ProviderID: Hashable, Sendable {
+struct ProviderID: Hashable, Codable, Sendable {
     let rawValue: String
 
     init(_ rawValue: String) {
@@ -8,7 +8,7 @@ struct ProviderID: Hashable, Sendable {
     }
 }
 
-struct ProviderModelID: Hashable, Sendable {
+struct ProviderModelID: Hashable, Codable, Sendable {
     let rawValue: String
 
     init(_ rawValue: String) {
@@ -16,7 +16,7 @@ struct ProviderModelID: Hashable, Sendable {
     }
 }
 
-struct ProviderVariantID: Hashable, Sendable {
+struct ProviderVariantID: Hashable, Codable, Sendable {
     let rawValue: String
 
     init(_ rawValue: String) {
@@ -33,6 +33,30 @@ struct ProviderModelCapability: Equatable, Sendable {
     let id: ProviderModelID
     let displayName: String
     let variants: [ProviderVariant]
+
+    var supportsThinking: Bool {
+        let nameLower = displayName.lowercased()
+        let idLower = id.rawValue.lowercased()
+
+        if variants.contains(where: { variant in
+            let vName = variant.displayName.lowercased()
+            let vID = variant.id.rawValue.lowercased()
+            return vName.contains("thinking") || vName.contains("reasoning")
+                || vID.contains("thinking") || vID.contains("reasoning")
+        }) {
+            return true
+        }
+
+        let thinkingTokens = [
+            "r1", "reasoning", "thinking", "qwq", "o1", "o3",
+            "deepseek-r1", "deepseek r1", "claude-3-7-sonnet",
+            "flash-thinking"
+        ]
+
+        return thinkingTokens.contains { token in
+            nameLower.contains(token) || idLower.contains(token)
+        }
+    }
 }
 
 struct ProviderCapabilities: Equatable, Sendable {
@@ -56,7 +80,7 @@ struct ProviderCapabilities: Equatable, Sendable {
     }
 }
 
-struct SessionConfiguration: Equatable, Sendable {
+struct SessionConfiguration: Equatable, Codable, Sendable {
     var providerID: ProviderID
     var modelID: ProviderModelID
     var variantID: ProviderVariantID?

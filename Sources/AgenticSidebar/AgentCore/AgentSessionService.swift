@@ -1,6 +1,12 @@
 import Foundation
 import Observation
 
+/// A list of conversations plus provider capability discovery.
+///
+/// Each conversation is an `AgentSession` with its own turn task, so a
+/// background session keeps streaming while the user reads or types in another
+/// one. The most-used members below forward to the active session, which keeps
+/// the chat, composer and menu bar views unchanged.
 @MainActor
 @Observable
 final class AgentSessionService {
@@ -8,81 +14,192 @@ final class AgentSessionService {
     private let runtimes: [any ProviderRuntime]
 
     @ObservationIgnored
-    private var activeTask: Task<Void, Never>?
+    private let archiveStore: SessionArchiveStore?
 
     @ObservationIgnored
-    private var activeStream: ProviderStream?
+    private var saveTask: Task<Void, Never>?
 
     @ObservationIgnored
-    private var activeTurnID: UUID?
+    private var hasPendingSave = false
 
-    @ObservationIgnored
-    private var activeAssistantMessageID: UUID?
-
-    @ObservationIgnored
-    private var streamingTextAccumulator = StreamingTextAccumulator.empty
-
-    @ObservationIgnored
-    private var streamingTextFlushTask: Task<Void, Never>?
-
-    private static let streamingTextUpdateInterval = Duration.milliseconds(40)
+    /// Streaming flushes are frequent, so writes are coalesced behind this delay
+    /// while structure changes (create/select/delete) save immediately.
+    private static let saveDebounce = Duration.seconds(2)
 
     private(set) var providers: [ProviderCapabilities] = []
-    private(set) var state: AgentSessionState
+    private(set) var sessions: [AgentSession] = []
+    private(set) var activeSessionID: UUID
 
     init(
         runtimes: [any ProviderRuntime],
-        state: AgentSessionState = AgentSessionState()
+        state: AgentSessionState = AgentSessionState(),
+        archiveStore: SessionArchiveStore? = nil
     ) {
         self.runtimes = runtimes
-        self.state = state
-    }
+        self.archiveStore = archiveStore
 
-    var availableModels: [ProviderModelCapability] {
-        guard
-            let configuration = state.configuration,
-            let provider = providers.first(where: { $0.id == configuration.providerID })
-        else {
-            return []
+        let restored: [AgentSession]
+        let restoredActiveID: UUID
+
+        if
+            let archive = archiveStore?.load(),
+            !archive.sessions.isEmpty
+        {
+            let snapshots = archive.sessions.sorted { $0.createdAt > $1.createdAt }
+            restored = snapshots.map { AgentSession(runtimes: runtimes, snapshot: $0) }
+            restoredActiveID = restored.first { $0.id == archive.activeSessionID }?.id
+                ?? restored[0].id
+        } else {
+            let session = AgentSession(runtimes: runtimes, state: state)
+            restored = [session]
+            restoredActiveID = session.id
         }
 
-        return provider.models
+        sessions = restored
+        activeSessionID = restoredActiveID
+
+        for session in restored {
+            adopt(session)
+        }
     }
 
-    var availableVariants: [ProviderVariant] {
-        guard
-            let configuration = state.configuration,
-            let provider = providers.first(where: { $0.id == configuration.providerID }),
-            let model = provider.model(id: configuration.modelID)
-        else {
-            return []
-        }
+    // MARK: - Active session
 
-        return model.variants
+    /// The session the views are bound to. The list always holds at least one
+    /// session, so this never has to fall back to an optional.
+    var activeSession: AgentSession {
+        sessions.first { $0.id == activeSessionID } ?? sessions[0]
+    }
+
+    var state: AgentSessionState {
+        activeSession.state
     }
 
     var isBusy: Bool {
-        switch state.status {
-        case .streaming, .runningTool, .waiting, .cancelling:
-            true
-        case .idle, .completed, .cancelled, .failed:
-            false
-        }
+        activeSession.isBusy
     }
 
     var canSubmit: Bool {
-        guard let configuration = state.configuration else {
-            return false
-        }
-
-        return runtime(for: configuration.providerID) != nil && !isBusy
+        activeSession.canSubmit
     }
 
-    func refreshCapabilities() async {
-        guard !isBusy else {
+    /// Aktif oturum şu anda bir mesaj alabilir mi (hemen başlatarak ya da
+    /// kuyruğa ekleyerek).
+    var canAcceptPrompt: Bool {
+        activeSession.canAcceptPrompt
+    }
+
+    var availableModels: [ProviderModelCapability] {
+        activeSession.availableModels
+    }
+
+    var availableVariants: [ProviderVariant] {
+        activeSession.availableVariants
+    }
+
+    var activeSessionTitle: String {
+        activeSession.title
+    }
+
+    var activeTurnID: UUID? {
+        activeSession.activeTurnID
+    }
+
+    /// Prompts waiting behind the active session's running turn, oldest first.
+    var queuedPrompts: [QueuedPrompt] {
+        activeSession.queuedPrompts
+    }
+
+    var sessionList: [SessionSummary] {
+        sessions.map { session in
+            SessionSummary(
+                id: session.id,
+                title: session.title,
+                isBusy: session.isBusy,
+                status: session.state.status,
+                completedAt: session.state.completedAt,
+                lastMessageAt: session.state.messages.last?.createdAt
+            )
+        }
+    }
+
+    // MARK: - Session management
+
+    @discardableResult
+    func createSession() -> UUID {
+        let session = AgentSession(
+            runtimes: runtimes,
+            state: AgentSessionState(configuration: activeSession.state.configuration)
+        )
+        adopt(session)
+        // Normalizing with no known capabilities yet would throw away the
+        // configuration the new session just inherited.
+        session.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
+        sessions.insert(session, at: 0)
+        activeSessionID = session.id
+        saveImmediately()
+        return session.id
+    }
+
+    func selectSession(_ id: UUID) {
+        guard sessions.contains(where: { $0.id == id }), activeSessionID != id else {
             return
         }
 
+        activeSessionID = id
+        saveImmediately()
+    }
+
+    /// Removes a conversation and stops whatever it was doing. The last session
+    /// is never removed: a fresh empty one replaces it.
+    func deleteSession(_ id: UUID) {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        let session = sessions.remove(at: index)
+        let runtimes = self.runtimes
+        Task {
+            await session.cancel()
+            // Sunucu tarafındaki oturum da kapatılır; aksi halde her silinen
+            // sohbet backend'de ölü bir oturum bırakır.
+            for runtime in runtimes {
+                await runtime.releaseSession(id)
+            }
+        }
+
+        guard !sessions.isEmpty else {
+            let replacement = AgentSession(runtimes: runtimes)
+            adopt(replacement)
+            replacement.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
+            sessions = [replacement]
+            activeSessionID = replacement.id
+            saveImmediately()
+            return
+        }
+
+        if activeSessionID == id {
+            activeSessionID = sessions[min(index, sessions.count - 1)].id
+        }
+
+        saveImmediately()
+    }
+
+    // MARK: - Configuration
+
+    func selectProvider(_ providerID: ProviderID) throws {
+        try activeSession.selectProvider(providerID)
+    }
+
+    func selectModel(_ modelID: ProviderModelID) throws {
+        try activeSession.selectModel(modelID)
+    }
+
+    func selectVariant(_ variantID: ProviderVariantID?) throws {
+        try activeSession.selectVariant(variantID)
+    }
+
+    func refreshCapabilities() async {
         var loadedProviders: [ProviderCapabilities] = []
         var capabilityErrors: [AgentSessionError] = []
 
@@ -94,7 +211,7 @@ final class AgentSessionService {
                 }
                 loadedProviders.append(capabilities)
             } catch let error as ProviderRuntimeError {
-                capabilityErrors.append(sessionError(for: error))
+                capabilityErrors.append(AgentSession.sessionError(for: error))
             } catch {
                 capabilityErrors.append(.providerUnavailable)
                 continue
@@ -103,505 +220,202 @@ final class AgentSessionService {
 
         providers = loadedProviders
 
+        // Every session keeps a usable configuration, but only idle ones are
+        // re-normalized: a running turn already captured its configuration.
+        for session in sessions {
+            session.applyCapabilities(
+                loadedProviders,
+                normalizeConfiguration: !session.isBusy
+            )
+        }
+
+        if !capabilityErrors.isEmpty {
+            AppLog.agentSession.error(
+                "Capability discovery failed for \(capabilityErrors.count, privacy: .public) of \(self.runtimes.count, privacy: .public) providers"
+            )
+        }
+
+        let active = activeSession
+        guard !active.isBusy else {
+            return
+        }
+
         if runtimes.isEmpty {
-            state.configuration = nil
-            state.status = .idle
-            state.error = nil
+            active.clearConfiguration()
             return
         }
 
         guard !loadedProviders.isEmpty else {
-            state.configuration = nil
-            state.status = .failed
-            state.error = capabilityErrors.count == runtimes.count
-                && capabilityErrors.allSatisfy { $0 == .missingCredential }
-                ? .missingCredential
-                : .providerUnavailable
-            return
-        }
-
-        state.status = .idle
-        state.error = nil
-        normalizeConfiguration()
-    }
-
-    func selectProvider(_ providerID: ProviderID) throws {
-        guard !isBusy else {
-            return
-        }
-
-        guard
-            let provider = providers.first(where: { $0.id == providerID }),
-            let model = provider.models.first
-        else {
-            throw AgentSessionError.unsupportedCapability
-        }
-
-        state.configuration = SessionConfiguration(
-            providerID: provider.id,
-            modelID: model.id,
-            variantID: nil
-        )
-        state.error = nil
-    }
-
-    func selectModel(_ modelID: ProviderModelID) throws {
-        guard !isBusy else {
-            return
-        }
-
-        guard
-            var configuration = state.configuration,
-            let provider = providers.first(where: { $0.id == configuration.providerID }),
-            let model = provider.model(id: modelID)
-        else {
-            throw AgentSessionError.unsupportedCapability
-        }
-
-        configuration.modelID = model.id
-        if !provider.supports(
-            variantID: configuration.variantID,
-            for: model.id
-        ) {
-            configuration.variantID = nil
-        }
-        state.configuration = configuration
-        state.error = nil
-    }
-
-    func selectVariant(_ variantID: ProviderVariantID?) throws {
-        guard !isBusy else {
-            return
-        }
-
-        guard
-            var configuration = state.configuration,
-            let provider = providers.first(where: { $0.id == configuration.providerID }),
-            provider.supports(
-                variantID: variantID,
-                for: configuration.modelID
+            active.failCapabilityDiscovery(
+                with: Self.preferredCapabilityError(from: capabilityErrors)
             )
-        else {
-            throw AgentSessionError.unsupportedCapability
+            return
         }
 
-        configuration.variantID = variantID
-        state.configuration = configuration
-        state.error = nil
+        active.markIdle()
     }
+
+    // MARK: - Turns
 
     @discardableResult
     func submit(_ prompt: String) -> Task<Void, Never>? {
-        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        activeSession.submit(prompt)
+    }
 
-        guard
-            !trimmedPrompt.isEmpty,
-            canSubmit,
-            let configuration = state.configuration,
-            let runtime = runtime(for: configuration.providerID)
-        else {
-            return nil
-        }
+    @discardableResult
+    func submit(
+        _ prompt: String,
+        attachmentPaths: [String]
+    ) -> Task<Void, Never>? {
+        activeSession.submit(prompt, attachmentPaths: attachmentPaths)
+    }
 
-        let userMessage = ChatMessage(role: .user, text: trimmedPrompt)
-        state.messages.append(userMessage)
-        state.status = .streaming
-        state.error = nil
-        state.startedAt = Date()
-        state.completedAt = nil
-        discardPendingAssistantText()
-        activeAssistantMessageID = nil
-
-        let turnID = UUID()
-        state.activityGroups.append(
-            AgentTurnActivityGroup(
-                id: turnID,
-                anchorMessageID: userMessage.id,
-                activities: [
-                    AgentActivity(
-                        id: thinkingActivityID(turnID: turnID),
-                        kind: .thinking,
-                        phase: .running
-                    )
-                ]
-            )
+    @discardableResult
+    func submit(
+        _ prompt: String,
+        attachmentPaths: [String],
+        speedMode: ResponseSpeedMode
+    ) -> Task<Void, Never>? {
+        activeSession.submit(
+            prompt,
+            attachmentPaths: attachmentPaths,
+            speedMode: speedMode
         )
+    }
 
-        let request = ProviderRequest(
-            sessionID: state.id,
-            configuration: configuration,
-            messages: state.messages
+    /// Starts the turn or queues the prompt behind the one that is running.
+    @discardableResult
+    func send(
+        _ prompt: String,
+        attachmentPaths: [String] = [],
+        speedMode: ResponseSpeedMode = .normal,
+        mode: AgentMode = .build,
+        tags: [ExtensionTag] = []
+    ) -> PromptAcceptance {
+        activeSession.send(
+            prompt,
+            attachmentPaths: attachmentPaths,
+            speedMode: speedMode,
+            mode: mode,
+            tags: tags
         )
-        activeTurnID = turnID
+    }
 
-        let task = Task { [weak self] in
-            guard let self else {
-                return
-            }
+    func removeQueuedPrompt(_ id: UUID) {
+        activeSession.removeQueuedPrompt(id)
+    }
 
-            await self.consume(
-                runtime: runtime,
-                request: request,
-                turnID: turnID
-            )
-        }
-        activeTask = task
-        return task
+    func clearQueuedPrompts() {
+        activeSession.clearQueuedPrompts()
     }
 
     func cancel() async {
-        guard let task = activeTask else {
+        await activeSession.cancel()
+    }
+
+    // MARK: - Persistence
+
+    private func adopt(_ session: AgentSession) {
+        session.onPersistentChange = { [weak self] in
+            self?.scheduleSave()
+        }
+    }
+
+    private func scheduleSave() {
+        guard archiveStore != nil else {
             return
         }
 
-        state.status = .cancelling
-        state.error = nil
-        task.cancel()
-
-        if let activeStream {
-            await activeStream.cancel()
+        hasPendingSave = true
+        guard saveTask == nil else {
+            return
         }
 
-        await task.value
-
-        if state.status == .cancelling {
-            state.status = .cancelled
-            state.completedAt = Date()
-        }
-
-        activeTask = nil
-        activeStream = nil
-        activeTurnID = nil
-    }
-
-    private func consume(
-        runtime: any ProviderRuntime,
-        request: ProviderRequest,
-        turnID: UUID
-    ) async {
-        do {
-            let stream = try await runtime.startStream(for: request)
-
-            if Task.isCancelled {
-                await stream.cancel()
-                throw CancellationError()
-            }
-
-            guard activeTurnID == turnID else {
-                await stream.cancel()
-                return
-            }
-
-            activeStream = stream
-            var didComplete = false
-
-            for try await event in stream.events {
-                try Task.checkCancellation()
-
-                guard activeTurnID == turnID else {
-                    return
-                }
-
-                switch event {
-                case let .assistantTextDelta(delta):
-                    finishThinkingActivity(turnID: turnID)
-                    enqueueAssistantText(delta, turnID: turnID)
-
-                case let .activityStarted(activity):
-                    flushPendingAssistantText(turnID: turnID)
-                    finishThinkingActivity(turnID: turnID)
-                    startActivity(activity, turnID: turnID)
-
-                case let .activityFinished(activityID, outcome):
-                    flushPendingAssistantText(turnID: turnID)
-                    finishActivity(
-                        activityID,
-                        outcome: outcome,
-                        turnID: turnID
-                    )
-                    state.status = .streaming
-
-                case .waiting:
-                    flushPendingAssistantText(turnID: turnID)
-                    state.status = .waiting
-
-                case .completed:
-                    flushPendingAssistantText(turnID: turnID)
-                    finishRunningActivities(
-                        turnID: turnID,
-                        phase: .completed
-                    )
-                    didComplete = true
-                }
-
-                if didComplete {
+        saveTask = Task { [weak self] in
+            while let self, self.hasPendingSave {
+                try? await Task.sleep(for: Self.saveDebounce)
+                guard !Task.isCancelled else {
                     break
                 }
+                self.hasPendingSave = false
+                await self.saveNow()
             }
 
-            if Task.isCancelled {
-                throw CancellationError()
+            // İptal edilmiş bir görev, yerine kurulmuş olabilecek yeni görevin
+            // izini silmemeli; aksi halde iki debounce döngüsü aynı anda çalışır.
+            if !Task.isCancelled {
+                self?.saveTask = nil
             }
-
-            guard activeTurnID == turnID else {
-                return
-            }
-
-            flushPendingAssistantText(turnID: turnID)
-
-            if didComplete {
-                state.status = .completed
-                state.completedAt = Date()
-            } else {
-                finishRunningActivities(turnID: turnID, phase: .failed)
-                state.status = .failed
-                state.error = .streamInterrupted
-                state.completedAt = Date()
-            }
-        } catch is CancellationError {
-            guard activeTurnID == turnID else {
-                return
-            }
-
-            flushPendingAssistantText(turnID: turnID)
-            finishRunningActivities(turnID: turnID, phase: .cancelled)
-            state.status = .cancelled
-            state.completedAt = Date()
-        } catch let error as ProviderRuntimeError {
-            guard activeTurnID == turnID else {
-                return
-            }
-
-            flushPendingAssistantText(turnID: turnID)
-            finishRunningActivities(turnID: turnID, phase: .failed)
-            state.status = .failed
-            state.error = sessionError(for: error)
-            state.completedAt = Date()
-        } catch {
-            guard activeTurnID == turnID else {
-                return
-            }
-
-            flushPendingAssistantText(turnID: turnID)
-            finishRunningActivities(turnID: turnID, phase: .failed)
-            state.status = .failed
-            state.error = .transportFailure
-            state.completedAt = Date()
-        }
-
-        if activeTurnID == turnID {
-            activeTask = nil
-            activeStream = nil
-            activeTurnID = nil
-            activeAssistantMessageID = nil
-            discardPendingAssistantText()
         }
     }
 
-    private func enqueueAssistantText(
-        _ delta: String,
-        turnID: UUID
-    ) {
-        guard activeTurnID == turnID else {
-            return
-        }
-
-        let appendResult = streamingTextAccumulator.appending(delta)
-        streamingTextAccumulator = appendResult.accumulator
-
-        guard appendResult.shouldScheduleFlush else {
-            return
-        }
-
-        streamingTextFlushTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: Self.streamingTextUpdateInterval)
-            } catch {
-                return
-            }
-
-            guard !Task.isCancelled else {
-                return
-            }
-
-            self?.flushPendingAssistantText(turnID: turnID)
+    /// Yapısal değişiklikler beklemeden yazılır; çağıran ana iş parçacığını
+    /// tutmaz çünkü kodlama ve disk yazımı arşiv aktöründe çalışır.
+    private func saveImmediately() {
+        Task { [weak self] in
+            await self?.saveNow()
         }
     }
 
-    private func flushPendingAssistantText(turnID: UUID) {
-        guard activeTurnID == turnID else {
-            return
-        }
-
-        streamingTextFlushTask?.cancel()
-        streamingTextFlushTask = nil
-
-        let drainResult = streamingTextAccumulator.draining()
-        streamingTextAccumulator = drainResult.accumulator
-
-        guard let text = drainResult.text else {
-            return
-        }
-
-        if
-            let activeAssistantMessageID,
-            let index = state.messages.firstIndex(where: { $0.id == activeAssistantMessageID })
-        {
-            state.messages[index].text += text
-        } else {
-            let message = ChatMessage(role: .assistant, text: text)
-            activeAssistantMessageID = message.id
-            state.messages.append(message)
-        }
-        state.status = .streaming
+    /// Bekleyen debounce'u boşaltır.
+    ///
+    /// Kapanışta çağrılmazsa son iki saniyedeki değişiklikler — pratikte biten
+    /// turun nihai hâli — hiç yazılmaz.
+    func flushPendingSave() async {
+        saveTask?.cancel()
+        saveTask = nil
+        await saveNow()
     }
 
-    private func discardPendingAssistantText() {
-        streamingTextFlushTask?.cancel()
-        streamingTextFlushTask = nil
-        streamingTextAccumulator = .empty
-    }
-
-    private func thinkingActivityID(turnID: UUID) -> ProviderActivityID {
-        ProviderActivityID("turn-\(turnID.uuidString)-thinking")
-    }
-
-    private func finishThinkingActivity(turnID: UUID) {
-        guard let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }) else {
+    /// Writes the archive immediately. Structure changes (create, select, delete)
+    /// call this directly; transcript updates go through the debounce above.
+    func saveNow() async {
+        guard let archiveStore else {
+            hasPendingSave = false
             return
         }
 
-        guard let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
-            where: { $0.kind == .thinking && $0.phase == .running }
-        ) else {
-            return
+        hasPendingSave = false
+
+        var snapshots = sessions
+            .map { $0.snapshot() }
+            .filter { !$0.messages.isEmpty }
+
+        // An empty active session still has to be restored, otherwise a relaunch
+        // would lose the selected provider and model.
+        if snapshots.isEmpty {
+            snapshots = [activeSession.snapshot()]
         }
 
-        state.activityGroups[groupIndex].activities[activityIndex].phase = .completed
-    }
-
-    private func startActivity(
-        _ descriptor: ProviderActivityDescriptor,
-        turnID: UUID
-    ) {
-        guard let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }) else {
-            return
-        }
-
-        if let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
-            where: { $0.id == descriptor.id }
-        ) {
-            state.activityGroups[groupIndex].activities[activityIndex].phase = .running
-        } else {
-            state.activityGroups[groupIndex].activities.append(
-                AgentActivity(
-                    id: descriptor.id,
-                    kind: descriptor.kind,
-                    phase: .running
-                )
+        await archiveStore.save(
+            SessionArchive(
+                version: SessionArchive.currentVersion,
+                activeSessionID: activeSessionID,
+                sessions: snapshots
             )
-        }
-
-        state.status = .runningTool(
-            AgentActivityPresentation(kind: descriptor.kind).runningStatusName
         )
     }
 
-    private func finishActivity(
-        _ activityID: ProviderActivityID,
-        outcome: ProviderActivityOutcome,
-        turnID: UUID
-    ) {
-        guard
-            let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }),
-            let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
-                where: { $0.id == activityID }
-            )
-        else {
-            return
-        }
-
-        state.activityGroups[groupIndex].activities[activityIndex].phase = switch outcome {
-        case .completed:
-            .completed
-        case .failed:
-            .failed
-        }
-    }
-
-    private func finishRunningActivities(
-        turnID: UUID,
-        phase: AgentActivityPhase
-    ) {
-        guard let groupIndex = state.activityGroups.firstIndex(where: { $0.id == turnID }) else {
-            return
-        }
-
-        let activities = state.activityGroups[groupIndex].activities
-        state.activityGroups[groupIndex].activities = activities.map { activity in
-            guard activity.phase == .running else {
-                return activity
-            }
-
-            return AgentActivity(
-                id: activity.id,
-                kind: activity.kind,
-                phase: phase
-            )
-        }
-    }
-
-    private func normalizeConfiguration() {
-        if
-            var configuration = state.configuration,
-            let provider = providers.first(where: { $0.id == configuration.providerID }),
-            provider.model(id: configuration.modelID) != nil
-        {
-            if !provider.supports(
-                variantID: configuration.variantID,
-                for: configuration.modelID
-            ) {
-                configuration.variantID = nil
-                state.configuration = configuration
-            }
-            return
-        }
-
-        guard
-            let provider = providers.first(where: { !$0.models.isEmpty }),
-            let model = provider.models.first
-        else {
-            state.configuration = nil
-            return
-        }
-
-        state.configuration = SessionConfiguration(
-            providerID: provider.id,
-            modelID: model.id,
-            variantID: nil
-        )
-    }
-
-    private func runtime(for providerID: ProviderID) -> (any ProviderRuntime)? {
-        runtimes.first { $0.id == providerID }
-    }
-
-    private func sessionError(for error: ProviderRuntimeError) -> AgentSessionError {
-        switch error {
-        case .missingCredential:
-            .missingCredential
-        case .executableUnavailable:
-            .backendExecutableUnavailable
-        case .startupFailure:
-            .backendStartupFailure
-        case .authenticationFailure:
-            .authenticationFailure
-        case .unavailable:
-            .providerUnavailable
-        case .transport:
-            .transportFailure
-        case .unexpectedResponse:
+    /// Capability discovery can fail for several providers at once. Surface the
+    /// most actionable cause instead of a generic unavailability message, so a
+    /// missing credential is never hidden behind an unrelated provider outage.
+    private static func preferredCapabilityError(
+        from errors: [AgentSessionError]
+    ) -> AgentSessionError {
+        let priority: [AgentSessionError] = [
+            .missingCredential,
+            .authenticationFailure,
+            .backendExecutableUnavailable,
+            .backendStartupFailure,
+            .providerUnavailable,
+            .rateLimited,
+            .contextLimitExceeded,
+            .transportFailure,
+            .unsupportedCapability,
+            .streamInterrupted,
             .unexpectedBackendResponse
-        }
+        ]
+
+        return priority.first { errors.contains($0) } ?? .providerUnavailable
     }
 }

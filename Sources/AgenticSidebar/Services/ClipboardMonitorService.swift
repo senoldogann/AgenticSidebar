@@ -1,0 +1,124 @@
+import AppKit
+import Foundation
+
+@MainActor
+final class ClipboardMonitorService {
+    private let sessionService: AgentSessionService
+    private let settingsStore: SettingsStore
+    private let pasteboard: any PasteboardReading
+
+    /// Oturumun henüz kabul edemediği kopyalar sırasını burada bekler.
+    ///
+    /// Tek yuvalı bir tampon, arka arkaya iki kopyalamada ilkini sessizce
+    /// düşürüyordu.
+    private static let maximumPendingSubmissions = 5
+
+    private var lastChangeCount: Int
+    private var lastSubmittedText = ""
+    private var pendingSubmissions: [String] = []
+    private var timer: Timer?
+
+    init(
+        sessionService: AgentSessionService,
+        settingsStore: SettingsStore,
+        pasteboard: any PasteboardReading = SystemPasteboardReader()
+    ) {
+        self.sessionService = sessionService
+        self.settingsStore = settingsStore
+        self.pasteboard = pasteboard
+        self.lastChangeCount = pasteboard.snapshot().changeCount
+    }
+
+    func start() {
+        stop()
+        lastChangeCount = pasteboard.snapshot().changeCount
+        pendingSubmissions = []
+        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.tick()
+            }
+        }
+        // `.common` keeps polling while AppKit runs a nested loop (window drag,
+        // menu tracking, scrolling); a `.default` timer silently paused there.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// One polling step. Kept internal so tests can drive the monitor without
+    /// depending on timer scheduling.
+    func tick() {
+        let snapshot = pasteboard.snapshot()
+        let didChange = snapshot.changeCount != lastChangeCount
+
+        // The clipboard is tracked even while the feature is disabled: otherwise
+        // enabling the setting submits whatever happened to be on the clipboard,
+        // which may be a credential copied long before.
+        lastChangeCount = snapshot.changeCount
+
+        guard settingsStore.autoSubmitClipboard else {
+            pendingSubmissions = []
+            return
+        }
+
+        if didChange {
+            capture(snapshot)
+        }
+
+        flushPendingSubmissions()
+    }
+
+    private func capture(_ snapshot: PasteboardSnapshot) {
+        guard !PasteboardPrivacyMarker.isMarked(snapshot) else {
+            AppLog.automation.debug(
+                "Ignored a clipboard item marked as concealed or transient"
+            )
+            return
+        }
+
+        guard let copiedString = pasteboard.currentString() else {
+            return
+        }
+
+        let trimmed = copiedString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != lastSubmittedText else {
+            return
+        }
+
+        lastSubmittedText = trimmed
+        pendingSubmissions.append(trimmed)
+
+        while pendingSubmissions.count > Self.maximumPendingSubmissions {
+            pendingSubmissions.removeFirst()
+            AppLog.automation.error(
+                "The clipboard queue is full; the oldest capture was dropped"
+            )
+        }
+    }
+
+    /// Bekleyen kopyalar sırayla oturuma verilir.
+    ///
+    /// `send` çalışan bir turun arkasına ekler; böylece yakalamalar da diğer
+    /// mesajlarla aynı kuyruktan geçer ve kullanıcı ne beklediğini görür.
+    /// Oturumun hiç kabul edemediği bir istek sırada kalır.
+    private func flushPendingSubmissions() {
+        while let next = pendingSubmissions.first, sessionService.canAcceptPrompt {
+            let acceptance = sessionService.send(
+                next,
+                attachmentPaths: [],
+                speedMode: settingsStore.responseSpeedMode,
+                mode: .build
+            )
+
+            guard acceptance.wasAccepted else {
+                return
+            }
+
+            pendingSubmissions.removeFirst()
+        }
+    }
+}

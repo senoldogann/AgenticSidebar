@@ -10,13 +10,14 @@ final class OpenCodeServerManagerTests: XCTestCase {
             processLauncher: launcher,
             healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
             portAllocator: StubOpenCodePortAllocator(port: 51160),
+            listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: InMemoryOpenCodeCredentialStore(),
             workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
             passwordGenerator: { "generated-password" }
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await manager.start()
+            try await manager.start(computerUse: nil)
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .executableUnavailable)
         }
@@ -38,12 +39,13 @@ final class OpenCodeServerManagerTests: XCTestCase {
             processLauncher: launcher,
             healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
             portAllocator: StubOpenCodePortAllocator(port: 51161),
+            listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: credentialStore,
             workingDirectoryURL: workingDirectoryURL,
             passwordGenerator: { "generated-password" }
         )
 
-        let connection = try await manager.start()
+        let connection = try await manager.start(computerUse: nil)
         let lastRequest = await launcher.lastRequest()
         let request = try XCTUnwrap(lastRequest)
 
@@ -79,6 +81,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             processLauncher: launcher,
             healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
             portAllocator: StubOpenCodePortAllocator(port: 51162),
+            listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: credentialStore,
             workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
             passwordGenerator: {
@@ -87,9 +90,9 @@ final class OpenCodeServerManagerTests: XCTestCase {
             }
         )
 
-        _ = try await manager.start()
+        _ = try await manager.start(computerUse: nil)
         await manager.stop()
-        _ = try await manager.start()
+        _ = try await manager.start(computerUse: nil)
 
         let requests = await launcher.requests()
         XCTAssertEqual(requests.count, 2)
@@ -111,16 +114,22 @@ final class OpenCodeServerManagerTests: XCTestCase {
             processLauncher: launcher,
             healthChecker: StubOpenCodeHealthChecker(result: .failure(.startupFailure)),
             portAllocator: StubOpenCodePortAllocator(port: 51163),
+            listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: InMemoryOpenCodeCredentialStore(),
             workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
             passwordGenerator: { "generated-password" }
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await manager.start()
+            try await manager.start(computerUse: nil)
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .startupFailure)
         }
+
+        // A failed health check is retried once on a fresh port, so two children
+        // are launched and both must be terminated.
+        let launchCount = await launcher.requests().count
+        XCTAssertEqual(launchCount, 2)
 
         let handle = await launcher.lastHandle()
         if let handle {
@@ -135,6 +144,47 @@ final class OpenCodeServerManagerTests: XCTestCase {
         XCTAssertEqual(status, .stopped)
     }
 
+    /// The password is only sent to a port the child owns. When the verifier says
+    /// the port belongs to somebody else, no credentialed request may go out at
+    /// all — the start has to fail instead.
+    func testAStartRefusesToSendCredentialsToAPortTheChildDoesNotOwn() async {
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let healthChecker = CountingOpenCodeHealthChecker()
+        let manager = ManagedOpenCodeServerManager(
+            executableLocator: StubOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            processLauncher: launcher,
+            healthChecker: healthChecker,
+            portAllocator: StubOpenCodePortAllocator(port: 51165),
+            listenerVerifier: StubListenerVerifier(owns: false),
+            credentialStore: InMemoryOpenCodeCredentialStore(),
+            workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
+            passwordGenerator: { "generated-password" }
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await manager.start(computerUse: nil)
+        ) { error in
+            XCTAssertEqual(error as? ProviderRuntimeError, .startupFailure)
+        }
+
+        let healthChecks = await healthChecker.attempts()
+        XCTAssertEqual(
+            healthChecks,
+            0,
+            "The health request carries the password, so it must not be sent before ownership is proven"
+        )
+
+        let handle = await launcher.lastHandle()
+        if let handle {
+            let terminationCount = await handle.terminationCount()
+            XCTAssertEqual(terminationCount, 1, "The child it did launch is not left running")
+        } else {
+            XCTFail("Expected launched process handle")
+        }
+    }
+
     func testStopTerminatesOwnedProcess() async throws {
         let launcher = RecordingOpenCodeProcessLauncher()
         let manager = ManagedOpenCodeServerManager(
@@ -144,12 +194,13 @@ final class OpenCodeServerManagerTests: XCTestCase {
             processLauncher: launcher,
             healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
             portAllocator: StubOpenCodePortAllocator(port: 51164),
+            listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: InMemoryOpenCodeCredentialStore(),
             workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
             passwordGenerator: { "generated-password" }
         )
 
-        _ = try await manager.start()
+        _ = try await manager.start(computerUse: nil)
         let handle = await launcher.lastHandle()
 
         await manager.stop()
@@ -169,7 +220,22 @@ final class OpenCodeServerManagerTests: XCTestCase {
 
 private struct StubOpenCodeExecutableLocator: OpenCodeExecutableLocating {
     let url: URL?
-    func locate() -> URL? { url }
+    func resolution() -> OpenCodeExecutableResolution {
+        url.map { .found($0) } ?? .notFound
+    }
+}
+
+/// Reporting every port as the child's own keeps these tests about startup
+/// bookkeeping; the refusal path has its own test.
+private struct StubListenerVerifier: OpenCodeListenerVerifying {
+    let owns: Bool
+
+    func waitUntilProcessOwnsListeningPort(
+        _ port: UInt16,
+        processIdentifier: Int32?
+    ) async -> Bool {
+        owns
+    }
 }
 
 private struct StubOpenCodePortAllocator: OpenCodePortAllocating {
@@ -185,8 +251,30 @@ private struct StubOpenCodeHealthChecker: OpenCodeHealthChecking {
     }
 }
 
+/// Counts the credentialed requests it was asked to make.
+private actor CountingOpenCodeHealthChecker: OpenCodeHealthChecking {
+    private var count = 0
+
+    func attempts() -> Int {
+        count
+    }
+
+    func waitUntilHealthy(connection: OpenCodeServerConnection) async throws -> String {
+        count += 1
+        return "1.18.31"
+    }
+}
+
 private actor RecordingOpenCodeProcessHandle: OpenCodeProcessHandling {
     private var terminations = 0
+
+    func isRunning() async -> Bool {
+        terminations == 0
+    }
+
+    func processIdentifier() async -> Int32? {
+        terminations == 0 ? 4242 : nil
+    }
 
     func terminate() async {
         terminations += 1

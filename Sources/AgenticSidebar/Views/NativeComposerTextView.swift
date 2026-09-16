@@ -26,10 +26,11 @@ final class NativeComposerTextView: NSTextView {
 
         switch action {
         case .submit:
+            // Without a submit handler, Return falls back to the platform default
+            // rather than terminating the application.
             guard let onSubmit else {
-                preconditionFailure(
-                    "Native composer must provide a submit action before handling Return."
-                )
+                super.keyDown(with: event)
+                return
             }
             onSubmit()
         case .insertNewline:
@@ -104,7 +105,9 @@ struct ComposerTextEditor: NSViewRepresentable {
         _ scrollView: NSScrollView,
         context: Context
     ) {
-        let textView = requiredTextView(in: scrollView)
+        guard let textView = textView(in: scrollView) else {
+            return
+        }
         updateConfiguration(textView)
 
         guard textView.string != text else {
@@ -127,12 +130,16 @@ struct ComposerTextEditor: NSViewRepresentable {
         nsView scrollView: NSScrollView,
         context: Context
     ) -> CGSize? {
-        guard let width = proposal.width else {
+        guard let width = proposal.width, let textView = textView(in: scrollView) else {
             return nil
         }
 
-        let textView = requiredTextView(in: scrollView)
-        let measuredText = textView.string.isEmpty ? " " : textView.string
+        // Only a bounded prefix is laid out. The editor is capped at a few lines,
+        // so measuring more of a pasted document changed nothing except the cost:
+        // text layout of the whole draft ran on every keystroke and every state
+        // change, which is what made a large paste feel stuck.
+        let prefix = ComposerDraftMetrics.measuredPrefix(of: textView.string)
+        let measuredText = prefix.isEmpty ? " " : prefix
         let font = textView.font ?? NSFont.systemFont(
             ofSize: NSFont.systemFontSize
         )
@@ -151,7 +158,7 @@ struct ComposerTextEditor: NSViewRepresentable {
 
         return CGSize(
             width: width,
-            height: min(max(contentHeight, 22), 104)
+            height: min(max(contentHeight, 22), ComposerDraftMetrics.maximumMeasuredHeight)
         )
     }
 
@@ -160,16 +167,8 @@ struct ComposerTextEditor: NSViewRepresentable {
         textView.onSubmit = onSubmit
     }
 
-    private func requiredTextView(
-        in scrollView: NSScrollView
-    ) -> NativeComposerTextView {
-        guard let textView = scrollView.documentView as? NativeComposerTextView else {
-            preconditionFailure(
-                "Composer scroll view must contain NativeComposerTextView."
-            )
-        }
-
-        return textView
+    private func textView(in scrollView: NSScrollView) -> NativeComposerTextView? {
+        scrollView.documentView as? NativeComposerTextView
     }
 
     @MainActor
@@ -182,9 +181,13 @@ struct ComposerTextEditor: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else {
-                preconditionFailure(
-                    "Composer text change notification must originate from NSTextView."
-                )
+                return
+            }
+
+            // Marked text is an input method's in-progress composition; writing it
+            // out would fight the candidate window.
+            guard !textView.hasMarkedText() else {
+                return
             }
 
             text.wrappedValue = textView.string

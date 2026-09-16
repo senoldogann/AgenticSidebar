@@ -1,0 +1,416 @@
+import Foundation
+import XCTest
+@testable import AgenticSidebar
+
+final class BackendRestartResilienceTests: XCTestCase {
+    func testStatusReportsStoppedWhenTheManagedProcessDied() async throws {
+        let launcher = ScriptedOpenCodeProcessLauncher()
+        let manager = makeManager(launcher: launcher)
+
+        _ = try await manager.start(computerUse: nil)
+        let handles = await launcher.handles()
+        let handle = try XCTUnwrap(handles.first)
+        await handle.setRunning(false)
+
+        let status = await manager.status()
+        XCTAssertEqual(status, .stopped)
+
+        let connection = await manager.currentConnection()
+        XCTAssertNil(connection)
+    }
+
+    func testStartRelaunchesAfterTheManagedProcessDied() async throws {
+        let launcher = ScriptedOpenCodeProcessLauncher()
+        let ports = IncrementingPortAllocator(start: 51200)
+        let manager = makeManager(launcher: launcher, portAllocator: ports)
+
+        let firstConnection = try await manager.start(computerUse: nil)
+        let handles = await launcher.handles()
+        let firstHandle = try XCTUnwrap(handles.first)
+        await firstHandle.setRunning(false)
+
+        let secondConnection = try await manager.start(computerUse: nil)
+
+        let requests = await launcher.requests()
+        XCTAssertEqual(requests.count, 2, "A dead child must be relaunched")
+        XCTAssertNotEqual(
+            firstConnection.baseURL,
+            secondConnection.baseURL,
+            "The relaunched server must get its own port"
+        )
+    }
+
+    func testHealthFailureRetriesOnceOnAFreshPort() async throws {
+        let launcher = ScriptedOpenCodeProcessLauncher()
+        let ports = IncrementingPortAllocator(start: 51300)
+        let manager = makeManager(
+            launcher: launcher,
+            healthChecker: ScriptedOpenCodeHealthChecker(
+                results: [.failure(.startupFailure), .success("1.18.31")]
+            ),
+            portAllocator: ports
+        )
+
+        let connection = try await manager.start(computerUse: nil)
+
+        let requests = await launcher.requests()
+        XCTAssertEqual(requests.count, 2)
+        let launchedPorts = requests.map { request -> String in
+            guard let portIndex = request.arguments.firstIndex(of: "--port"),
+                  request.arguments.indices.contains(portIndex + 1) else {
+                return "missing"
+            }
+            return request.arguments[portIndex + 1]
+        }
+        XCTAssertEqual(
+            launchedPorts,
+            ["51300", "51301"],
+            "The retry must probe a fresh port"
+        )
+        XCTAssertEqual(connection.baseURL.absoluteString, "http://127.0.0.1:51301")
+
+        let status = await manager.status()
+        XCTAssertEqual(status, .running(version: "1.18.31", baseURL: connection.baseURL))
+    }
+
+    func testRuntimeForgetsRemoteSessionsWhenTheServerConnectionChanges() async throws {
+        let serverManager = MutableConnectionServerManager(
+            connection: makeConnection(port: 51400)
+        )
+        let client = RestartRecordingOpenCodeClient()
+        let runtime = OpenCodeProviderRuntime(
+            serverManager: serverManager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+        let sessionID = UUID()
+
+        let firstStream = try await runtime.startStream(
+            for: makeRequest(sessionID: sessionID)
+        )
+        await firstStream.cancel()
+
+        await serverManager.setConnection(makeConnection(port: 51401))
+
+        let secondStream = try await runtime.startStream(
+            for: makeRequest(sessionID: sessionID)
+        )
+        await secondStream.cancel()
+
+        let createdSessions = await client.createdSessions()
+        XCTAssertEqual(
+            createdSessions,
+            ["ses_1", "ses_2"],
+            "A restarted backend cannot know about sessions created by the previous server"
+        )
+    }
+
+    func testRuntimeRecreatesARejectedRemoteSessionOnce() async throws {
+        let serverManager = MutableConnectionServerManager(
+            connection: makeConnection(port: 51402)
+        )
+        let client = RestartRecordingOpenCodeClient(
+            promptErrors: [ProviderRuntimeError.unexpectedResponse]
+        )
+        let runtime = OpenCodeProviderRuntime(
+            serverManager: serverManager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+
+        let stream = try await runtime.startStream(
+            for: makeRequest(sessionID: UUID())
+        )
+        await stream.cancel()
+
+        let createdSessions = await client.createdSessions()
+        let prompts = await client.prompts()
+
+        XCTAssertEqual(createdSessions, ["ses_1", "ses_2"])
+        XCTAssertEqual(prompts.count, 2)
+        XCTAssertEqual(prompts.first, prompts.last)
+    }
+
+    private func makeManager(
+        launcher: ScriptedOpenCodeProcessLauncher,
+        healthChecker: any OpenCodeHealthChecking = ScriptedOpenCodeHealthChecker(
+            results: Array(repeating: .success("1.18.31"), count: 4)
+        ),
+        portAllocator: any OpenCodePortAllocating = IncrementingPortAllocator(start: 51250)
+    ) -> ManagedOpenCodeServerManager {
+        ManagedOpenCodeServerManager(
+            executableLocator: RestartStubExecutableLocator(),
+            processLauncher: launcher,
+            healthChecker: healthChecker,
+            portAllocator: portAllocator,
+            listenerVerifier: RestartStubListenerVerifier(),
+            credentialStore: RestartInMemoryCredentialStore(),
+            workingDirectoryURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("opencode-restart-tests-\(UUID().uuidString)"),
+            passwordGenerator: { "generated-password" }
+        )
+    }
+
+    private func makeConnection(port: UInt16) -> OpenCodeServerConnection {
+        OpenCodeServerConnection(
+            baseURL: URL(string: "http://127.0.0.1:\(port)")!,
+            username: "opencode",
+            password: "server-password"
+        )
+    }
+
+    private func makeRequest(sessionID: UUID) -> ProviderRequest {
+        ProviderRequest(
+            sessionID: sessionID,
+            configuration: SessionConfiguration(
+                providerID: ProviderID("opencode"),
+                modelID: ProviderModelID("anthropic/claude/opus"),
+                variantID: nil
+            ),
+            messages: [ChatMessage(role: .user, text: "Continue")],
+            speedMode: .normal
+        )
+    }
+}
+
+/// The child in these tests is a stub with no socket of its own, so the port
+/// ownership check is answered here.
+private struct RestartStubListenerVerifier: OpenCodeListenerVerifying {
+    func waitUntilProcessOwnsListeningPort(
+        _ port: UInt16,
+        processIdentifier: Int32?
+    ) async -> Bool {
+        true
+    }
+}
+
+private struct RestartStubExecutableLocator: OpenCodeExecutableLocating {
+    func resolution() -> OpenCodeExecutableResolution {
+        .found(URL(fileURLWithPath: "/opt/homebrew/bin/opencode"))
+    }
+}
+
+private final class IncrementingPortAllocator: OpenCodePortAllocating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextPort: UInt16
+
+    init(start: UInt16) {
+        self.nextPort = start
+    }
+
+    func allocate() throws -> UInt16 {
+        lock.withLock {
+            defer { nextPort += 1 }
+            return nextPort
+        }
+    }
+}
+
+private final class ScriptedOpenCodeHealthChecker: OpenCodeHealthChecking, @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Result<String, ProviderRuntimeError>]
+
+    init(results: [Result<String, ProviderRuntimeError>]) {
+        self.results = results
+    }
+
+    func waitUntilHealthy(connection: OpenCodeServerConnection) async throws -> String {
+        let next = lock.withLock { results.isEmpty ? nil : results.removeFirst() }
+
+        guard let next else {
+            throw ProviderRuntimeError.startupFailure
+        }
+
+        return try next.get()
+    }
+}
+
+private actor InMemoryOpenCodeProcessHandle: OpenCodeProcessHandling {
+    private var running: Bool
+    private var terminations = 0
+
+    init(running: Bool) {
+        self.running = running
+    }
+
+    func setRunning(_ value: Bool) {
+        running = value
+    }
+
+    func isRunning() async -> Bool {
+        running
+    }
+
+    func processIdentifier() async -> Int32? {
+        running ? 4242 : nil
+    }
+
+    func terminate() async {
+        running = false
+        terminations += 1
+    }
+
+    func terminationCount() -> Int {
+        terminations
+    }
+}
+
+private actor ScriptedOpenCodeProcessLauncher: OpenCodeProcessLaunching {
+    private var recordedRequests: [OpenCodeProcessLaunchRequest] = []
+    private var recordedHandles: [InMemoryOpenCodeProcessHandle] = []
+
+    func launch(
+        _ request: OpenCodeProcessLaunchRequest
+    ) async throws -> any OpenCodeProcessHandling {
+        recordedRequests.append(request)
+
+        let handle = InMemoryOpenCodeProcessHandle(running: true)
+        recordedHandles.append(handle)
+        return handle
+    }
+
+    func requests() -> [OpenCodeProcessLaunchRequest] {
+        recordedRequests
+    }
+
+    func handles() -> [InMemoryOpenCodeProcessHandle] {
+        recordedHandles
+    }
+}
+
+private actor MutableConnectionServerManager: OpenCodeServerManaging {
+    private var connection: OpenCodeServerConnection?
+
+    init(connection: OpenCodeServerConnection?) {
+        self.connection = connection
+    }
+
+    func setConnection(_ connection: OpenCodeServerConnection?) {
+        self.connection = connection
+    }
+
+    func status() async -> OpenCodeServerStatus {
+        guard let connection else {
+            return .stopped
+        }
+        return .running(version: "1.18.31", baseURL: connection.baseURL)
+    }
+
+    func start(computerUse: ComputerUseConfiguration?) async throws -> OpenCodeServerConnection {
+        guard let connection else {
+            throw ProviderRuntimeError.unavailable
+        }
+        return connection
+    }
+
+    func currentConnection() async -> OpenCodeServerConnection? {
+        connection
+    }
+
+    func stop() async {
+        connection = nil
+    }
+}
+
+private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
+    private var sessions: [String] = []
+    private var recordedPrompts: [String] = []
+    private var promptErrors: [Error]
+
+    init(promptErrors: [Error] = []) {
+        self.promptErrors = promptErrors
+    }
+
+    func capabilities() async throws -> ProviderCapabilities {
+        ProviderCapabilities(id: ProviderID("opencode"), displayName: "OpenCode", models: [])
+    }
+
+    func authMethods() async throws -> [String: [OpenCodeAuthMethod]] { [:] }
+
+    func setAPIKey(
+        providerID: String,
+        key: String,
+        metadata: [String: String]
+    ) async throws {}
+
+    func createSession() async throws -> String {
+        let sessionID = "ses_\(sessions.count + 1)"
+        sessions.append(sessionID)
+        return sessionID
+    }
+
+    func deleteSession(sessionID: String) async throws {
+        sessions.removeAll { $0 == sessionID }
+    }
+
+    func sendPromptAsync(
+        sessionID: String,
+        model: OpenCodeModelReference,
+        variant: String?,
+        parts: [OpenCodePromptPart]
+    ) async throws {
+        let text = parts.compactMap { part -> String? in
+            if case let .text(str) = part { return str }
+            return nil
+        }.joined(separator: "\n")
+        recordedPrompts.append(text)
+
+        if !promptErrors.isEmpty {
+            throw promptErrors.removeFirst()
+        }
+    }
+
+    func abort(sessionID: String) async throws {}
+
+    func replyPermission(requestID: String, reply: String) async throws {}
+
+    func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {
+        [:]
+    }
+
+    func addMCPServer(
+        name: String,
+        config: OpenCodeMCPServerConfig
+    ) async throws -> [String: OpenCodeMCPServerStatus] {
+        [:]
+    }
+
+    func disconnectMCPServer(name: String) async throws {}
+
+    func eventStream() async throws -> OpenCodeLineStream {
+        let pair = AsyncThrowingStream<String, Error>.makeStream()
+        pair.continuation.finish()
+        return OpenCodeLineStream(statusCode: 200, lines: pair.stream)
+    }
+
+    func createdSessions() -> [String] {
+        sessions
+    }
+
+    func prompts() -> [String] {
+        recordedPrompts
+    }
+}
+
+private final class RestartInMemoryCredentialStore: CredentialStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [CredentialKey: String] = [:]
+
+    func contains(_ key: CredentialKey) throws -> Bool {
+        lock.withLock { values[key] != nil }
+    }
+
+    func read(_ key: CredentialKey) throws -> String? {
+        lock.withLock { values[key] }
+    }
+
+    func write(_ value: String, for key: CredentialKey) throws {
+        lock.withLock { values[key] = value }
+    }
+
+    func delete(_ key: CredentialKey) throws {
+        _ = lock.withLock { values.removeValue(forKey: key) }
+    }
+}

@@ -11,7 +11,8 @@ final class OpenCodeSettingsTests: XCTestCase {
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
             ),
             serverManager: manager,
-            clientFactory: { _ in SettingsOpenCodeClient() }
+            clientFactory: { _ in SettingsOpenCodeClient() },
+            computerUseProvider: { .disabled }
         )
 
         await settings.refreshStatus()
@@ -45,7 +46,8 @@ final class OpenCodeSettingsTests: XCTestCase {
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
             ),
             serverManager: manager,
-            clientFactory: { _ in client }
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
         )
 
         let didStart = await settings.start()
@@ -89,7 +91,8 @@ final class OpenCodeSettingsTests: XCTestCase {
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
             ),
             serverManager: manager,
-            clientFactory: { _ in client }
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
         )
         let didStart = await settings.start()
         XCTAssertTrue(didStart)
@@ -128,7 +131,8 @@ final class OpenCodeSettingsTests: XCTestCase {
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
             ),
             serverManager: SettingsOpenCodeServerManager(connection: connection),
-            clientFactory: { _ in client }
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
         )
         let didStart = await settings.start()
         XCTAssertTrue(didStart)
@@ -155,7 +159,8 @@ final class OpenCodeSettingsTests: XCTestCase {
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
             ),
             serverManager: manager,
-            clientFactory: { _ in client }
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
         )
         let didStart = await settings.start()
         XCTAssertTrue(didStart)
@@ -171,6 +176,82 @@ final class OpenCodeSettingsTests: XCTestCase {
         XCTAssertEqual(stopCount, 1)
     }
 
+    func testStartRegistersComputerUseServerWhenReady() async throws {
+        let connection = makeConnection()
+        let client = SettingsOpenCodeClient()
+        let configuration = ComputerUseConfiguration(
+            projectRootURL: URL(fileURLWithPath: "/tmp/chatgpt-system"),
+            nodeExecutableURL: URL(fileURLWithPath: "/opt/homebrew/bin/node"),
+            workingDirectoryURL: URL(fileURLWithPath: "/tmp/agentic-sidebar")
+        )
+        let settings = OpenCodeSettings(
+            executableLocator: SettingsOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            serverManager: SettingsOpenCodeServerManager(connection: connection),
+            clientFactory: { _ in client },
+            computerUseProvider: { .ready(configuration) }
+        )
+
+        let didStart = await settings.start()
+
+        XCTAssertTrue(didStart)
+        XCTAssertTrue(settings.runningComputerUseEnabled)
+        XCTAssertEqual(settings.computerUseRegistration, .registered)
+        XCTAssertNil(settings.computerUseErrorMessage)
+        let registrations = await client.mcpRegistrations()
+        XCTAssertEqual(registrations.map(\.name), ["chatgpt-system"])
+        XCTAssertEqual(
+            registrations.first?.config.command.first,
+            "/opt/homebrew/bin/node"
+        )
+        XCTAssertEqual(registrations.first?.config.command.last, "--enable-computer-use")
+    }
+
+    func testStartWithInvalidComputerUseConfigurationKeepsTheServerAndReportsTheReason() async throws {
+        let connection = makeConnection()
+        let client = SettingsOpenCodeClient()
+        let settings = OpenCodeSettings(
+            executableLocator: SettingsOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            serverManager: SettingsOpenCodeServerManager(connection: connection),
+            clientFactory: { _ in client },
+            computerUseProvider: { .invalid(message: "dist/cli.js was not found") }
+        )
+
+        let didStart = await settings.start()
+
+        XCTAssertTrue(didStart)
+        XCTAssertFalse(settings.runningComputerUseEnabled)
+        XCTAssertEqual(
+            settings.computerUseRegistration,
+            .failed(message: "dist/cli.js was not found")
+        )
+        let registrations = await client.mcpRegistrations()
+        XCTAssertTrue(registrations.isEmpty)
+    }
+
+    func testDisabledComputerUseDoesNotRegisterAnything() async throws {
+        let connection = makeConnection()
+        let client = SettingsOpenCodeClient()
+        let settings = OpenCodeSettings(
+            executableLocator: SettingsOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            serverManager: SettingsOpenCodeServerManager(connection: connection),
+            clientFactory: { _ in client },
+            computerUseProvider: { .disabled }
+        )
+
+        _ = await settings.start()
+
+        XCTAssertFalse(settings.runningComputerUseEnabled)
+        XCTAssertEqual(settings.computerUseRegistration, .disabled)
+        let registrations = await client.mcpRegistrations()
+        XCTAssertTrue(registrations.isEmpty)
+    }
+
     private func makeConnection() -> OpenCodeServerConnection {
         OpenCodeServerConnection(
             baseURL: URL(string: "http://127.0.0.1:51190")!,
@@ -182,7 +263,9 @@ final class OpenCodeSettingsTests: XCTestCase {
 
 private struct SettingsOpenCodeExecutableLocator: OpenCodeExecutableLocating {
     let url: URL?
-    func locate() -> URL? { url }
+    func resolution() -> OpenCodeExecutableResolution {
+        url.map { .found($0) } ?? .notFound
+    }
 }
 
 private actor SettingsOpenCodeServerManager: OpenCodeServerManaging {
@@ -204,7 +287,7 @@ private actor SettingsOpenCodeServerManager: OpenCodeServerManaging {
         return .running(version: version, baseURL: connection.baseURL)
     }
 
-    func start() async throws -> OpenCodeServerConnection {
+    func start(computerUse: ComputerUseConfiguration?) async throws -> OpenCodeServerConnection {
         starts += 1
         guard let connection else {
             throw ProviderRuntimeError.executableUnavailable
@@ -231,10 +314,16 @@ private struct SettingsOpenCodeSubmission: Equatable, Sendable {
     let metadata: [String: String]
 }
 
+private struct SettingsMCPRegistration: Equatable, Sendable {
+    let name: String
+    let config: OpenCodeMCPServerConfig
+}
+
 private actor SettingsOpenCodeClient: OpenCodeClientProtocol {
     private let methodSet: [String: [OpenCodeAuthMethod]]
     private let setAPIKeyError: Error?
     private var recordedSubmissions: [SettingsOpenCodeSubmission] = []
+    private var recordedMCPRegistrations: [SettingsMCPRegistration] = []
 
     init(
         authMethods: [String: [OpenCodeAuthMethod]] = [:],
@@ -269,14 +358,38 @@ private actor SettingsOpenCodeClient: OpenCodeClientProtocol {
 
     func createSession() async throws -> String { "unused" }
 
+    func deleteSession(sessionID: String) async throws {}
+
     func sendPromptAsync(
         sessionID: String,
         model: OpenCodeModelReference,
         variant: String?,
-        text: String
+        parts: [OpenCodePromptPart]
     ) async throws {}
 
     func abort(sessionID: String) async throws {}
+
+    func replyPermission(requestID: String, reply: String) async throws {}
+
+    func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {
+        [:]
+    }
+
+    func addMCPServer(
+        name: String,
+        config: OpenCodeMCPServerConfig
+    ) async throws -> [String: OpenCodeMCPServerStatus] {
+        recordedMCPRegistrations.append(
+            SettingsMCPRegistration(name: name, config: config)
+        )
+        return [name: OpenCodeMCPServerStatus(status: "connected", error: nil)]
+    }
+
+    func disconnectMCPServer(name: String) async throws {}
+
+    func mcpRegistrations() -> [SettingsMCPRegistration] {
+        recordedMCPRegistrations
+    }
 
     func eventStream() async throws -> OpenCodeLineStream {
         let pair = AsyncThrowingStream<String, Error>.makeStream()

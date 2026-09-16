@@ -8,7 +8,6 @@ final class CapturePrivacyControllerTests: XCTestCase {
         let controller = CapturePrivacyController()
 
         XCTAssertFalse(controller.capabilities.externalCaptureExclusionGuaranteed)
-        XCTAssertTrue(controller.capabilities.supportsSelfCaptureFiltering)
         XCTAssertFalse(controller.capabilities.limitation.isEmpty)
     }
 

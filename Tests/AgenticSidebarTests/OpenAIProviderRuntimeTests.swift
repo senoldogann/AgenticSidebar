@@ -81,7 +81,8 @@ final class OpenAIProviderRuntimeTests: XCTestCase {
                 modelID: ProviderModelID("gpt-5.6"),
                 variantID: ProviderVariantID("medium")
             ),
-            messages: [ChatMessage(role: .user, text: "Hi")]
+            messages: [ChatMessage(role: .user, text: "Hi")],
+            speedMode: .normal
         )
 
         let stream = try await runtime.startStream(for: request)
@@ -133,7 +134,8 @@ final class OpenAIProviderRuntimeTests: XCTestCase {
                 modelID: ProviderModelID("gpt-5.6"),
                 variantID: nil
             ),
-            messages: [ChatMessage(role: .user, text: "Hi")]
+            messages: [ChatMessage(role: .user, text: "Hi")],
+            speedMode: .normal
         )
 
         let stream = try await runtime.startStream(for: request)

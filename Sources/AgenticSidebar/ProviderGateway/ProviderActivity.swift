@@ -8,8 +8,22 @@ struct ProviderActivityID: Hashable, Sendable {
     }
 }
 
-enum ProviderActivityKind: Equatable, Sendable {
+/// Persisted as a bare string, so an archive stays readable and a preview of the
+/// activity timeline survives a relaunch.
+extension ProviderActivityID: Codable {
+    init(from decoder: any Decoder) throws {
+        rawValue = try decoder.singleValueContainer().decode(String.self)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+enum ProviderActivityKind: String, Equatable, Codable, Sendable {
     case thinking
+    case command
     case read
     case delete
     case update
@@ -26,6 +40,58 @@ enum ProviderActivityOutcome: Equatable, Sendable {
 struct ProviderActivityDescriptor: Equatable, Sendable {
     let id: ProviderActivityID
     let kind: ProviderActivityKind
+    let title: String?
+    let detail: String?
+    let output: String?
+    /// A `+`/`-` preview of what a file-changing tool did, when the tool input
+    /// describes the change.
+    let diff: String?
+
+    init(
+        id: ProviderActivityID,
+        kind: ProviderActivityKind,
+        title: String?,
+        detail: String?,
+        output: String?,
+        diff: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = title
+        self.detail = detail
+        self.output = output
+        self.diff = diff
+    }
+
+    init(
+        id: ProviderActivityID,
+        kind: ProviderActivityKind
+    ) {
+        self.id = id
+        self.kind = kind
+        self.title = nil
+        self.detail = nil
+        self.output = nil
+        self.diff = nil
+    }
+
+    static func sanitizedTool(
+        id: ProviderActivityID,
+        toolName: String,
+        title: String?,
+        detail: String?,
+        output: String?,
+        diff: String? = nil
+    ) -> ProviderActivityDescriptor {
+        ProviderActivityDescriptor(
+            id: id,
+            kind: sanitizedKind(for: toolName),
+            title: title,
+            detail: detail,
+            output: output,
+            diff: diff
+        )
+    }
 
     static func sanitizedTool(
         id: ProviderActivityID,
@@ -33,7 +99,10 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
     ) -> ProviderActivityDescriptor {
         ProviderActivityDescriptor(
             id: id,
-            kind: sanitizedKind(for: toolName)
+            kind: sanitizedKind(for: toolName),
+            title: nil,
+            detail: nil,
+            output: nil
         )
     }
 
@@ -44,6 +113,10 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
                 .split { !$0.isLetter && !$0.isNumber }
                 .map(String.init)
         )
+
+        if !tokens.isDisjoint(with: ["bash", "sh", "terminal", "exec", "command", "run"]) {
+            return .command
+        }
 
         if normalizedName.contains("web")
             && (normalizedName.contains("search") || normalizedName.contains("fetch"))

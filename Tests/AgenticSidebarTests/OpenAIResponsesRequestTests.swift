@@ -14,7 +14,8 @@ final class OpenAIResponsesRequestTests: XCTestCase {
             messages: [
                 ChatMessage(role: .user, text: "Hello"),
                 ChatMessage(role: .assistant, text: "Hi there")
-            ]
+            ],
+            speedMode: .normal
         )
 
         let urlRequest = try OpenAIResponsesRequest.make(
@@ -34,6 +35,10 @@ final class OpenAIResponsesRequestTests: XCTestCase {
         )
         XCTAssertEqual(object["model"] as? String, "gpt-5.6")
         XCTAssertEqual(object["stream"] as? Bool, true)
+        XCTAssertNil(
+            object["instructions"],
+            "Normal mode must leave the provider's own instructions in place"
+        )
 
         let reasoning = try XCTUnwrap(object["reasoning"] as? [String: Any])
         XCTAssertEqual(reasoning["effort"] as? String, "high")
@@ -59,7 +64,8 @@ final class OpenAIResponsesRequestTests: XCTestCase {
                 modelID: ProviderModelID("gpt-6-astra"),
                 variantID: nil
             ),
-            messages: [ChatMessage(role: .user, text: "Hello")]
+            messages: [ChatMessage(role: .user, text: "Hello")],
+            speedMode: .normal
         )
 
         let urlRequest = try OpenAIResponsesRequest.make(
@@ -73,5 +79,33 @@ final class OpenAIResponsesRequestTests: XCTestCase {
         )
 
         XCTAssertNil(object["reasoning"])
+    }
+
+    func testFastModeCarriesTheSpeedInstructionAsSystemInstructions() throws {
+        let request = ProviderRequest(
+            sessionID: UUID(),
+            configuration: SessionConfiguration(
+                providerID: ProviderID("openai"),
+                modelID: ProviderModelID("gpt-6-astra"),
+                variantID: nil
+            ),
+            messages: [ChatMessage(role: .user, text: "Hello")],
+            speedMode: .fast
+        )
+
+        let urlRequest = try OpenAIResponsesRequest.make(
+            baseURL: URL(string: "https://example.test/v1")!,
+            apiKey: "test-token",
+            providerRequest: request
+        )
+        let body = try XCTUnwrap(urlRequest.httpBody)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+
+        XCTAssertEqual(
+            object["instructions"] as? String,
+            ResponseSpeedMode.fast.instruction
+        )
     }
 }

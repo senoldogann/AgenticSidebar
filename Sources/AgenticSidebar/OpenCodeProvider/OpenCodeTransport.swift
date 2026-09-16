@@ -1,93 +1,35 @@
 import Foundation
 
-struct OpenCodeHTTPResponse: Sendable {
-    let statusCode: Int
-    let data: Data
-}
+/// OpenCode adaptörünün HTTP tipleri, ortak taşıma katmanının tipleridir.
+typealias OpenCodeHTTPResponse = HTTPResponse
+typealias OpenCodeLineStream = HTTPLineStream
 
-struct OpenCodeLineStream: Sendable {
-    let statusCode: Int
-    let lines: AsyncThrowingStream<String, Error>
-    let cancel: @Sendable () async -> Void
+/// OpenCode adaptörünün taşıma sözleşmesi.
+///
+/// Gereksinimler ortak `ProviderHTTPTransport`'tan gelir; ayrı bir isim olarak
+/// kalmasının nedeni tip güvenliği: derleyici böylece OpenAI taşımasının
+/// OpenCode istemcisine verilmesini engeller.
+protocol OpenCodeTransport: ProviderHTTPTransport {}
 
-    init(
-        statusCode: Int,
-        lines: AsyncThrowingStream<String, Error>,
-        cancel: @escaping @Sendable () async -> Void = {}
-    ) {
-        self.statusCode = statusCode
-        self.lines = lines
-        self.cancel = cancel
-    }
-}
-
-protocol OpenCodeTransport: Sendable {
-    func send(_ request: URLRequest) async throws -> OpenCodeHTTPResponse
-    func stream(_ request: URLRequest) async throws -> OpenCodeLineStream
-}
-
+/// `URLSession` uygulamasını ortak taşımaya devreder.
 struct URLSessionOpenCodeTransport: OpenCodeTransport {
-    private let session: URLSession
+    private let http: URLSessionHTTPTransport
 
-    init(session: URLSession) {
-        self.session = session
+    private init(http: URLSessionHTTPTransport) {
+        self.http = http
     }
 
-    static func shared() -> Self {
-        Self(session: .shared)
+    /// Uzun süre sessiz kalabilen olay akışı için ayarlanmış bir oturum kurar.
+    /// Her çağrı kendi oturumunu açar.
+    static func streaming() -> Self {
+        Self(http: .streaming())
     }
 
     func send(_ request: URLRequest) async throws -> OpenCodeHTTPResponse {
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let response = response as? HTTPURLResponse else {
-                throw ProviderRuntimeError.unexpectedResponse
-            }
-            return OpenCodeHTTPResponse(statusCode: response.statusCode, data: data)
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw ProviderRuntimeError.transport
-        }
+        try await http.send(request)
     }
 
     func stream(_ request: URLRequest) async throws -> OpenCodeLineStream {
-        do {
-            let (bytes, response) = try await session.bytes(for: request)
-            guard let response = response as? HTTPURLResponse else {
-                throw ProviderRuntimeError.unexpectedResponse
-            }
-
-            let pair = AsyncThrowingStream<String, Error>.makeStream()
-            let forwardingTask = Task {
-                do {
-                    for try await line in bytes.lines {
-                        try Task.checkCancellation()
-                        pair.continuation.yield(line)
-                    }
-                    pair.continuation.finish()
-                } catch is CancellationError {
-                    pair.continuation.finish(throwing: CancellationError())
-                } catch {
-                    pair.continuation.finish(throwing: ProviderRuntimeError.transport)
-                }
-            }
-
-            return OpenCodeLineStream(
-                statusCode: response.statusCode,
-                lines: pair.stream,
-                cancel: {
-                    forwardingTask.cancel()
-                }
-            )
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw ProviderRuntimeError.transport
-        }
+        try await http.stream(request)
     }
 }

@@ -71,7 +71,8 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
             [
                 .activityFinished(
                     ProviderActivityID("prt_tool"),
-                    outcome: .completed
+                    outcome: .completed,
+                    output: "ok"
                 )
             ]
         )
@@ -91,7 +92,8 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
             [
                 .activityFinished(
                     ProviderActivityID("prt_tool"),
-                    outcome: .failed
+                    outcome: .failed,
+                    output: "backend detail"
                 )
             ]
         )
@@ -132,6 +134,18 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
         }
     }
 
+    func testContextOverflowErrorIsReportedAsAnActionableCause() {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertThrowsError(
+            try normalizer.consume(
+                line: #"data: {"type":"session.error","properties":{"sessionID":"ses_target","error":{"name":"ContextOverflowError","data":{"message":"Input exceeds the context window"}}}}"#
+            )
+        ) { error in
+            XCTAssertEqual(error as? ProviderRuntimeError, .contextLimitExceeded)
+        }
+    }
+
     func testSSEControlLinesAndUnknownEventsAreIgnored() throws {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
@@ -143,5 +157,60 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
             ),
             []
         )
+    }
+
+    func testPermissionAskedInvokesCallbackWithStructuredRequest() throws {
+        final class RequestBox: @unchecked Sendable {
+            var value: OpenCodePermissionRequest?
+        }
+        let box = RequestBox()
+        var normalizer = OpenCodeStreamNormalizer(
+            sessionID: "ses_target",
+            onPermissionRequest: { request in
+                box.value = request
+            }
+        )
+
+        let ignored = try normalizer.consume(
+            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_other","id":"per_ignored","permission":"chatgpt-system_computer_click"}}"#
+        )
+        XCTAssertEqual(ignored, [])
+        XCTAssertNil(box.value)
+
+        let events = try normalizer.consume(
+            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_12345","permission":"chatgpt-system_computer_click","patterns":["*"],"always":["chatgpt-system_computer_click*"],"metadata":{"description":"Click the Run button"}}}"#
+        )
+        XCTAssertEqual(events, [])
+        XCTAssertEqual(
+            box.value,
+            OpenCodePermissionRequest(
+                id: "per_12345",
+                remoteSessionID: "ses_target",
+                toolName: "chatgpt-system_computer_click",
+                patterns: ["*"],
+                alwaysPatterns: ["chatgpt-system_computer_click*"],
+                detail: "description: Click the Run button"
+            )
+        )
+    }
+
+    func testPermissionAskedWithoutPermissionNameIsIgnored() throws {
+        final class RequestBox: @unchecked Sendable {
+            var value: OpenCodePermissionRequest?
+        }
+        let box = RequestBox()
+        var normalizer = OpenCodeStreamNormalizer(
+            sessionID: "ses_target",
+            onPermissionRequest: { request in
+                box.value = request
+            }
+        )
+
+        let events = try normalizer.consume(
+            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_12345"}}"#
+        )
+
+        XCTAssertEqual(events, [])
+        XCTAssertNil(box.value)
     }
 }

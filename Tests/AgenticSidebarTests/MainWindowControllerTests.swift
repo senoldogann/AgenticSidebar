@@ -28,6 +28,30 @@ final class MainWindowControllerTests: XCTestCase {
         XCTAssertFalse(window.isVisible)
     }
 
+    func testAppearanceModeAppliesToRegisteredWindowAndSystemClearsIt() {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        let controller = MainWindowController()
+
+        // A mode chosen before the window exists must still reach it.
+        controller.setAppearance(.dark)
+        controller.register(window)
+        XCTAssertEqual(window.appearance?.name, .darkAqua)
+
+        controller.setAppearance(.light)
+        XCTAssertEqual(window.appearance?.name, .aqua)
+
+        // `.system` must *clear* the override: leaving a concrete appearance in
+        // place would pin every AppKit-drawn surface for the life of the window.
+        controller.setAppearance(.system)
+        XCTAssertNil(window.appearance)
+    }
+
     func testShowUsesReopenActionWhenNoWindowIsRegistered() {
         var reopenCount = 0
         let controller = MainWindowController()

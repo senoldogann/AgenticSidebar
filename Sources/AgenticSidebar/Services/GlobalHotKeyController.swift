@@ -52,18 +52,26 @@ final class GlobalHotKeyController {
                     return parameterStatus
                 }
 
+                // `self` is owned by the app delegate for the whole process
+                // lifetime, so an unretained reference cannot dangle here.
                 let controller = Unmanaged<GlobalHotKeyController>
                     .fromOpaque(userData)
                     .takeUnretainedValue()
 
-                return MainActor.assumeIsolated {
-                    guard receivedIdentifier.signature == controller.identifier.signature,
-                          receivedIdentifier.id == controller.identifier.id else {
-                        return OSStatus(eventNotHandledErr)
+                // The handler is installed on the application event target and
+                // runs on the main thread in practice. Hop explicitly instead of
+                // trapping with assumeIsolated if that ever changes.
+                guard Thread.isMainThread else {
+                    DispatchQueue.main.async {
+                        _ = MainActor.assumeIsolated {
+                            controller.handle(receivedIdentifier)
+                        }
                     }
-
-                    controller.action()
                     return noErr
+                }
+
+                return MainActor.assumeIsolated {
+                    controller.handle(receivedIdentifier)
                 }
             },
             1,
@@ -100,6 +108,16 @@ final class GlobalHotKeyController {
         }
 
         hotKeyRef = registeredHotKey
+    }
+
+    func handle(_ receivedIdentifier: EventHotKeyID) -> OSStatus {
+        guard receivedIdentifier.signature == identifier.signature,
+              receivedIdentifier.id == identifier.id else {
+            return OSStatus(eventNotHandledErr)
+        }
+
+        action()
+        return noErr
     }
 
     func unregister() {

@@ -109,7 +109,14 @@ final class OpenCodeClientTests: XCTestCase {
             sessionID: sessionID,
             model: OpenCodeModelReference(providerID: "anthropic", modelID: "claude/opus"),
             variant: "high",
-            text: "Hello"
+            parts: [
+                .text("Hello"),
+                .file(
+                    mime: "image/png",
+                    filename: "shot.png",
+                    url: "data:image/png;base64,AAAA"
+                )
+            ]
         )
         try await client.abort(sessionID: sessionID)
 
@@ -128,7 +135,15 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(model["modelID"], "claude/opus")
         XCTAssertEqual(object["variant"] as? String, "high")
         let parts = try XCTUnwrap(object["parts"] as? [[String: String]])
-        XCTAssertEqual(parts, [["type": "text", "text": "Hello"]])
+        XCTAssertEqual(parts, [
+            ["type": "text", "text": "Hello"],
+            [
+                "type": "file",
+                "mime": "image/png",
+                "filename": "shot.png",
+                "url": "data:image/png;base64,AAAA"
+            ]
+        ])
     }
 
     func testEventStreamUsesAuthenticatedSSEEndpointAndPreservesCancellation() async throws {
@@ -172,6 +187,69 @@ final class OpenCodeClientTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .authenticationFailure)
         }
+    }
+
+    func testMCPStatusAddAndDisconnectUseDocumentedEndpoints() async throws {
+        let transport = RecordingOpenCodeTransport { request in
+            switch (request.httpMethod, request.url?.path) {
+            case ("GET", "/mcp"):
+                return OpenCodeHTTPResponse(
+                    statusCode: 200,
+                    data: Data(
+                        #"{"chatgpt-system":{"status":"connected"},"other":{"status":"failed","error":"boom"}}"#.utf8
+                    )
+                )
+            case ("POST", "/mcp"):
+                return OpenCodeHTTPResponse(
+                    statusCode: 200,
+                    data: Data(#"{"chatgpt-system":{"status":"connected","error":null}}"#.utf8)
+                )
+            case ("POST", "/mcp/chatgpt-system/disconnect"):
+                return OpenCodeHTTPResponse(statusCode: 200, data: Data("true".utf8))
+            default:
+                XCTFail("Unexpected OpenCode request")
+                return OpenCodeHTTPResponse(statusCode: 404, data: Data())
+            }
+        }
+        let client = makeClient(transport: transport)
+
+        let statuses = try await client.mcpServerStatuses()
+        XCTAssertEqual(statuses["chatgpt-system"]?.isConnected, true)
+        XCTAssertEqual(statuses["other"]?.status, "failed")
+        XCTAssertEqual(statuses["other"]?.error, "boom")
+
+        let added = try await client.addMCPServer(
+            name: "chatgpt-system",
+            config: OpenCodeMCPServerConfig(
+                type: "local",
+                command: ["/opt/homebrew/bin/node", "/tmp/cli.js", "stdio"],
+                environment: nil,
+                enabled: true,
+                timeout: 20_000
+            )
+        )
+        XCTAssertEqual(added["chatgpt-system"]?.isConnected, true)
+        try await client.disconnectMCPServer(name: "chatgpt-system")
+
+        let requests = await transport.requests()
+        XCTAssertEqual(
+            requests.map { $0.url?.path },
+            ["/mcp", "/mcp", "/mcp/chatgpt-system/disconnect"]
+        )
+        let body = try XCTUnwrap(requests[1].httpBody)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: body) as? [String: Any]
+        )
+        XCTAssertEqual(object["name"] as? String, "chatgpt-system")
+        let config = try XCTUnwrap(object["config"] as? [String: Any])
+        XCTAssertEqual(config["type"] as? String, "local")
+        XCTAssertEqual(
+            config["command"] as? [String],
+            ["/opt/homebrew/bin/node", "/tmp/cli.js", "stdio"]
+        )
+        XCTAssertEqual(config["enabled"] as? Bool, true)
+        XCTAssertEqual(config["timeout"] as? Int, 20_000)
+        XCTAssertNil(config["environment"])
     }
 
     private func makeClient(transport: any OpenCodeTransport) -> OpenCodeClient {

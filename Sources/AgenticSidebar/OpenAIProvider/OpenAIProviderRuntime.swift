@@ -80,43 +80,71 @@ struct OpenAIProviderRuntime: ProviderRuntime {
         }
 
         guard (200..<300).contains(lineStream.statusCode) else {
+            let bodyPreview = await Self.bodyPreview(from: lineStream)
             await lineStream.cancel()
-            throw runtimeError(forHTTPStatus: lineStream.statusCode)
+            throw runtimeError(
+                forHTTPStatus: lineStream.statusCode,
+                bodyPreview: bodyPreview
+            )
         }
 
-        let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+        // Bounded: a fast token stream suspends here instead of buffering the
+        // whole response while the session is busy applying it.
+        let channel = BoundedChannel<ProviderEvent>(capacity: 128)
         let forwardingTask = Task {
             do {
                 for try await line in lineStream.lines {
                     try Task.checkCancellation()
 
                     if let event = try OpenAIStreamDecoder.decode(line: line) {
-                        pair.continuation.yield(event)
+                        try await channel.send(event)
 
                         if event == .completed {
-                            pair.continuation.finish()
+                            await lineStream.cancel()
+                            await channel.finish()
                             return
                         }
                     }
                 }
 
-                pair.continuation.finish()
+                await channel.finish()
             } catch is CancellationError {
-                pair.continuation.finish(throwing: CancellationError())
+                await channel.finish(throwing: CancellationError())
             } catch let error as ProviderRuntimeError {
-                pair.continuation.finish(throwing: error)
+                await channel.finish(throwing: error)
             } catch {
-                pair.continuation.finish(throwing: ProviderRuntimeError.transport)
+                await channel.finish(throwing: ProviderRuntimeError.transport)
             }
         }
 
         return ProviderStream(
-            events: pair.stream,
+            events: channel.makeStream(),
             cancellation: {
                 forwardingTask.cancel()
                 await lineStream.cancel()
+                await channel.finish(throwing: CancellationError())
             }
         )
+    }
+
+    /// Error responses carry a short JSON body describing the cause. Reading a
+    /// bounded prefix lets the app tell a context-window overflow apart from an
+    /// unrelated bad request without ever showing the body to the user.
+    static func bodyPreview(from lineStream: OpenAILineStream) async -> String {
+        var preview = ""
+
+        do {
+            for try await line in lineStream.lines {
+                preview += line
+                if preview.count >= 4_096 {
+                    break
+                }
+            }
+        } catch {
+            return preview
+        }
+
+        return preview
     }
 
     private func resolveAPIKey() throws -> String {
@@ -145,15 +173,39 @@ struct OpenAIProviderRuntime: ProviderRuntime {
         return request
     }
 
-    private func runtimeError(forHTTPStatus statusCode: Int) -> ProviderRuntimeError {
-        switch statusCode {
-        case 401, 403:
-            .missingCredential
-        case 400..<500, 500..<600:
-            .unavailable
-        default:
-            .unexpectedResponse
+    /// A request that overruns the model context window is reported as a plain
+    /// 400, so the body has to be classified to keep the actionable cause.
+    static func indicatesContextOverflow(statusCode: Int, bodyPreview: String) -> Bool {
+        guard statusCode == 400 || statusCode == 413 else {
+            return false
         }
+
+        let lowercased = bodyPreview.lowercased()
+        let markers = [
+            "context_length_exceeded",
+            "context length",
+            "maximum context",
+            "context window",
+            "too many tokens",
+            "reduce the length"
+        ]
+
+        return markers.contains { lowercased.contains($0) }
+    }
+
+    private func runtimeError(
+        forHTTPStatus statusCode: Int,
+        bodyPreview: String = ""
+    ) -> ProviderRuntimeError {
+        AppLog.openAI.error("OpenAI HTTP status \(statusCode, privacy: .public)")
+
+        if Self.indicatesContextOverflow(statusCode: statusCode, bodyPreview: bodyPreview) {
+            return .contextLimitExceeded
+        }
+
+        // Durum eşlemesi ortak politikadır; OpenAI için 401/403 reddedilen bir
+        // API anahtarıdır ve kullanıcının Settings'te düzeltebileceği şey odur.
+        return .forHTTPStatus(statusCode, unauthorized: .missingCredential)
     }
 }
 

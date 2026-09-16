@@ -1,260 +1,252 @@
 import SwiftUI
 
+enum SettingsTab: String, CaseIterable, Identifiable {
+    case appearance = "Appearance"
+    case ai = "AI & Models"
+    case extensions = "MCP & Plugins"
+    case automation = "Automation"
+    case computerUse = "Computer Use"
+    case general = "General"
+
+    var id: String { rawValue }
+
+    var iconName: String {
+        switch self {
+        case .appearance: "paintpalette.fill"
+        case .ai: "cpu.fill"
+        case .extensions: "puzzlepiece.extension.fill"
+        case .automation: "bolt.fill"
+        case .computerUse: "cursorarrow.rays"
+        case .general: "gearshape.fill"
+        }
+    }
+}
+
+/// Settings shell: sidebar navigation, header and tab routing.
+///
+/// The tabs themselves live in `Views/Settings/Settings*Tab.swift`, and the
+/// shared card/button chrome in `Views/Settings/SettingsComponents.swift`; each
+/// tab only describes its own content.
 struct SettingsView: View {
+    @Environment(\.colorScheme) var systemColorScheme
+
     let settingsStore: SettingsStore
     let openAICredentialSettings: OpenAICredentialSettings
     let openCodeSettings: OpenCodeSettings
+    let extensionStore: ExtensionStore
+    /// The provider is chosen here rather than in the composer, so this screen
+    /// needs the session it configures.
+    let sessionService: AgentSessionService
+    /// Owns this session's "Always allow" decisions and the audit log the tool
+    /// approval card reads, so the two cards show the state the agent is in.
+    let permissionApprovalCenter: PermissionApprovalCenter
     let capturePrivacyCapabilities: CapturePrivacyCapabilities
     let onOpenAICredentialChange: @MainActor () -> Void
     let onOpenCodeChange: @MainActor () -> Void
+    let onDismiss: () -> Void
+
+    @State private var selectedTab: SettingsTab = .appearance
+
+    /// The audit log's tail, loaded when the tool-approval card appears.
+    @State var recentDecisions: [ToolAuditLog.Record] = []
+
+    // Drafts for the MCP, plugin and skill forms. They live on the shell rather
+    // than in the tab so typing survives a switch to another tab and back.
+    @State var newMCPName = ""
+    @State var newMCPTarget = ""
+    @State var newMCPTransport: MCPTransport = .local
+    @State var newPluginModule = ""
+    @State var pluginQuery = ""
+    @State var skillQuery = ""
+    @State var skillRepository = ""
+    @State var skillName = ""
 
     init(
         settingsStore: SettingsStore,
         openAICredentialSettings: OpenAICredentialSettings,
         openCodeSettings: OpenCodeSettings,
+        extensionStore: ExtensionStore,
+        sessionService: AgentSessionService,
+        permissionApprovalCenter: PermissionApprovalCenter,
         capturePrivacyCapabilities: CapturePrivacyCapabilities,
-        onOpenAICredentialChange: @escaping @MainActor () -> Void = {},
-        onOpenCodeChange: @escaping @MainActor () -> Void = {}
+        onOpenAICredentialChange: @escaping @MainActor () -> Void,
+        onOpenCodeChange: @escaping @MainActor () -> Void,
+        onDismiss: @escaping () -> Void
     ) {
         self.settingsStore = settingsStore
         self.openAICredentialSettings = openAICredentialSettings
         self.openCodeSettings = openCodeSettings
+        self.extensionStore = extensionStore
+        self.sessionService = sessionService
+        self.permissionApprovalCenter = permissionApprovalCenter
         self.capturePrivacyCapabilities = capturePrivacyCapabilities
         self.onOpenAICredentialChange = onOpenAICredentialChange
         self.onOpenCodeChange = onOpenCodeChange
+        self.onDismiss = onDismiss
     }
 
     var body: some View {
-        @Bindable var settings = settingsStore
-        @Bindable var openAI = openAICredentialSettings
-        @Bindable var openCode = openCodeSettings
+        HStack(spacing: 0) {
+            // Left Sidebar Navigation
+            VStack(alignment: .leading, spacing: 14) {
+                Text("SETTINGS")
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 2)
 
-        Form {
-            Section("OpenAI") {
-                SecureField("OpenAI API key", text: $openAI.apiKeyDraft)
+                // Vertical Tab Items
+                VStack(spacing: 4) {
+                    ForEach(SettingsTab.allCases) { tab in
+                        Button {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                selectedTab = tab
+                            }
+                        } label: {
+                            HStack(spacing: 9) {
+                                Image(systemName: tab.iconName)
+                                    .font(.system(size: 12.5, weight: selectedTab == tab ? .semibold : .medium))
+                                    .frame(width: 18)
 
-                HStack {
-                    Button("Save API Key") {
-                        if openAICredentialSettings.save() {
-                            onOpenAICredentialChange()
+                                Text(tab.rawValue)
+                                    .font(.system(size: 13, weight: selectedTab == tab ? .semibold : .medium))
+
+                                Spacer()
+                            }
+                            .foregroundStyle(
+                                selectedTab == tab
+                                    ? Color.white
+                                    : (isDarkMode ? Color.white.opacity(0.75) : Color.black.opacity(0.75))
+                            )
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .background {
+                                if selectedTab == tab {
+                                    LinearGradient(
+                                        colors: currentTheme.accentGradient,
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                }
+                            }
+                            .interactiveHoverPill(cornerRadius: 8)
                         }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
                     }
-                    .disabled(
-                        openAICredentialSettings.apiKeyDraft
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
-                            .isEmpty
-                    )
-
-                    Button("Delete API Key", role: .destructive) {
-                        if openAICredentialSettings.delete() {
-                            onOpenAICredentialChange()
-                        }
-                    }
-                    .disabled(!openAICredentialSettings.hasStoredCredential)
                 }
 
-                if openAICredentialSettings.hasStoredCredential {
-                    Text("API key saved in macOS Keychain.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("The saved API key is stored only in macOS Keychain and is never displayed here.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+                Spacer()
 
-                if let errorMessage = openAICredentialSettings.errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
-            }
+                // Active Theme Info Card at Bottom of Sidebar
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: currentTheme.accentGradient,
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 14, height: 14)
 
-            Section("OpenCode") {
-                HStack {
-                    Text(openCodeStatusText)
+                    Text(currentTheme.displayName)
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(.secondary)
 
                     Spacer()
-
-                    if isOpenCodeRunning {
-                        Button("Stop OpenCode", role: .destructive) {
-                            Task {
-                                await openCodeSettings.stop()
-                                onOpenCodeChange()
-                            }
-                        }
-                    } else {
-                        Button("Start OpenCode") {
-                            Task {
-                                if await openCodeSettings.start() {
-                                    onOpenCodeChange()
-                                }
-                            }
-                        }
-                        .disabled(!openCodeSettings.isInstalled)
-                    }
                 }
-
-                if isOpenCodeRunning {
-                    if !openCodeSettings.apiProviderIDs.isEmpty {
-                        Picker(
-                            "Provider credential",
-                            selection: providerSelection
-                        ) {
-                            ForEach(openCodeSettings.apiProviderIDs, id: \.self) { providerID in
-                                Text(providerID).tag(providerID)
-                            }
-                        }
-
-                        if openCodeSettings.selectedAPIMethods.count > 1 {
-                            Picker(
-                                "Authentication method",
-                                selection: methodSelection
-                            ) {
-                                ForEach(
-                                    Array(openCodeSettings.selectedAPIMethods.enumerated()),
-                                    id: \.offset
-                                ) { index, method in
-                                    Text(method.label).tag(index)
-                                }
-                            }
-                        } else if let method = openCodeSettings.selectedAPIMethod {
-                            LabeledContent("Authentication method", value: method.label)
-                        }
-
-                        ForEach(openCodeSettings.activePrompts, id: \.key) { prompt in
-                            metadataControl(for: prompt)
-                        }
-
-                        SecureField("Provider API key", text: $openCode.apiKeyDraft)
-
-                        Button("Save Provider Credential") {
-                            Task {
-                                if await openCodeSettings.saveAPIKey() {
-                                    onOpenCodeChange()
-                                }
-                            }
-                        }
-                        .disabled(
-                            openCodeSettings.apiKeyDraft
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                                .isEmpty
-                        )
-
-                        Text("Provider credentials are sent to the local OpenCode server and are not persisted by AgenticSidebar.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("No API-key authentication methods are advertised by this OpenCode installation.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    if !oauthProviderIDs.isEmpty {
-                        Text("OAuth sign-in is available for \(oauthProviderIDs.joined(separator: ", ")), but browser OAuth setup is not implemented in this milestone.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                if let errorMessage = openCodeSettings.errorMessage {
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.red)
-                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 38)
+            .padding(.bottom, 14)
+            .frame(width: 220)
+            .background(
+                currentTheme.background(isDark: isDarkMode)
+            )
+            .overlay(alignment: .trailing) {
+                Rectangle()
+                    .fill(currentTheme.border(isDark: isDarkMode).opacity(0.4 * settingsStore.contrast))
+                    .frame(width: 1)
             }
 
-            Section("Application") {
-                Toggle(
-                    "Show session status in the menu bar",
-                    isOn: $settings.menuBarSessionEnabled
-                )
+            // Right Main Content Area
+            VStack(spacing: 0) {
+                // Content Header Bar
+                HStack {
+                    HStack(spacing: 8) {
+                        Image(systemName: selectedTab.iconName)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
 
-                Text(capturePrivacyCapabilities.limitation)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                        Text(selectedTab.rawValue)
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundStyle(.primary)
+                    }
+
+                    Spacer()
+                }
+                .padding(.horizontal, 28)
+                .padding(.top, 38)
+                .padding(.bottom, 14)
+                .background(
+                    currentTheme.background(isDark: isDarkMode)
+                )
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(currentTheme.border(isDark: isDarkMode).opacity(0.3 * settingsStore.contrast))
+                        .frame(height: 1)
+                }
+
+                // Tab Content ScrollView
+                ScrollView {
+                    VStack(spacing: 20) {
+                        switch selectedTab {
+                        case .appearance:
+                            appearanceTabContent
+                        case .ai:
+                            aiTabContent
+                        case .extensions:
+                            extensionsTabContent
+                        case .automation:
+                            automationTabContent
+                        case .computerUse:
+                            computerUseTabContent
+                        case .general:
+                            generalTabContent
+                        }
+                    }
+                    .frame(maxWidth: 820)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 24)
+                    .frame(maxWidth: .infinity)
+                }
+                .background(
+                    currentTheme.background(isDark: isDarkMode)
+                )
             }
         }
-        .formStyle(.grouped)
-        .frame(width: 520)
-        .padding()
+        .background(
+            currentTheme.background(isDark: isDarkMode)
+        )
+        .preferredColorScheme(settingsStore.colorSchemeMode.preferredColorScheme)
+        .background {
+            SettingsWindowAppearanceBridge(mode: settingsStore.colorSchemeMode)
+        }
         .onAppear {
             openAICredentialSettings.refreshStatus()
             Task {
                 await openCodeSettings.refreshStatus()
             }
-        }
-    }
-
-    @ViewBuilder
-    private func metadataControl(for prompt: OpenCodeAuthPrompt) -> some View {
-        switch prompt.type {
-        case .text:
-            TextField(
-                prompt.message,
-                text: metadataBinding(for: prompt.key),
-                prompt: prompt.placeholder.map(Text.init)
-            )
-
-        case .select:
-            Picker(
-                prompt.message,
-                selection: metadataBinding(for: prompt.key)
-            ) {
-                ForEach(prompt.options ?? [], id: \.value) { option in
-                    Text(option.hint.map { "\(option.label) — \($0)" } ?? option.label)
-                        .tag(option.value)
-                }
+            Task {
+                await extensionStore.refresh()
             }
         }
-    }
-
-    private var providerSelection: Binding<String> {
-        Binding(
-            get: { openCodeSettings.selectedProviderID ?? "" },
-            set: { openCodeSettings.selectProvider($0) }
-        )
-    }
-
-    private var methodSelection: Binding<Int> {
-        Binding(
-            get: { openCodeSettings.selectedMethodIndex },
-            set: { openCodeSettings.selectMethod(index: $0) }
-        )
-    }
-
-    private func metadataBinding(for key: String) -> Binding<String> {
-        Binding(
-            get: { openCodeSettings.metadataDrafts[key] ?? "" },
-            set: { openCodeSettings.metadataDrafts[key] = $0 }
-        )
-    }
-
-    private var isOpenCodeRunning: Bool {
-        if case .running = openCodeSettings.serverStatus {
-            return true
-        }
-        return false
-    }
-
-    private var openCodeStatusText: String {
-        switch openCodeSettings.serverStatus {
-        case .stopped:
-            openCodeSettings.isInstalled
-                ? "Installed — server stopped"
-                : "OpenCode executable not found"
-        case .starting:
-            "Starting local server…"
-        case let .running(version, _):
-            "Running OpenCode \(version) on authenticated loopback"
-        }
-    }
-
-    private var oauthProviderIDs: [String] {
-        openCodeSettings.authMethods
-            .filter { _, methods in methods.contains(where: { $0.type == .oauth }) }
-            .map(\.key)
-            .sorted()
+        // Every label, path and command on these screens is text the user may
+        // need to copy — a config path, a module name, an error message.
+        .textSelection(.enabled)
     }
 }

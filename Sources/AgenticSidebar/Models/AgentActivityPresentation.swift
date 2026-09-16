@@ -11,6 +11,10 @@ struct AgentActivityPresentation: Equatable, Sendable {
             title = "Thinking"
             runningStatusName = "Thinking"
             symbolName = "brain"
+        case .command:
+            title = "Running command"
+            runningStatusName = "Running command"
+            symbolName = "terminal"
         case .read:
             title = "Reading"
             runningStatusName = "Read"
@@ -36,5 +40,31 @@ struct AgentActivityPresentation: Equatable, Sendable {
             runningStatusName = "Tool"
             symbolName = "wrench.and.screwdriver"
         }
+    }
+}
+
+enum ChatMessagePresenter {
+    static func cleanUserDisplayText(from rawText: String, hasAttachments: Bool) -> String {
+        var text = rawText
+
+        if let ocrRange = text.range(of: #"Extracted content from screenshot:\s*"""[\s\S]*?"""\s*"#, options: .regularExpression) {
+            text.removeSubrange(ocrRange)
+        }
+
+        text = text.replacingOccurrences(of: #"\s*\(No machine-readable text found in screenshot\)\s*"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\[Screenshot captured:[^\]]*\]\s*"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\s*Please inspect this screenshot carefully:.*"#, with: "", options: .regularExpression)
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if hasAttachments && trimmed == "Please inspect the attached file." {
+            return ""
+        }
+
+        if trimmed.isEmpty && !hasAttachments {
+            return rawText
+        }
+
+        return trimmed
     }
 }

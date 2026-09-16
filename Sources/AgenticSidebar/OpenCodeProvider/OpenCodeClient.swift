@@ -1,5 +1,60 @@
 import Foundation
 
+/// OpenCode `mcp` yapılandırmasındaki sunucu tanımı.
+///
+/// Yerel (`command`) ve uzak (`url`/`headers`/`oauth`) alanların ikisi de
+/// taşınır; hangisinin geçerli olduğunu `type` belirler. Boş alanlar kodlanmaz.
+struct OpenCodeMCPServerConfig: Encodable, Equatable, Sendable {
+    let type: String
+    let command: [String]
+    let environment: [String: String]?
+    let enabled: Bool
+    let timeout: Int?
+    var url: String? = nil
+    var headers: [String: String]? = nil
+    var cwd: String? = nil
+    var oauth: OpenCodeMCPOAuthSetting? = nil
+}
+
+/// Uzak MCP sunucusu için OAuth davranışı.
+///
+/// `nil` (alan hiç yazılmaz) OpenCode'un otomatik OAuth akışını açar; `false`
+/// API anahtarı kullanan sunucular için otomatik akışı kapatır; nesne ise önceden
+/// kaydedilmiş istemci bilgilerini taşır.
+enum OpenCodeMCPOAuthSetting: Encodable, Equatable, Sendable {
+    case disabled
+    case registered(clientID: String, clientSecret: String?, scope: String?)
+
+    func encode(to encoder: any Encoder) throws {
+        switch self {
+        case .disabled:
+            var container = encoder.singleValueContainer()
+            try container.encode(false)
+        case let .registered(clientID, clientSecret, scope):
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(clientID, forKey: .clientId)
+            try container.encodeIfPresent(clientSecret, forKey: .clientSecret)
+            try container.encodeIfPresent(scope, forKey: .scope)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case clientId
+        case clientSecret
+        case scope
+    }
+}
+
+/// `GET /mcp` yanıtındaki tek bir sunucunun durumu.
+struct OpenCodeMCPServerStatus: Decodable, Equatable, Sendable {
+    let status: String
+    let error: String?
+
+    var isConnected: Bool {
+        status == "connected"
+    }
+}
+
 protocol OpenCodeClientProtocol: Sendable {
     func capabilities() async throws -> ProviderCapabilities
     func authMethods() async throws -> [String: [OpenCodeAuthMethod]]
@@ -9,14 +64,33 @@ protocol OpenCodeClientProtocol: Sendable {
         metadata: [String: String]
     ) async throws
     func createSession() async throws -> String
+    func deleteSession(sessionID: String) async throws
     func sendPromptAsync(
         sessionID: String,
         model: OpenCodeModelReference,
         variant: String?,
-        text: String
+        parts: [OpenCodePromptPart]
     ) async throws
     func abort(sessionID: String) async throws
     func eventStream() async throws -> OpenCodeLineStream
+    func replyPermission(requestID: String, reply: String) async throws
+    func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus]
+    func addMCPServer(
+        name: String,
+        config: OpenCodeMCPServerConfig
+    ) async throws -> [String: OpenCodeMCPServerStatus]
+    func disconnectMCPServer(name: String) async throws
+    /// Starts a remote MCP server's OAuth flow and returns the page the user has
+    /// to visit. `nil` means the server had nothing to authorize.
+    func startMCPAuthorization(name: String) async throws -> URL?
+    func completeMCPAuthorization(name: String, code: String) async throws
+}
+
+extension OpenCodeClientProtocol {
+    // Fakes in tests only ever answer the calls their test exercises; a server
+    // that asks for no authorization is the honest default for them.
+    func startMCPAuthorization(name: String) async throws -> URL? { nil }
+    func completeMCPAuthorization(name: String, code: String) async throws {}
 }
 
 struct OpenCodeClient: OpenCodeClientProtocol {
@@ -117,11 +191,21 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         return session.id
     }
 
+    /// Sunucu tarafındaki oturumu siler; silinen sohbetin arkasında ölü bir
+    /// oturum bırakmamak için.
+    func deleteSession(sessionID: String) async throws {
+        let request = makeRequest(
+            pathComponents: ["session", sessionID],
+            method: "DELETE"
+        )
+        _ = try await send(request)
+    }
+
     func sendPromptAsync(
         sessionID: String,
         model: OpenCodeModelReference,
         variant: String?,
-        text: String
+        parts: [OpenCodePromptPart]
     ) async throws {
         let request = try makeJSONRequest(
             pathComponents: ["session", sessionID, "prompt_async"],
@@ -132,7 +216,7 @@ struct OpenCodeClient: OpenCodeClientProtocol {
                     modelID: model.modelID
                 ),
                 variant: variant,
-                parts: [PromptPart(type: "text", text: text)]
+                parts: parts
             )
         )
         _ = try await send(request)
@@ -144,6 +228,88 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             method: "POST"
         )
         _ = try await send(request)
+    }
+
+    func replyPermission(requestID: String, reply: String) async throws {
+        let request = try makeJSONRequest(
+            pathComponents: ["permission", requestID, "reply"],
+            method: "POST",
+            body: PermissionReplyBody(reply: reply)
+        )
+        _ = try await send(request)
+    }
+
+    func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {
+        let request = makeRequest(pathComponents: ["mcp"], method: "GET")
+        let response = try await send(request)
+        return try decode(
+            [String: OpenCodeMCPServerStatus].self,
+            from: response.data
+        )
+    }
+
+    func addMCPServer(
+        name: String,
+        config: OpenCodeMCPServerConfig
+    ) async throws -> [String: OpenCodeMCPServerStatus] {
+        let request = try makeJSONRequest(
+            pathComponents: ["mcp"],
+            method: "POST",
+            body: AddMCPServerBody(name: name, config: config)
+        )
+        let response = try await send(request)
+        return try decode(
+            [String: OpenCodeMCPServerStatus].self,
+            from: response.data
+        )
+    }
+
+    func disconnectMCPServer(name: String) async throws {
+        let request = makeRequest(
+            pathComponents: ["mcp", name, "disconnect"],
+            method: "POST"
+        )
+        _ = try await send(request)
+    }
+
+    func startMCPAuthorization(name: String) async throws -> URL? {
+        let request = makeRequest(
+            pathComponents: ["mcp", name, "auth"],
+            method: "POST"
+        )
+        let response = try await send(request)
+        return Self.authorizationURL(in: response.data)
+    }
+
+    func completeMCPAuthorization(name: String, code: String) async throws {
+        let request = try makeJSONRequest(
+            pathComponents: ["mcp", name, "auth", "callback"],
+            method: "POST",
+            body: AuthorizationCallbackBody(code: code)
+        )
+        _ = try await send(request)
+    }
+
+    /// The field the flow's URL arrives in has moved between server versions, so
+    /// the three names it has used are all read rather than one being trusted.
+    static func authorizationURL(in data: Data) -> URL? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+
+        for key in ["url", "authorizationUrl", "authorization_url"] {
+            if let text = object[key] as? String, let url = URL(string: text) {
+                return url
+            }
+        }
+
+        return nil
+    }
+
+    private struct AuthorizationCallbackBody: Encodable {
+        let code: String
     }
 
     func eventStream() async throws -> OpenCodeLineStream {
@@ -166,7 +332,7 @@ struct OpenCodeClient: OpenCodeClientProtocol {
     private func send(_ request: URLRequest) async throws -> OpenCodeHTTPResponse {
         do {
             let response = try await transport.send(request)
-            try validate(statusCode: response.statusCode)
+            try validate(statusCode: response.statusCode, body: response.data)
             return response
         } catch let error as ProviderRuntimeError {
             throw error
@@ -177,17 +343,30 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         }
     }
 
-    private func validate(statusCode: Int) throws {
-        switch statusCode {
-        case 200..<300:
+    /// `body` is used only for the statuses the shared policy does not name: the
+    /// provider's own answer is then the only thing that can explain the failure,
+    /// and without it the user saw one generic sentence.
+    private func validate(statusCode: Int, body: Data = Data()) throws {
+        guard !(200..<300).contains(statusCode) else {
             return
-        case 401, 403:
-            throw ProviderRuntimeError.authenticationFailure
-        case 500..<600:
-            throw ProviderRuntimeError.unavailable
-        default:
-            throw ProviderRuntimeError.unexpectedResponse
         }
+
+        // Durum eşlemesi ortak politikadır; yerel sunucu için 401/403 reddedilen
+        // sunucu kimlik bilgisi demektir.
+        let mapped = ProviderRuntimeError.forHTTPStatus(
+            statusCode,
+            unauthorized: .authenticationFailure
+        )
+
+        if mapped == .unexpectedResponse, !body.isEmpty {
+            ProviderResponseDiagnostics.shared.record(
+                provider: "OpenCode",
+                statusCode: statusCode,
+                body: String(data: body, encoding: .utf8) ?? "<\(body.count) bytes>"
+            )
+        }
+
+        throw mapped
     }
 
     private func makeRequest(
@@ -250,7 +429,7 @@ struct OpenCodeClient: OpenCodeClientProtocol {
     private struct PromptBody: Encodable {
         let model: PromptModel
         let variant: String?
-        let parts: [PromptPart]
+        let parts: [OpenCodePromptPart]
     }
 
     private struct PromptModel: Encodable {
@@ -258,8 +437,12 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         let modelID: String
     }
 
-    private struct PromptPart: Encodable {
-        let type: String
-        let text: String
+    private struct PermissionReplyBody: Encodable {
+        let reply: String
+    }
+
+    private struct AddMCPServerBody: Encodable {
+        let name: String
+        let config: OpenCodeMCPServerConfig
     }
 }
