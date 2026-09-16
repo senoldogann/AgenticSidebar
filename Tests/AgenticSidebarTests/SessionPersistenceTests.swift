@@ -711,6 +711,67 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertFalse(reduced.sessions.contains { $0.id == middle.id })
     }
 
+    func testActiveEmptyConversationSurvivesAlongsideExistingMessages() async throws {
+        let (store, directory) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let runtime = makeRuntime()
+        let service = AgentSessionService(runtimes: [runtime], archiveStore: store)
+        await service.refreshCapabilities()
+        let turn = try XCTUnwrap(service.submit("Keep this conversation"))
+        await turn.value
+
+        let emptyActiveID = service.createSession()
+        await service.saveNow()
+        let restored = AgentSessionService(runtimes: [runtime], archiveStore: store)
+
+        XCTAssertEqual(restored.activeSessionID, emptyActiveID)
+        XCTAssertEqual(restored.sessions.count, 2)
+        XCTAssertTrue(restored.state.messages.isEmpty)
+        XCTAssertEqual(restored.state.configuration?.providerID, ProviderID("alpha"))
+    }
+
+    func testSessionCountLimitKeepsPinnedConversation() {
+        var pinned = makeSnapshot(text: "pinned", createdAt: 0)
+        pinned.isPinned = true
+        let others = (1...SessionArchiveStore.maximumSessionCount).map {
+            makeSnapshot(text: "ordinary", createdAt: TimeInterval($0))
+        }
+        let archive = SessionArchive(
+            version: SessionArchive.currentVersion,
+            activeSessionID: others.last!.id,
+            sessions: [pinned] + others
+        )
+        let bounded = archive.boundedForStorage(
+            maximumSessionCount: SessionArchiveStore.maximumSessionCount,
+            maximumActivities: 120,
+            maximumOutputLength: 4_000
+        )
+        XCTAssertEqual(bounded.sessions.count, SessionArchiveStore.maximumSessionCount)
+        XCTAssertTrue(bounded.sessions.contains { $0.id == pinned.id })
+        XCTAssertTrue(bounded.sessions.contains { $0.id == archive.activeSessionID })
+    }
+
+    func testSessionCountLimitNeverDropsActiveConversation() {
+        var pinned = (1...SessionArchiveStore.maximumSessionCount).map {
+            makeSnapshot(text: "pinned", createdAt: TimeInterval($0))
+        }
+        for index in pinned.indices { pinned[index].isPinned = true }
+        let active = makeSnapshot(text: "active", createdAt: 0)
+        let archive = SessionArchive(
+            version: SessionArchive.currentVersion,
+            activeSessionID: active.id,
+            sessions: pinned + [active]
+        )
+        let bounded = archive.boundedForStorage(
+            maximumSessionCount: SessionArchiveStore.maximumSessionCount,
+            maximumActivities: 120,
+            maximumOutputLength: 4_000
+        )
+        XCTAssertTrue(bounded.sessions.contains { $0.id == active.id })
+        XCTAssertEqual(bounded.sessions.count, SessionArchiveStore.maximumSessionCount)
+    }
+
     private func makeSnapshot(text: String, createdAt: TimeInterval) -> SessionSnapshot {
         SessionSnapshot(
             id: UUID(),

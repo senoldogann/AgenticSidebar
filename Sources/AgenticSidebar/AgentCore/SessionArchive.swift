@@ -78,8 +78,12 @@ extension SessionArchive {
         if bounded.sessions.count > maximumSessionCount {
             // Sabitliler korunur: önce pinsiz en eskiler düşer.
             let sorted = bounded.sessions.sorted { lhs, rhs in
+                // The selected conversation must survive the session ceiling.
+                if (lhs.id == activeSessionID) != (rhs.id == activeSessionID) {
+                    return lhs.id == activeSessionID
+                }
                 if lhs.isPinned != rhs.isPinned {
-                    return rhs.isPinned && !lhs.isPinned
+                    return lhs.isPinned
                 }
                 return lhs.createdAt > rhs.createdAt
             }

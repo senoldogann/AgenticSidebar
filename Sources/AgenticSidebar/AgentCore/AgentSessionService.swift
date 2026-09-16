@@ -488,6 +488,10 @@ final class AgentSessionService {
         var snapshots = sessions
             .map { $0.snapshot() }
             .filter { snapshot in
+                // A blank selected conversation still owns the current provider/model.
+                if snapshot.id == activeSessionID {
+                    return true
+                }
                 // Boş ama sabitli ya da başlıklı oturum kaybolmamalı; yoksa
                 // kullanıcı sabitlediği boş taslağı relaunch'ta kaybeder.
                 if !snapshot.messages.isEmpty {

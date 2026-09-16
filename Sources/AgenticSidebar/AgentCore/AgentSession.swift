@@ -25,6 +25,10 @@ final class AgentSession {
     @ObservationIgnored
     private var activeAssistantMessageID: UUID?
 
+    /// Invalidates older asynchronous todo reads, including reads from previous turns.
+    @ObservationIgnored
+    private var todoRefreshGeneration = 0
+
     @ObservationIgnored
     private var streamingTextAccumulator = StreamingTextAccumulator.empty
 
@@ -527,6 +531,7 @@ final class AgentSession {
         state.error = nil
         state.startedAt = Date()
         state.completedAt = nil
+        todoRefreshGeneration &+= 1
         // Yeni tur önceki turun listesiyle açılmıyordu: ajan kendi listesini
         // yazana kadar besteci paneli eski maddeleri gösteriyordu.
         state.todos = []
@@ -772,20 +777,22 @@ final class AgentSession {
             return
         }
 
+        todoRefreshGeneration &+= 1
+        let generation = todoRefreshGeneration
         let sessionID = state.id
         Task { [weak self] in
             guard let todos = await runtime.sessionTodos(sessionID: sessionID) else {
                 return
             }
 
-            self?.applyTodos(todos, sessionID: sessionID)
+            self?.applyTodos(todos, sessionID: sessionID, generation: generation)
         }
     }
 
-    private func applyTodos(_ todos: [AgentTodo], sessionID: UUID) {
+    private func applyTodos(_ todos: [AgentTodo], sessionID: UUID, generation: Int) {
         // A slow answer for a session the user has already left must not land in
         // whichever session is on screen now.
-        guard state.id == sessionID else {
+        guard state.id == sessionID, generation == todoRefreshGeneration else {
             return
         }
 
