@@ -74,16 +74,35 @@ final class AgentSession {
         }
     }
 
+    /// Kullanıcının verdiği başlık; `nil` ise otomatik başlık gösterilir.
+    /// `state` dışında tutulduğu için değişimde kalıcılık elle tetiklenir.
+    var customTitle: String? {
+        didSet {
+            onPersistentChange?()
+        }
+    }
+
+    /// Sabitli oturumlar listede üstte durur, arşiv budamada en son düşer.
+    var isPinned: Bool {
+        didSet {
+            onPersistentChange?()
+        }
+    }
+
     init(
         runtimes: [any ProviderRuntime],
         state: AgentSessionState = AgentSessionState(),
-        budget: TranscriptBudget = TranscriptBudget()
+        budget: TranscriptBudget = TranscriptBudget(),
+        customTitle: String? = nil,
+        isPinned: Bool = false
     ) {
         self.runtimes = runtimes
         self.state = state
         self.id = state.id
         self.createdAt = Date()
         self.budget = budget
+        self.customTitle = customTitle
+        self.isPinned = isPinned
     }
 
     init(
@@ -95,6 +114,8 @@ final class AgentSession {
         self.id = snapshot.id
         self.createdAt = snapshot.createdAt
         self.budget = budget
+        self.customTitle = snapshot.customTitle
+        self.isPinned = snapshot.isPinned
         self.state = AgentSessionState(
             id: snapshot.id,
             configuration: snapshot.configuration,
@@ -117,11 +138,14 @@ final class AgentSession {
             createdAt: createdAt,
             configuration: state.configuration,
             messages: state.messages,
-            activityGroups: state.activityGroups
+            activityGroups: state.activityGroups,
+            customTitle: customTitle,
+            isPinned: isPinned
         )
     }
 
-    var title: String {
+    /// İlk kullanıcı mesajından türetilen otomatik başlık.
+    var automaticTitle: String {
         guard let firstUserMessage = state.messages.first(where: { $0.role == .user }) else {
             return "New session"
         }
@@ -137,6 +161,40 @@ final class AgentSession {
         }
 
         return String(trimmed.prefix(60)) + "…"
+    }
+
+    /// Ekranda ve listede gösterilen başlık: özel başlık varsa o.
+    var effectiveTitle: String {
+        guard let customTitle else {
+            return automaticTitle
+        }
+        let trimmed = customTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? automaticTitle : trimmed
+    }
+
+    var title: String {
+        effectiveTitle
+    }
+
+    /// Kullanıcı başlığını günceller; boş ya da yalnızca boşluk ise `nil` olur.
+    /// Başlık en fazla 120 karakter saklanır, fazlası kırpılır.
+    func rename(to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            customTitle = nil
+            return
+        }
+        customTitle = String(trimmed.prefix(120))
+    }
+
+    /// Sabitleme durumunu ayarlar.
+    func setPinned(_ pinned: Bool) {
+        isPinned = pinned
+    }
+
+    /// Sabitleme durumunu tersine çevirir.
+    func togglePin() {
+        isPinned.toggle()
     }
 
     var isBusy: Bool {
@@ -383,6 +441,54 @@ final class AgentSession {
         queuedPrompts.removeAll { $0.id == id }
     }
 
+    /// Rewrites a queued message, keeping its place in line.
+    ///
+    /// Editing must not move it. With several messages waiting, an edit that
+    /// jumped to the back would silently reorder turns the user wrote in a
+    /// deliberate order — and the queue is exactly where that order is decided.
+    /// Everything else about the prompt is preserved, so a correction cannot
+    /// change the mode or speed the turn was written with.
+    @discardableResult
+    func updateQueuedPrompt(_ id: UUID, text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return false
+        }
+
+        guard let index = queuedPrompts.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+
+        let existing = queuedPrompts[index]
+        queuedPrompts[index] = QueuedPrompt(
+            id: existing.id,
+            text: trimmed,
+            attachmentPaths: existing.attachmentPaths,
+            extensionTags: existing.extensionTags,
+            speedMode: existing.speedMode,
+            mode: existing.mode
+        )
+        return true
+    }
+
+    /// Moves a queued message to another position in the queue.
+    ///
+    /// The queue is the order the turns will run in, so this is how the user
+    /// decides what the agent does next while it is still busy. The destination
+    /// is clamped rather than rejected: dropping a row past the last one means
+    /// "at the end", not "nowhere".
+    @discardableResult
+    func moveQueuedPrompt(_ id: UUID, to destinationIndex: Int) -> Bool {
+        guard let sourceIndex = queuedPrompts.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+
+        let prompt = queuedPrompts.remove(at: sourceIndex)
+        let clamped = min(max(destinationIndex, 0), queuedPrompts.count)
+        queuedPrompts.insert(prompt, at: clamped)
+        return clamped != sourceIndex
+    }
+
     func clearQueuedPrompts() {
         queuedPrompts.removeAll()
     }
@@ -421,6 +527,9 @@ final class AgentSession {
         state.error = nil
         state.startedAt = Date()
         state.completedAt = nil
+        // Yeni tur önceki turun listesiyle açılmıyordu: ajan kendi listesini
+        // yazana kadar besteci paneli eski maddeleri gösteriyordu.
+        state.todos = []
         discardPendingAssistantText()
         activeAssistantMessageID = nil
 
@@ -548,6 +657,13 @@ final class AgentSession {
                     finishThinkingActivity(turnID: turnID)
                     startActivity(activity, turnID: turnID)
 
+                    // A task-list tool is the moment the agent's plan changes, so
+                    // the checklist is re-read as it happens: the point of showing
+                    // it is to see the work move, not to read it afterwards.
+                    if activity.kind == .todo {
+                        refreshTodos()
+                    }
+
                 case let .activityFinished(activityID, outcome, output, diff):
                     flushPendingAssistantText(turnID: turnID)
                     finishActivity(
@@ -637,8 +753,47 @@ final class AgentSession {
             activeAssistantMessageID = nil
             discardPendingAssistantText()
             pruneActivityHistory()
+            // The last write of a turn and the turn's own completion are not the
+            // same event, so the list is read once more at the end: the checklist
+            // left on screen has to be the state the agent actually stopped in.
+            refreshTodos()
             startNextQueuedTurn()
         }
+    }
+
+    /// Re-reads the agent's task list for this session.
+    ///
+    /// Every call replaces the list; a provider that has no list answers `nil` and
+    /// leaves the last one in place, because "no answer" is not "no tasks".
+    func refreshTodos() {
+        guard let configuration = state.configuration,
+              let runtime = runtime(for: configuration.providerID)
+        else {
+            return
+        }
+
+        let sessionID = state.id
+        Task { [weak self] in
+            guard let todos = await runtime.sessionTodos(sessionID: sessionID) else {
+                return
+            }
+
+            self?.applyTodos(todos, sessionID: sessionID)
+        }
+    }
+
+    private func applyTodos(_ todos: [AgentTodo], sessionID: UUID) {
+        // A slow answer for a session the user has already left must not land in
+        // whichever session is on screen now.
+        guard state.id == sessionID else {
+            return
+        }
+
+        guard state.todos != todos else {
+            return
+        }
+
+        state.todos = todos
     }
 
     private func enqueueAssistantText(

@@ -318,6 +318,81 @@ final class MultiSessionTests: XCTestCase {
         XCTAssertEqual(session.state.configuration?.modelID, ProviderModelID("alpha-2"))
     }
 
+    func testRenameSessionSetsCustomTitleAndEmptyReturnsToAutomatic() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        let turn = try XCTUnwrap(service.submit("hello world"))
+        await turn.value
+        let id = service.activeSessionID
+
+        service.renameSession(id, to: "  My custom name  ")
+        XCTAssertEqual(service.sessionList.first?.customTitle, "My custom name")
+        XCTAssertEqual(service.sessionList.first?.displayTitle, "My custom name")
+        XCTAssertEqual(service.activeSessionTitle, "My custom name")
+
+        service.renameSession(id, to: "   ")
+        XCTAssertNil(service.sessionList.first?.customTitle)
+        XCTAssertEqual(service.sessionList.first?.displayTitle, "hello world")
+    }
+
+    func testRenameTruncatesTo120Characters() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        let id = service.activeSessionID
+        service.renameSession(id, to: String(repeating: "x", count: 200))
+        XCTAssertEqual(service.sessionList.first?.customTitle?.count, 120)
+    }
+
+    func testPinAndUnpinSession() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        let id = service.activeSessionID
+        XCTAssertFalse(service.sessionList.first?.isPinned ?? true)
+
+        service.setSessionPinned(id, pinned: true)
+        XCTAssertTrue(service.sessionList.first?.isPinned ?? false)
+
+        service.toggleSessionPin(id)
+        XCTAssertFalse(service.sessionList.first?.isPinned ?? true)
+    }
+
+    func testDeleteSessionsRemovesManyAndKeepsActiveInvariant() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        let firstID = service.activeSessionID
+        let secondID = service.createSession()
+        let thirdID = service.createSession()
+        XCTAssertEqual(service.sessions.count, 3)
+
+        service.deleteSessions([firstID, secondID])
+        XCTAssertEqual(service.sessions.count, 1)
+        XCTAssertEqual(service.activeSessionID, thirdID)
+    }
+
+    func testDeleteSessionsWithAllSessionsLeavesOneEmptyReplacement() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        let ids = Set(service.sessions.map(\.id))
+        service.deleteSessions(ids)
+
+        XCTAssertEqual(service.sessions.count, 1)
+        XCTAssertTrue(service.state.messages.isEmpty)
+    }
+
+    func testDeleteSessionsWithEmptySetDoesNothing() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        let count = service.sessions.count
+        service.deleteSessions([])
+        XCTAssertEqual(service.sessions.count, count)
+    }
+
     // MARK: - Helpers
 
     private func waitUntil(

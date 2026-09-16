@@ -285,6 +285,129 @@ final class PromptQueueTests: XCTestCase {
         XCTAssertTrue(service.state.messages.allSatisfy { $0.text != "third" })
     }
 
+    func testAQueuedMessageCanBeRewrittenWithoutLosingItsPlace() async {
+        let gate = GatedProviderRuntime()
+        let service = AgentSessionService(runtimes: [gate.runtime])
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.send("running turn"), .started)
+        XCTAssertEqual(service.send("first queued", speedMode: .fast, mode: .plan), .queued)
+        XCTAssertEqual(service.send("second queued"), .queued)
+
+        let firstID = try? XCTUnwrap(service.queuedPrompts.first?.id)
+        let edited = firstID.map { service.updateQueuedPrompt($0, text: "  corrected  ") }
+        XCTAssertEqual(edited, true)
+
+        XCTAssertEqual(
+            service.queuedPrompts.map(\.text),
+            ["corrected", "second queued"],
+            "An edit must not move the message to the back of the queue"
+        )
+        XCTAssertEqual(
+            service.queuedPrompts.first?.speedMode,
+            .fast,
+            "A correction keeps the speed and mode the turn was written with"
+        )
+        XCTAssertEqual(service.queuedPrompts.first?.mode, .plan)
+
+        service.clearQueuedPrompts()
+        gate.completeNext()
+        let settled = await waitUntil { !service.isBusy }
+        XCTAssertTrue(settled)
+    }
+
+    func testAnEmptyEditIsRefusedRatherThanQueuedAsABlankPrompt() async {
+        let gate = GatedProviderRuntime()
+        let service = AgentSessionService(runtimes: [gate.runtime])
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.send("running turn"), .started)
+        XCTAssertEqual(service.send("keep me"), .queued)
+
+        let id = try? XCTUnwrap(service.queuedPrompts.first?.id)
+        let refused = id.map { service.updateQueuedPrompt($0, text: "   ") }
+
+        XCTAssertEqual(refused, false)
+        XCTAssertEqual(service.queuedPrompts.map(\.text), ["keep me"])
+        XCTAssertEqual(
+            service.updateQueuedPrompt(UUID(), text: "gone already"),
+            false,
+            "A prompt that is no longer queued cannot be edited"
+        )
+
+        service.clearQueuedPrompts()
+        gate.completeNext()
+        let settled = await waitUntil { !service.isBusy }
+        XCTAssertTrue(settled)
+    }
+
+    func testQueuedMessagesCanBeReordered() async {
+        let gate = GatedProviderRuntime()
+        let service = AgentSessionService(runtimes: [gate.runtime])
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.send("first"), .started)
+        for text in ["a", "b", "c"] {
+            XCTAssertEqual(service.send(text), .queued)
+        }
+
+        let lastID = try? XCTUnwrap(service.queuedPrompts.last?.id)
+        let moved = lastID.map { service.moveQueuedPrompt($0, to: 0) }
+        XCTAssertEqual(moved, true)
+        XCTAssertEqual(service.queuedPrompts.map(\.text), ["c", "a", "b"])
+
+        let firstID = try? XCTUnwrap(service.queuedPrompts.first?.id)
+        let movedToEnd = firstID.map { service.moveQueuedPrompt($0, to: 99) }
+        XCTAssertEqual(movedToEnd, true, "Dropping past the end means the end, not nowhere")
+        XCTAssertEqual(service.queuedPrompts.map(\.text), ["a", "b", "c"])
+
+        let stayID = try? XCTUnwrap(service.queuedPrompts.first?.id)
+        let unchanged = stayID.map { service.moveQueuedPrompt($0, to: 0) }
+        XCTAssertEqual(unchanged, false, "Dropping a message on itself changes nothing")
+        XCTAssertEqual(service.queuedPrompts.map(\.text), ["a", "b", "c"])
+
+        service.clearQueuedPrompts()
+        gate.completeNext()
+        let settled = await waitUntil { !service.isBusy }
+        XCTAssertTrue(settled)
+    }
+
+    func testAReorderedQueueRunsInTheNewOrder() async {
+        let gate = GatedProviderRuntime()
+        let service = AgentSessionService(runtimes: [gate.runtime])
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.send("first"), .started)
+        XCTAssertEqual(service.send("second"), .queued)
+        XCTAssertEqual(service.send("third"), .queued)
+
+        if let thirdID = service.queuedPrompts.last?.id {
+            service.moveQueuedPrompt(thirdID, to: 0)
+        }
+
+        gate.completeNext()
+        var started = await waitUntil {
+            service.state.messages.contains { $0.text == "third" }
+        }
+        XCTAssertTrue(started)
+
+        gate.completeNext()
+        started = await waitUntil {
+            service.state.messages.contains { $0.text == "second" }
+        }
+        XCTAssertTrue(started)
+
+        gate.completeNext()
+        let settled = await waitUntil { !service.isBusy }
+        XCTAssertTrue(settled)
+
+        XCTAssertEqual(
+            service.state.messages.filter { $0.role == .user }.map(\.text),
+            ["first", "third", "second"],
+            "The strip's order is the order the turns run in"
+        )
+    }
+
     func testEmptyOrUnconfiguredPromptsAreRejected() async {
         let service = AgentSessionService(runtimes: [])
 

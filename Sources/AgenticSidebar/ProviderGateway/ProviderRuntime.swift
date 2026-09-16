@@ -87,8 +87,18 @@ protocol ProviderRuntime: Sendable {
     /// (OpenCode) burada sunucu tarafındaki oturumu da kapatır, aksi halde her
     /// silinen sohbet arkasında ölü bir uzak oturum bırakır.
     func releaseSession(_ sessionID: UUID) async
+
+    /// The tasks the agent is tracking for a session, when the provider keeps such
+    /// a list.
+    ///
+    /// `nil` — not an empty list — means the provider has no such notion, which is
+    /// why that is the default: an empty list would say "this turn has no tasks"
+    /// and wipe a checklist the provider simply does not report.
+    func sessionTodos(sessionID: UUID) async -> [AgentTodo]?
 }
 
 extension ProviderRuntime {
     func releaseSession(_ sessionID: UUID) async {}
+
+    func sessionTodos(sessionID: UUID) async -> [AgentTodo]? { nil }
 }

@@ -45,7 +45,13 @@ final class AgentSessionService {
             let archive = archiveStore?.load(),
             !archive.sessions.isEmpty
         {
-            let snapshots = archive.sessions.sorted { $0.createdAt > $1.createdAt }
+            // Sabitliler önce, sonra oluşturulma yeniden eskiye.
+            let snapshots = archive.sessions.sorted { lhs, rhs in
+                if lhs.isPinned != rhs.isPinned {
+                    return lhs.isPinned && !rhs.isPinned
+                }
+                return lhs.createdAt > rhs.createdAt
+            }
             restored = snapshots.map { AgentSession(runtimes: runtimes, snapshot: $0) }
             restoredActiveID = restored.first { $0.id == archive.activeSessionID }?.id
                 ?? restored[0].id
@@ -118,7 +124,10 @@ final class AgentSessionService {
                 isBusy: session.isBusy,
                 status: session.state.status,
                 completedAt: session.state.completedAt,
-                lastMessageAt: session.state.messages.last?.createdAt
+                lastMessageAt: session.state.messages.last?.createdAt,
+                createdAt: session.createdAt,
+                customTitle: session.customTitle,
+                isPinned: session.isPinned
             )
         }
     }
@@ -148,6 +157,14 @@ final class AgentSessionService {
 
         activeSessionID = id
         saveImmediately()
+        // The checklist lives with the backend's session, not with the archive, so
+        // it is re-read when a conversation is opened rather than restored.
+        activeSession.refreshTodos()
+    }
+
+    /// The agent's task list for the conversation on screen.
+    var todos: [AgentTodo] {
+        activeSession.state.todos
     }
 
     /// Removes a conversation and stops whatever it was doing. The last session
@@ -180,6 +197,87 @@ final class AgentSessionService {
 
         if activeSessionID == id {
             activeSessionID = sessions[min(index, sessions.count - 1)].id
+        }
+
+        saveImmediately()
+    }
+
+    /// Kullanıcı başlığını günceller; boş başlık otomatiğe döndürür.
+    func renameSession(_ id: UUID, to newTitle: String) {
+        guard let session = sessions.first(where: { $0.id == id }) else {
+            return
+        }
+        session.rename(to: newTitle)
+        saveImmediately()
+    }
+
+    /// Sabitleme durumunu ayarlar.
+    func setSessionPinned(_ id: UUID, pinned: Bool) {
+        guard let session = sessions.first(where: { $0.id == id }) else {
+            return
+        }
+        session.setPinned(pinned)
+        saveImmediately()
+    }
+
+    /// Sabitleme durumunu tersine çevirir.
+    func toggleSessionPin(_ id: UUID) {
+        guard let session = sessions.first(where: { $0.id == id }) else {
+            return
+        }
+        session.togglePin()
+        saveImmediately()
+    }
+
+    /// Birden fazla sohbeti tek onay ile siler. Meşgul oturumlar durdurulur,
+    /// backend oturumları kapatılır; son oturum silinemez, yerine boş gelir.
+    func deleteSessions(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else {
+            return
+        }
+
+        let targets = sessions.filter { ids.contains($0.id) }
+        guard !targets.isEmpty else {
+            return
+        }
+
+        let runtimes = self.runtimes
+        let removedIDs = Set(targets.map(\.id))
+        let removedActive = removedIDs.contains(activeSessionID)
+        // Kalan listedeki aktifin eski konumu; silinenlerden sonraki seçimi bulur.
+        let activeOldIndex = sessions.firstIndex(where: { $0.id == activeSessionID })
+
+        sessions.removeAll { removedIDs.contains($0.id) }
+
+        for session in targets {
+            Task {
+                await session.cancel()
+                for runtime in runtimes {
+                    await runtime.releaseSession(session.id)
+                }
+            }
+        }
+
+        guard !sessions.isEmpty else {
+            let replacement = AgentSession(runtimes: runtimes)
+            adopt(replacement)
+            replacement.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
+            sessions = [replacement]
+            activeSessionID = replacement.id
+            saveImmediately()
+            return
+        }
+
+        if removedActive {
+            let fallbackIndex: Int
+            if let activeOldIndex {
+                // Silinen aktiften sonra gelen ilk kalan oturumu seçer.
+                let survivorsAfter = sessions.indices.filter { $0 >= min(activeOldIndex, sessions.count) }
+                fallbackIndex = survivorsAfter.first ?? (sessions.count - 1)
+            } else {
+                fallbackIndex = 0
+            }
+            activeSessionID = sessions[fallbackIndex].id
         }
 
         saveImmediately()
@@ -305,6 +403,16 @@ final class AgentSessionService {
         activeSession.removeQueuedPrompt(id)
     }
 
+    @discardableResult
+    func updateQueuedPrompt(_ id: UUID, text: String) -> Bool {
+        activeSession.updateQueuedPrompt(id, text: text)
+    }
+
+    @discardableResult
+    func moveQueuedPrompt(_ id: UUID, to destinationIndex: Int) -> Bool {
+        activeSession.moveQueuedPrompt(id, to: destinationIndex)
+    }
+
     func clearQueuedPrompts() {
         activeSession.clearQueuedPrompts()
     }
@@ -379,7 +487,20 @@ final class AgentSessionService {
 
         var snapshots = sessions
             .map { $0.snapshot() }
-            .filter { !$0.messages.isEmpty }
+            .filter { snapshot in
+                // Boş ama sabitli ya da başlıklı oturum kaybolmamalı; yoksa
+                // kullanıcı sabitlediği boş taslağı relaunch'ta kaybeder.
+                if !snapshot.messages.isEmpty {
+                    return true
+                }
+                if snapshot.isPinned {
+                    return true
+                }
+                if let customTitle = snapshot.customTitle {
+                    return !customTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                return false
+            }
 
         // An empty active session still has to be restored, otherwise a relaunch
         // would lose the selected provider and model.

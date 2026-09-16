@@ -366,6 +366,10 @@ private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
 
     func replyPermission(requestID: String, reply: String) async throws {}
 
+    func sessionTodos(sessionID: String) async throws -> [AgentTodo] {
+        []
+    }
+
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] {
         [:]
     }

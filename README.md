@@ -61,8 +61,16 @@ instruction, not by a tool-permission change, so the provider's own workflow is 
 alone.
 
 A message sent while a turn is running is queued instead of being refused: queued
-prompts keep the speed and mode they were sent with, appear as a removable strip above
-the composer, drain in order when the turn settles, and survive a cancellation.
+prompts keep the speed and mode they were sent with, appear as a strip above the
+composer, drain in order when the turn settles, and survive a cancellation. The strip
+is editable — a pencil rewrites a queued message in place without moving it, and the
+grip handle on the left drags a row to a new position, because that order is the order
+the turns will run in. Those are decisions about work the agent has not started yet.
+
+Once a turn is over, your own messages carry two actions as well: **Write again** puts
+the message back in the composer to be edited and sent, and the copy button takes the
+text as it was sent. Both wait for the turn to finish, since re-sending mid-turn would
+only queue a duplicate of something you have not seen answered.
 
 Activity rows in the timeline expand into what the tool actually did — a `+`/`-` diff
 for a file change, the contents read, or the console output of a command. "Thought for
@@ -77,16 +85,62 @@ transcript; hovering shows the prompt itself. The column appears once a conversa
 has more than one prompt, and the transcript reserves its width so the bars never sit
 over the text.
 
+## One backend per app, and nothing left behind
+
+The app runs a single managed OpenCode server: it starts one when the window
+appears, reuses it for every conversation, and stops it — with the MCP servers
+that server started — when the app ends. "Ends" is the part that used to be a
+lie:
+
+- **The whole tree is stopped, not just the child.** The backend spawns a process
+  per MCP server, and `Process.terminate()` only reaches the process it launched.
+- **A signal runs the same shutdown.** `applicationShouldTerminate` is only
+  consulted for a graceful quit, so `pkill`, a logout or a crash used to kill the
+  app and leave its backend running. `SIGTERM`/`SIGINT` are handled with dispatch
+  sources and go through the same bounded cleanup as a quit.
+- **Leftovers are adopted and ended at the next launch.** Each server records a
+  lease (`OpenCode/servers/<pid>.json`) while it runs; at startup a live lease is
+  ended after its command line is checked — pids are reused — and any *orphaned*
+  process with this app's exact launch shape (`serve --hostname 127.0.0.1 --port
+  … --pure`, parent `launchd`) is ended too. A server you started yourself in a
+  terminal does not match either check and is left alone.
+- **The development script waits** for the old instance to finish its cleanup
+  instead of racing the new one against it.
+
+An MCP server that is switched off is no longer merely silenced: it is declared
+`enabled: false`, so OpenCode does not start the node/python process behind it at
+all. Silencing its tools stays as well, for a server only your own
+`opencode.json` knows about.
+
+## The agent's task list
+
+When the agent tracks its work as tasks — OpenCode's own todo tool — the app reads
+that list from the session (`GET /session/:id/todo`) and shows it as a collapsible
+card above the turn it belongs to: a `completed/total` count in the header, a
+filled check for what is done, and an accent ring for what is being worked on. It
+refreshes as the agent writes it, again when the turn ends, and when a
+conversation is reopened. Providers with no such concept (the direct OpenAI
+path) show no card at all.
+
 ## The composer
 
 One control beside the model holds the two settings that answer the same
 question — how hard the model should work on this turn: the **reasoning effort**
 (the model's own variants, with the default marked) and **fast mode**. Its chip
-reads `XHigh · Fast`. The agent mode (Build / Plan) sits next to it, and the
-provider is shown there but chosen in Settings → AI & Models, because it is a
-long-lived choice about how the app is wired rather than something to change
-mid-sentence. Provider marks are vector paths drawn in-app, so they stay sharp
-without an asset catalogue.
+reads `XHigh · Fast`. The agent mode (Build / Plan) and the tool approval level sit
+next to it. The provider is *not* there: it is a long-lived choice about how the app
+is wired, so it is chosen in Settings → AI & Models — and the approval level has no
+"more info" link either, because the card in Settings explains the levels and a
+control row that points at its own explanation reads as part of the decision. Every
+control in the row, and every other clickable thing in the window, lifts a
+theme-tinted highlight under the pointer and switches the cursor to a hand.
+
+An answer is selectable in one drag: consecutive prose blocks of a message are laid
+out in a single text view, so the selection no longer stops at every paragraph,
+heading or list item — SwiftUI gives each `Text` its own text view, which is exactly
+where a drag used to break. Code blocks, tables, charts and plan documents keep
+their own views (and their own copy buttons) and end that run. Provider marks are
+vector paths drawn in-app, so they stay sharp without an asset catalogue.
 
 Pasting a document does not slow the app down, and neither does switching
 between long conversations: the per-keystroke work is bounded to a prefix of the
@@ -154,8 +208,8 @@ deletes its own throwaway item in the login keychain.
   guarantees this window is excluded from system screenshots or third-party
   recorders; see `docs/verification/`.
 - **Tool approvals**: one level for every tool — shell commands, edits, the
-  network and computer use — chosen in Settings → AI & Models or from the toolbar
-  menu in the chat window:
+  network and computer use — chosen in Settings → AI & Models or from the level
+  control in the composer and on a waiting approval card:
   - **Ask** — reads and in-folder edits run; every shell command, every path
     outside the working folder and every network call waits for your decision.
   - **Approve for me** — safe inspection (`git status`, `ls`, `rg`, `cat` …) and
@@ -195,10 +249,32 @@ deletes its own throwaway item in the login keychain.
   `computer_*` and `session_authority_*` tools are exposed: the filesystem, git,
   terminal, browser and full-host JavaScript tools stay denied by the app's own
   rules whatever the tool approval level is, and `computer_*` /`session_authority_*`
-  requests are decided by that level like every other tool. The first run needs
-  the helper installed once with
-  `npm run setup:computer:macos` in the chatgpt-system folder; see
-  `docs/verification/2026-09-16-computer-use-integration.md`.
+  requests are decided by that level like every other tool.
+
+  The first run needs the helper installed once with
+  `npm run setup:computer:macos` in the chatgpt-system folder. The tab does not
+  leave  the user to guess whether that worked: it resolves the folder, Node and
+  `dist/cli.js`, inspects the installed helper's bundle identifier and signature,
+  and then reports each grant **from the process macOS asks for it**. That
+  distinction is the whole point of the card, because the four grants do not
+  share an owner: Accessibility, Input Monitoring and posting events are the
+  signed helper's, while Screen Recording is enforced on the *responsible*
+  process — whoever launched the helper — so it is this app's. The tccd log shows
+  it plainly: the same helper binary reports `screenCaptureAuthorized: true` when
+  a granted process starts it and `false` from inside AgenticSidebar, even with
+  **ChatGPTSystemComputerRuntime** switched on in System Settings. A card that
+  read all four from the helper would therefore be right about three and
+  confidently wrong about the one that breaks screenshots.
+
+  The card leads with one line (Ready, or exactly which grant is missing and
+  which process owes it), deep-links each missing grant to the Privacy &
+  Security pane that owns it, and offers a **Grant Screen Recording…** button —
+  the app can only *ask*, which is what makes macOS list AgenticSidebar itself so
+  the switch is findable at all. It also reveals the helper in Finder for the “+”
+  button, and can run the two setup commands itself (through `env`, never a
+  shell). A helper that does not answer is reported as unknown, never as denied. See
+  `docs/verification/2026-09-16-computer-use-integration.md` and
+  `docs/verification/2026-09-16-computer-use-readiness-and-permissions.md`.
 
 ## Documentation
 

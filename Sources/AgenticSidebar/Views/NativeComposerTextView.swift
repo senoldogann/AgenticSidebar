@@ -5,8 +5,20 @@ import SwiftUI
 final class NativeComposerTextView: NSTextView {
     var submissionAvailability = ComposerSubmissionAvailability.unavailable
     var onSubmit: (() -> Void)?
+    /// Escape önce öneri panelini kapatır; kapatacak bir panel yoksa `false`
+    /// döner ve tuş sistemin varsayılanına bırakılır.
+    var onCancelSuggestions: (() -> Bool)?
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            let handled = !hasMarkedText() && onCancelSuggestions?() == true
+            if handled {
+                return
+            }
+            super.keyDown(with: event)
+            return
+        }
+
         guard event.keyCode == 36 || event.keyCode == 76 else {
             super.keyDown(with: event)
             return
@@ -67,6 +79,8 @@ struct ComposerTextEditor: NSViewRepresentable {
 
     let submissionAvailability: ComposerSubmissionAvailability
     let onSubmit: @MainActor () -> Void
+    /// Öneri paneli açıkken Escape'in onu kapatıp kapatmadığını bildirir.
+    let onCancelSuggestions: @MainActor () -> Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text)
@@ -165,6 +179,7 @@ struct ComposerTextEditor: NSViewRepresentable {
     private func updateConfiguration(_ textView: NativeComposerTextView) {
         textView.submissionAvailability = submissionAvailability
         textView.onSubmit = onSubmit
+        textView.onCancelSuggestions = onCancelSuggestions
     }
 
     private func textView(in scrollView: NSScrollView) -> NativeComposerTextView? {

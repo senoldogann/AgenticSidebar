@@ -641,3 +641,220 @@ steps:
 - [x] Claims about build/test state are backed by commands actually run in this session (clean build, 353 tests, secret scan, force-unwrap scan).
 - [x] ~~**Open question for the author**: is the allow-all permission policy in CR-ITEM-1.2 deliberate?~~ **Answered 2026-09-16: yes, intentional.** Recorded as an accepted decision; only the visibility recommendation survives.
 - [ ] **Open question for the author**: does the app intend to support remote/third-party MCP servers that require OAuth (the client exposes `startMCPAuthorization`/`completeMCPAuthorization`)? If so, the local-opencode threat model in CR-ITEM-1.3 should be revisited (a remote server plus loopback exposure widens the blast radius).
+
+---
+
+# Round 3 — deep review: performance, background services, computer-use proof
+
+Date: 2026-09-16 · Branch: `feat/chat-ux-streaming-activities-enter` · HEAD: `986e277` + working tree
+Scope: the whole tree, with emphasis on (a) steady-state performance, (b) the
+processes the app starts and stops, and (c) an end-to-end proof of the
+computer-use chain rather than a proof of its flags.
+
+## Context
+
+- Language/runtime: Swift 6.2 (`-Xswiftc -warnings-as-errors`), SwiftUI, macOS 26.
+- Backend: a managed `opencode serve --hostname 127.0.0.1 --port <n> --pure`
+  child, plus one child per enabled MCP server, plus the signed
+  `ChatGPTSystemComputerRuntime` helper for computer use.
+- Evidence in `docs/verification/2026-09-16-deep-review-performance-and-background-services.md`.
+
+## Findings and resolutions
+
+- [x] **CR-ITEM-3.1 [Performance · High] `codesign` on the main actor.**
+  - **Location**: `ComputerUse/ComputerUseReadiness.swift` (`SystemComputerUseSignatureReader`), `ComputerUse/ComputerUseStatus.swift` (`refresh`).
+  - **Description**: the readiness refresh is `@MainActor` and called it on every
+    appearance of the Computer Use card, on every toggle change and after every
+    setup run. Inside, the reader spawned `/usr/bin/codesign --display` and called
+    `readDataToEndOfFile()` + `waitUntilExit()`. That is a process launch plus two
+    blocking waits on the thread that draws the window.
+  - **Resolution**: the protocol requirement is now `async`
+    (`signingStatus(bundleURL:) async -> ComputerUseSigningStatus`) and the
+    implementation does the spawn inside `Task.detached`. A synchronous
+    requirement would have invited the same mistake again; the async signature
+    makes the blocking call impossible on the main actor. `inspect` was split into
+    the cheap filesystem half and `addingSigning(_:)`, so the expensive half is
+    opt-in and composable. Tests: the live reader is exercised in the opt-in test;
+    the composition is covered by `testSigningIsOnlyAttachedToAnInstalledHelper`.
+
+- [x] **CR-ITEM-3.2 [Performance · High] A full Desktop enumeration plus a Spotlight query per file, once a second, on the main thread.**
+  - **Location**: `Services/ScreenshotMonitorService.swift` (`recentScreenshotFileURLs`, `tick`).
+  - **Description**: `tick()` runs from a 1 s `Timer` on the main actor. It called
+    `contentsOfDirectory(at: ~/Desktop)` and, for every entry, evaluated
+    `hasScreenshotName(fileName) || isScreenCaptureByMetadata(url)`. The `||`
+    meant **`MDItemCreateWithURL` ran for every entry whose name did not match —
+    including PDFs, folders, `.txt` and archives**, because the extension check
+    happened inside `hasScreenshotName` only after the metadata call was already
+    scheduled. On a Desktop with thousands of files that is thousands of stat +
+    Spotlight calls per second, on the main thread.
+  - **Resolution**: one predicate, `isScreenshotCandidate(fileURL:metadataProbe:)`,
+    with the extension gate first and `metadataProbe` called only for an image
+    whose name says nothing; the scan itself is a `nonisolated static`
+    (`scanRecentScreenshots`) run from `Task.detached`, and `tick()` is serialized
+    with an `isTicking` guard so a slow OCR cannot stack scans. Tests:
+    `testSpotlightIsOnlyAskedAboutImagesWhoseNameSaysNothing` asserts the probe is
+    called for exactly one file out of seven, and
+    `testSpotlightsAnswerIsUsedWhenTheNameSaysNothing` keeps the fallback honest.
+
+- [x] **CR-ITEM-3.3 [Background services · High] A launch could kill a *live* second instance's server.**
+  - **Location**: `OpenCodeProvider/OpenCodeServerLedger.swift` (`reapOrphans`).
+  - **Description**: the ledger pass killed any recorded pid that was alive and
+    whose command line matched the app's fingerprint. The fingerprint cannot tell
+    *whose* server it is: with two copies of the app running (the development
+    script's `pkill` and relaunch, or a `swift run` beside the built app), the
+    second launch would SIGKILL the first launch's backend and its whole MCP tree.
+  - **Resolution**: a lease is only acted on when the process has been orphaned
+    (`parent == 1`), which is both the accurate definition of "left behind by an
+    earlier launch" and impossible to confuse with a running app's child. The
+    decision is now a pure function, `shouldReap(_:facts:)`, and the process facts
+    are an injectable parameter (`factsProvider`), because a test cannot arrange a
+    real orphan of its own but can check every branch of the rule and still
+    exercise the real signal. Tests: `testTheReapDecision` (six branches),
+    `testAReapEndsAServerRecordedInALease` (real `SIGKILL`),
+    `testAReapLeavesAServerThatStillHasALiveParentAlone` (uses the real
+    `systemFacts`, asserts the fixture's parent is the test runner).
+
+- [x] **CR-ITEM-3.4 [Background services · Medium] Two orphaned `opencode serve` processes on this machine that the app must not reap.**
+  - **Location**: the host, not the code: pid 10904 (`serve --port 41231`, ppid 1,
+    ~201 MB RSS, 11 h 45 m) and pid 18276 (`serve --hostname=127.0.0.1
+    --port=60848`, ppid 1, ~291 MB RSS, 11 d 23 h). A 16-day-old `uc_driver`
+    (Selenium) is running beside them.
+  - **Description**: neither matches the app's launch fingerprint (no `--pure`,
+    different flag syntax), so the sweep deliberately leaves them alone — the same
+    rule that stops a terminal-started server from being killed. They are ~490 MB
+    of resident memory that nothing will ever reclaim.
+  - **Recommendation (open, author's call)**: end them once by hand:
+    `kill 10904 18276` — or leave them if they are in use. A Settings affordance
+    that *lists* unowned servers and kills only on an explicit click would be the
+    app-side version of this and is recorded as a follow-up, not a fix.
+
+- [ ] **CR-ITEM-3.5 [Performance · Low] The launch-time seeding scan is still synchronous.**
+  - **Location**: `Services/ScreenshotMonitorService.swift` (`start`).
+  - **Description**: the one scan that runs on the main thread is the seeding pass
+    in `start()`. It exists to stop yesterday's screenshots from being analysed on
+    the first tick, and it happens once per launch.
+  - **Assessment**: accepted as-is. Fixing it means either racing the first tick
+    against the seed (a real behaviour change: files created in between would be
+    silently skipped) or an async seeding protocol for a saving of one directory
+    walk at launch. Recorded so the trade-off is visible, not silently left.
+
+- [ ] **CR-ITEM-3.6 [Performance · Low] The clipboard monitor reads pasteboard types 2.5×/s even when the feature is off.**
+  - **Location**: `Services/ClipboardMonitorService.swift` (`tick`).
+  - **Description**: `pasteboard.snapshot()` (change count + types + privacy
+    markers) runs every 0.4 s on the main actor; the feature-disabled path needs
+    only the change count.
+  - **Assessment**: measured cost is microseconds and the change count is
+    deliberately tracked while disabled (so enabling the feature cannot submit a
+    credential copied long before). Left as-is; splitting the snapshot would trade
+    a real guarantee for an unmeasurable gain.
+
+- [ ] **CR-ITEM-3.7 [Performance · Low] Two one-second `TimelineView`s keep rendering while visible.**
+  - **Location**: `Views/MenuBarSessionView.swift`, `Views/AgentActivityTimelineView.swift`.
+  - **Description**: both re-render once a second to animate elapsed time.
+  - **Assessment**: view-scoped (nothing renders when the view is off screen) and
+    the app measures 0.0 % CPU idle, so this is backlog rather than a fix.
+
+## What is measurably fine
+
+- The app's own steady state: **0.0 % CPU, ~150–170 MB RSS** across a 12-second
+  sample, with both background monitors disabled.
+- The managed backend idles at **2.3–2.7 % CPU / ~763 MB RSS** and peaks around
+  6 % during startup. Nothing the app does drives it: the unified log shows no
+  repeating entries (an SSE reconnect storm would), and the only periodic
+  app-side fetch — the agent's task list — is event-driven (on a `todo` activity
+  and at turn end), not per delta.
+- `OpenCodeProcessTree.snapshot()` (all pids, `proc_pidinfo` + `proc_pidpath`) plus
+  one `KERN_PROCARGS2` read costs under 10 ms: the ledger test that spawns a
+  process, snapshots the table and reads arguments completes in 0.011 s.
+
+## Computer-use: proof rather than assertion
+
+- [x] **CR-POS-3.1 The chain was exercised end to end.** `script/verify-computer-use.mjs`
+  drives the same MCP server the app registers, with the same arguments, and then
+  calls the real tools. **8/8 steps passed**: handshake (chatgpt-system 0.1.0),
+  `tools/list` (19 `computer_*` and 3 `session_authority_*` of 80 tools),
+  `computer_run_js` present so the app's deny rule is load-bearing,
+  `computer_health` (`state=running`, all four grants true),
+  `session_authority_start` (admin lease), `computer_observe` (frontmost
+  application: Freebuff — real accessibility data), `computer_screenshot`
+  (1710×1112, 868 KiB of real PNG — screen recording, not just its flag).
+- [x] **CR-POS-3.2 The app's managed configuration is what the tests say it is.**
+  On disk: `chatgpt-system_*: deny` → `chatgpt-system_computer_*: ask` →
+  `chatgpt-system_session_authority_*: ask` → `chatgpt-system_computer_health:
+  allow` → `chatgpt-system_computer_run_js: deny`, in that order, with
+  `instructions` pointing at `computer-use-instructions.md`.
+- [x] **CR-POS-3.3 Shutdown leaves nothing behind.** `SIGTERM` to the running app
+  (the signal the development script sends) produced "Managed shutdown completed"
+  and, afterwards: 0 matching servers, 0 MCP children, 0 helper hosts and
+  **0 leases** in `…/OpenCode/servers` — the ledger was written and consumed
+  correctly in production, not only in tests.
+
+## Quality assurance
+
+- [x] Every finding has a severity, a location and either a fix with its test or an
+  explicit accepted trade-off.
+- [x] Fixes are covered by tests: 460 tests, 2 skipped (opt-in keychain and live
+  helper), 0 failures, clean under `-warnings-as-errors`.
+- [x] Claims about CPU, memory, process counts and log content are the output of
+  commands run in this session; the raw transcript is in the verification note.
+- [x] The three fixed findings each had a measurable failure mode: a process launch
+  on the main thread, thousands of Spotlight queries per second, and a sweep that
+  could kill a peer instance.
+
+# Round 4 — macOS Screen Recording is the app's grant, not the helper's
+
+- [x] **CR-ITEM-4.1 [Correctness / Critical] The permissions card read one grant
+  from the wrong process.**
+  - **Location**: `Sources/AgenticSidebar/ComputerUse/ComputerUseReadiness.swift`,
+    `ComputerUseStatus.swift`, `Views/Settings/SettingsComputerUseTab.swift:302-378`
+  - **Description**: All four grants were read from the signed helper's `health`
+    reply. That is right for three of them and wrong for Screen Recording:
+    `tccd` answers `kTCCServiceScreenCapture` for the **responsible** process —
+    whoever launched the helper — and never consults the helper's own row. The
+    card therefore reported "Screen Recording: Missing" beside a System Settings
+    list showing the helper switched on, and granting it again could not change
+    anything. Confirmed in the tccd log: the same helper binary returns
+    `Auth Right: Unknown (None)` under `Resp:{com.dogan.AgenticSidebar}` and
+    `Auth Right: Allowed (System Set)` under `Resp:{com.freebuff.desktop}`.
+  - **Recommendation (applied)**: `ComputerUsePermission.subject` names the owner;
+    a new `ComputerUseAppPermissionReading` reads this app's own preflights
+    in-process and exposes `CGRequestScreenCaptureAccess()` off the main actor, so
+    the app lists itself in the pane. `ComputerUseReadiness.isGranted(_:)` and
+    `missingPermissions` derive from both sources; the card says which process
+    owes what. Tests: 6 new/updated cases plus an injected fake reader everywhere,
+    because calling the real preflights would make the suite's result depend on the
+    test runner's own grants.
+
+- [x] **CR-ITEM-4.2 [Verification integrity / High] The previous "100 % verified"
+  claim measured the wrong tree.**
+  - **Location**: `script/verify-computer-use.mjs:298-320`,
+    `Tests/AgenticSidebarTests/ComputerUseReadinessTests.swift` (live test)
+  - **Description**: Both verification paths spawn the helper from a shell and
+    report `screenRecording=true`, which is the **caller's** grant. A green run in
+    the terminal could coexist with a correct "Missing" in the app — so the
+    earlier claim was true about the other three grants and false about this one.
+  - **Recommendation (applied)**: both now state the attribution caveat in the code
+    where they read the flag; the screenshot step demands a real frame
+    (`> 10 000 bytes`, non-zero dimensions) instead of "bytes came back", because a
+    refused capture still answers with a frame that compresses to nothing.
+
+- [x] **CR-POS-4.1 The rules are pinned by tests, not by observation.**
+  `missingPermissions == []` while the helper could not be asked (unknown is not
+  denied), full-order missing set when the helper answers all four false, and the
+  exact production reading — helper `true` for everything, app grant absent —
+  asserted as `.missingPermissions([.screenRecording])`.
+
+- [x] **CR-POS-4.2 The chain really does capture when the grant is there.**
+  `node script/verify-computer-use.mjs` from a granted shell: 8/8 and a genuine
+  1710×1112, 541 KiB PNG. That is the mechanism the app needs; what was missing
+  was the grant landing on the right process.
+
+## Quality assurance
+
+- [x] `swift build` / `swift test` clean under `-warnings-as-errors`: **465 tests,
+  2 skipped (opt-in), 0 failures**.
+- [x] Every claim above is a command output from this session; the transcript is in
+  `docs/verification/2026-09-16-screen-recording-attribution-fix.md`.
+- [ ] **Open — needs the user**: the app cannot grant itself Screen Recording.
+  Pressing **Grant Screen Recording…** lists AgenticSidebar in the pane; toggling
+  it on is the remaining step, and the card's Ready line is the confirmation.

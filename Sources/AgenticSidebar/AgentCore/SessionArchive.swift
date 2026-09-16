@@ -11,6 +11,10 @@ struct SessionSnapshot: Codable, Equatable, Sendable {
     var configuration: SessionConfiguration?
     var messages: [ChatMessage]
     var activityGroups: [AgentTurnActivityGroup] = []
+    /// Kullanıcının verdiği başlık; yoksa otomatik başlık kullanılır.
+    var customTitle: String? = nil
+    /// Sabitli oturumlar budamada korunur.
+    var isPinned: Bool = false
 }
 
 extension SessionSnapshot {
@@ -29,7 +33,9 @@ extension SessionSnapshot {
             activityGroups: try container.decodeIfPresent(
                 [AgentTurnActivityGroup].self,
                 forKey: .activityGroups
-            ) ?? []
+            ) ?? [],
+            customTitle: try container.decodeIfPresent(String.self, forKey: .customTitle),
+            isPinned: try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
         )
     }
 
@@ -52,7 +58,7 @@ extension SessionSnapshot {
 }
 
 struct SessionArchive: Codable, Equatable, Sendable {
-    static let currentVersion = 2
+    static let currentVersion = 3
 
     var version: Int
     var activeSessionID: UUID
@@ -70,11 +76,14 @@ extension SessionArchive {
         var bounded = self
 
         if bounded.sessions.count > maximumSessionCount {
-            bounded.sessions = Array(
-                bounded.sessions
-                    .sorted { $0.createdAt > $1.createdAt }
-                    .prefix(maximumSessionCount)
-            )
+            // Sabitliler korunur: önce pinsiz en eskiler düşer.
+            let sorted = bounded.sessions.sorted { lhs, rhs in
+                if lhs.isPinned != rhs.isPinned {
+                    return rhs.isPinned && !lhs.isPinned
+                }
+                return lhs.createdAt > rhs.createdAt
+            }
+            bounded.sessions = Array(sorted.prefix(maximumSessionCount))
         }
 
         bounded.sessions = bounded.sessions.map {
@@ -94,15 +103,16 @@ extension SessionArchive {
     /// Tavan yükleme sırasında uygulanırsa bütün sohbetler tek seferde gider;
     /// bu yüzden sınır verinin üretildiği yerde, yazma anında zorlanır.
     func droppingOldestStoredContent(fraction: Double = 0.1) -> SessionArchive? {
-        if
-            sessions.count > 1,
-            let oldest = sessions
-                .filter({ $0.id != activeSessionID })
-                .min(by: { $0.createdAt < $1.createdAt })
-        {
-            var reduced = self
-            reduced.sessions.removeAll { $0.id == oldest.id }
-            return reduced
+        if sessions.count > 1 {
+            let candidates = sessions.filter({ $0.id != activeSessionID })
+            // Önce pinsizler arasından en eski düşer; hepsi sabitliyse en eski sabitli düşer.
+            let unpinned = candidates.filter({ !$0.isPinned })
+            let pool = unpinned.isEmpty ? candidates : unpinned
+            if let oldest = pool.min(by: { $0.createdAt < $1.createdAt }) {
+                var reduced = self
+                reduced.sessions.removeAll { $0.id == oldest.id }
+                return reduced
+            }
         }
 
         guard

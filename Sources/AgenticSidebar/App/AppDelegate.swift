@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let shutdownDeadline = Duration.seconds(3)
 
     private var terminationTask: Task<Void, Never>?
+    private var terminationSignalSources: [DispatchSourceSignal] = []
 
     private lazy var globalHotKeyController = GlobalHotKeyController { [weak self] in
         self?.mainWindowController.toggle()
@@ -28,9 +29,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         applyGlobalShortcut(launchShortcut)
+        installTerminationSignalHandlers()
 
         NSApp.activate()
         AppLog.lifecycle.info("Application launched with accessory activation policy")
+    }
+
+    /// Runs the managed shutdown when the process is asked to end by signal.
+    ///
+    /// `applicationShouldTerminate` only runs for a *graceful* quit. A signal —
+    /// `pkill` from the development script, a logout, `kill` from anywhere — ends
+    /// the process without AppKit being consulted at all, so the OpenCode server
+    /// and its MCP children stayed alive with nobody left to stop them. Thirty-six
+    /// orphaned servers were found on this machine, all started this way.
+    ///
+    /// A dispatch source rather than a signal handler function: the handler has to
+    /// be async-signal-safe, and starting tasks and awaiting cleanups is not.
+    private func installTerminationSignalHandlers() {
+        for number in [SIGTERM, SIGINT] {
+            // The source only delivers a signal that is not handled by the default
+            // disposition, which would otherwise terminate us first.
+            signal(number, SIG_IGN)
+
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { [weak self] in
+                self?.handleTerminationSignal()
+            }
+            source.resume()
+            terminationSignalSources.append(source)
+        }
+    }
+
+    private func handleTerminationSignal() {
+        guard terminationTask == nil else {
+            return
+        }
+
+        terminationTask = Task { @MainActor [weak self] in
+            if let managedShutdown = self?.managedShutdown {
+                _ = await Self.runShutdown(managedShutdown)
+            }
+
+            AppLog.lifecycle.info("Termination signal handled; exiting")
+            exit(EXIT_SUCCESS)
+        }
     }
 
     /// The shortcut registered at launch: the **stored** choice, never the

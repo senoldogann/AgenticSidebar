@@ -83,31 +83,47 @@ enum ComputerUseFiles {
         let serverName = ComputerUseConfiguration.serverName
 
         return """
-        # Computer Use (chatgpt-system)
+        # Computer Use (\(serverName))
 
         Computer Use is enabled through the local `\(serverName)` MCP server. Its
         tools are prefixed with `\(serverName)_`; file, git, terminal and browser
         tools from that server are disabled by policy.
 
-        Required workflow:
+        Workflow & Best Practices:
 
-        1. Mint an Admin authority lease with
-           `\(serverName)_session_authority_start` (`profile: "admin"`,
-           `requestedTtlSeconds` up to 3600). Pass the returned `leaseId` as
-           `authorityLeaseId` on every other tool call. Leases expire; mint a new
-           one when a call fails with AUTHORITY_REQUIRED or AUTHORITY_EXPIRED.
-        2. Check readiness with `\(serverName)_computer_health` before the first
-           action. `state` must be `"running"`. If it is `"unavailable"` or a TCC
-           boolean is false, tell the user which macOS permission (Accessibility
-           or Screen Recording) the helper needs instead of retrying.
-        3. Observe before acting: `computer_observe` (accessibility tree) and
-           `computer_screenshot` (pixels). Prefer semantic targets (role, text,
-           label) over raw coordinates, and re-observe after the UI changes.
-        4. Use `computer_run` for short multi-step programs. Handle
-           COMPUTER_USER_TAKEOVER (the user took control), COMPUTER_STALE_SNAPSHOT
-           and COMPUTER_NEEDS_REPLAN by stopping and re-observing.
-        5. Each computer action is approved by the user before it runs. Never try
-           to work around a denied action; explain what you need instead.
+        1. Authority: Call `\(serverName)_session_authority_start` once per session
+           to obtain an Admin authority lease (arguments are optional, defaults to admin profile).
+           Pass the returned `leaseId` as `authorityLeaseId` on subsequent computer tool calls.
+           Renew only if a call returns AUTHORITY_EXPIRED or AUTHORITY_REQUIRED.
+        2. Fast Perception:
+           - Call `\(serverName)_computer_observe` to inspect the frontmost
+             application, window title, and active accessibility elements.
+           - Use `\(serverName)_computer_screenshot` ONLY when visual inspection
+             (e.g., Canvas, web graphics, visual verification) is strictly necessary.
+             Do NOT request screenshots on every step when UI tree observation suffices.
+           - Check `\(serverName)_computer_health` only if a tool fails with an
+             unexpected permission error; do not call it before every routine action.
+        3. Batch Execution via `computer_run` (HIGHLY RECOMMENDED):
+           - Group sequential physical interactions into a single `\(serverName)_computer_run`
+             call instead of executing them as separate turn-by-turn tool calls.
+           - For example, batch: click target -> type text -> press Return.
+           - Pass `finalObservation: "observe"` in `computer_run` to automatically receive
+             the updated perception tree in the same turn without an extra round-trip.
+        4. Precise Element Grounding:
+           - Ground actions using semantic element index from the active observation:
+             `target: { by: "index", snapshotId: observation.snapshotId, index: element.index }`.
+           - Fall back to `target: { by: "text", text: "..." }` or `target: { by: "ocrText", text: "..." }`.
+           - Avoid raw screen coordinates unless canvas/visual targeting is required.
+        5. Application Launching & Focus:
+           - When opening applications with `\(serverName)_computer_open_app`, always prefer
+             providing `bundleIdentifier` (e.g., `com.apple.Safari`, `com.google.Chrome`,
+             `com.apple.calculator`, `com.apple.TextEdit`) for instant resolution.
+           - You may specify `timeoutMs` up to 60000.
+        6. Approvals & Safety:
+           - Each computer action program is approved by the user before it runs.
+           - Batching multiple actions inside `computer_run` requires only ONE user approval.
+           - Never try to work around a denied action; explain what you need instead.
+           - If `COMPUTER_USER_TAKEOVER` occurs, stop immediately and yield control.
         """
     }
 

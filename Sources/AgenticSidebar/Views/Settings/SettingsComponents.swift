@@ -21,7 +21,7 @@ extension SettingsView {
         icon: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        settingsCardChrome {
             HStack(spacing: 10) {
                 Image(systemName: icon)
                     .font(.system(size: 14, weight: .semibold))
@@ -40,6 +40,77 @@ extension SettingsView {
                 Spacer()
             }
 
+            content()
+        }
+    }
+
+    /// Başlığına tıklanınca açılan kart.
+    ///
+    /// Uzun bir listeyi sürekli ekranda tutmak yerine başlık görünür kalır;
+    /// içerik yalnız açılınca kurulur, bu yüzden listeyi yükleyen `task` da
+    /// içerikle birlikte ilk açılışta çalışır.
+    @ViewBuilder
+    func collapsibleSettingsCard<Content: View>(
+        title: String,
+        subtitle: String,
+        icon: String,
+        isExpanded: Binding<Bool>,
+        trailingText: String?,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        settingsCardChrome {
+            Button {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                    isExpanded.wrappedValue.toggle()
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: icon)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
+
+                        Text(subtitle)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if let trailingText {
+                        Text(trailingText)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+                .interactiveHoverPill(cornerRadius: 8)
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+
+            if isExpanded.wrappedValue {
+                content()
+            }
+        }
+    }
+
+    /// Her kartın ortak gövdesi: zemin, çerçeve ve gölge tek yerde durur, kart
+    /// çeşitleri yalnız içeriklerini anlatır.
+    @ViewBuilder
+    func settingsCardChrome<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
             content()
         }
         .padding(18)
@@ -95,10 +166,10 @@ extension SettingsView {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .stroke(Color.white.opacity(isDisabled ? 0.0 : 0.2), lineWidth: 0.5)
             )
+            .interactiveHoverOutline(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
-        .pointingHandCursor()
     }
 
     /// The quiet counterpart to `primaryActionButton`: for a card that offers an
@@ -132,11 +203,11 @@ extension SettingsView {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .stroke(accent.opacity(0.32), lineWidth: 1)
             )
+            .interactiveHoverOutline(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.5 : 1)
-        .pointingHandCursor()
     }
 
     @ViewBuilder

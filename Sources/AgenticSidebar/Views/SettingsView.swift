@@ -50,6 +50,12 @@ struct SettingsView: View {
 
     /// The audit log's tail, loaded when the tool-approval card appears.
     @State var recentDecisions: [ToolAuditLog.Record] = []
+    /// "Recent tool decisions" kartı kapalı başlar: kayıt dosyası zaten
+    /// tutuluyor, kart yalnız kuyruğunu gösteren bir görüntüleyici.
+    @State var isToolDecisionLogExpanded: Bool = false
+    /// Bilgisayar kullanımı kartının canlı durumu: kurulu yardımcı, onun sahip
+    /// olduğu macOS izinleri ve çalıştırılabilen kurulum adımları.
+    @State var computerUseStatus = ComputerUseStatus()
 
     // Drafts for the MCP, plugin and skill forms. They live on the shell rather
     // than in the tab so typing survives a switch to another tab and back.

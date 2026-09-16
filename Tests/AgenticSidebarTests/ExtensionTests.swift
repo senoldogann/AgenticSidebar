@@ -245,7 +245,8 @@ final class ManagedConfigurationTests: XCTestCase {
             extensions: ExtensionRuntimeSnapshot(registry: registry)
         )
 
-        // The enabled server is registered, the disabled one only silenced.
+        // The enabled server is registered; the disabled one is silenced *and*
+        // declared off, because silencing only hides its tools.
         XCTAssertTrue(rendered.contains("\"github\""))
         XCTAssertTrue(rendered.contains("https://example.com/mcp"))
         XCTAssertFalse(rendered.contains("notion_\\*"), "Patterns are written literally")
@@ -263,6 +264,52 @@ final class ManagedConfigurationTests: XCTestCase {
         let decoded = try JSONSerialization.jsonObject(with: Data(rendered.utf8)) as? [String: Any]
         XCTAssertNotNil(decoded, "The generated configuration has to be valid JSON")
         XCTAssertEqual((decoded?["tools"] as? [String: Any])?["notion_*"] as? Bool, false)
+
+        let mcp = try XCTUnwrap(decoded?["mcp"] as? [String: Any])
+        XCTAssertEqual(
+            (mcp["notion"] as? [String: Any])?["enabled"] as? Bool,
+            false,
+            "An off server must not be started: OpenCode starts every server it knows about"
+        )
+        XCTAssertEqual(
+            (mcp["notion"] as? [String: Any])?["command"] as? [String],
+            ["npx", "notion"],
+            "The definition stays complete, so the entry is valid on its own"
+        )
+        XCTAssertEqual(
+            (mcp["github"] as? [String: Any])?["enabled"] as? Bool,
+            true,
+            "An enabled server is written exactly as the runtime API receives it"
+        )
+    }
+
+    /// A name registered as enabled wins: the disabled map is only there for the
+    /// servers the registry did not hand over as enabled.
+    func testAServerIsNeverBothEnabledAndDisabled() throws {
+        let definition = MCPDefinition(transport: .local, command: ["npx", "thing"])
+        let snapshot = ExtensionRuntimeSnapshot(
+            mcpServers: ["thing": definition],
+            disabledMCPServers: ["thing": definition],
+            silencedToolPatterns: [:],
+            plugins: [],
+            deniedSkills: []
+        )
+
+        let rendered = ManagedOpenCodeConfiguration.rendered(
+            instructionPaths: [],
+            permissionRules: [],
+            extensions: snapshot
+        )
+        let decoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(rendered.utf8)) as? [String: Any]
+        )
+        let mcp = try XCTUnwrap(decoded["mcp"] as? [String: Any])
+
+        XCTAssertEqual(mcp.count, 1)
+        XCTAssertEqual(
+            (mcp["thing"] as? [String: Any])?["enabled"] as? Bool,
+            true
+        )
     }
 
     /// The permission rules do not depend on the extensions, and they do not

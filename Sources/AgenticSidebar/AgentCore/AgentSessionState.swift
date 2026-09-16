@@ -41,6 +41,8 @@ struct AgentSessionState: Equatable, Sendable {
     var startedAt: Date?
     var completedAt: Date?
     var activityGroups: [AgentTurnActivityGroup] = []
+    /// The agent's own task list for this session, as the backend reports it.
+    var todos: [AgentTodo] = []
 
     init(
         id: UUID = UUID(),

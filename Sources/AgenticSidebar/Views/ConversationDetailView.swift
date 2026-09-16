@@ -6,6 +6,9 @@ struct ConversationDetailView: View {
     let permissionApprovalCenter: PermissionApprovalCenter
 
     @Environment(SettingsStore.self) private var settingsStore
+    /// What "write again" on an earlier message is for: the draft it edits lives
+    /// in the composer, one view away.
+    @Environment(ComposerDraftCenter.self) private var draftCenter: ComposerDraftCenter?
     @Environment(\.colorScheme) private var systemColorScheme
 
     @State private var previewImagePath: String? = nil
@@ -245,6 +248,16 @@ struct ConversationDetailView: View {
         }
     }
 
+    /// Hands a message back to the composer, where it can be edited before it is
+    /// sent again.
+    private func writeAgain(_ message: ChatMessage) {
+        draftCenter?.requestRestore(
+            text: message.text,
+            attachmentPaths: message.attachmentPaths,
+            sessionID: sessionService.activeSessionID
+        )
+    }
+
     /// One transcript entry: the message, then the timeline of the turn it
     /// started.
     @ViewBuilder
@@ -259,7 +272,9 @@ struct ConversationDetailView: View {
             isDark: isDark,
             contrast: settingsStore.contrast,
             isPlanAwaitingApproval: isPlanAwaitingApproval(for: message),
+            canResend: !sessionService.isBusy,
             onApprovePlan: approvePlan,
+            onRestore: { writeAgain(message) },
             onImageTap: { path in
                 previewImagePath = path
             }
@@ -278,6 +293,8 @@ struct ConversationDetailView: View {
         .transition(.opacity.combined(with: .move(edge: .bottom)))
 
         if let activityGroup = activityGroup(after: message.id) {
+            // Kontrol listesi yalnız composer'ın üstündeki panelde durur;
+            // transkriptte her turun üstünde yinelenmiyordu artık.
             AgentActivityTimelineView(
                 group: activityGroup,
                 isTurnActive: isTurnActive(for: activityGroup)
@@ -659,9 +676,9 @@ struct ConversationDetailView: View {
                     x: 0,
                     y: 4
                 )
+                .interactiveHoverOutlineCircle()
         }
         .buttonStyle(.plain)
-        .pointingHandCursor()
         .help("Scroll to the latest message")
         .accessibilityLabel("Scroll to bottom")
         .padding(.bottom, 8)
@@ -714,58 +731,28 @@ private struct ChatMessageRow: View {
     let isDark: Bool
     let contrast: Double
     let isPlanAwaitingApproval: Bool
+    /// False while a turn is running: re-sending the same text then would queue a
+    /// duplicate of a message the user has not seen answered yet.
+    let canResend: Bool
     let onApprovePlan: () -> Void
+    let onRestore: () -> Void
     let onImageTap: (String) -> Void
 
     @Environment(SettingsStore.self) private var settingsStore: SettingsStore?
 
     @State private var isCopied = false
-    @State private var isHoveringCopy = false
+    @State private var isCopiedOwnMessage = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             if message.role == .user {
                 Spacer(minLength: 60)
 
-                VStack(alignment: .trailing, spacing: 8) {
-                    ForEach(message.attachmentPaths, id: \.self) { path in
-                        attachmentView(for: path)
-                    }
+                VStack(alignment: .trailing, spacing: 4) {
+                    userBubble
 
-                    let displayText = ChatMessagePresenter.cleanUserDisplayText(
-                        from: message.text,
-                        hasAttachments: !message.attachmentPaths.isEmpty
-                    )
-                    if !displayText.isEmpty {
-                        let baseSize = settingsStore?.fontSize.pointSize ?? 14.0
-                        let design = settingsStore?.fontFamily.fontDesign ?? .default
-                        let spacing = settingsStore?.lineSpacing.spacing ?? 3.0
-                        Text(displayText)
-                            .font(.system(size: baseSize, weight: .regular, design: design))
-                            .lineSpacing(spacing)
-                            // The light user-bubble gradients are pale, so white
-                            // text vanished in light mode.
-                            .foregroundStyle(preset.userBubbleForeground(isDark: isDark))
-                    }
+                    userMessageActions
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(
-                    LinearGradient(
-                        colors: isDark ? preset.userBubbleDark : preset.userBubbleLight,
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    in: RoundedRectangle(cornerRadius: 15, style: .continuous)
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 15, style: .continuous)
-                        .stroke(
-                            (isDark ? preset.borderSubtleDark : preset.borderSubtleLight)
-                                .opacity(contrast),
-                            lineWidth: 1
-                        )
-                )
             } else {
                 VStack(alignment: .leading, spacing: 6) {
                     MarkdownContentView(markdown: message.text)
@@ -777,46 +764,11 @@ private struct ChatMessageRow: View {
                     }
 
                     HStack(spacing: 8) {
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(message.text, forType: .string)
-                            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
-                                isCopied = true
-                            }
-                            Task {
-                                try? await Task.sleep(nanoseconds: 1_800_000_000)
-                                withAnimation {
-                                    isCopied = false
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                                    .font(.system(size: 11, weight: .medium))
-                                    .foregroundStyle(isCopied ? .green : (isHoveringCopy ? .primary : .secondary.opacity(0.7)))
-
-                                if isCopied {
-                                    Text("Copied")
-                                        .font(.caption2.weight(.medium))
-                                        .foregroundStyle(.green)
-                                }
-                            }
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(
-                                isHoveringCopy
-                                    ? (isDark ? Color.white.opacity(0.10) : Color.black.opacity(0.08))
-                                    : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            )
-                            .animation(.easeInOut(duration: 0.15), value: isHoveringCopy)
-                            .onHover { hovering in
-                                isHoveringCopy = hovering
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .pointingHandCursor()
-                        .help("Copy message to clipboard")
+                        copyButton(
+                            text: message.text,
+                            isCopied: $isCopied,
+                            help: "Copy message to clipboard"
+                        )
 
                         Text(formattedTimestamp(message.createdAt))
                             .font(.caption2.monospacedDigit())
@@ -831,6 +783,126 @@ private struct ChatMessageRow: View {
             }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// What the user wrote, in the bubble it was sent in.
+    private var userBubble: some View {
+        let displayText = ChatMessagePresenter.cleanUserDisplayText(
+            from: message.text,
+            hasAttachments: !message.attachmentPaths.isEmpty
+        )
+
+        return VStack(alignment: .trailing, spacing: 8) {
+            ForEach(message.attachmentPaths, id: \.self) { path in
+                attachmentView(for: path)
+            }
+
+            if !displayText.isEmpty {
+                let baseSize = settingsStore?.fontSize.pointSize ?? 14.0
+                let design = settingsStore?.fontFamily.fontDesign ?? .default
+                let spacing = settingsStore?.lineSpacing.spacing ?? 3.0
+                Text(displayText)
+                    .font(.system(size: baseSize, weight: .regular, design: design))
+                    .lineSpacing(spacing)
+                    // The light user-bubble gradients are pale, so white
+                    // text vanished in light mode.
+                    .foregroundStyle(preset.userBubbleForeground(isDark: isDark))
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(
+            LinearGradient(
+                colors: isDark ? preset.userBubbleDark : preset.userBubbleLight,
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 15, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                .stroke(
+                    (isDark ? preset.borderSubtleDark : preset.borderSubtleLight)
+                        .opacity(contrast),
+                    lineWidth: 1
+                )
+        )
+    }
+
+    /// What can be done with a message the user sent: read it again, or write it
+    /// again. The send-again control only appears once the turn is over — it puts
+    /// the text back in the composer rather than replaying it, so the user edits
+    /// before it goes out.
+    private var userMessageActions: some View {
+        HStack(spacing: 8) {
+            if canResend {
+                Button(action: onRestore) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.uturn.backward")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("Write again")
+                            .font(.caption2.weight(.medium))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .interactiveHoverPill(cornerRadius: 5)
+                }
+                .buttonStyle(.plain)
+                .help("Put this message back in the composer so it can be sent again")
+            }
+
+            copyButton(
+                text: message.text,
+                isCopied: $isCopiedOwnMessage,
+                help: "Copy your message to clipboard"
+            )
+
+            Text(formattedTimestamp(message.createdAt))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.trailing, 4)
+    }
+
+    /// One copy control for both roles: the click has no other visible effect, so
+    /// the icon turning into a green check is the only proof it worked.
+    private func copyButton(
+        text: String,
+        isCopied: Binding<Bool>,
+        help: String
+    ) -> some View {
+        Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.8)) {
+                isCopied.wrappedValue = true
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 1_800_000_000)
+                withAnimation {
+                    isCopied.wrappedValue = false
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: isCopied.wrappedValue ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(isCopied.wrappedValue ? .green : .secondary)
+
+                if isCopied.wrappedValue {
+                    Text("Copied")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .interactiveHoverPill(cornerRadius: 5)
+        }
+        .buttonStyle(.plain)
+        .help(help)
+        .accessibilityLabel(help)
     }
 
     /// The gate between proposing and building.
@@ -989,6 +1061,7 @@ private struct ChatMessageRow: View {
                     lineWidth: 1
                 )
         )
+        .interactiveHoverOutline(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .shadow(color: .black.opacity(0.18), radius: 6, x: 0, y: 3)
         .onTapGesture {
             onImageTap(path)
@@ -1066,9 +1139,11 @@ private struct ImagePreviewModal: View {
                         Image(systemName: "arrow.up.right.square")
                             .font(.system(size: 15))
                             .foregroundStyle(Color.white.opacity(0.85))
+                            .padding(5)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .pointingHandCursor()
+                    .interactiveHoverHalo()
                     .help("Open with external application")
 
                     Button {
@@ -1079,7 +1154,7 @@ private struct ImagePreviewModal: View {
                             .foregroundStyle(Color.white.opacity(0.85))
                     }
                     .buttonStyle(.plain)
-                    .pointingHandCursor()
+                    .interactiveHoverHalo()
                     .keyboardShortcut(.escape, modifiers: [])
                 }
                 .padding(.horizontal, 16)

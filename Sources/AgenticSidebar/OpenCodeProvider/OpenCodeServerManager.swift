@@ -16,6 +16,10 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     private let passwordGenerator: @Sendable () async throws -> String
 
     private var processHandle: (any OpenCodeProcessHandling)?
+
+    /// Reaping runs once per app launch: it is a scan of the process table, and
+    /// the answer cannot change while this process is starting servers.
+    private var hasReapedOrphans = false
     private var connection: OpenCodeServerConnection?
     private var serverStatus: OpenCodeServerStatus = .stopped
 
@@ -117,6 +121,15 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             await stop()
         }
 
+        // Before a new server is started, any server an earlier launch left
+        // behind is ended. A relaunch (the development script, a crash, a forced
+        // shutdown) is the normal case here, not the exception: without this, each
+        // one added a whole MCP tree that nothing would ever stop.
+        if !hasReapedOrphans {
+            hasReapedOrphans = true
+            OpenCodeServerLedger.reapOrphans(in: workingDirectoryURL)
+        }
+
         guard let executableURL = executableLocator.locate() else {
             throw ProviderRuntimeError.executableUnavailable
         }
@@ -188,6 +201,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             }
 
             processHandle = launchedHandle
+            let launchedPID = await launchedHandle.processIdentifier() ?? 0
 
             do {
                 // Before the first request that carries the password: the child
@@ -212,12 +226,25 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 )
                 connection = candidateConnection
                 serverStatus = .running(version: version, baseURL: baseURL)
+                // Written down while it is known to be ours: if this process is
+                // killed before it can stop the server, the next launch reads the
+                // lease and ends it instead of leaving a second server behind.
+                OpenCodeServerLedger.record(
+                    OpenCodeServerLease(
+                        pid: launchedPID,
+                        port: port,
+                        executablePath: executableURL.path,
+                        startedAt: Date()
+                    ),
+                    in: workingDirectoryURL
+                )
                 AppLog.openCode.info(
                     "OpenCode \(version, privacy: .public) listening on authenticated loopback"
                 )
                 return candidateConnection
             } catch let error as ProviderRuntimeError {
                 await launchedHandle.terminate()
+                OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
@@ -236,12 +263,14 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 // start nobody is waiting for and then reporting it as a failure
                 // was both wasteful and misleading.
                 await launchedHandle.terminate()
+                OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
                 throw CancellationError()
             } catch {
                 await launchedHandle.terminate()
+                OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
@@ -254,8 +283,11 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
 
     func stop() async {
         if let processHandle {
+            let pid = await processHandle.processIdentifier() ?? 0
             await processHandle.terminate()
+            OpenCodeServerLedger.release(pid: pid, in: workingDirectoryURL)
         }
+
         processHandle = nil
         connection = nil
         serverStatus = .stopped

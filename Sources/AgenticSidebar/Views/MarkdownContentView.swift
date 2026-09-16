@@ -101,12 +101,70 @@ struct MarkdownContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(blocks) { block in
-                renderBlock(block)
+            ForEach(rows) { row in
+                switch row {
+                case let .text(id, blocks):
+                    SelectableMarkdownTextView(blocks: blocks, typography: runTypography)
+                        .id(id)
+
+                case let .block(block):
+                    renderBlock(block)
+                }
             }
         }
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A run of prose, or a block that has to be its own view.
+    ///
+    /// Consecutive prose is grouped so one drag can select a whole answer; a code
+    /// block or a table ends the run because it brings its own view and its own
+    /// affordances.
+    private enum MarkdownRow: Identifiable {
+        case text(id: String, blocks: [MarkdownBlock])
+        case block(MarkdownBlock)
+
+        var id: String {
+            switch self {
+            case let .text(id, _): "run-\(id)"
+            case let .block(block): block.id
+            }
+        }
+    }
+
+    private var runTypography: MarkdownRunTypography {
+        MarkdownRunTypography(
+            fontFamily: fontFamily,
+            pointSize: fontSize.pointSize,
+            lineSpacing: lineSpacing.spacing
+        )
+    }
+
+    private var rows: [MarkdownRow] {
+        var rows: [MarkdownRow] = []
+        var run: [MarkdownBlock] = []
+
+        func flushRun() {
+            guard let first = run.first else {
+                return
+            }
+            rows.append(.text(id: first.id, blocks: run))
+            run = []
+        }
+
+        for block in blocks {
+            guard MarkdownTextRunBuilder.isTextual(block) else {
+                flushRun()
+                rows.append(.block(block))
+                continue
+            }
+
+            run.append(block)
+        }
+
+        flushRun()
+        return rows
     }
 
     @ViewBuilder

@@ -181,13 +181,17 @@ extension SettingsView {
     ///
     /// On a level that does not ask, this list is the substitute for the prompt:
     /// the record of what ran, from where, and whether a level, an earlier
-    /// "Always allow" or the user answered it.
+    /// "Always allow" or the user answered it. Kapalı bir görüntüleyicidir —
+    /// kayıt `audit.jsonl` dosyasına zaten yazılır, bu kart yalnız kuyruğunu
+    /// gösterir, o yüzden varsayılan olarak kapalı durur.
     @ViewBuilder
     var toolDecisionLogCard: some View {
-        settingsCard(
+        collapsibleSettingsCard(
             title: "Recent tool decisions",
             subtitle: "Every approval the app answered for the agent, newest first, kept in the app's own folder.",
-            icon: "list.bullet.rectangle"
+            icon: "list.bullet.rectangle",
+            isExpanded: $isToolDecisionLogExpanded,
+            trailingText: recentDecisions.isEmpty ? nil : "\(recentDecisions.count)"
         ) {
             VStack(alignment: .leading, spacing: 8) {
                 if recentDecisions.isEmpty {
@@ -216,8 +220,10 @@ extension SettingsView {
                     }
                 }
             }
-            .task { await reloadRecentDecisions() }
         }
+        // Kart kapalıyken de başlıktaki sayı güncel kalsın diye kuyruk kart
+        // görünür olduğunda okunur; satırlar yalnız açılınca kurulur.
+        .task { await reloadRecentDecisions() }
     }
 
     @ViewBuilder
@@ -337,9 +343,9 @@ extension SettingsView {
                     )
             )
             .contentShape(Rectangle())
+            .interactiveHoverOutline(RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
         .buttonStyle(.plain)
-        .pointingHandCursor()
         .accessibilityLabel("\(policy.displayName). \(policy.summary)")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
