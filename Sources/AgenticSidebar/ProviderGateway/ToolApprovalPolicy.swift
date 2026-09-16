@@ -84,6 +84,19 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
         }
     }
 
+    /// The level in one word, for the composer's control row.
+    ///
+    /// The composer shows this next to the input field, where a sentence per state
+    /// would push the field itself out of the row. ``summary`` and ``detail`` are
+    /// for the tooltips and for Settings, which is one link away.
+    var compactName: String {
+        switch self {
+        case .ask: "Ask"
+        case .approveSafe: "Approve"
+        case .fullAccess: "Full access"
+        }
+    }
+
     /// Whether the copy should be tinted as a warning.
     var isUnrestricted: Bool {
         self == .fullAccess

@@ -91,6 +91,13 @@ extension SettingsView {
     /// row here because there is nothing to restart.
     @ViewBuilder
     var toolApprovalCard: some View {
+        toolApprovalCardBody
+            // The deep-link target: "More info" in the composer scrolls here.
+            .id(SettingsAnchor.toolApprovals)
+    }
+
+    @ViewBuilder
+    var toolApprovalCardBody: some View {
         settingsCard(
             title: "Tool approvals",
             subtitle: "How much the agent may do without asking. One level for every tool: shell commands, edits, the network and computer use. Changes apply to the running agent on its next tool call.",

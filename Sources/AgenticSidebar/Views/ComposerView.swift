@@ -4,9 +4,15 @@ import UniformTypeIdentifiers
 
 struct ComposerView: View {
     let sessionService: AgentSessionService
+    /// Answers this session's "Always allow" decisions and holds the prompts that
+    /// are waiting, which the level control has to show and re-answer.
+    let permissionApprovalCenter: PermissionApprovalCenter
 
     @Environment(SettingsStore.self) private var settingsStore
     @Environment(ExtensionStore.self) private var extensionStore
+    /// The approval level's long explanation lives in Settings; the one-line
+    /// control here links to it.
+    @Environment(SettingsWindowController.self) private var settingsWindowController: SettingsWindowController?
     @Environment(\.colorScheme) private var systemColorScheme
 
     /// Taslaklar oturuma göre saklanır.
@@ -243,9 +249,13 @@ struct ComposerView: View {
 
     // MARK: - Unified composer control pill
 
-    /// Transparent row housing: model | variant | provider | agent mode | speed
-    /// mode. Sections are separated by thin vertical dividers. Each section gets
-    /// its own hover highlight via `interactiveHoverPill`.
+    /// Transparent row housing: model | variant | agent mode | speed mode |
+    /// approval level. Sections are separated by thin vertical dividers. Each
+    /// section gets its own hover highlight via `interactiveHoverPill`.
+    ///
+    /// The provider is deliberately not here any more: it is a long-lived choice
+    /// made in Settings, and the room is better spent on the approval level, which
+    /// is the one setting a user changes *while* watching the agent work.
     private var composerControlPill: some View {
         HStack(spacing: 0) {
             // Model section
@@ -261,14 +271,97 @@ struct ComposerView: View {
             pillDivider
             agentModeMenuSection
 
-            // Which provider is running: a long-lived choice, shown here and
-            // changed in Settings.
-            if selectedProviderID != nil {
-                pillDivider
-                providerBadge
-            }
+            // Tool approval level: short here, explained in Settings.
+            pillDivider
+            approvalLevelSection
         }
         .fixedSize()
+    }
+
+    /// How much the agent may do without asking, in one line.
+    ///
+    /// The level names are kept to a word each ("Ask", "Approve", "Full access")
+    /// and the explanation is not repeated here: a composer that recited two
+    /// sentences per state would push the input field out of the place it is being
+    /// typed into. "More info" opens the card in Settings that does explain it.
+    private var approvalLevelSection: some View {
+        let policy = settingsStore.toolApprovalPolicy
+        let pendingCount = permissionApprovalCenter.pending.count
+
+        return HStack(spacing: 2) {
+            Menu {
+                ForEach(ToolApprovalPolicy.allCases) { candidate in
+                    Button {
+                        chooseApprovalLevel(candidate)
+                    } label: {
+                        Label(
+                            candidate.compactName,
+                            systemImage: candidate == policy
+                                ? "checkmark"
+                                : candidate.symbolName
+                        )
+                    }
+                    .help(candidate.summary)
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: policy.symbolName)
+                        .font(.system(size: 10.5, weight: .semibold))
+
+                    Text(policy.compactName)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(1)
+
+                    if pendingCount > 0 {
+                        Text("\(pendingCount)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.orange, in: Capsule())
+                    }
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
+                .foregroundStyle(policy.isUnrestricted ? Color.orange : .secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .interactiveHoverPill(cornerRadius: 6)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Tool approvals: \(policy.displayName)")
+            .help("Tool approvals: \(policy.summary)")
+
+            Button {
+                settingsWindowController?.show(tab: .ai, anchor: .toolApprovals)
+            } label: {
+                Text("More info")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 5)
+                    .interactiveHoverPill(cornerRadius: 6)
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .accessibilityLabel("More info about tool approvals")
+            .help("Open Settings → AI & Models at the tool approvals section")
+        }
+        .padding(.trailing, 4)
+    }
+
+    private func chooseApprovalLevel(_ policy: ToolApprovalPolicy) {
+        guard settingsStore.toolApprovalPolicy != policy else {
+            return
+        }
+
+        settingsStore.toolApprovalPolicy = policy
+        // The prompts on screen were asked under the previous level; leaving them
+        // to time out would refuse work the user just approved.
+        permissionApprovalCenter.reinterpretPendingRequests()
     }
 
     /// Build or Plan for the *next* turn, so it stays switchable while a turn is
@@ -584,28 +677,6 @@ struct ComposerView: View {
         }
     }
 
-    /// Which adapter is running, shown rather than chosen: a provider is a
-    /// long-lived choice, and having it beside the per-turn controls invited
-    /// switching it by accident.
-    private var providerBadge: some View {
-        HStack(spacing: 5) {
-            ProviderLogoView(
-                logo: ProviderLogo.matching(selectedProviderIdentifier),
-                size: 11,
-                tint: .secondary
-            )
-
-            Text(selectedProviderName)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .accessibilityLabel("Provider: \(selectedProviderName)")
-        .help("Change the provider in Settings → AI & Models")
-    }
-
     private var attachmentButton: some View {
         Button {
             openFileAttachmentDialog()
@@ -744,14 +815,6 @@ struct ComposerView: View {
 
         return sessionService.providers.first { $0.id == selectedProviderID }?.id.rawValue
             ?? selectedProviderID.rawValue
-    }
-
-    private var selectedProviderName: String {
-        if let selectedProviderID,
-           let provider = sessionService.providers.first(where: { $0.id == selectedProviderID }) {
-            return provider.displayName
-        }
-        return "Full access"
     }
 
     private var sendButtonHelp: String {

@@ -27,10 +27,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        applyGlobalShortcut(.default)
+        applyGlobalShortcut(launchShortcut)
 
         NSApp.activate()
         AppLog.lifecycle.info("Application launched with accessory activation policy")
+    }
+
+    /// The shortcut registered at launch: the **stored** choice, never the
+    /// built-in default.
+    ///
+    /// Registering `.default` here used to clobber the user's preference. The
+    /// window applies the stored spec as it appears, and when the built-in default
+    /// became a different chord (⇧⌘B, see ``GlobalShortcutSpec/default``) this later
+    /// registration silently replaced it — the window had already registered ⌘B,
+    /// and the launch path then unregistered it and took ⇧⌘B instead. The chosen
+    /// shortcut stopped working, and nothing said why.
+    var launchShortcut: GlobalShortcutSpec {
+        settingsStore?.globalShortcutChoice.spec ?? .default
     }
 
     /// Registers (or re-registers) the global show/hide shortcut. Registration is
@@ -39,8 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try globalHotKeyController.register(spec)
             settingsStore?.globalShortcutError = nil
+            // The modifiers are logged as well: when a stored choice was replaced
+            // by the built-in default, ⌘B and ⇧⌘B were indistinguishable in this
+            // line, which is exactly why the regression went unnoticed.
             AppLog.lifecycle.info(
-                "Registered global shortcut with key code \(spec.keyCode, privacy: .public)"
+                "Registered global shortcut with key code \(spec.keyCode, privacy: .public) and modifiers \(spec.modifiers, privacy: .public)"
             )
         } catch {
             // Sessiz bir başarısızlık, hiç çalışmayan bir kısayolun etkin

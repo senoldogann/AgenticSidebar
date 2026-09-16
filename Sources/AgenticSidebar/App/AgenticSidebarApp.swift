@@ -165,6 +165,7 @@ struct AgenticSidebarApp: App {
                     extensionStore: initialExtensionStore,
                     sessionService: initialSessionService,
                     permissionApprovalCenter: permissionApprovalCenter,
+                    navigation: appDelegate.settingsWindowController.navigation,
                     capturePrivacyCapabilities: appDelegate.capturePrivacyController.capabilities,
                     onOpenAICredentialChange: {
                         Task {

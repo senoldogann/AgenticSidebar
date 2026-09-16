@@ -31,15 +31,10 @@ struct RootChatView: View {
                 permissionApprovalCenter: permissionApprovalCenter
             )
         }
+        // No approval control in the toolbar: it lives in the composer (see
+        // `ComposerView.approvalLevelSection`), beside the input it applies to,
+        // and two controls for the same decision read as two decisions.
         .navigationSplitViewStyle(.prominentDetail)
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                ToolApprovalLevelMenu(
-                    settingsStore: settingsStore,
-                    permissionApprovalCenter: permissionApprovalCenter
-                )
-            }
-        }
         .background(currentTheme.background(isDark: isDarkMode))
         .toolbarBackground(currentTheme.background(isDark: isDarkMode), for: .windowToolbar)
         .frame(minWidth: 760, minHeight: 520)

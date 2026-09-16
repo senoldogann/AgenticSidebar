@@ -40,12 +40,13 @@ struct SettingsView: View {
     /// Owns this session's "Always allow" decisions and the audit log the tool
     /// approval card reads, so the two cards show the state the agent is in.
     let permissionApprovalCenter: PermissionApprovalCenter
+    /// The tab and card the window should show. Outside state, because this view
+    /// is built once and a link from the composer has to reach it later.
+    let navigation: SettingsNavigation
     let capturePrivacyCapabilities: CapturePrivacyCapabilities
     let onOpenAICredentialChange: @MainActor () -> Void
     let onOpenCodeChange: @MainActor () -> Void
     let onDismiss: () -> Void
-
-    @State private var selectedTab: SettingsTab = .appearance
 
     /// The audit log's tail, loaded when the tool-approval card appears.
     @State var recentDecisions: [ToolAuditLog.Record] = []
@@ -68,6 +69,7 @@ struct SettingsView: View {
         extensionStore: ExtensionStore,
         sessionService: AgentSessionService,
         permissionApprovalCenter: PermissionApprovalCenter,
+        navigation: SettingsNavigation,
         capturePrivacyCapabilities: CapturePrivacyCapabilities,
         onOpenAICredentialChange: @escaping @MainActor () -> Void,
         onOpenCodeChange: @escaping @MainActor () -> Void,
@@ -79,6 +81,7 @@ struct SettingsView: View {
         self.extensionStore = extensionStore
         self.sessionService = sessionService
         self.permissionApprovalCenter = permissionApprovalCenter
+        self.navigation = navigation
         self.capturePrivacyCapabilities = capturePrivacyCapabilities
         self.onOpenAICredentialChange = onOpenAICredentialChange
         self.onOpenCodeChange = onOpenCodeChange
@@ -100,28 +103,28 @@ struct SettingsView: View {
                     ForEach(SettingsTab.allCases) { tab in
                         Button {
                             withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                selectedTab = tab
+                                navigation.tab = tab
                             }
                         } label: {
                             HStack(spacing: 9) {
                                 Image(systemName: tab.iconName)
-                                    .font(.system(size: 12.5, weight: selectedTab == tab ? .semibold : .medium))
+                                    .font(.system(size: 12.5, weight: navigation.tab == tab ? .semibold : .medium))
                                     .frame(width: 18)
 
                                 Text(tab.rawValue)
-                                    .font(.system(size: 13, weight: selectedTab == tab ? .semibold : .medium))
+                                    .font(.system(size: 13, weight: navigation.tab == tab ? .semibold : .medium))
 
                                 Spacer()
                             }
                             .foregroundStyle(
-                                selectedTab == tab
+                                navigation.tab == tab
                                     ? Color.white
                                     : (isDarkMode ? Color.white.opacity(0.75) : Color.black.opacity(0.75))
                             )
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .background {
-                                if selectedTab == tab {
+                                if navigation.tab == tab {
                                     LinearGradient(
                                         colors: currentTheme.accentGradient,
                                         startPoint: .leading,
@@ -178,11 +181,11 @@ struct SettingsView: View {
                 // Content Header Bar
                 HStack {
                     HStack(spacing: 8) {
-                        Image(systemName: selectedTab.iconName)
+                        Image(systemName: navigation.tab.iconName)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
 
-                        Text(selectedTab.rawValue)
+                        Text(navigation.tab.rawValue)
                             .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.primary)
                     }
@@ -201,28 +204,46 @@ struct SettingsView: View {
                         .frame(height: 1)
                 }
 
-                // Tab Content ScrollView
-                ScrollView {
-                    VStack(spacing: 20) {
-                        switch selectedTab {
-                        case .appearance:
-                            appearanceTabContent
-                        case .ai:
-                            aiTabContent
-                        case .extensions:
-                            extensionsTabContent
-                        case .automation:
-                            automationTabContent
-                        case .computerUse:
-                            computerUseTabContent
-                        case .general:
-                            generalTabContent
+                // Tab Content ScrollView, with the deep-link target handling: a
+                // link from the composer has to reveal the card it names, not
+                // just the tab that contains it.
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(spacing: 20) {
+                            switch navigation.tab {
+                            case .appearance:
+                                appearanceTabContent
+                            case .ai:
+                                aiTabContent
+                            case .extensions:
+                                extensionsTabContent
+                            case .automation:
+                                automationTabContent
+                            case .computerUse:
+                                computerUseTabContent
+                            case .general:
+                                generalTabContent
+                            }
+                        }
+                        .frame(maxWidth: 820)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 24)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .onChange(of: navigation.scrollRequest) { _, request in
+                        guard let request else {
+                            return
+                        }
+
+                        // One run loop turn, so the tab's content exists before
+                        // the scroll target is looked up.
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(30))
+                            withAnimation(.easeInOut(duration: 0.28)) {
+                                proxy.scrollTo(request.anchor, anchor: .top)
+                            }
                         }
                     }
-                    .frame(maxWidth: 820)
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 24)
-                    .frame(maxWidth: .infinity)
                 }
                 .background(
                     currentTheme.background(isDark: isDarkMode)

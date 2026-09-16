@@ -9,6 +9,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var contentBuilder: (@MainActor () -> AnyView)?
     var isWindowOpen: Bool = false
 
+    /// Which tab the window shows and which card it scrolls to. Read by
+    /// `SettingsView`, written by whoever opens the window.
+    let navigation = SettingsNavigation()
+
     override init() {
         super.init()
     }
@@ -17,7 +21,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.contentBuilder = contentBuilder
     }
 
-    func show() {
+    /// Opens the window, optionally on a specific tab and card.
+    ///
+    /// The navigation is set before the window is brought forward so that a first
+    /// open lands on the right card, and an already-open window still moves: a
+    /// link that silently did nothing on the second press would be worse than no
+    /// link at all.
+    func show(tab: SettingsTab? = nil, anchor: SettingsAnchor? = nil) {
+        if tab != nil || anchor != nil {
+            navigation.open(tab: tab ?? navigation.tab, anchor: anchor)
+        }
+
         if let existing = window {
             if !existing.isVisible {
                 existing.center()

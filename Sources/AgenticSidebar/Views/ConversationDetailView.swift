@@ -182,7 +182,10 @@ struct ConversationDetailView: View {
                     )
                 }
 
-                ComposerView(sessionService: sessionService)
+                ComposerView(
+                    sessionService: sessionService,
+                    permissionApprovalCenter: permissionApprovalCenter
+                )
             }
 
             if let path = previewImagePath {
@@ -418,8 +421,9 @@ struct ConversationDetailView: View {
                             settingsStore.toolApprovalPolicy = policy
                             permissionApprovalCenter.reinterpretPendingRequests()
                         } label: {
-                            Text("\(policy.displayName) — \(policy.summary)")
+                            Text(policy.compactName)
                         }
+                        .help(policy.summary)
                     }
                 } label: {
                     HStack(spacing: 4) {
