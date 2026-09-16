@@ -99,27 +99,49 @@ final class BoundedChannelTests: XCTestCase {
         let channel = BoundedChannel<Int>(capacity: 1)
         let probe = SendProbe()
 
+        try await channel.send(1)  // fills the buffer
+
         let producer = Task {
-            for value in 1...5 {
-                do {
-                    try await channel.send(value)
-                } catch {
-                    await probe.recordFailure(error)
-                    return
-                }
-                await probe.record(value)
+            do {
+                try await channel.send(2)
+            } catch {
+                await probe.recordFailure(error)
+                return
             }
+            await probe.record(2)
         }
 
-        let reachedOne = await waitUntil(timeout: .seconds(5)) { await probe.count == 1 }
-        XCTAssertTrue(reachedOne)
+        // This waits for the producer to be *suspended*, not merely for the
+        // buffer to be full. Cancelling in the window between `send(1)`
+        // returning and `send(2)` parking is not a failure — a finished channel
+        // drops later sends — but it silently changed what this test measured,
+        // and on a slower machine it made an expected count look wrong.
+        let isBlocked = await waitUntil(timeout: .seconds(5)) { await channel.blockedSenderCount == 1 }
+        XCTAssertTrue(isBlocked, "The producer must suspend on the full buffer")
+
         await channel.cancel()
         _ = await producer.result
 
         let finalCount = await probe.count
-        XCTAssertEqual(finalCount, 1, "Only the buffered element was accepted")
+        XCTAssertEqual(finalCount, 0, "The blocked send is rejected, not accepted")
         let lastFailure = await probe.lastFailure
         XCTAssertTrue(lastFailure is CancellationError)
+    }
+
+    /// The other half of the contract above: a send that arrives after the
+    /// exchange ended is dropped, not failed. Failing it would report the
+    /// consumer's cancellation to the producer as a transport error.
+    func testSendingAfterCancelIsDroppedAndKeepsTheBufferedElement() async throws {
+        let channel = BoundedChannel<Int>(capacity: 2)
+        try await channel.send(1)
+        await channel.cancel()
+
+        try await channel.send(2)
+
+        let queuedCount = await channel.queuedCount
+        XCTAssertEqual(queuedCount, 1)
+        let blockedSenderCount = await channel.blockedSenderCount
+        XCTAssertEqual(blockedSenderCount, 0)
     }
 
     func testCancelReleasesAWaitingConsumer() async throws {

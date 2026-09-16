@@ -32,6 +32,17 @@ actor BoundedChannel<Element: Sendable> {
         buffer.count
     }
 
+    /// How many producers are suspended on a full buffer.
+    ///
+    /// Exposed for the same reason as the count of what the buffer holds: whether
+    /// the producer is *suspended* is a property of this actor, and a test that
+    /// guessed at it could only be timing-dependent. The back-pressure test tried
+    /// to infer it from the buffer being full and lost the race on a slower
+    /// machine, where the cancel arrived after the producer had already moved on.
+    var blockedSenderCount: Int {
+        sendWaiters.count
+    }
+
     /// Enqueues an element, suspending while the buffer is at capacity.
     func send(_ element: Element) async throws {
         while true {
