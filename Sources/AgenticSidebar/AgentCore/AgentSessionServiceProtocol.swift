@@ -28,6 +28,8 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     func selectSession(_ id: UUID)
     func deleteSession(_ id: UUID)
     func deleteSessions(_ ids: Set<UUID>)
+    @discardableResult
+    func forkSession(id: UUID, throughMessageID: UUID) -> UUID?
     func renameSession(_ id: UUID, to newTitle: String)
     func setSessionPinned(_ id: UUID, pinned: Bool)
     func toggleSessionPin(_ id: UUID)

@@ -293,6 +293,48 @@ final class AgentSessionService {
         saveImmediately()
     }
 
+    /// Mesaj dizisindeki bir dönüm noktasından yeni bir dal oturumu açar.
+    ///
+    /// Kaynak oturuma dokunulmaz; ön ek yeni bir `AgentSession` olarak başa
+    /// eklenir ve aktif yapılır. Backend tarafında istekli (lazy) çalışır:
+    /// burada sunucuya `POST` yapılmaz, ilk gönderimde runtime ön eki history
+    /// preamble olarak tekrar oynatır. Meşgul bir kaynaktan da dallanılabilir,
+    /// çünkü yalnızca bitmiş `state` kopyalanır, çalışan turun görevi değil.
+    ///
+    /// - Returns: Dönüm noktası bulunamazsa `nil`.
+    @discardableResult
+    func forkSession(id: UUID, throughMessageID: UUID) -> UUID? {
+        guard let source = sessions.first(where: { $0.id == id }) else {
+            return nil
+        }
+        guard let fork = SessionFork.plan(
+            sourceMessages: source.state.messages,
+            sourceActivityGroups: source.state.activityGroups,
+            sourceAutomaticTitle: source.automaticTitle,
+            sourceCustomTitle: source.customTitle,
+            throughMessageID: throughMessageID
+        ) else {
+            return nil
+        }
+        var forkedState = AgentSessionState(
+            configuration: source.state.configuration,
+            messages: fork.messages,
+            status: .idle
+        )
+        forkedState.activityGroups = fork.activityGroups
+        let branch = AgentSession(
+            runtimes: runtimes,
+            state: forkedState,
+            customTitle: fork.title
+        )
+        adopt(branch)
+        branch.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
+        sessions.insert(branch, at: 0)
+        activeSessionID = branch.id
+        saveImmediately()
+        return branch.id
+    }
+
     // MARK: - Configuration
 
     func selectProvider(_ providerID: ProviderID) throws {
