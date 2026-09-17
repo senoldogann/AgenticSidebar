@@ -212,6 +212,17 @@ struct InspectorTabsContainerView: View {
                 }
             )
             .id("review:\(summary.id.uuidString):\(initialFile?.id.uuidString ?? "all")")
+
+        case let .livePreview(_, title, html):
+            LivePreviewPanelView(
+                title: title,
+                html: html,
+                preset: preset,
+                isDark: isDark,
+                onDismiss: {
+                    onCloseTab(tab.id)
+                }
+            )
         }
     }
 }

@@ -5,6 +5,10 @@ enum InspectorTabKind: Equatable, Hashable, Sendable {
     case file(url: URL)
     case subagentReport(activityID: ProviderActivityID, title: String, report: String)
     case changesReview(turnID: UUID, summary: TurnFileChangesSummary, initialFile: FileChangeItem?)
+    /// LLM üretimi işaretlemeden canlı önizleme. Ham HTML saklanır; CSP ve
+    /// izolasyon `PreviewArtifactBuilder` + `LivePreviewPanelView` tarafında
+    /// uygulanır, burada yalnızca veri taşınır.
+    case livePreview(id: String, title: String, html: String)
 }
 
 /// Represents one tab in the right-side inspector panel.
@@ -96,6 +100,16 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
         )
     }
 
+    static func forLivePreview(id: String, title: String, html: String) -> InspectorTab {
+        InspectorTab(
+            id: "preview:\(id)",
+            kind: .livePreview(id: id, title: title, html: html),
+            title: title,
+            iconName: "eye",
+            iconColorName: "green"
+        )
+    }
+
     /// Discretely numbered label for the tab bar ("Sekme 1", "Sekme 2" or "Agent 1", "Agent 2").
     static func displayLabel(for tab: InspectorTab, among tabs: [InspectorTab]) -> String {
         switch tab.kind {
@@ -106,7 +120,7 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
             }
             let index = (agentTabs.firstIndex(where: { $0.id == tab.id }) ?? 0) + 1
             return "Agent \(index)"
-        case .file, .changesReview:
+        case .file, .changesReview, .livePreview:
             let fileTabs = tabs.filter {
                 if case .subagentReport = $0.kind { return false }
                 return true
