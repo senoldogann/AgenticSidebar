@@ -78,6 +78,10 @@ cat >"$INFO_PLIST" <<PLIST
   <string>NSApplication</string>
   <key>NSRequiresAquaSystemAppearance</key>
   <false/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>AgenticSidebar uses the microphone only when you tap the dictation button, to transcribe your speech into the composer draft.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>AgenticSidebar uses speech recognition only when you tap the dictation button, to transcribe your speech into the composer draft.</string>
 </dict>
 </plist>
 PLIST
