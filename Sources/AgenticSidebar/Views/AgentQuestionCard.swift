@@ -5,6 +5,8 @@ struct AgentQuestionCard: View {
     let question: AgentQuestion
     let preset: AppThemePreset
     let isDark: Bool
+    let isSubmitting: Bool
+    let submissionFailed: Bool
     let onAnswer: (AgentQuestionAnswer) -> Void
     let onDismiss: () -> Void
 
@@ -49,6 +51,7 @@ struct AgentQuestionCard: View {
                         )
                 }
                 .buttonStyle(.plain)
+                .disabled(isSubmitting)
                 .help("Dismiss question")
                 .pointingHandCursor()
             }
@@ -113,6 +116,15 @@ struct AgentQuestionCard: View {
                 )
             }
 
+            if submissionFailed {
+                Text("OpenCode could not receive this response. Retry or skip.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+            } else if isSubmitting {
+                ProgressView("Sending response…")
+                    .font(.system(size: 11))
+            }
+
             // Action Footer
             HStack(spacing: 10) {
                 Button {
@@ -123,6 +135,7 @@ struct AgentQuestionCard: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
+                .disabled(isSubmitting)
                 .pointingHandCursor()
 
                 Spacer(minLength: 0)
@@ -155,7 +168,7 @@ struct AgentQuestionCard: View {
                     )
                 }
                 .buttonStyle(.plain)
-                .disabled(!canSubmit)
+                .disabled(!canSubmit || isSubmitting)
                 .pointingHandCursor()
             }
         }
@@ -174,8 +187,10 @@ struct AgentQuestionCard: View {
             x: 0,
             y: 5
         )
+        .frame(maxWidth: 820)
         .padding(.horizontal, 20)
-        .padding(.bottom, 8)
+        .padding(.bottom, 6)
+        .frame(maxWidth: .infinity, alignment: .center)
         .onAppear {
             if !question.isMultiSelect, let recommended = question.options.first(where: { $0.isRecommended }) {
                 selectedOptionIDs = [recommended.id]
@@ -188,7 +203,7 @@ struct AgentQuestionCard: View {
     }
 
     private func submitCurrentAnswer() {
-        guard canSubmit else { return }
+        guard canSubmit && !isSubmitting else { return }
 
         let answer = AgentQuestion.formatAnswer(
             options: question.options,
@@ -266,6 +281,7 @@ struct AgentQuestionCard: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(isSubmitting)
         .pointingHandCursor()
     }
 

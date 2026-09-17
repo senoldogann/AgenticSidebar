@@ -52,6 +52,10 @@ struct AgentSessionState: Equatable, Sendable {
     var todos: [AgentTodo] = []
     /// The currently active question waiting for user input, if any.
     var activeQuestion: AgentQuestion? = nil
+    /// A backend question stays visible until the server accepts the response.
+    var isQuestionSubmitting = false
+    /// The response failed; the existing card can be retried or rejected.
+    var questionSubmissionFailed = false
     /// History of questions asked and answered in this session.
     var questionHistory: [AgentQuestion] = []
 

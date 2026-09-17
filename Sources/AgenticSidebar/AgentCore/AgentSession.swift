@@ -20,6 +20,19 @@ final class AgentSession {
     @ObservationIgnored
     private var activeStream: ProviderStream?
 
+    /// Answers for a single OpenCode request must be sent together, in order.
+    /// Keep the user-facing questions pending until the server accepts the batch.
+    private struct PendingBackendQuestion {
+        let request: OpenCodeQuestionRequest
+        let turnID: UUID
+        var index = 0
+        var answers: [[String]] = []
+        var resolvedQuestions: [AgentQuestion] = []
+    }
+
+    @ObservationIgnored private var pendingBackendQuestion: PendingBackendQuestion?
+    @ObservationIgnored private var queuedBackendQuestions: [OpenCodeQuestionRequest] = []
+
     private(set) var activeTurnID: UUID?
 
     @ObservationIgnored
@@ -27,6 +40,9 @@ final class AgentSession {
 
     @ObservationIgnored
     private var activeAssistantMessageID: UUID?
+
+    @ObservationIgnored
+    private var currentTurnAnchorMessageID: UUID?
 
     /// Invalidates older asynchronous todo reads, including reads from previous turns.
     @ObservationIgnored
@@ -565,6 +581,10 @@ final class AgentSession {
         guard var question = state.activeQuestion else {
             return
         }
+        if pendingBackendQuestion != nil {
+            answerBackendQuestion(answer)
+            return
+        }
 
         question.status = .answered(answer)
         state.questionHistory.append(question)
@@ -588,10 +608,171 @@ final class AgentSession {
         guard var question = state.activeQuestion else {
             return
         }
+        if pendingBackendQuestion != nil {
+            rejectBackendQuestion()
+            return
+        }
 
         question.status = .dismissed
         state.questionHistory.append(question)
         state.activeQuestion = nil
+    }
+
+    /// The question tool supplies a server request ID, not a suggested next prompt.
+    private func receiveBackendQuestion(_ request: OpenCodeQuestionRequest, turnID: UUID) {
+        guard !request.questions.isEmpty else { return }
+        if pendingBackendQuestion != nil {
+            guard !queuedBackendQuestions.contains(where: { $0.requestID == request.requestID }) else { return }
+            queuedBackendQuestions.append(request)
+            return
+        }
+        pendingBackendQuestion = PendingBackendQuestion(request: request, turnID: turnID)
+        presentBackendQuestion(request.questions[0], toolCallID: request.toolCallID)
+    }
+
+    private func presentBackendQuestion(_ item: OpenCodeQuestionItem, toolCallID: String?) {
+        state.activeQuestion = AgentQuestion(
+            id: UUID(), toolCallID: toolCallID, prompt: item.prompt,
+            options: item.options, allowCustomAnswer: item.allowCustomAnswer,
+            isMultiSelect: item.isMultiSelect, createdAt: Date(), status: .pending
+        )
+        state.isQuestionSubmitting = false
+        state.questionSubmissionFailed = false
+        state.status = .waiting
+    }
+
+    private func answerBackendQuestion(_ answer: AgentQuestionAnswer) {
+        guard !state.isQuestionSubmitting,
+              var batch = pendingBackendQuestion,
+              let current = state.activeQuestion,
+              activeTurnID == batch.turnID
+        else { return }
+
+        if batch.answers.count < batch.request.questions.count {
+            let item = batch.request.questions[batch.index]
+            let validIDs = Set(item.options.map(\.id))
+            let selected = Set(answer.selectedOptionIDs)
+            guard selected.isSubset(of: validIDs),
+                  item.isMultiSelect || selected.count <= 1
+            else { return }
+
+            var values = item.options.filter { selected.contains($0.id) }.map(\.label)
+            if item.allowCustomAnswer,
+               let custom = answer.customText?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !custom.isEmpty {
+                values.append(custom)
+            }
+            guard !values.isEmpty else { return }
+
+            var answered = current
+            answered.status = .answered(answer)
+            batch.answers.append(values)
+            batch.resolvedQuestions.append(answered)
+
+            if batch.answers.count < batch.request.questions.count {
+                batch.index += 1
+                pendingBackendQuestion = batch
+                presentBackendQuestion(batch.request.questions[batch.index], toolCallID: batch.request.toolCallID)
+                return
+            }
+            pendingBackendQuestion = batch
+        }
+        submitBackendAnswers()
+    }
+
+    private func submitBackendAnswers() {
+        guard let batch = pendingBackendQuestion,
+              batch.answers.count == batch.request.questions.count,
+              let stream = activeStream,
+              !state.isQuestionSubmitting
+        else { return }
+
+        state.isQuestionSubmitting = true
+        state.questionSubmissionFailed = false
+        Task { @MainActor [weak self] in
+            do {
+                try await stream.replyQuestion(requestID: batch.request.requestID, answers: batch.answers)
+                guard let self,
+                      self.activeTurnID == batch.turnID,
+                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                else { return }
+                self.state.questionHistory.append(contentsOf: batch.resolvedQuestions)
+                self.pendingBackendQuestion = nil
+                self.state.activeQuestion = nil
+                self.state.isQuestionSubmitting = false
+                self.state.questionSubmissionFailed = false
+                self.state.status = .streaming
+                self.presentNextBackendQuestion(turnID: batch.turnID)
+            } catch {
+                guard let self,
+                      self.activeTurnID == batch.turnID,
+                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                else { return }
+                // A failed request is not an accepted answer. Keep earlier
+                // answers for a multi-question batch, but allow editing the
+                // final choice before retrying the same backend request.
+                if var pending = self.pendingBackendQuestion {
+                    pending.answers.removeLast()
+                    pending.resolvedQuestions.removeLast()
+                    self.pendingBackendQuestion = pending
+                }
+                self.state.isQuestionSubmitting = false
+                self.state.questionSubmissionFailed = true
+                AppLog.agentSession.error("OpenCode question reply could not be delivered")
+            }
+        }
+    }
+
+    private func rejectBackendQuestion() {
+        guard let batch = pendingBackendQuestion,
+              let stream = activeStream,
+              !state.isQuestionSubmitting
+        else { return }
+        state.isQuestionSubmitting = true
+        state.questionSubmissionFailed = false
+        Task { @MainActor [weak self] in
+            do {
+                try await stream.rejectQuestion(requestID: batch.request.requestID)
+                guard let self,
+                      self.activeTurnID == batch.turnID,
+                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                else { return }
+                if var active = self.state.activeQuestion {
+                    active.status = .dismissed
+                    self.state.questionHistory.append(active)
+                }
+                self.pendingBackendQuestion = nil
+                self.state.activeQuestion = nil
+                self.state.isQuestionSubmitting = false
+                self.state.questionSubmissionFailed = false
+                self.state.status = .streaming
+                self.presentNextBackendQuestion(turnID: batch.turnID)
+            } catch {
+                guard let self,
+                      self.activeTurnID == batch.turnID,
+                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                else { return }
+                self.state.isQuestionSubmitting = false
+                self.state.questionSubmissionFailed = true
+                AppLog.agentSession.error("OpenCode question rejection could not be delivered")
+            }
+        }
+    }
+
+    private func presentNextBackendQuestion(turnID: UUID) {
+        guard !queuedBackendQuestions.isEmpty, activeTurnID == turnID else { return }
+        let next = queuedBackendQuestions.removeFirst()
+        receiveBackendQuestion(next, turnID: turnID)
+    }
+
+    /// A cancelled/completed stream cannot accept a stale question reply.
+    private func clearBackendQuestions(turnID: UUID) {
+        guard pendingBackendQuestion?.turnID == turnID else { return }
+        pendingBackendQuestion = nil
+        queuedBackendQuestions.removeAll()
+        state.activeQuestion = nil
+        state.isQuestionSubmitting = false
+        state.questionSubmissionFailed = false
     }
 
     /// Kuyruk `state` dışında durur, o yüzden değişimi kalıcılığa elle bildirir.
@@ -646,6 +827,7 @@ final class AgentSession {
         state.todos = []
         discardPendingAssistantText()
         activeAssistantMessageID = nil
+        currentTurnAnchorMessageID = userMessage.id
 
         let turnID = UUID()
         state.activityGroups.append(
@@ -658,7 +840,8 @@ final class AgentSession {
                         kind: .thinking,
                         phase: .running
                     )
-                ]
+                ],
+                turnID: turnID
             )
         )
 
@@ -765,6 +948,11 @@ final class AgentSession {
                 }
 
                 switch event {
+                case let .questionAsked(question):
+                    flushPendingAssistantText(turnID: turnID)
+                    finishThinkingActivity(turnID: turnID)
+                    receiveBackendQuestion(question, turnID: turnID)
+
                 case let .assistantTextDelta(delta):
                     finishThinkingActivity(turnID: turnID)
                     enqueueAssistantText(delta, turnID: turnID)
@@ -772,6 +960,10 @@ final class AgentSession {
                 case let .activityStarted(activity):
                     flushPendingAssistantText(turnID: turnID)
                     finishThinkingActivity(turnID: turnID)
+                    if activeAssistantMessageID != nil {
+                        currentTurnAnchorMessageID = activeAssistantMessageID
+                        activeAssistantMessageID = nil
+                    }
                     startActivity(activity, turnID: turnID)
 
                     // A task-list tool is the moment the agent's plan changes, so
@@ -779,7 +971,9 @@ final class AgentSession {
                     // it is to see the work move, not to read it afterwards.
                     if activity.kind == .todo {
                         refreshTodos()
-                    } else if activity.kind == .question {
+                    } else if activity.kind == .question,
+                              request.configuration.providerID != ProviderID("opencode") {
+                        // OpenCode questions use question.asked, never a title-derived imitation.
                         let parsedQuestion = AgentQuestionParser.parseFromToolInput(
                             toolCallID: activity.id.rawValue,
                             input: [
@@ -881,6 +1075,7 @@ final class AgentSession {
         }
 
         if activeTurnID == turnID {
+            clearBackendQuestions(turnID: turnID)
             activeTask = nil
             activeStream = nil
             activeTurnID = nil
@@ -1040,6 +1235,7 @@ final class AgentSession {
         } else {
             let message = ChatMessage(role: .assistant, text: text)
             activeAssistantMessageID = message.id
+            currentTurnAnchorMessageID = message.id
             state.messages.append(message)
         }
         state.status = .streaming
@@ -1134,55 +1330,72 @@ final class AgentSession {
     }
 
     private func finishThinkingActivity(turnID: UUID) {
-        guard let groupIndex = activityGroupIndex(turnID: turnID) else {
-            return
+        for groupIndex in state.activityGroups.indices {
+            if let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
+                where: { $0.kind == .thinking && $0.phase == .running }
+            ) {
+                state.activityGroups[groupIndex].activities[activityIndex].phase = .completed
+                state.activityGroups[groupIndex].activities[activityIndex].completedAt = Date()
+            }
         }
-
-        guard let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
-            where: { $0.kind == .thinking && $0.phase == .running }
-        ) else {
-            return
-        }
-
-        state.activityGroups[groupIndex].activities[activityIndex].phase = .completed
-        state.activityGroups[groupIndex].activities[activityIndex].completedAt = Date()
     }
 
     private func startActivity(
         _ descriptor: ProviderActivityDescriptor,
         turnID: UUID
     ) {
-        guard let groupIndex = activityGroupIndex(turnID: turnID) else {
+        if let existingGroupIndex = state.activityGroups.indices.reversed().first(where: {
+            state.activityGroups[$0].activities.contains { $0.id == descriptor.id }
+        }) {
+            if let activityIndex = state.activityGroups[existingGroupIndex].activities.firstIndex(
+                where: { $0.id == descriptor.id }
+            ) {
+                state.activityGroups[existingGroupIndex].activities[activityIndex].phase = .running
+                if let output = descriptor.output {
+                    state.activityGroups[existingGroupIndex].activities[activityIndex].output =
+                        Self.boundedForMemory(output)
+                }
+                if let diff = descriptor.diff {
+                    state.activityGroups[existingGroupIndex].activities[activityIndex].diff =
+                        Self.boundedForMemory(diff)
+                }
+            }
+            state.status = .runningTool(
+                AgentActivityPresentation(kind: descriptor.kind).runningStatusName
+            )
+            noteActivityChange()
             return
         }
 
-        if let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
-            where: { $0.id == descriptor.id }
-        ) {
-            state.activityGroups[groupIndex].activities[activityIndex].phase = .running
-            if let output = descriptor.output {
-                state.activityGroups[groupIndex].activities[activityIndex].output =
-                    Self.boundedForMemory(output)
-            }
-            if let diff = descriptor.diff {
-                state.activityGroups[groupIndex].activities[activityIndex].diff =
-                    Self.boundedForMemory(diff)
-            }
+        let anchorID = currentTurnAnchorMessageID ?? state.messages.last?.id ?? UUID()
+        let targetGroupIndex: Int
+        if let lastGroupIndex = state.activityGroups.indices.last,
+           state.activityGroups[lastGroupIndex].anchorMessageID == anchorID {
+            targetGroupIndex = lastGroupIndex
         } else {
-            state.activityGroups[groupIndex].activities.append(
-                AgentActivity(
-                    id: descriptor.id,
-                    kind: descriptor.kind,
-                    phase: .running,
-                    title: descriptor.title,
-                    detail: descriptor.detail,
-                    output: descriptor.output.map(Self.boundedForMemory),
-                    diff: descriptor.diff.map(Self.boundedForMemory),
-                    startedAt: Date(),
-                    completedAt: nil
-                )
+            let newGroup = AgentTurnActivityGroup(
+                id: UUID(),
+                anchorMessageID: anchorID,
+                activities: [],
+                turnID: activeTurnID
             )
+            state.activityGroups.append(newGroup)
+            targetGroupIndex = state.activityGroups.indices.last!
         }
+
+        state.activityGroups[targetGroupIndex].activities.append(
+            AgentActivity(
+                id: descriptor.id,
+                kind: descriptor.kind,
+                phase: .running,
+                title: descriptor.title,
+                detail: descriptor.detail,
+                output: descriptor.output.map(Self.boundedForMemory),
+                diff: descriptor.diff.map(Self.boundedForMemory),
+                startedAt: Date(),
+                completedAt: nil
+            )
+        )
 
         state.status = .runningTool(
             AgentActivityPresentation(kind: descriptor.kind).runningStatusName
@@ -1216,6 +1429,10 @@ final class AgentSession {
     }
 
     private func flushPendingActivityUpdates(turnID: UUID) {
+        guard activeTurnID == turnID else {
+            return
+        }
+
         activityUpdateFlushTask?.cancel()
         activityUpdateFlushTask = nil
 
@@ -1223,11 +1440,11 @@ final class AgentSession {
             return
         }
 
-        let updates = pendingActivityUpdates
-        pendingActivityUpdates.removeAll(keepingCapacity: true)
+        let updates = pendingActivityUpdates.values
+        pendingActivityUpdates.removeAll(keepingCapacity: false)
 
         var didChange = false
-        for (_, item) in updates {
+        for item in updates {
             if applyActivityUpdate(item.descriptor, turnID: item.turnID) {
                 didChange = true
             }
@@ -1241,7 +1458,9 @@ final class AgentSession {
     @discardableResult
     private func applyActivityUpdate(_ descriptor: ProviderActivityDescriptor, turnID: UUID) -> Bool {
         guard
-            let groupIndex = activityGroupIndex(turnID: turnID),
+            let groupIndex = state.activityGroups.indices.reversed().first(where: {
+                state.activityGroups[$0].activities.contains { $0.id == descriptor.id }
+            }),
             let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
                 where: { $0.id == descriptor.id }
             )
@@ -1277,7 +1496,9 @@ final class AgentSession {
         turnID: UUID
     ) {
         guard
-            let groupIndex = activityGroupIndex(turnID: turnID),
+            let groupIndex = state.activityGroups.indices.reversed().first(where: {
+                state.activityGroups[$0].activities.contains { $0.id == activityID }
+            }),
             let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
                 where: { $0.id == activityID }
             )
@@ -1315,8 +1536,12 @@ final class AgentSession {
             return
         }
 
-        let stillRunning = activityGroupIndex(turnID: turnID).flatMap { groupIndex in
-            state.activityGroups[groupIndex].activities.last { $0.phase == .running }
+        var stillRunning: AgentActivity?
+        for group in state.activityGroups.reversed() {
+            if let running = group.activities.last(where: { $0.phase == .running }) {
+                stillRunning = running
+                break
+            }
         }
 
         guard let stillRunning else {
@@ -1333,19 +1558,16 @@ final class AgentSession {
         turnID: UUID,
         phase: AgentActivityPhase
     ) {
-        guard let groupIndex = activityGroupIndex(turnID: turnID) else {
-            return
-        }
-
-        let activities = state.activityGroups[groupIndex].activities
         let finishedAt = Date()
-        state.activityGroups[groupIndex].activities = activities.map { activity in
-            guard activity.phase == .running else {
-                return activity
+        for groupIndex in state.activityGroups.indices {
+            for activityIndex in state.activityGroups[groupIndex].activities.indices {
+                if state.activityGroups[groupIndex].activities[activityIndex].phase == .running {
+                    state.activityGroups[groupIndex].activities[activityIndex].phase = phase
+                    state.activityGroups[groupIndex].activities[activityIndex].completedAt = finishedAt
+                }
             }
-
-            return activity.finishing(with: phase, at: finishedAt)
         }
+        noteActivityChange()
     }
 
     private func normalizeConfigurationState() {
