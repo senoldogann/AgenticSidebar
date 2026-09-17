@@ -12,7 +12,9 @@ import Observation
 /// Otomatik cevaplar `.once`'tır, `.always` değil: OpenCode `always` cevabını
 /// sunucu oturumu boyunca hatırlar, dolayısıyla otomatik onayda onu kullanmak
 /// kullanıcı daha sıkı bir seviyeye döndüğünde sessizce onay vermeye devam
-/// ederdi. `.always` yalnızca kullanıcı tıkladığı için gönderilir.
+/// ederdi. Kullanıcının "Always allow" seçimi yalnızca uygulama içinde
+/// saklanır; OpenCode'a bu istek için `.once` gönderilir. Böylece "Revoke all"
+/// sunucuda geri alınamayacak bir izin bırakmaz.
 @MainActor
 @Observable
 final class PermissionApprovalCenter {
@@ -60,9 +62,9 @@ final class PermissionApprovalCenter {
 
     /// Kullanıcının "Always allow" dediği bir karar.
     ///
-    /// Sunucu tarafındaki `always` sunucu oturumuyla yaşar; bu liste uygulama
-    /// tarafındaki kopyasıdır, böylece arka uç yeniden başladığında da geçerlidir
-    /// ve kullanıcı geri alabilir.
+    /// OpenCode'a `.always` göndermek sunucuda geri alınamayan bir izin
+    /// bırakır. Bu liste izinlerin tek uygulama kaynağıdır; backend her istekte
+    /// yalnız `.once` alır, böylece liste temizlendiğinde izin gerçekten kalkar.
     ///
     /// Eşleşme **aynı araç + aynı desenler** üzerinedir. `alwaysPatterns`
     /// (OpenCode'un "her zaman" için kapsayacağı kalıp) saklanır ama eşleşmede
@@ -209,8 +211,12 @@ final class PermissionApprovalCenter {
             rememberGrant(for: request)
         }
 
+        // Never grant OpenCode a server-lifetime approval: there is no matching
+        // backend revoke operation. Preserve the user's `.always` intent in the
+        // app and audit, but send only a one-time approval over the wire.
+        let backendReply: OpenCodePermissionReply = reply == .always ? .once : reply
         for waiter in waiters {
-            waiter.resume(returning: reply)
+            waiter.resume(returning: backendReply)
         }
 
         if let request {

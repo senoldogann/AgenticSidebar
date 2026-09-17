@@ -85,7 +85,7 @@ final class PermissionApprovalCenterTests: XCTestCase {
 
         center.resolve(id: "per_2", reply: .always)
         let secondReply = await secondDecision.value
-        XCTAssertEqual(secondReply, .always)
+        XCTAssertEqual(secondReply, .once, "An always grant must not persist in OpenCode")
     }
 
     func testRejectAllForAConversationAlsoClearsItsSubagentsRequests() async {
@@ -214,6 +214,33 @@ final class PermissionApprovalCenterTests: XCTestCase {
         XCTAssertTrue(center.pending.isEmpty)
     }
 
+    func testAlwaysApprovalCanBeRevokedWithoutLeavingABackendGrant() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+
+        let first = Task { await center.submit(makeRequest(id: "first", sessionID: "same_server")) }
+        await waitUntil { center.pending.count == 1 }
+        center.resolve(id: "first", reply: .always)
+        let backendReply = await first.value
+        XCTAssertEqual(backendReply, .once, "OpenCode must never cache the app's grant")
+        XCTAssertEqual(center.grants.count, 1)
+
+        let coveredReply = await center.submit(
+            makeRequest(id: "covered", sessionID: "same_server")
+        )
+        XCTAssertEqual(coveredReply, .once)
+        center.revokeAllGrants()
+        let afterRevoke = Task {
+            await center.submit(makeRequest(id: "after_revoke", sessionID: "same_server"))
+        }
+        await waitUntil { center.pending.map(\.id) == ["after_revoke"] }
+        center.resolve(id: "after_revoke", reply: .reject)
+        let revokedReply = await afterRevoke.value
+        XCTAssertEqual(revokedReply, .reject)
+    }
+
     func testAGrantDoesNotCoverADifferentCommand() async {
         let center = PermissionApprovalCenter(
             automaticReplyProvider: { _, _ in nil },
@@ -324,7 +351,7 @@ final class PermissionApprovalCenterTests: XCTestCase {
         center.resolve(id: "per_fast", reply: .always)
 
         let reply = await decision.value
-        XCTAssertEqual(reply, .always)
+        XCTAssertEqual(reply, .once, "Backend receives one approval, app keeps the grant")
         XCTAssertTrue(center.pending.isEmpty)
     }
 
