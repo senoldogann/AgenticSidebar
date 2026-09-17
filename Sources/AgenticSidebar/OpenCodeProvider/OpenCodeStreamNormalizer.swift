@@ -32,11 +32,15 @@ struct OpenCodeStreamNormalizer: Sendable {
     /// Eşlemesi öğrenilmeden önce görülen çocuk adımları. Sahiplenilmezse tur
     /// sonunda düşer; başka bir sohbetin olayı olabilir.
     private var bufferedChildSteps: [String: [OpenCodeSubagentStep]] = [:]
+    /// Global SSE may expose foreign permissions before a child's ownership is
+    /// known. Never dispatch them until the parent task identifies the child.
+    private var bufferedChildPermissions: [String: [OpenCodePermissionRequest]] = [:]
 
     /// Tek bir alt ajan için tutulan en fazla adım; taşan en eskiden düşer.
     private static let maximumSubagentSteps = 64
     /// Eşlemesi bilinmeyen çocuk oturumlar için tampon sınırı.
     private static let maximumBufferedChildSessions = 8
+    private static let maximumBufferedPermissionsPerSession = 16
 
     init(sessionID: String) {
         self.sessionID = sessionID
@@ -103,12 +107,16 @@ struct OpenCodeStreamNormalizer: Sendable {
             }
             throw Self.error(fromSessionError: properties)
         case "permission.asked":
-            // İzin istekleri oturum filtresine takılmaz: alt ajanlar kendi çocuk
-            // oturumlarında koşar ve isteklerini yalnız bu akıştan duyurur; filtre
-            // onları yanıtsız bırakıp sonsuza dek askıda tutuyordu. Aynı istek
-            // birden çok koşuya ulaşırsa karar PermissionApprovalCenter'da paylaşılır.
             if let request = OpenCodePermissionRequest.make(from: properties) {
-                onPermissionRequest?(request.marked(ownedBy: sessionID))
+                if request.remoteSessionID == sessionID
+                    || subagentOwnerByChildSession[request.remoteSessionID] != nil
+                {
+                    onPermissionRequest?(request.marked(ownedBy: sessionID))
+                } else {
+                    // /event covers every conversation. Do not assign a foreign
+                    // permission to this turn merely because it was observed.
+                    bufferChildPermission(request)
+                }
             }
             return []
         default:
@@ -428,6 +436,25 @@ struct OpenCodeStreamNormalizer: Sendable {
         }
     }
 
+    /// Unknown sessions are held briefly and never replied to by this turn.
+    /// A verified parent task will flush its child's requests in arrival order.
+    private mutating func bufferChildPermission(_ request: OpenCodePermissionRequest) {
+        var pending = bufferedChildPermissions[request.remoteSessionID] ?? []
+        guard !pending.contains(where: { $0.id == request.id }) else {
+            return
+        }
+        pending.append(request)
+        if pending.count > Self.maximumBufferedPermissionsPerSession {
+            pending.removeFirst(pending.count - Self.maximumBufferedPermissionsPerSession)
+        }
+        bufferedChildPermissions[request.remoteSessionID] = pending
+        if bufferedChildPermissions.count > Self.maximumBufferedChildSessions,
+           let evicted = bufferedChildPermissions.keys.sorted().first
+        {
+            bufferedChildPermissions.removeValue(forKey: evicted)
+        }
+    }
+
     /// `task` parçasının metadata'sındaki çocuk oturum kimliği.
     private static func childSessionID(in state: [String: Any]) -> String? {
         guard
@@ -449,6 +476,11 @@ struct OpenCodeStreamNormalizer: Sendable {
         agent: String?
     ) -> [ProviderEvent] {
         subagentOwnerByChildSession[childSessionID] = activityID
+        if let requests = bufferedChildPermissions.removeValue(forKey: childSessionID) {
+            for request in requests {
+                onPermissionRequest?(request.marked(ownedBy: sessionID))
+            }
+        }
         if subagentTitles[activityID] == nil, let title, !title.isEmpty {
             subagentTitles[activityID] = title
         }
@@ -666,6 +698,7 @@ struct OpenCodeStreamNormalizer: Sendable {
         subagentSteps.removeAll()
         subagentStepIndexes.removeAll()
         bufferedChildSteps.removeAll()
+        bufferedChildPermissions.removeAll()
 
         return pendingText + [.completed]
     }

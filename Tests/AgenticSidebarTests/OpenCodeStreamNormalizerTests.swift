@@ -182,26 +182,12 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
             }
         )
 
-        // Başka bir oturumun isteği (ör. bir alt ajanın çocuk oturumu) artık
-        // düşürülmez: aksi hâlde o oturumun araç çağrısı yanıtsız kalır. Karar,
-        // isteği gören koşular arasında PermissionApprovalCenter'da paylaşılır.
+        // A global /event subscription also sees unrelated conversations.
         let otherSession = try normalizer.consume(
             line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_other","id":"per_other","permission":"chatgpt-system_computer_click"}}"#
         )
         XCTAssertEqual(otherSession, [])
-        XCTAssertEqual(
-            box.value,
-            OpenCodePermissionRequest(
-                id: "per_other",
-                remoteSessionID: "ses_other",
-                toolName: "chatgpt-system_computer_click",
-                patterns: [],
-                alwaysPatterns: [],
-                detail: nil,
-                // İstek bu koşunun oturumuna ait değil: onu soran bir alt ajan.
-                isDelegatedSession: true
-            )
-        )
+        XCTAssertNil(box.value, "Foreign session requests have no verified owner")
 
         let events = try normalizer.consume(
             line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_12345","permission":"chatgpt-system_computer_click","patterns":["*"],"always":["chatgpt-system_computer_click*"],"metadata":{"description":"Click the Run button"}}}"#
@@ -241,12 +227,46 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         XCTAssertEqual(box.value?.isDelegatedSession, false)
 
+        // The parent task's backend metadata is the evidence of ownership.
+        _ = try normalizer.consume(
+            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","type":"tool","tool":"task","state":{"status":"running","input":{},"metadata":{"sessionId":"ses_child"}}}}}"#
+        )
         _ = try normalizer.consume(
             line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_child","id":"per_child","permission":"external_directory","patterns":["/tmp/*"],"always":[]}}"#
         )
 
         XCTAssertEqual(box.value?.isDelegatedSession, true)
         XCTAssertEqual(box.value?.remoteSessionID, "ses_child")
+    }
+
+    func testForeignPermissionWaitsForVerifiedSubagentOwnership() throws {
+        final class RequestBox: @unchecked Sendable {
+            var requests: [OpenCodePermissionRequest] = []
+        }
+        let box = RequestBox()
+        var normalizer = OpenCodeStreamNormalizer(
+            sessionID: "ses_target",
+            onPermissionRequest: { box.requests.append($0) }
+        )
+
+        // /event is global. Never attribute a foreign conversation's request.
+        _ = try normalizer.consume(
+            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_foreign","id":"per_foreign","permission":"bash","patterns":["rm -rf *"]}}"#
+        )
+        XCTAssertTrue(box.requests.isEmpty)
+
+        // A delegated child can ask before the task publishes its identity.
+        _ = try normalizer.consume(
+            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_child","id":"per_child","permission":"bash","patterns":["swift test"]}}"#
+        )
+        XCTAssertTrue(box.requests.isEmpty)
+
+        _ = try normalizer.consume(
+            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","type":"tool","tool":"task","state":{"status":"running","input":{"subagent_type":"explore"},"metadata":{"sessionId":"ses_child"}}}}}"#
+        )
+        XCTAssertEqual(box.requests.map(\.id), ["per_child"])
+        XCTAssertEqual(box.requests.first?.remoteSessionID, "ses_child")
+        XCTAssertEqual(box.requests.first?.isDelegatedSession, true)
     }
 
     func testPermissionAskedWithoutPermissionNameIsIgnored() throws {
