@@ -513,7 +513,7 @@ struct ComposerView: View {
                 AgentModeGlyph(
                     mode: mode,
                     size: 11,
-                    tint: mode == .plan
+                    tint: mode != .build
                         ? (currentTheme.accentGradient.first ?? .secondary)
                         : .secondary
                 )
@@ -538,8 +538,6 @@ struct ComposerView: View {
                 ) {
                     settingsStore.agentMode = candidate
                 } icon: {
-                    // Pill'deki çizilmiş işaretin kendisi: menüde sistem
-                    // sembolüne düşüyordu ve Plan satırı ikonsuz kalıyordu.
                     AgentModeGlyph(
                         mode: candidate,
                         size: 11,
@@ -593,9 +591,17 @@ struct ComposerView: View {
         if sessionService.state.activeQuestion != nil {
             return "Agent is waiting for your choice above — or write a reply here"
         }
-        return sessionService.isBusy
-            ? "Add a follow-up — it is queued and sent when this turn finishes"
-            : "Message or request changes — @ for MCP and plugins, / for skills"
+        if sessionService.isBusy {
+            return "Add a follow-up — it is queued and sent when this turn finishes"
+        }
+        switch settingsStore.agentMode {
+        case .build:
+            return "Message or request changes — @ for MCP and plugins, / for skills"
+        case .plan:
+            return "Ask to plan a feature, architectural change, or refactoring…"
+        case .review:
+            return "Ask to review changes, branch, or target project using Alibaba OCR…"
+        }
     }
 
     private var pillDivider: some View {

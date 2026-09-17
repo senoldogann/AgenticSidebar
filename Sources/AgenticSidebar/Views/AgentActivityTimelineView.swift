@@ -6,6 +6,7 @@ struct AgentActivityTimelineView: View {
     let group: AgentTurnActivityGroup
     let isTurnActive: Bool
     let isSessionBusy: Bool
+    let hasPendingApproval: Bool
     /// Bitmiş bir alt ajanın raporunu sağ panelde açmak için; verilmezse düğme
     /// çizilmez.
     let onOpenReport: ((AgentActivity) -> Void)?
@@ -20,27 +21,46 @@ struct AgentActivityTimelineView: View {
         group: AgentTurnActivityGroup,
         isTurnActive: Bool,
         isSessionBusy: Bool,
+        hasPendingApproval: Bool = false,
         onOpenReport: ((AgentActivity) -> Void)?,
         onOpenReview: ((TurnFileChangesSummary, FileChangeItem?) -> Void)?
     ) {
         self.group = group
         self.isTurnActive = isTurnActive
         self.isSessionBusy = isSessionBusy
+        self.hasPendingApproval = hasPendingApproval
         self.onOpenReport = onOpenReport
         self.onOpenReview = onOpenReview
     }
 
     private var isTurnRunning: Bool {
-        isSessionBusy || isTurnActive || group.activities.contains { $0.phase == .running }
+        isTurnActive || group.activities.contains { $0.phase == .running }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let thinking = group.activities.first(where: { $0.kind == .thinking }) {
-                let children = group.activities.filter { $0.id != thinking.id }
-                thinkingParentRow(thinking: thinking, children: children)
+        VStack(alignment: .leading, spacing: 4) {
+            let nonThinkingActivities = group.activities.filter { $0.kind != .thinking }
+            let thinking = group.activities.first(where: { $0.kind == .thinking })
+
+            if let thinking {
+                activityRow(thinking, isNested: false)
+            }
+
+            if nonThinkingActivities.count > 1 {
+                let isExpanded = isGroupSummaryExpanded(group.id)
+                summaryButton(for: nonThinkingActivities, isExpanded: isExpanded)
+
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(nonThinkingActivities) { activity in
+                            activityRow(activity, isNested: true)
+                        }
+                    }
+                    .padding(.leading, 8)
+                    .transition(.opacity)
+                }
             } else {
-                ForEach(group.activities) { activity in
+                ForEach(nonThinkingActivities) { activity in
                     activityRow(activity, isNested: false)
                 }
             }
@@ -64,28 +84,120 @@ struct AgentActivityTimelineView: View {
                 )
                 .padding(.top, 2)
             }
-
-            if isTurnRunning {
-                HStack(spacing: 6) {
-                    Text(workingText)
-                        .font(.system(size: 13, weight: .regular))
-                        .foregroundStyle(.secondary)
-                        .sunshineShimmer(isActive: true)
-
-                    Spacer()
-                }
-                .padding(.leading, 4)
-                .padding(.top, 2)
-                .task {
-                    while !Task.isCancelled && isTurnRunning {
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        workingDotCount = (workingDotCount % 3) + 1
-                    }
-                }
-            }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.spring(response: 0.3, dampingFraction: 0.82), value: isTurnRunning)
+    }
+
+    private func isGroupSummaryExpanded(_ groupID: UUID) -> Bool {
+        let key = "grp:\(groupID.uuidString)"
+        if explicitlyCollapsedIDs.contains(key) {
+            return false
+        }
+        if explicitlyExpandedIDs.contains(key) {
+            return true
+        }
+        return isTurnRunning
+    }
+
+    private func toggleGroupSummaryExpanded(_ groupID: UUID) {
+        let key = "grp:\(groupID.uuidString)"
+        if isGroupSummaryExpanded(groupID) {
+            explicitlyExpandedIDs.remove(key)
+            explicitlyCollapsedIDs.insert(key)
+        } else {
+            explicitlyCollapsedIDs.remove(key)
+            explicitlyExpandedIDs.insert(key)
+        }
+    }
+
+    private func summaryTitle(for activities: [AgentActivity]) -> String {
+        let commands = activities.filter { $0.kind == .command }.count
+        let updates = activities.filter { $0.kind != .command }.count
+
+        if commands > 0 && updates > 0 {
+            let cmdWord = commands == 1 ? "command" : "commands"
+            let updWord = updates == 1 ? "update" : "updates"
+            if commands >= updates {
+                return "Ran \(commands) \(cmdWord) and received \(updates) \(updWord)"
+            } else {
+                return "Received \(updates) \(updWord) and ran \(commands) \(cmdWord)"
+            }
+        } else if commands > 1 {
+            return "Ran \(commands) commands"
+        } else if commands == 1 {
+            return "Ran 1 command"
+        } else if updates > 1 {
+            return "Received \(updates) updates"
+        } else if updates == 1 {
+            return "Received 1 update"
+        } else {
+            return "Ran \(activities.count) actions"
+        }
+    }
+
+    @ViewBuilder
+    private func summaryIcon(for activities: [AgentActivity]) -> some View {
+        let commands = activities.filter { $0.kind == .command }.count
+        let updates = activities.filter { $0.kind != .command }.count
+
+        if commands > 0 && updates == 0 {
+            terminalPromptIcon
+        } else {
+            Image(systemName: "hammer")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+        }
+    }
+
+    private var terminalPromptIcon: some View {
+        HStack(spacing: 0.5) {
+            Text(">")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+            Text("_")
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+        }
+        .foregroundStyle(.secondary)
+        .frame(width: 16, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func summaryButton(for activities: [AgentActivity], isExpanded: Bool) -> some View {
+        let isRunning = activities.contains { $0.phase == .running }
+
+        Button {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                toggleGroupSummaryExpanded(group.id)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                summaryIcon(for: activities)
+
+                Text(summaryTitle(for: activities))
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .sunshineShimmer(isActive: isRunning)
+
+                Spacer(minLength: 8)
+
+                if isRunning {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(minWidth: 12, minHeight: 12)
+                }
+
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary.opacity(0.8))
+            }
+            .padding(.vertical, 3)
+            .padding(.horizontal, 4)
+            .contentShape(Rectangle())
+            .interactiveHoverPill(cornerRadius: 6)
+        }
+        .buttonStyle(.plain)
     }
 
     private func isActivityExpanded(_ activity: AgentActivity) -> Bool {
@@ -249,10 +361,7 @@ struct AgentActivityTimelineView: View {
     private func activityIcon(for activity: AgentActivity) -> some View {
         switch activity.kind {
         case .command:
-            Image(systemName: "terminal")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: 16)
+            terminalPromptIcon
         case .read:
             Image(systemName: "doc.text.magnifyingglass")
                 .font(.system(size: 11, weight: .medium))
@@ -294,7 +403,7 @@ struct AgentActivityTimelineView: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 16)
         case .tool:
-            Image(systemName: "wrench.and.screwdriver")
+            Image(systemName: "hammer")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 16)
@@ -308,7 +417,15 @@ struct AgentActivityTimelineView: View {
 
     @ViewBuilder
     private func rowLabel(for activity: AgentActivity) -> some View {
-        if activity.kind == .thinking {
+        if activity.kind == .command {
+            let cmd = activity.detail ?? activity.title ?? "command"
+            Text(cmd)
+                .font(.system(size: 12.5, weight: .regular, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .sunshineShimmer(isActive: activity.phase == .running)
+        } else if activity.kind == .thinking {
             thinkingRowLabel(thinking: activity)
         } else if let title = activity.title, !title.isEmpty {
             parseTitleText(title)
@@ -531,19 +648,34 @@ struct AgentActivityTimelineView: View {
                 Spacer(minLength: 4)
 
                 if activity.phase == .running {
-                    HStack(spacing: 5) {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .frame(minWidth: 10, minHeight: 10)
-                        Text("Live")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.blue)
+                    if hasPendingApproval {
+                        HStack(spacing: 4) {
+                            Image(systemName: "lock.shield")
+                                .font(.system(size: 9, weight: .bold))
+                            Text("Awaiting approval")
+                                .font(.system(size: 10, weight: .semibold))
+                        }
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(Color.orange.opacity(0.15))
+                        )
+                    } else {
+                        HStack(spacing: 5) {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .frame(minWidth: 10, minHeight: 10)
+                            Text("Live")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(.blue)
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(Color.blue.opacity(0.12))
+                        )
                     }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule().fill(Color.blue.opacity(0.12))
-                    )
                 } else if activity.phase == .completed {
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark")

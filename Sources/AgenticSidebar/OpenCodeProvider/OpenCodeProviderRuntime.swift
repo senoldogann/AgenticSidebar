@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 actor OpenCodeProviderRuntime: ProviderRuntime {
     nonisolated let id = ProviderID("opencode")
@@ -200,41 +201,71 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         let permissionHandler = self.permissionHandler
         let appSessionID = request.sessionID
         let auditLog = self.auditLog
+        let handledPermissionIDs = Mutex<Set<String>>(Set())
+
+        let handlePermissionRequest: @Sendable (OpenCodePermissionRequest) -> Void = { request in
+            let isNew = handledPermissionIDs.withLock { ids -> Bool in
+                if ids.contains(request.id) {
+                    return false
+                }
+                ids.insert(request.id)
+                return true
+            }
+            guard isNew else { return }
+
+            Task {
+                let reply: OpenCodePermissionReply
+                if let permissionHandler {
+                    var attributedRequest = request
+                    attributedRequest.appSessionID = appSessionID
+                    reply = await permissionHandler(attributedRequest)
+                } else {
+                    // Fail closed. A missing decision surface is not consent,
+                    // and `.always` is not "just this once": OpenCode keeps
+                    // it for the rest of the server session. A runtime
+                    // constructed without a handler is a wiring mistake, and
+                    // it must not read as blanket approval.
+                    reply = .reject
+                }
+                do {
+                    try await client.replyPermission(
+                        requestID: request.id,
+                        reply: reply.rawValue
+                    )
+                } catch {
+                    AppLog.openCode.error(
+                        "Could not deliver the permission reply for \(request.toolName, privacy: .public)"
+                    )
+                }
+            }
+        }
+
+        let reconciliationTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                guard !Task.isCancelled else { break }
+                guard let pending = try? await client.pendingPermissions() else { continue }
+                for req in pending {
+                    handlePermissionRequest(req)
+                }
+            }
+        }
+
         let forwardingTask = Task {
             var auditActivities: [ProviderActivityID: ProviderActivityDescriptor] = [:]
             var normalizer = OpenCodeStreamNormalizer(
                 sessionID: activeSessionID,
                 onPermissionRequest: { request in
-                    Task {
-                        let reply: OpenCodePermissionReply
-                        if let permissionHandler {
-                            var attributedRequest = request
-                            attributedRequest.appSessionID = appSessionID
-                            reply = await permissionHandler(attributedRequest)
-                        } else {
-                            // Fail closed. A missing decision surface is not consent,
-                            // and `.always` is not "just this once": OpenCode keeps
-                            // it for the rest of the server session. A runtime
-                            // constructed without a handler is a wiring mistake, and
-                            // it must not read as blanket approval.
-                            reply = .reject
-                        }
-                        do {
-                            try await client.replyPermission(
-                                requestID: request.id,
-                                reply: reply.rawValue
-                            )
-                        } catch {
-                            AppLog.openCode.error(
-                                "Could not deliver the permission reply for \(request.toolName, privacy: .public)"
-                            )
-                        }
-                    }
+                    handlePermissionRequest(request)
                 }
             )
+            var questionRouter = OpenCodeQuestionEventRouter(sessionID: activeSessionID)
             do {
                 streamLoop: for try await line in lineStream.lines {
                     try Task.checkCancellation()
+                    for question in questionRouter.consume(line: line) {
+                        try await channel.send(.questionAsked(question))
+                    }
                     for event in try normalizer.consume(line: line) {
                         // The provider emits execution even for tools pre-allowed by
                         // configuration. Permission decisions alone cannot audit them.
@@ -269,14 +300,18 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                         }
                     }
                 }
+                reconciliationTask.cancel()
                 await lineStream.cancel()
                 await channel.finish()
             } catch is CancellationError {
+                reconciliationTask.cancel()
                 await channel.finish(throwing: CancellationError())
             } catch let error as ProviderRuntimeError {
+                reconciliationTask.cancel()
                 await lineStream.cancel()
                 await channel.finish(throwing: error)
             } catch {
+                reconciliationTask.cancel()
                 await lineStream.cancel()
                 await channel.finish(throwing: ProviderRuntimeError.transport)
             }
@@ -286,10 +321,17 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             events: channel.makeStream(),
             cancellation: {
                 forwardingTask.cancel()
+                reconciliationTask.cancel()
                 await self.cancelPendingPermissions?(activeSessionID, appSessionID)
                 try? await client.abort(sessionID: activeSessionID)
                 await lineStream.cancel()
                 await channel.finish(throwing: CancellationError())
+            },
+            questionReply: { requestID, answers in
+                try await client.replyQuestion(requestID: requestID, answers: answers)
+            },
+            questionRejection: { requestID in
+                try await client.rejectQuestion(requestID: requestID)
             }
         )
     }

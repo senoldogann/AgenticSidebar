@@ -113,6 +113,40 @@ extension SettingsView {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                if let override = GlobalOpenCodeConfigReader.live().globalPermissionOverrides(),
+                   !override.rules.isEmpty {
+                    let conflictingRules = override.rules.map { "\($0.key): \($0.value)" }.sorted().joined(separator: ", ")
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.system(size: 14))
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("External OpenCode configuration overrides approvals")
+                                .font(.system(size: 11.5, weight: .semibold))
+                                .foregroundStyle(.primary)
+
+                            Text(
+                                "Your external configuration at \(override.sourceURL.path) defines `\(conflictingRules)`. OpenCode applies these rules with higher priority, which may allow tools (e.g. bash) without prompting regardless of the policy selected above."
+                            )
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        Spacer(minLength: 8)
+
+                        secondaryActionButton(
+                            title: "Reveal",
+                            icon: "folder"
+                        ) {
+                            NSWorkspace.shared.activateFileViewerSelecting([override.sourceURL])
+                        }
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+
                 // The grant is a file the user can read, so it is named here
                 // rather than left to be inferred from behaviour. What the file
                 // does *not* contain is the level — that is the point.

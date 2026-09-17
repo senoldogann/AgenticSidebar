@@ -21,15 +21,47 @@ struct GlobalOpenCodeConfigReader: Sendable {
     }
 
     static func live() -> GlobalOpenCodeConfigReader {
-        let configDirectory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/opencode", isDirectory: true)
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let configDirectory = home.appendingPathComponent(".config/opencode", isDirectory: true)
+        let altConfigDirectory = home.appendingPathComponent(".opencode", isDirectory: true)
 
         return GlobalOpenCodeConfigReader(
             configURLs: [
                 configDirectory.appendingPathComponent("opencode.json"),
-                configDirectory.appendingPathComponent("opencode.jsonc")
+                configDirectory.appendingPathComponent("opencode.jsonc"),
+                altConfigDirectory.appendingPathComponent("opencode.json"),
+                altConfigDirectory.appendingPathComponent("opencode.jsonc")
             ]
         )
+    }
+
+    /// Permission rules declared in the user's global configuration files,
+    /// along with the file URL they were read from.
+    func globalPermissionOverrides() -> (rules: [String: String], sourceURL: URL)? {
+        for url in configURLs {
+            guard
+                fileManager.fileExists(atPath: url.path),
+                let raw = try? String(contentsOf: url, encoding: .utf8),
+                let object = Self.decodeObject(raw),
+                let permissions = object["permission"] as? [String: Any]
+            else {
+                continue
+            }
+
+            var rules: [String: String] = [:]
+            for (key, value) in permissions {
+                if let str = value as? String {
+                    rules[key] = str
+                } else if let boolVal = value as? Bool {
+                    rules[key] = boolVal ? "allow" : "deny"
+                }
+            }
+
+            if !rules.isEmpty {
+                return (rules: rules, sourceURL: url)
+            }
+        }
+        return nil
     }
 
     /// The `mcp` map of the user's configuration, keyed by server name.

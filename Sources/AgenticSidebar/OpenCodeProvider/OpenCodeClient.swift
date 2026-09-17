@@ -81,6 +81,9 @@ protocol OpenCodeClientProtocol: Sendable {
     func abort(sessionID: String) async throws
     func eventStream() async throws -> OpenCodeLineStream
     func replyPermission(requestID: String, reply: String) async throws
+    func pendingPermissions() async throws -> [OpenCodePermissionRequest]
+    func replyQuestion(requestID: String, answers: [[String]]) async throws
+    func rejectQuestion(requestID: String) async throws
     /// The tasks the agent is tracking for a session, as the backend keeps them.
     func sessionTodos(sessionID: String) async throws -> [AgentTodo]
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus]
@@ -110,6 +113,18 @@ extension OpenCodeClientProtocol {
             throw ProviderRuntimeError.unavailable
         }
         try await sendPromptAsync(sessionID: sessionID, model: model, variant: variant, parts: parts)
+    }
+
+    func replyQuestion(requestID: String, answers: [[String]]) async throws {
+        throw ProviderRuntimeError.unavailable
+    }
+
+    func rejectQuestion(requestID: String) async throws {
+        throw ProviderRuntimeError.unavailable
+    }
+
+    func pendingPermissions() async throws -> [OpenCodePermissionRequest] {
+        []
     }
 
     // Fakes in tests only ever answer the calls their test exercises; a server
@@ -273,6 +288,37 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             pathComponents: ["permission", requestID, "reply"],
             method: "POST",
             body: PermissionReplyBody(reply: reply)
+        )
+        _ = try await send(request)
+    }
+
+    func pendingPermissions() async throws -> [OpenCodePermissionRequest] {
+        let request = makeRequest(
+            pathComponents: ["permission"],
+            method: "GET"
+        )
+        let response = try await send(request)
+        guard
+            let json = try? JSONSerialization.jsonObject(with: response.data) as? [[String: Any]]
+        else {
+            return []
+        }
+        return json.compactMap { OpenCodePermissionRequest.make(from: $0) }
+    }
+
+    func replyQuestion(requestID: String, answers: [[String]]) async throws {
+        let request = try makeJSONRequest(
+            pathComponents: ["question", requestID, "reply"],
+            method: "POST",
+            body: QuestionReplyBody(answers: answers)
+        )
+        _ = try await send(request)
+    }
+
+    func rejectQuestion(requestID: String) async throws {
+        let request = makeRequest(
+            pathComponents: ["question", requestID, "reject"],
+            method: "POST"
         )
         _ = try await send(request)
     }
@@ -479,6 +525,10 @@ struct OpenCodeClient: OpenCodeClientProtocol {
 
     private struct PermissionReplyBody: Encodable {
         let reply: String
+    }
+
+    private struct QuestionReplyBody: Encodable {
+        let answers: [[String]]
     }
 
     private struct AddMCPServerBody: Encodable {

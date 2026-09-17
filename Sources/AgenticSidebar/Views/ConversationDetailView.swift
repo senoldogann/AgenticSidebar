@@ -46,170 +46,10 @@ struct ConversationDetailView: View {
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
                     if sessionService.state.messages.isEmpty {
-                    VStack(spacing: 16) {
-                        Image(systemName: emptyStateSymbol)
-                            .font(.system(size: 42, weight: .light))
-                            .foregroundStyle(
-                                LinearGradient(
-                                    colors: preset.accentGradient,
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-
-                        VStack(spacing: 6) {
-                            Text(emptyStateTitle)
-                                .font(.title3.weight(.semibold))
-                                .foregroundStyle(.primary)
-
-                            Text(emptyStateDescription)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .multilineTextAlignment(.center)
-                        }
+                        emptyStateView(preset: preset)
+                    } else {
+                        transcriptScrollView(preset: preset, isDark: isDark)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(24)
-                } else {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(spacing: 14) {
-                                ForEach(sessionService.state.messages) { message in
-                                    transcriptRow(
-                                        for: message,
-                                        preset: preset,
-                                        isDark: isDark
-                                    )
-                                }
-
-                                Color.clear
-                                    .frame(height: 1)
-                                    .frame(maxWidth: .infinity)
-                                    .id("bottom_anchor")
-                            }
-                            .padding(.leading, transcriptLeadingInset)
-                            .padding(.trailing, 20)
-                            .padding(.vertical, 16)
-                            .frame(maxWidth: contentMaxWidth)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                        }
-                        .id(sessionService.activeSessionID)
-                        .coordinateSpace(.named(Self.transcriptSpace))
-                        // Sohbet her zaman sonda açılır; konum sabiti ilk
-                        // yerleşimi sondan başlatır, böylece LazyVStack
-                        // yalnızca görünen satırları kurar. Oturum
-                        // değişiminde `scrollTo` ile sona atlamak bütün
-                        // transkripti ilk kareden önce dizer ve mesajlar
-                        // geç belirir.
-                        .defaultScrollAnchor(.bottom)
-                        // Ölçüm adımlara yuvarlanır: hızlı kaydırmada konum bir
-                        // karede birkaç kez değişir ve SwiftUI bu modifiye ediciyi
-                        // "tried to update multiple times per frame" diye işaretler.
-                        // Karar, 8 pt'lik "yukarı hareket" adımına ve 40 pt'lik
-                        // dipte olma sınırına baktığı için 4 pt'lik ölçüm adımı
-                        // duyarlılık kaybı değil, gürültü temizliğidir.
-                        .onScrollGeometryChange(for: ChatScrollSnapshot.self) { geometry in
-                            ChatScrollSnapshot(
-                                offsetY: (geometry.contentOffset.y / 4).rounded() * 4,
-                                contentHeight: (geometry.contentSize.height / 4).rounded() * 4,
-                                containerHeight: geometry.containerSize.height
-                            )
-                        } action: { _, newValue in
-                            // Yalnız kaydedilir; yayın ekran döngüsünün dışında.
-                            followState.record(snapshot: newValue)
-                        }
-                        .onScrollPhaseChange { _, phase in
-                            followState.setScrolling(phase != .idle && phase != .animating)
-                        }
-                        .onChange(of: sessionService.state.messages.count) { _, _ in
-                            let lastMessage = sessionService.state.messages.last
-                            if lastMessage?.role == .user {
-                                isUserScrolledUp = false
-                                followState.resumeFollow()
-                            }
-
-                            // Boş listede kaydırılacak satır yoktur.
-                            guard sessionService.state.messages.last != nil else {
-                                return
-                            }
-
-                            // Tek uçuş: 40 ms'lik yerleşme beklemesi LazyVStack'in
-                            // yeni satırı dizmesine yeter; bekleme bitmeden gelen
-                            // yeni bir ekleme eski görevi iptal eder, yoksa bayat
-                            // bir `scrollTo` güncel yerleşimi ezer ve ekran boş kalır.
-                            // Yerleşmemiş bir satır kimliğine kaydırmaktan
-                            // bilerek kaçınılır — hedef yalnız `bottom_anchor`.
-                            messageCountScrollTask?.cancel()
-                            messageCountScrollTask = Task { @MainActor in
-                                try? await Task.sleep(for: .milliseconds(40))
-                                guard !Task.isCancelled else {
-                                    return
-                                }
-                                proxy.scrollTo("bottom_anchor", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: sessionService.state.messages.last?.text) { _, _ in
-                            // Kullanıcı jesti sürerken takip modu kaydırmayla
-                            // kavga etmez: içerik, kullanıcı bırakana kadar sabit kalır.
-                            guard sessionService.isBusy, followState.shouldAutoFollow(now: Date()) else {
-                                return
-                            }
-
-                            proxy.scrollTo("bottom_anchor", anchor: .bottom)
-                        }
-                        .onChange(of: sessionService.state.activityGroups.last?.activities.count) { _, _ in
-                            guard sessionService.isBusy, followState.shouldAutoFollow(now: Date()) else {
-                                return
-                            }
-
-                            proxy.scrollTo("bottom_anchor", anchor: .bottom)
-                        }
-                        .onChange(of: sessionService.isBusy) { oldValue, newValue in
-                            if oldValue && !newValue && !isUserScrolledUp && !followState.isUserScrolling {
-                                proxy.scrollTo("bottom_anchor", anchor: .bottom)
-                            }
-                        }
-                        .onChange(of: sessionService.activeSessionID) { _, _ in
-                            isUserScrolledUp = false
-                            offsetTracker.clear()
-                            followState.reset()
-                            activePromptID = nil
-                            Task { @MainActor in
-                                proxy.scrollTo("bottom_anchor", anchor: .bottom)
-                            }
-                        }
-                        .overlay(alignment: .leading) {
-                            if promptItems.count > 1 {
-                                GeometryReader { geometry in
-                                    PromptNavigatorRail(
-                                        items: promptItems,
-                                        activeID: activePromptID,
-                                        onSelect: { promptID in
-                                            withAnimation(.easeInOut(duration: 0.28)) {
-                                                proxy.scrollTo(promptID, anchor: .top)
-                                            }
-                                        }
-                                    )
-                                    .padding(
-                                        .leading,
-                                        railLeadingInset(paneWidth: geometry.size.width)
-                                    )
-                                }
-                                .transition(.opacity)
-                            }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if isUserScrolledUp {
-                                scrollToBottomButton(
-                                    proxy: proxy,
-                                    preset: preset,
-                                    isDark: isDark
-                                )
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
 
                 if let error = sessionService.state.error,
                    !sessionService.state.messages.isEmpty {
@@ -234,6 +74,8 @@ struct ConversationDetailView: View {
                         question: question,
                         preset: preset,
                         isDark: isDark,
+                        isSubmitting: sessionService.state.isQuestionSubmitting,
+                        submissionFailed: sessionService.state.questionSubmissionFailed,
                         onAnswer: { answer in
                             sessionService.answerActiveQuestion(answer)
                         },
@@ -241,6 +83,7 @@ struct ConversationDetailView: View {
                             sessionService.dismissActiveQuestion()
                         }
                     )
+                    .id(question.id)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 } else if let request = permissionApprovalCenter.pending.first(where: {
                     $0.appSessionID == sessionService.activeSessionID
@@ -340,7 +183,7 @@ struct ConversationDetailView: View {
     private func isPlanAwaitingApproval(for message: ChatMessage) -> Bool {
         guard
             message.role == .assistant,
-            settingsStore.agentMode == .plan,
+            settingsStore.agentMode == .plan || settingsStore.agentMode == .review,
             !sessionService.isBusy,
             message.id == sessionService.state.messages.last?.id
         else {
@@ -394,39 +237,56 @@ struct ConversationDetailView: View {
         preset: AppThemePreset,
         isDark: Bool
     ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            ChatMessageRow(
-                message: message,
-                preset: preset,
-                isDark: isDark,
-                contrast: settingsStore.contrast,
-                isPlanAwaitingApproval: isPlanAwaitingApproval(for: message),
-                canResend: !sessionService.isBusy,
-                isActiveAssistant: message.role == .assistant
-                    && sessionService.isBusy
-                    && message.id == sessionService.state.messages.last?.id,
-                onApprovePlan: approvePlan,
-                onRestore: { writeAgain(message) },
-                onInspectFile: { url in
-                    openFileInInspector(url: url)
-                }
-            )
-            .modifier(
-                PromptOffsetProbe(
-                    messageID: message.id,
-                    isUserMessage: message.role == .user,
-                    space: Self.transcriptSpace,
-                    onOffset: { messageID, offset in
-                        reportPromptOffset(offset, for: messageID)
+        let isVisibleUser = message.role == .user
+        let isVisibleAssistant = message.role == .assistant && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasTurnHeader = message.role == .user && shouldShowTurnHeader(for: message)
+        let activityGroup = activityGroup(after: message.id)
+
+        VStack(alignment: .leading, spacing: 4) {
+            if isVisibleUser || isVisibleAssistant {
+                ChatMessageRow(
+                    message: message,
+                    preset: preset,
+                    isDark: isDark,
+                    contrast: settingsStore.contrast,
+                    isPlanAwaitingApproval: isPlanAwaitingApproval(for: message),
+                    canResend: !sessionService.isBusy,
+                    isActiveAssistant: message.role == .assistant
+                        && sessionService.isBusy
+                        && message.id == sessionService.state.messages.last?.id,
+                    isLastAssistantOfTurn: isLastAssistantMessageOfTurn(message),
+                    onApprovePlan: approvePlan,
+                    onRestore: { writeAgain(message) },
+                    onInspectFile: { url in
+                        openFileInInspector(url: url)
                     }
                 )
-            )
+                .modifier(
+                    PromptOffsetProbe(
+                        messageID: message.id,
+                        isUserMessage: message.role == .user,
+                        isEnabled: promptItems.count > 1,
+                        space: Self.transcriptSpace,
+                        onOffset: { messageID, offset in
+                            reportPromptOffset(offset, for: messageID)
+                        }
+                    )
+                )
+            }
 
-            if let activityGroup = activityGroup(after: message.id) {
+            if hasTurnHeader {
+                turnHeaderView(for: message, isDark: isDark)
+            }
+
+            if let activityGroup {
+                let hasPending = permissionApprovalCenter.pending.contains {
+                    $0.appSessionID == sessionService.activeSessionID
+                } || !permissionApprovalCenter.pending.isEmpty
                 AgentActivityTimelineView(
                     group: activityGroup,
                     isTurnActive: isTurnActive(for: activityGroup),
                     isSessionBusy: sessionService.isBusy,
+                    hasPendingApproval: hasPending,
                     onOpenReport: { activity in
                         openSubagentReportInInspector(activity: activity)
                     },
@@ -436,9 +296,85 @@ struct ConversationDetailView: View {
                 )
             }
         }
-        // Prompt rayı, satırı `proxy.scrollTo(promptID)` ile arar; açık kimlik
-        // yoksa LazyVStack içinde hedef bulunamaz.
         .id(message.id)
+    }
+
+    private func isLastAssistantMessageOfTurn(_ message: ChatMessage) -> Bool {
+        guard message.role == .assistant else { return false }
+        let allMessages = sessionService.state.messages
+        guard let index = allMessages.firstIndex(where: { $0.id == message.id }) else {
+            return false
+        }
+        for i in (index + 1)..<allMessages.count {
+            let next = allMessages[i]
+            if next.role == .user {
+                return true
+            }
+            if next.role == .assistant {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func shouldShowTurnHeader(for userMessage: ChatMessage) -> Bool {
+        guard userMessage.role == .user else { return false }
+        if sessionService.isBusy && userMessage.id == sessionService.state.messages.last(where: { $0.role == .user })?.id {
+            return true
+        }
+        let allMessages = sessionService.state.messages
+        guard let index = allMessages.firstIndex(where: { $0.id == userMessage.id }) else {
+            return false
+        }
+        if index + 1 < allMessages.count && allMessages[index + 1].role == .assistant {
+            return true
+        }
+        if activityGroup(after: userMessage.id) != nil {
+            return true
+        }
+        return false
+    }
+
+    @ViewBuilder
+    private func turnHeaderView(for userMessage: ChatMessage, isDark: Bool) -> some View {
+        let isCurrentBusyTurn = sessionService.isBusy &&
+            userMessage.id == sessionService.state.messages.last(where: { $0.role == .user })?.id
+
+        VStack(alignment: .leading, spacing: 4) {
+            if isCurrentBusyTurn {
+                TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                    let start = sessionService.state.startedAt ?? Date()
+                    let duration = formatTurnDuration(startedAt: start, endedAt: context.date)
+                    Text("Working for \(duration)")
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                let start = sessionService.state.startedAt ?? userMessage.createdAt
+                let end = sessionService.state.completedAt ?? Date()
+                let duration = formatTurnDuration(startedAt: start, endedAt: end)
+                Text("Working for \(duration)")
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(.secondary)
+            }
+
+            Rectangle()
+                .fill(Color.primary.opacity(isDark ? 0.08 : 0.06))
+                .frame(height: 1)
+        }
+        .padding(.top, 2)
+        .padding(.bottom, 1)
+    }
+
+    private func formatTurnDuration(startedAt: Date, endedAt: Date) -> String {
+        let elapsed = max(1, Int(endedAt.timeIntervalSince(startedAt)))
+        let minutes = elapsed / 60
+        let seconds = elapsed % 60
+        if minutes > 0 {
+            return "\(minutes)m \(seconds)s"
+        } else {
+            return "\(seconds)s"
+        }
     }
 
     private var emptyStateTitle: String {
@@ -786,7 +722,20 @@ struct ConversationDetailView: View {
         }
 
         if let activeTurnID = sessionService.activeTurnID {
-            return activeTurnID == group.id
+            if let groupTurnID = group.turnID {
+                return groupTurnID == activeTurnID
+            }
+            if activeTurnID == group.id {
+                return true
+            }
+        }
+
+        let messages = sessionService.state.messages
+        if let activeUserIndex = messages.lastIndex(where: { $0.role == .user }) {
+            let activeTurnMessageIDs = Set(messages[activeUserIndex...].map(\.id))
+            if activeTurnMessageIDs.contains(group.anchorMessageID) {
+                return true
+            }
         }
 
         return sessionService.state.activityGroups.last?.id == group.id
@@ -880,38 +829,215 @@ struct ConversationDetailView: View {
                 proxy.scrollTo("bottom_anchor", anchor: .bottom)
             }
         } label: {
-            Image(systemName: "arrow.down")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(preset.accentGradient.first ?? .accentColor)
-                .frame(width: 34, height: 34)
-                .background(
-                    Circle()
-                        .fill(
-                            (isDark ? preset.surfaceDark : preset.surfaceLight)
-                                .opacity(isDark ? 0.94 : 0.97)
-                        )
-                )
-                .overlay(
-                    Circle()
-                        .stroke(
-                            (isDark ? preset.borderSubtleDark : preset.borderSubtleLight)
-                                .opacity(1.0),
-                            lineWidth: 1
-                        )
-                )
-                .shadow(
-                    color: .black.opacity(isDark ? 0.45 : 0.20),
-                    radius: 10,
-                    x: 0,
-                    y: 4
-                )
-                .interactiveHoverOutlineCircle()
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Scroll to end")
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundStyle(.primary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(
+                Capsule()
+                    .fill(
+                        (isDark ? preset.surfaceDark : preset.surfaceLight)
+                            .opacity(isDark ? 0.94 : 0.97)
+                    )
+            )
+            .overlay(
+                Capsule()
+                    .stroke(
+                        (isDark ? preset.borderSubtleDark : preset.borderSubtleLight)
+                            .opacity(1.0),
+                        lineWidth: 1
+                    )
+            )
+            .shadow(
+                color: .black.opacity(isDark ? 0.45 : 0.20),
+                radius: 10,
+                x: 0,
+                y: 4
+            )
+            .interactiveHoverPill(cornerRadius: 16)
         }
         .buttonStyle(.plain)
         .help("Scroll to the latest message")
-        .accessibilityLabel("Scroll to bottom")
+        .accessibilityLabel("Scroll to end")
         .padding(.bottom, 8)
         .transition(.opacity.combined(with: .scale(scale: 0.9)))
+    }
+
+    @ViewBuilder
+    private func emptyStateView(preset: AppThemePreset) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: emptyStateSymbol)
+                .font(.system(size: 42, weight: .light))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: preset.accentGradient,
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+
+            VStack(spacing: 6) {
+                Text(emptyStateTitle)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.primary)
+
+                Text(emptyStateDescription)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
+    }
+
+    @ViewBuilder
+    private func transcriptScrollView(preset: AppThemePreset, isDark: Bool) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(sessionService.state.messages) { message in
+                        transcriptRow(
+                            for: message,
+                            preset: preset,
+                            isDark: isDark
+                        )
+                    }
+
+                    Color.clear
+                        .frame(height: 1)
+                        .frame(maxWidth: .infinity)
+                        .id("bottom_anchor")
+                }
+                .padding(.leading, transcriptLeadingInset)
+                .padding(.trailing, 20)
+                .padding(.vertical, 10)
+                .frame(maxWidth: contentMaxWidth)
+                .frame(maxWidth: .infinity, alignment: .center)
+            }
+            .id(sessionService.activeSessionID)
+            .coordinateSpace(.named(Self.transcriptSpace))
+            .defaultScrollAnchor(.bottom)
+            .onScrollGeometryChange(for: ChatScrollSnapshot.self) { geometry in
+                guard geometry.containerSize.height > 0 && geometry.contentSize.height > 0 else {
+                    return ChatScrollSnapshot(offsetY: 0, contentHeight: 0, containerHeight: 0)
+                }
+                return ChatScrollSnapshot(
+                    offsetY: (geometry.contentOffset.y / 4).rounded() * 4,
+                    contentHeight: (geometry.contentSize.height / 4).rounded() * 4,
+                    containerHeight: geometry.containerSize.height
+                )
+            } action: { _, newValue in
+                guard newValue.containerHeight > 0 else { return }
+                followState.record(snapshot: newValue)
+            }
+            .onScrollPhaseChange { _, phase in
+                followState.setScrolling(phase != .idle && phase != .animating)
+            }
+            .onChange(of: sessionService.state.messages.count) { _, _ in
+                let lastMessage = sessionService.state.messages.last
+                if lastMessage?.role == .user {
+                    isUserScrolledUp = false
+                    followState.resumeFollow()
+                }
+
+                guard sessionService.state.messages.last != nil else {
+                    return
+                }
+
+                messageCountScrollTask?.cancel()
+                messageCountScrollTask = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(40))
+                    guard !Task.isCancelled else {
+                        return
+                    }
+                    proxy.scrollTo("bottom_anchor", anchor: .bottom)
+                }
+            }
+            .onChange(of: sessionService.state.messages.last?.text) { _, _ in
+                handleStreamingTextChange(proxy: proxy)
+            }
+            .onChange(of: sessionService.state.activityGroups.last?.activities.count) { _, _ in
+                handleActivityCountChange(proxy: proxy)
+            }
+            .onChange(of: sessionService.isBusy) { oldValue, newValue in
+                handleBusyChange(oldValue: oldValue, newValue: newValue, proxy: proxy)
+            }
+            .onChange(of: sessionService.activeSessionID) { _, _ in
+                handleActiveSessionChange(proxy: proxy)
+            }
+            .overlay(alignment: .leading) {
+                promptNavigatorOverlay(proxy: proxy)
+            }
+            .overlay(alignment: .bottom) {
+                if isUserScrolledUp {
+                    scrollToBottomButton(
+                        proxy: proxy,
+                        preset: preset,
+                        isDark: isDark
+                    )
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: isUserScrolledUp)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func handleStreamingTextChange(proxy: ScrollViewProxy) {
+        guard sessionService.isBusy, followState.shouldAutoFollow(now: Date()) else {
+            return
+        }
+        proxy.scrollTo("bottom_anchor", anchor: .bottom)
+    }
+
+    private func handleActivityCountChange(proxy: ScrollViewProxy) {
+        guard sessionService.isBusy, followState.shouldAutoFollow(now: Date()) else {
+            return
+        }
+        proxy.scrollTo("bottom_anchor", anchor: .bottom)
+    }
+
+    private func handleBusyChange(oldValue: Bool, newValue: Bool, proxy: ScrollViewProxy) {
+        if oldValue && !newValue && !isUserScrolledUp && !followState.isUserScrolling {
+            proxy.scrollTo("bottom_anchor", anchor: .bottom)
+        }
+    }
+
+    private func handleActiveSessionChange(proxy: ScrollViewProxy) {
+        isUserScrolledUp = false
+        offsetTracker.clear()
+        followState.reset()
+        activePromptID = nil
+        Task { @MainActor in
+            proxy.scrollTo("bottom_anchor", anchor: .bottom)
+        }
+    }
+
+    @ViewBuilder
+    private func promptNavigatorOverlay(proxy: ScrollViewProxy) -> some View {
+        if promptItems.count > 1 {
+            GeometryReader { geometry in
+                PromptNavigatorRail(
+                    items: promptItems,
+                    activeID: activePromptID,
+                    onSelect: { promptID in
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            proxy.scrollTo(promptID, anchor: .top)
+                        }
+                    }
+                )
+                .padding(
+                    .leading,
+                    railLeadingInset(paneWidth: geometry.size.width)
+                )
+            }
+            .transition(.opacity)
+        }
     }
 }
 
@@ -923,12 +1049,13 @@ struct ConversationDetailView: View {
 private struct PromptOffsetProbe: ViewModifier {
     let messageID: UUID
     let isUserMessage: Bool
+    let isEnabled: Bool
     let space: String
     let onOffset: (UUID, CGFloat) -> Void
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if isUserMessage {
+        if isUserMessage && isEnabled {
             content.onGeometryChange(
                 for: CGFloat.self,
                 of: { proxy in
@@ -948,25 +1075,30 @@ private struct PromptOffsetProbe: ViewModifier {
 /// mutasyonları SwiftUI'ı invalidate etmez; yalnızca değişen aktif prompt
 /// kimliği yayınlanır.
 private final class PromptOffsetTracker {
-    private var offsets: [UUID: CGFloat] = [:]
+    private var lastActiveID: UUID?
 
     func clear() {
-        offsets.removeAll()
+        lastActiveID = nil
     }
 
+    /// En üstte veya ona en yakın olan prompt'u seçer.
     func update(
         messageID: UUID,
         offset: CGFloat,
         items: [PromptNavigatorRail.Item]
     ) -> UUID? {
-        guard offsets[messageID] != offset else {
+        guard let item = items.first(where: { $0.id == messageID }) else {
             return nil
         }
-        offsets[messageID] = offset
-        return PromptRailSelection.activeID(
-            among: items.map(\.id),
-            offsets: offsets
-        )
+
+        // Görünür alanın üst kenarına en yakın olan prompt aktif sayılır.
+        if offset >= 0 && offset < 300 {
+            if lastActiveID != item.id {
+                lastActiveID = item.id
+                return item.id
+            }
+        }
+        return nil
     }
 }
 
@@ -995,6 +1127,7 @@ private struct ChatMessageRow: View {
     /// True while this assistant message is still being written: the copy
     /// control and the timestamp appear only once the turn is over.
     let isActiveAssistant: Bool
+    let isLastAssistantOfTurn: Bool
     let onApprovePlan: () -> Void
     let onRestore: () -> Void
     let onInspectFile: (URL) -> Void
@@ -1016,34 +1149,37 @@ private struct ChatMessageRow: View {
                     userMessageActions
                 }
             } else {
-                VStack(alignment: .leading, spacing: 6) {
-                    MarkdownContentView(markdown: message.text)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 6)
+                let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        MarkdownContentView(markdown: message.text)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
 
-                    if isPlanAwaitingApproval {
-                        planApprovalBar
-                    }
-
-                    if !isActiveAssistant {
-                        HStack(spacing: 8) {
-                            copyButton(
-                                text: message.text,
-                                isCopied: $isCopied,
-                                help: "Copy message to clipboard"
-                            )
-
-                            Text(formattedTimestamp(message.createdAt))
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.tertiary)
+                        if isPlanAwaitingApproval {
+                            planApprovalBar
                         }
-                        .padding(.leading, 4)
-                        .padding(.top, 2)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer(minLength: 40)
+                        if !isActiveAssistant && isLastAssistantOfTurn {
+                            HStack(spacing: 8) {
+                                copyButton(
+                                    text: message.text,
+                                    isCopied: $isCopied,
+                                    help: "Copy message to clipboard"
+                                )
+
+                                Text(formattedTimestamp(message.createdAt))
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.leading, 4)
+                            .padding(.top, 2)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Spacer(minLength: 40)
+                }
             }
         }
         .frame(maxWidth: .infinity)

@@ -286,6 +286,70 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(permissions["task"], nil)
     }
 
+    func testQuestionReplyAndRejectUseBackendRequestIDAndStructuredAnswers() async throws {
+        let transport = RecordingOpenCodeTransport { request in
+            XCTAssertEqual(request.httpMethod, "POST")
+            return OpenCodeHTTPResponse(statusCode: 200, data: Data("true".utf8))
+        }
+        let client = makeClient(transport: transport)
+
+        try await client.replyQuestion(
+            requestID: "que_123",
+            answers: [["PostgreSQL"], ["Redis", "Custom detail"]]
+        )
+        try await client.rejectQuestion(requestID: "que_456")
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.url?.path), [
+            "/question/que_123/reply",
+            "/question/que_456/reject"
+        ])
+        XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Content-Type"), "application/json")
+        let body = try XCTUnwrap(requests[0].httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["answers"] as? [[String]], [
+            ["PostgreSQL"], ["Redis", "Custom detail"]
+        ])
+        XCTAssertNil(requests[1].httpBody)
+        XCTAssertNotNil(requests[0].value(forHTTPHeaderField: "Authorization"))
+        XCTAssertNotNil(requests[1].value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testPendingPermissionsAndReplyPermission() async throws {
+        let transport = RecordingOpenCodeTransport { request in
+            switch (request.httpMethod, request.url?.path) {
+            case ("GET", "/permission"):
+                return OpenCodeHTTPResponse(
+                    statusCode: 200,
+                    data: Data(
+                        #"[{"id":"perm_1","sessionID":"ses_1","permission":"bash","patterns":["echo hi"],"always":["echo *"]}]"#.utf8
+                    )
+                )
+            case ("POST", "/permission/perm_1/reply"):
+                return OpenCodeHTTPResponse(statusCode: 200, data: Data("true".utf8))
+            default:
+                XCTFail("Unexpected request: \(request.httpMethod ?? "") \(request.url?.path ?? "")")
+                return OpenCodeHTTPResponse(statusCode: 404, data: Data())
+            }
+        }
+        let client = makeClient(transport: transport)
+
+        let pending = try await client.pendingPermissions()
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.id, "perm_1")
+        XCTAssertEqual(pending.first?.toolName, "bash")
+        XCTAssertEqual(pending.first?.patterns, ["echo hi"])
+
+        try await client.replyPermission(requestID: "perm_1", reply: "once")
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests[0].httpMethod, "GET")
+        XCTAssertEqual(requests[0].url?.path, "/permission")
+        XCTAssertEqual(requests[1].httpMethod, "POST")
+        XCTAssertEqual(requests[1].url?.path, "/permission/perm_1/reply")
+    }
+
     private func makeClient(transport: any OpenCodeTransport) -> OpenCodeClient {
         OpenCodeClient(
             transport: transport,

@@ -773,7 +773,7 @@ final class SkillsShClientTests: XCTestCase {
     func testTheDirectoryPayloadIsDecoded() throws {
         let payload = """
         {"skills":[
-          {"id":"mattpocock/skills/code-review","skillID":"code-review","name":"code-review","installs":1234,"source":"mattpocock/skills"}
+          {"id":"mattpocock/skills/code-review","skillId":"code-review","name":"code-review","installs":1234,"source":"mattpocock/skills"}
         ]}
         """
 
@@ -1079,6 +1079,23 @@ final class ExtensionStoreTests: XCTestCase {
         await store.applyToAgent()
 
         XCTAssertEqual(applied?.mcpServers.keys.sorted(), ["github"])
+    }
+
+    func testGlobalOpenCodeConfigReaderDetectsPermissionOverrides() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let configURL = directory.appendingPathComponent("opencode.json")
+        try Data(
+            #"{"permission":{"bash":"allow","edit":"ask"}}"#.utf8
+        ).write(to: configURL)
+
+        let reader = GlobalOpenCodeConfigReader(configURLs: [configURL])
+        let overrides = try XCTUnwrap(reader.globalPermissionOverrides())
+
+        XCTAssertEqual(overrides.sourceURL, configURL)
+        XCTAssertEqual(overrides.rules["bash"], "allow")
+        XCTAssertEqual(overrides.rules["edit"], "ask")
     }
 
     /// Hermetic: no skills on this Mac and no user configuration are read, so a
