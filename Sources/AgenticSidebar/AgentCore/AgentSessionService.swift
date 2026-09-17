@@ -22,6 +22,11 @@ final class AgentSessionService {
     @ObservationIgnored
     private var hasPendingSave = false
 
+    /// Silinen oturumların uzak temizlik işleri. Kapanış yarışında kaybolmaması
+    /// için `flushPendingSave()` bunları bekler; normal akışta kendiliğinden biter.
+    @ObservationIgnored
+    private var pendingCleanupTasks: [Task<Void, Never>] = []
+
     /// Streaming flushes are frequent, so writes are coalesced behind this delay
     /// while structure changes (create/select/delete) save immediately.
     private static let saveDebounce = Duration.seconds(2)
@@ -29,6 +34,9 @@ final class AgentSessionService {
     private(set) var providers: [ProviderCapabilities] = []
     private(set) var sessions: [AgentSession] = []
     private(set) var activeSessionID: UUID
+
+    /// Hook for notifications or observers when any session finishes a turn.
+    var onSessionTurnCompleted: (@MainActor (_ sessionID: UUID, _ sessionTitle: String, _ status: AgentSessionStatus, _ previewText: String?) -> Void)?
 
     init(
         runtimes: [any ProviderRuntime],
@@ -176,7 +184,7 @@ final class AgentSessionService {
 
         let session = sessions.remove(at: index)
         let runtimes = self.runtimes
-        Task {
+        let cleanup = Task {
             await session.cancel()
             // Sunucu tarafındaki oturum da kapatılır; aksi halde her silinen
             // sohbet backend'de ölü bir oturum bırakır.
@@ -184,6 +192,7 @@ final class AgentSessionService {
                 await runtime.releaseSession(id)
             }
         }
+        pendingCleanupTasks.append(cleanup)
 
         guard !sessions.isEmpty else {
             let replacement = AgentSession(runtimes: runtimes)
@@ -250,12 +259,13 @@ final class AgentSessionService {
         sessions.removeAll { removedIDs.contains($0.id) }
 
         for session in targets {
-            Task {
+            let cleanup = Task {
                 await session.cancel()
                 for runtime in runtimes {
                     await runtime.releaseSession(session.id)
                 }
             }
+            pendingCleanupTasks.append(cleanup)
         }
 
         guard !sessions.isEmpty else {
@@ -399,6 +409,21 @@ final class AgentSessionService {
         )
     }
 
+    @discardableResult
+    func send(
+        _ prompt: String,
+        speedMode: ResponseSpeedMode,
+        mode: AgentMode
+    ) -> PromptAcceptance {
+        send(
+            prompt,
+            attachmentPaths: [],
+            speedMode: speedMode,
+            mode: mode,
+            tags: []
+        )
+    }
+
     func removeQueuedPrompt(_ id: UUID) {
         activeSession.removeQueuedPrompt(id)
     }
@@ -417,8 +442,22 @@ final class AgentSessionService {
         activeSession.clearQueuedPrompts()
     }
 
+    func drainQueuedPrompts() {
+        activeSession.drainQueueIfPossible()
+    }
+
     func cancel() async {
         await activeSession.cancel()
+    }
+
+    // MARK: - Interactive Questions
+
+    func answerActiveQuestion(_ answer: AgentQuestionAnswer) {
+        activeSession.answerActiveQuestion(answer)
+    }
+
+    func dismissActiveQuestion() {
+        activeSession.dismissActiveQuestion()
     }
 
     // MARK: - Persistence
@@ -426,6 +465,12 @@ final class AgentSessionService {
     private func adopt(_ session: AgentSession) {
         session.onPersistentChange = { [weak self] in
             self?.scheduleSave()
+        }
+        session.onImmediatePersistentChange = { [weak self] in
+            self?.saveImmediately()
+        }
+        session.onTurnFinished = { [weak self] sessionID, sessionTitle, status, snippet in
+            self?.onSessionTurnCompleted?(sessionID, sessionTitle, status, snippet)
         }
     }
 
@@ -473,6 +518,13 @@ final class AgentSessionService {
         saveTask?.cancel()
         saveTask = nil
         await saveNow()
+        // Silme sonrası hemen kapanılırsa uzak oturumlar arkada kalmasın diye
+        // bekleyen temizlik işleri burada tüketilir.
+        let cleanups = pendingCleanupTasks
+        pendingCleanupTasks = []
+        for cleanup in cleanups {
+            await cleanup.value
+        }
     }
 
     /// Writes the archive immediately. Structure changes (create, select, delete)

@@ -1,24 +1,62 @@
 import AppKit
 import SwiftUI
 
+/// İç içe hover bölgeleri için imleç sayacı.
+///
+/// Bir alt bölge bırakıldığında imleci doğrudan ok işaretine çevirmek, hâlâ
+/// hover'da olan komşusunun pointing-hand'ini eziyordu: `onHover` yalnız
+/// değişimde çağrıldığı için komşu kendi durumunu yeniden bildirmiyor ve imleç
+/// el olması gerekirken ok kalıyordu. Bu yüzden "ok"a dönüş, ancak iç içe
+/// bölgelerin tamamı bırakıldığında yapılır.
+@MainActor
+enum HoverCursorDepth {
+    private static var depth = 0
+
+    /// Hover'a girildi. İmleci el yapmak gerekiyorsa `true`.
+    static func enter() -> Bool {
+        depth += 1
+        return depth == 1
+    }
+
+    /// Hover'dan çıkıldı. İmleci ok işaretine döndürmek gerekiyorsa `true`.
+    static func exit() -> Bool {
+        depth = max(0, depth - 1)
+        return depth == 0
+    }
+
+    /// Yalnız testler için: sayacı bilinen bir duruma getirir.
+    static func reset() {
+        depth = 0
+    }
+}
+
 struct PointingHandModifier: ViewModifier {
     @State private var isHovering: Bool = false
 
     func body(content: Content) -> some View {
         content
             .onHover { hovering in
-                if hovering && !isHovering {
+                if hovering {
+                    guard !isHovering else {
+                        return
+                    }
                     isHovering = true
-                    NSCursor.pointingHand.push()
-                } else if !hovering && isHovering {
+                    if HoverCursorDepth.enter() {
+                        NSCursor.pointingHand.set()
+                    }
+                } else if isHovering {
                     isHovering = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
             .onDisappear {
                 if isHovering {
                     isHovering = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
     }
@@ -36,18 +74,27 @@ struct InteractiveHoverPillModifier: ViewModifier {
             )
             .animation(.easeInOut(duration: 0.15), value: isHovered)
             .onHover { hovering in
-                if hovering && !isHovered {
+                if hovering {
+                    guard !isHovered else {
+                        return
+                    }
                     isHovered = true
-                    NSCursor.pointingHand.push()
-                } else if !hovering && isHovered {
+                    if HoverCursorDepth.enter() {
+                        NSCursor.pointingHand.set()
+                    }
+                } else if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
             .onDisappear {
                 if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
     }
@@ -64,18 +111,27 @@ struct InteractiveHoverCircleModifier: ViewModifier {
             )
             .animation(.easeInOut(duration: 0.15), value: isHovered)
             .onHover { hovering in
-                if hovering && !isHovered {
+                if hovering {
+                    guard !isHovered else {
+                        return
+                    }
                     isHovered = true
-                    NSCursor.pointingHand.push()
-                } else if !hovering && isHovered {
+                    if HoverCursorDepth.enter() {
+                        NSCursor.pointingHand.set()
+                    }
+                } else if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
             .onDisappear {
                 if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
     }
@@ -102,18 +158,27 @@ struct InteractiveHoverOutlineModifier<Outline: Shape>: ViewModifier {
             )
             .animation(.easeInOut(duration: 0.15), value: isHovered)
             .onHover { hovering in
-                if hovering && !isHovered {
+                if hovering {
+                    guard !isHovered else {
+                        return
+                    }
                     isHovered = true
-                    NSCursor.pointingHand.push()
-                } else if !hovering && isHovered {
+                    if HoverCursorDepth.enter() {
+                        NSCursor.pointingHand.set()
+                    }
+                } else if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
             .onDisappear {
                 if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
     }
@@ -135,18 +200,27 @@ struct InteractiveHoverHaloModifier: ViewModifier {
             )
             .animation(.easeInOut(duration: 0.15), value: isHovered)
             .onHover { hovering in
-                if hovering && !isHovered {
+                if hovering {
+                    guard !isHovered else {
+                        return
+                    }
                     isHovered = true
-                    NSCursor.pointingHand.push()
-                } else if !hovering && isHovered {
+                    if HoverCursorDepth.enter() {
+                        NSCursor.pointingHand.set()
+                    }
+                } else if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
             .onDisappear {
                 if isHovered {
                     isHovered = false
-                    NSCursor.pop()
+                    if HoverCursorDepth.exit() {
+                        NSCursor.arrow.set()
+                    }
                 }
             }
     }

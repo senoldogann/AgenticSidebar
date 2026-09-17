@@ -137,7 +137,7 @@ final class SettingsStoreTests: XCTestCase {
         let store = SettingsStore(defaults: defaults)
         XCTAssertFalse(store.computerUseEnabled)
         XCTAssertEqual(store.chatgptSystemRootPath, SettingsStore.defaultChatgptSystemRootPath)
-        XCTAssertEqual(store.toolApprovalPolicy, .fullAccess)
+        XCTAssertEqual(store.toolApprovalPolicy, .approveSafe)
 
         store.computerUseEnabled = true
         store.chatgptSystemRootPath = "~/code/chatgpt-system"
@@ -147,6 +147,16 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(reloadedStore.computerUseEnabled)
         XCTAssertEqual(reloadedStore.chatgptSystemRootPath, "~/code/chatgpt-system")
         XCTAssertEqual(reloadedStore.toolApprovalPolicy, .ask)
+    }
+
+    func testFreshInstallDefaultsToApproveSafe() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertEqual(store.toolApprovalPolicy, .approveSafe)
     }
 
     func testTheOlderComputerUseOnlyLevelIsStillReadAsTheGlobalLevel() {
@@ -161,6 +171,57 @@ final class SettingsStoreTests: XCTestCase {
 
         let store = SettingsStore(defaults: defaults)
         XCTAssertEqual(store.toolApprovalPolicy, .approveSafe)
+    }
+
+    func testStealthModeEnabledDefaultsToTrueAndPersists() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertTrue(store.stealthModeEnabled)
+
+        store.stealthModeEnabled = false
+
+        let reloadedStore = SettingsStore(defaults: defaults)
+        XCTAssertFalse(reloadedStore.stealthModeEnabled)
+    }
+
+    func testMenuBarIconChoiceDefaultsToSystemSlidersAndPersists() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertEqual(store.menuBarIconChoice, .systemSliders)
+
+        store.menuBarIconChoice = .cpuChip
+
+        let reloadedStore = SettingsStore(defaults: defaults)
+        XCTAssertEqual(reloadedStore.menuBarIconChoice, .cpuChip)
+    }
+
+    func testSessionNotificationSettingsDefaultsAndPersistence() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertTrue(store.sessionNotificationsEnabled)
+        XCTAssertTrue(store.sessionNotificationSoundEnabled)
+        XCTAssertEqual(store.sessionNotificationSound, "Glass")
+
+        store.sessionNotificationsEnabled = false
+        store.sessionNotificationSoundEnabled = false
+        store.sessionNotificationSound = "Hero"
+
+        let reloadedStore = SettingsStore(defaults: defaults)
+        XCTAssertFalse(reloadedStore.sessionNotificationsEnabled)
+        XCTAssertFalse(reloadedStore.sessionNotificationSoundEnabled)
+        XCTAssertEqual(reloadedStore.sessionNotificationSound, "Hero")
     }
 }
 

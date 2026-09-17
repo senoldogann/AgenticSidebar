@@ -26,6 +26,11 @@ final class SettingsStore {
         static let computerUseEnabled = "settings.computerUseEnabled"
         static let chatgptSystemRootPath = "settings.chatgptSystemRootPath"
         static let toolApprovalPolicy = "settings.toolApprovalPolicy"
+        static let stealthModeEnabled = "settings.stealthModeEnabled"
+        static let menuBarIconChoice = "settings.menuBarIconChoice"
+        static let sessionNotificationsEnabled = "settings.sessionNotificationsEnabled"
+        static let sessionNotificationSoundEnabled = "settings.sessionNotificationSoundEnabled"
+        static let sessionNotificationSound = "settings.sessionNotificationSound"
         /// Önceki sürümün bilgisayar kullanımına özel onay anahtarı. Yalnızca göç
         /// için okunur; yeni değer her zaman `toolApprovalPolicy` altına yazılır.
         static let legacyComputerUseApprovalMode = "settings.computerUseApprovalMode"
@@ -182,6 +187,62 @@ final class SettingsStore {
     var toolApprovalPolicy: ToolApprovalPolicy {
         didSet {
             defaults.set(toolApprovalPolicy.rawValue, forKey: Key.toolApprovalPolicy)
+        }
+    }
+
+    /// Whether the windows should be excluded from screenshots and screen recordings via NSWindow.sharingType = .none.
+    var stealthModeEnabled: Bool {
+        didSet {
+            defaults.set(stealthModeEnabled, forKey: Key.stealthModeEnabled)
+        }
+    }
+
+    /// Menu bar icon representation style.
+    var menuBarIconChoice: MenuBarIconChoice {
+        didSet {
+            defaults.set(menuBarIconChoice.rawValue, forKey: Key.menuBarIconChoice)
+        }
+    }
+
+    /// Whether macOS system notifications are sent when an agent session finishes.
+    var sessionNotificationsEnabled: Bool {
+        didSet {
+            defaults.set(sessionNotificationsEnabled, forKey: Key.sessionNotificationsEnabled)
+        }
+    }
+
+    /// Whether a sound plays when a session completion notification arrives.
+    var sessionNotificationSoundEnabled: Bool {
+        didSet {
+            defaults.set(sessionNotificationSoundEnabled, forKey: Key.sessionNotificationSoundEnabled)
+        }
+    }
+
+    /// The selected alert sound played on session completion.
+    var sessionNotificationSound: String {
+        didSet {
+            defaults.set(sessionNotificationSound, forKey: Key.sessionNotificationSound)
+        }
+    }
+
+    static let availableNotificationSounds: [String] = [
+        "Default",
+        "Glass",
+        "Ping",
+        "Pop",
+        "Hero",
+        "Submarine",
+        "Tink",
+        "Basso",
+        "Purr"
+    ]
+
+    func playTestNotificationSound() {
+        guard sessionNotificationSoundEnabled else { return }
+        if sessionNotificationSound == "Default" {
+            NSSound.beep()
+        } else {
+            NSSound(named: sessionNotificationSound)?.play()
         }
     }
 
@@ -362,10 +423,70 @@ final class SettingsStore {
             toolApprovalPolicy = migrated
             defaults.set(migrated.rawValue, forKey: Key.toolApprovalPolicy)
         } else {
-            // Varsayılan, uygulamanın bugüne kadarki davranışıdır — sormadan
-            // çalışmak — çünkü kullanıcının seçtiği davranış buydu. Daha sıkı iki
-            // seviye Ayarlar'da tek tık uzaklıkta.
-            toolApprovalPolicy = .fullAccess
+            // Varsayılan, kullanıcıyı boğmadan güvenli duruştur: okuma ve
+            // klasör-içi düzenlemeler sorulmadan çalışır, shell komutları,
+            // klasör-dışı yollar, ağ erişimi ve bilgisayar kullanımı sorulur.
+            // Daha gevşek seviye Ayarlar'da tek tık uzaklıkta.
+            toolApprovalPolicy = .approveSafe
+        }
+
+        if defaults.object(forKey: Key.stealthModeEnabled) == nil {
+            stealthModeEnabled = true
+        } else {
+            stealthModeEnabled = defaults.bool(forKey: Key.stealthModeEnabled)
+        }
+
+        if let rawIcon = defaults.string(forKey: Key.menuBarIconChoice),
+           let iconChoice = MenuBarIconChoice(rawValue: rawIcon) {
+            menuBarIconChoice = iconChoice
+        } else {
+            menuBarIconChoice = .systemSliders
+        }
+
+        if defaults.object(forKey: Key.sessionNotificationsEnabled) == nil {
+            sessionNotificationsEnabled = true
+        } else {
+            sessionNotificationsEnabled = defaults.bool(forKey: Key.sessionNotificationsEnabled)
+        }
+
+        if defaults.object(forKey: Key.sessionNotificationSoundEnabled) == nil {
+            sessionNotificationSoundEnabled = true
+        } else {
+            sessionNotificationSoundEnabled = defaults.bool(forKey: Key.sessionNotificationSoundEnabled)
+        }
+
+        if let sound = defaults.string(forKey: Key.sessionNotificationSound) {
+            sessionNotificationSound = sound
+        } else {
+            sessionNotificationSound = "Glass"
+        }
+    }
+}
+
+extension SettingsStore {
+    enum MenuBarIconChoice: String, CaseIterable, Identifiable {
+        case systemSliders = "slider.horizontal.3"
+        case cpuChip = "cpu"
+        case activityGauge = "gauge.with.dots.needle.bottom.50percent"
+        case minimalDot = "dot.circle"
+        case systemGrid = "circle.grid.2x2"
+        case sidebar = "sidebar.leading"
+
+        var id: String { rawValue }
+
+        var displayName: String {
+            switch self {
+            case .systemSliders: "System Controls (Slider)"
+            case .cpuChip: "Hardware Monitor (CPU)"
+            case .activityGauge: "Activity Gauge"
+            case .minimalDot: "Minimalist Dot"
+            case .systemGrid: "System Grid"
+            case .sidebar: "Sidebar (Original)"
+            }
+        }
+
+        var systemImage: String {
+            rawValue
         }
     }
 }

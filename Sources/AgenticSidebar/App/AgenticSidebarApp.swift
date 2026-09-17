@@ -15,6 +15,8 @@ struct AgenticSidebarApp: App {
     /// Shared by the transcript (which asks for a message to be written again)
     /// and the composer (which owns the draft it lands in).
     @State private var composerDraftCenter = ComposerDraftCenter()
+    /// Unsent composer drafts, kept across relaunches next to the archive.
+    @State private var composerDraftStore: ComposerDraftStore
 
     init() {
         let credentialStore = KeychainCredentialStore()
@@ -47,9 +49,6 @@ struct AgenticSidebarApp: App {
         )
         extensionSnapshotBox.install(initialExtensionStore)
 
-        Task {
-            await initialExtensionStore.refresh()
-        }
         // One audit log for the app: the centre records into it and the settings
         // screen reads it, so both have to be the same instance.
         let toolAuditLog = ToolAuditLog.live()
@@ -78,11 +77,13 @@ struct AgenticSidebarApp: App {
                     permissionHandler: { request in
                         await permissionApprovalCenter.submit(request)
                     },
-                    cancelPendingPermissions: { remoteSessionID in
+                    cancelPendingPermissions: { remoteSessionID, appSessionID in
                         await permissionApprovalCenter.rejectAll(
-                            remoteSessionID: remoteSessionID
+                            remoteSessionID: remoteSessionID,
+                            appSessionID: appSessionID
                         )
-                    }
+                    },
+                    auditLog: toolAuditLog
                 ),
                 OpenAIProviderRuntime(
                     transport: URLSessionOpenAITransport.streaming(),
@@ -93,6 +94,28 @@ struct AgenticSidebarApp: App {
             // and the app starts clean instead of failing to open.
             archiveStore: SessionArchiveStore.live()
         )
+
+        let notificationService = SessionNotificationService.shared
+        notificationService.onSelectSession = { [weak initialSessionService] sessionID in
+            initialSessionService?.selectSession(sessionID)
+        }
+
+        initialSessionService.onSessionTurnCompleted = { [weak initialSettingsStore] sessionID, sessionTitle, status, snippet in
+            guard let initialSettingsStore else { return }
+            SessionNotificationService.shared.postSessionCompletionNotification(
+                sessionID: sessionID,
+                sessionTitle: sessionTitle,
+                status: status,
+                previewText: snippet,
+                soundName: initialSettingsStore.sessionNotificationSound,
+                playSound: initialSettingsStore.sessionNotificationSoundEnabled,
+                enabled: initialSettingsStore.sessionNotificationsEnabled
+            )
+        }
+
+        Task {
+            await notificationService.requestAuthorization()
+        }
 
         let initialClipboardMonitor = ClipboardMonitorService(
             sessionService: initialSessionService,
@@ -134,6 +157,10 @@ struct AgenticSidebarApp: App {
         _openCodeSettings = State(initialValue: initialOpenCodeSettings)
         _permissionApprovalCenter = State(initialValue: permissionApprovalCenter)
         _extensionStore = State(initialValue: initialExtensionStore)
+        // Unsent drafts survive a relaunch beside the archive. The local holds the
+        // instance for the shutdown path below; State shares it with the views.
+        let initialComposerDraftStore = ComposerDraftStore.live()
+        _composerDraftStore = State(initialValue: initialComposerDraftStore)
 
         // The one thing the extensions screen cannot do itself: bring the agent
         // back up so a configuration change takes effect. That is this screen's
@@ -149,6 +176,7 @@ struct AgenticSidebarApp: App {
         // outcome here so a shortcut another app already owns is visible in
         // Settings instead of failing silently.
         appDelegate.settingsStore = initialSettingsStore
+        appDelegate.settingsWindowController.setStealthMode(initialSettingsStore.stealthModeEnabled)
 
         appDelegate.settingsWindowController.configure { [weak initialSettingsStore, weak initialOpenAICredentialSettings, weak initialOpenCodeSettings, weak initialSessionService, weak initialExtensionStore, weak appDelegate] in
             guard let initialSettingsStore,
@@ -203,13 +231,14 @@ struct AgenticSidebarApp: App {
             // Debounce boşaltılmazsa son iki saniyedeki değişiklikler — biten
             // turun nihai hâli — hiç yazılmadan kapanılır.
             await initialSessionService.flushPendingSave()
+            await initialComposerDraftStore.flush()
             await openCodeServerManager.stop()
             AppLog.lifecycle.info("Managed shutdown completed")
         }
     }
 
     var body: some Scene {
-        WindowGroup(AppIdentity.name, id: "main") {
+        Window(AppIdentity.name, id: "main") {
             RootChatView(
                 sessionService: sessionService,
                 mainWindowController: appDelegate.mainWindowController,
@@ -218,6 +247,8 @@ struct AgenticSidebarApp: App {
                 openAICredentialSettings: openAICredentialSettings,
                 openCodeSettings: openCodeSettings,
                 permissionApprovalCenter: permissionApprovalCenter,
+                clipboardMonitor: clipboardMonitor,
+                screenshotMonitor: screenshotMonitor,
                 onApplyGlobalShortcut: { spec in
                     appDelegate.applyGlobalShortcut(spec)
                 }
@@ -225,6 +256,7 @@ struct AgenticSidebarApp: App {
             .environment(appDelegate.settingsWindowController)
             .environment(extensionStore)
             .environment(composerDraftCenter)
+            .environment(composerDraftStore)
             .preferredColorScheme(settingsStore.colorSchemeMode.preferredColorScheme)
             // Yetenek keşfi yalnızca burada yapılır; `RootChatView` de çağırdığında
             // her açılışta iki kez /provider ve /models isteği gidiyordu.
@@ -238,6 +270,7 @@ struct AgenticSidebarApp: App {
             }
         }
         .defaultSize(width: 980, height: 680)
+        .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appSettings) {
                 Button("Settings...") {
@@ -249,7 +282,7 @@ struct AgenticSidebarApp: App {
 
         MenuBarExtra(
             AppIdentity.name,
-            systemImage: "sidebar.leading",
+            systemImage: settingsStore.menuBarIconChoice.systemImage,
             isInserted: menuBarSessionBinding
         ) {
             MenuBarSessionView(

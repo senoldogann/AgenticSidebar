@@ -326,7 +326,8 @@ final class ManagedConfigurationTests: XCTestCase {
             try JSONSerialization.jsonObject(with: Data(rendered.utf8)) as? [String: Any]
         )
 
-        XCTAssertEqual(decoded.keys.sorted(), ["$schema", "permission"])
+        XCTAssertEqual(decoded.keys.sorted(), ["$schema", "agent", "permission"])
+        XCTAssertNotNil((decoded["agent"] as? [String: Any])?[ManagedOpenCodeConfiguration.planAgentName])
 
         let permission = try XCTUnwrap(decoded["permission"] as? [String: Any])
         XCTAssertEqual(permission["*"] as? String, "ask")
@@ -339,6 +340,49 @@ final class ManagedConfigurationTests: XCTestCase {
         // make changing it require a backend restart.
         XCTAssertNil(permission["fullAccess"])
         XCTAssertNil(permission["approveSafe"])
+    }
+
+    /// A switched-off skill shares the single `skill` member with the blanket
+    /// allow that precedes it. Written as two members, OpenCode kept only the
+    /// last one — the denials — so every skill the user had *not* switched off
+    /// fell through to the catch-all and raised a prompt the app answered itself.
+    func testDeniedSkillsShareOneSkillMemberWithTheBlanketAllow() throws {
+        let snapshot = ExtensionRuntimeSnapshot(
+            mcpServers: [:],
+            disabledMCPServers: [:],
+            silencedToolPatterns: [:],
+            plugins: [],
+            deniedSkills: ["noisy", "louder"]
+        )
+
+        let rendered = ManagedOpenCodeConfiguration.rendered(
+            instructionPaths: [],
+            permissionRules: [],
+            extensions: snapshot
+        )
+
+        XCTAssertEqual(
+            rendered.components(separatedBy: "\"skill\"").count - 1,
+            1,
+            "A JSON object cannot carry the same key twice; the parser keeps the last one"
+        )
+
+        let decoded = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(rendered.utf8)) as? [String: Any]
+        )
+        let permission = try XCTUnwrap(decoded["permission"] as? [String: Any])
+        let skill = try XCTUnwrap(permission["skill"] as? [String: Any])
+        XCTAssertEqual(skill["*"] as? String, "allow")
+        XCTAssertEqual(skill["noisy"] as? String, "deny")
+        XCTAssertEqual(skill["louder"] as? String, "deny")
+
+        // The same last-rule-wins reading applies inside the object: a skill the
+        // user switched off has to outrank the blanket allow.
+        let memberStart = try XCTUnwrap(rendered.range(of: "\"skill\"")).lowerBound
+        let member = String(rendered[memberStart...].prefix(400))
+        let allow = try XCTUnwrap(member.range(of: "\"*\"")).lowerBound
+        let denial = try XCTUnwrap(member.range(of: "\"noisy\"")).lowerBound
+        XCTAssertLessThan(allow, denial)
     }
 
     func testTheConfigurationIsWrittenWhereTheServerReadsIt() throws {

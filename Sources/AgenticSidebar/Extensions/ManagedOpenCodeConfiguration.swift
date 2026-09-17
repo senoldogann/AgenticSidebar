@@ -70,6 +70,7 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
 enum ManagedOpenCodeConfiguration {
     static let fileName = "managed-config.json"
     static let schemaURL = "https://opencode.ai/config.json"
+    static let planAgentName = "agenticsidebar-readonly"
 
     /// Builds the configuration OpenCode reads, with empty sections left out.
     ///
@@ -90,14 +91,22 @@ enum ManagedOpenCodeConfiguration {
         // its own policy (computer use) is the one that decides for its own tools.
         var permission = ToolApprovalPolicy.routedPermissionRules + permissionRules
         if !extensions.deniedSkills.isEmpty {
-            // No `*` default is written: that would outrank a stricter policy in
-            // the user's own configuration. Only the skills the user switched off
-            // are named.
+            // One member, not two. A JSON object cannot carry the same key twice
+            // and OpenCode's parser keeps the last `skill` it reads, so appending
+            // a second one for the denials silently threw away the routed
+            // `skill: "allow"` — every skill then fell through to the catch-all
+            // and raised a prompt the app answered itself.
+            //
+            // The denials are written after the allow because the same "last rule
+            // wins" rule applies inside the object: a skill the user switched off
+            // has to outrank the blanket allow, not the other way round.
+            permission.removeAll { $0.key == "skill" }
             permission.append(
                 JSONValue.Member(
                     "skill",
                     .object(
-                        extensions.deniedSkills
+                        [("*", JSONValue.string("allow"))]
+                            + extensions.deniedSkills
                             .sorted()
                             .map { ($0, JSONValue.string("deny")) }
                     )
@@ -154,6 +163,27 @@ enum ManagedOpenCodeConfiguration {
                 ("plugin", .array(extensions.plugins.sorted().map(JSONValue.string)))
             )
         }
+
+        // The plan agent is a backend-enforced tool boundary, not just a prompt.
+        // A catch-all deny includes plugins, subagents, shell and computer use;
+        // only known read-only capabilities are re-enabled for this agent.
+        let readOnlyPermissions = JSONValue.object([
+            JSONValue.Member("*", .string("deny")),
+            JSONValue.Member("read", .string("allow")),
+            JSONValue.Member("glob", .string("allow")),
+            JSONValue.Member("grep", .string("allow")),
+            JSONValue.Member("list", .string("allow")),
+            JSONValue.Member("lsp", .string("allow")),
+            JSONValue.Member("question", .string("allow")),
+            JSONValue.Member("websearch", .string("allow"))
+        ])
+        members.append(("agent", .object([
+            JSONValue.Member(planAgentName, .object([
+                JSONValue.Member("description", .string("Read-only planning without file or host mutations")),
+                JSONValue.Member("mode", .string("primary")),
+                JSONValue.Member("permission", readOnlyPermissions)
+            ]))
+        ])))
 
         return .object(members)
     }

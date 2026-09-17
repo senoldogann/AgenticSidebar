@@ -99,6 +99,11 @@ final class OpenCodeServerLedgerTests: XCTestCase {
         XCTAssertTrue(OpenCodeServerLedger.record(lease, in: directory))
         XCTAssertEqual(OpenCodeServerLedger.leases(in: directory), [lease])
 
+        let leaseURL = OpenCodeServerLedger.directoryURL(in: directory)
+            .appendingPathComponent("\(lease.pid).json")
+        let permissions = (try? FileManager.default.attributesOfItem(atPath: leaseURL.path)[.posixPermissions] as? NSNumber)?.uint16Value
+        XCTAssertEqual(permissions, 0o600, "kira dosyası yalnız sahibine okunur olmalı")
+
         OpenCodeServerLedger.release(pid: lease.pid, in: directory)
         XCTAssertTrue(OpenCodeServerLedger.leases(in: directory).isEmpty)
     }

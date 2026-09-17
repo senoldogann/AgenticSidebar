@@ -341,10 +341,15 @@ struct ExtensionRegistryStore: Sendable {
         do {
             try fileManager.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             let data = try Self.encoder.encode(registry)
             try data.write(to: fileURL, options: .atomic)
+            try? fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fileURL.path
+            )
         } catch {
             AppLog.extensions.error(
                 "Extension registry could not be written: \(error.localizedDescription, privacy: .public)"

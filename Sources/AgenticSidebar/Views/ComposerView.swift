@@ -3,15 +3,21 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ComposerView: View {
-    let sessionService: AgentSessionService
+    let sessionService: any AgentSessionServiceProtocol
     /// Answers this session's "Always allow" decisions and holds the prompts that
     /// are waiting, which the level control has to show and re-answer.
     let permissionApprovalCenter: PermissionApprovalCenter
+    var onInspectFile: ((URL) -> Void)? = nil
+    /// Ek yolu filtreleri için enjekte edilen dosya sistemi; üretimde `.default`.
+    var fileManager: FileManager = .default
 
     @Environment(SettingsStore.self) private var settingsStore
     @Environment(ExtensionStore.self) private var extensionStore
     /// "Write this again" on an earlier message puts its text back in this field.
     @Environment(ComposerDraftCenter.self) private var draftCenter: ComposerDraftCenter?
+    /// Unsent drafts kept across relaunches; the field stays the source of truth
+    /// while the app runs, the store only carries it over a quit.
+    @Environment(ComposerDraftStore.self) private var draftStore: ComposerDraftStore?
     @Environment(\.colorScheme) private var systemColorScheme
 
     /// Taslaklar oturuma göre saklanır.
@@ -178,7 +184,8 @@ struct ComposerView: View {
                     text: draftBinding,
                     submissionAvailability: submissionAvailability,
                     onSubmit: sendDraft,
-                    onCancelSuggestions: dismissVisibleSuggestions
+                    onCancelSuggestions: dismissVisibleSuggestions,
+                    onSpillLargePaste: spillLargePasteToAttachment
                 )
 
                 if draft.isEmpty {
@@ -270,7 +277,11 @@ struct ComposerView: View {
         }
         .onChange(of: sessionService.activeSessionID) { _, _ in
             discardDraftsOfRemovedSessions()
+            restoreStoredDraftIfEmpty()
             applyPendingRestore()
+        }
+        .onChange(of: sessionService.sessionList.map(\.id)) { _, ids in
+            draftStore?.discardSessions(notIn: Set(ids))
         }
         .onChange(of: draft) { _, _ in
             // Trigger taslaktan tümüyle çıkınca kapanış kaydı da düşer: aynı
@@ -278,8 +289,13 @@ struct ComposerView: View {
             if activeTrigger == nil {
                 dismissedSuggestionToken = nil
             }
+            pushDraftToStore()
+        }
+        .onChange(of: attachedURLs) { _, _ in
+            pushDraftToStore()
         }
         .onAppear {
+            restoreStoredDraftIfEmpty()
             applyPendingRestore()
         }
         .onChange(of: draftCenter?.pending) { _, _ in
@@ -305,13 +321,51 @@ struct ComposerView: View {
         _ = draftCenter.consumePending()
         draft = ComposerDraftPlacement.merged(existing: draft, restored: request.text)
 
-        let alreadyAttached = Set(attachedURLs.map(\.path))
-        for path in request.attachmentPaths
-        where !alreadyAttached.contains(path) && FileManager.default.fileExists(atPath: path) {
-            // An attachment whose file is gone would be sent as a path the agent
-            // cannot read, so it is left out rather than restored as a warning.
-            attachedURLs.append(URL(fileURLWithPath: path))
+        // An attachment whose file is gone would be sent as a path the agent
+        // cannot read, so it is left out rather than restored as a warning.
+        attachedURLs.append(
+            contentsOf: AttachmentPaths.existingAttachmentURLs(
+                request.attachmentPaths,
+                excluding: Set(attachedURLs.map(\.path)),
+                fileManager: fileManager
+            )
+        )
+    }
+
+    /// Unsent field content rides to the store; the store debounces the disk
+    /// write, so a keystroke costs a comparison, not I/O.
+    private func pushDraftToStore() {
+        draftStore?.update(
+            sessionID: sessionService.activeSessionID,
+            text: draft,
+            attachmentPaths: attachedURLs.map(\.path)
+        )
+    }
+
+    /// Brings back what was left unsent before a quit. Only into an empty
+    /// field: a draft written since launch is newer than anything on disk, and
+    /// a pending "write again" merges on top afterwards.
+    private func restoreStoredDraftIfEmpty() {
+        guard
+            draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            attachedURLs.isEmpty,
+            let stored = draftStore?.storedDraft(for: sessionService.activeSessionID)
+        else {
+            return
         }
+
+        if !stored.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            draft = stored.text
+        }
+
+        // An attachment whose file is gone would be sent as a path the agent
+        // cannot read, so it is left out rather than restored as a warning.
+        attachedURLs.append(
+            contentsOf: AttachmentPaths.existingAttachmentURLs(
+                stored.attachmentPaths,
+                fileManager: fileManager
+            )
+        )
     }
 
     private func handleDrop(providers: [NSItemProvider]) -> Bool {
@@ -536,9 +590,12 @@ struct ComposerView: View {
     }
 
     private var placeholderText: String {
-        sessionService.isBusy
+        if sessionService.state.activeQuestion != nil {
+            return "Agent is waiting for your choice above — or write a reply here"
+        }
+        return sessionService.isBusy
             ? "Add a follow-up — it is queued and sent when this turn finishes"
-            : "Ask for changes — @ for MCP and plugins, / for skills"
+            : "Message or request changes — @ for MCP and plugins, / for skills"
     }
 
     private var pillDivider: some View {
@@ -908,6 +965,30 @@ struct ComposerView: View {
             draft = ""
             attachedURLs = []
             selectedTags = []
+            draftStore?.clear(sessionID: sessionService.activeSessionID)
+        }
+    }
+
+    /// Codex/ChatGPT davranışı: eşik üstü bir yapıştırma metin alanını şişirmez,
+    /// markdown dosya eki olur. Alan olduğu gibi kalır — varsa yazı korunur —
+    /// dosya ek çipi olarak yana eklenir. Yazma başarısız olursa `false` döner
+    /// ve metin her zamanki gibi satıra yapışır: yapıştırmanın kaybolması,
+    /// ağır bir taslaktan kötüdür.
+    private func spillLargePasteToAttachment(_ text: String) -> Bool {
+        do {
+            let url = try PastedTextAttachment.spill(text)
+            if !attachedURLs.contains(url) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    attachedURLs.append(url)
+                }
+            }
+            pushDraftToStore()
+            return true
+        } catch {
+            AppLog.agentSession.error(
+                "A long paste could not be spilled to a file; inserting inline"
+            )
+            return false
         }
     }
 
@@ -1113,11 +1194,7 @@ struct ComposerView: View {
     }
 
     private func iconName(for kind: ExtensionKind) -> String {
-        switch kind {
-        case .mcp: "server.rack"
-        case .plugin: "puzzlepiece.extension"
-        case .skill: "books.vertical"
-        }
+        kind.symbolName
     }
 
     private func openFileAttachmentDialog() {
@@ -1143,34 +1220,43 @@ struct ComposerView: View {
         let isPDF = ext == "pdf"
 
         return HStack(spacing: 6) {
-            if isImage, let image = NSImage(contentsOf: url) {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 24, height: 24)
-                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-            } else if isPDF, let doc = PDFDocument(url: url), let page = doc.page(at: 0) {
-                Image(nsImage: page.thumbnail(of: CGSize(width: 48, height: 48), for: .mediaBox))
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 24, height: 24)
-                    .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .stroke(Color.red.opacity(0.4), lineWidth: 0.5)
-                    )
-            } else {
-                Image(systemName: isPDF ? "doc.richtext.fill" : "doc.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(isPDF ? .red : .secondary)
-                    .frame(width: 24, height: 24)
-            }
+            Button {
+                onInspectFile?(url)
+            } label: {
+                HStack(spacing: 6) {
+                    if isImage, let image = AttachmentPreviewCache.shared.imageThumbnail(for: url, maxPixelSize: 96) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: 24, height: 24)
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    } else if isPDF, let thumbnail = AttachmentPreviewCache.shared.pdfThumbnail(for: url, maxPixelSize: 96) {
+                        Image(nsImage: thumbnail)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: 24, height: 24)
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                    .stroke(Color.red.opacity(0.4), lineWidth: 0.5)
+                            )
+                    } else {
+                        Image(systemName: isPDF ? "doc.richtext.fill" : (ext == "md" ? "doc.richtext.fill" : "doc.fill"))
+                            .font(.system(size: 13))
+                            .foregroundStyle(isPDF ? .red : (ext == "md" ? .blue : .secondary))
+                            .frame(width: 24, height: 24)
+                    }
 
-            Text(url.lastPathComponent)
-                .font(.system(size: 11.5, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 160)
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 160)
+                }
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("Click to preview file")
 
             Button {
                 attachedURLs.removeAll { $0 == url }
@@ -1183,6 +1269,7 @@ struct ComposerView: View {
             }
             .buttonStyle(.plain)
             .pointingHandCursor()
+            .help("Remove attachment")
         }
         .padding(.leading, 4)
         .padding(.trailing, 6)

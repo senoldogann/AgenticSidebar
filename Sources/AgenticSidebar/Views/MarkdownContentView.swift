@@ -363,9 +363,7 @@ private struct CodeBlockView: View {
     }
 
     private func copyToClipboard() {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(code, forType: .string)
+        Pasteboard.copy(code)
 
         isCopied = true
         Task {

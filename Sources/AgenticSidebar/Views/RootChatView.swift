@@ -3,13 +3,15 @@ import SwiftUI
 struct RootChatView: View {
     @Environment(\.openWindow) private var openWindow
 
-    let sessionService: AgentSessionService
+    let sessionService: any AgentSessionServiceProtocol
     let mainWindowController: MainWindowController
     let capturePrivacyController: CapturePrivacyController
     let settingsStore: SettingsStore
     let openAICredentialSettings: OpenAICredentialSettings
     let openCodeSettings: OpenCodeSettings
     let permissionApprovalCenter: PermissionApprovalCenter
+    let clipboardMonitor: ClipboardMonitorService
+    let screenshotMonitor: ScreenshotMonitorService
     let onApplyGlobalShortcut: @MainActor (GlobalShortcutSpec) -> Void
 
     @Environment(\.colorScheme) private var systemColorScheme
@@ -46,13 +48,15 @@ struct RootChatView: View {
         .background {
             WindowLifecycleBridge(
                 windowController: mainWindowController,
-                capturePrivacyController: capturePrivacyController
+                capturePrivacyController: capturePrivacyController,
+                stealthModeEnabled: settingsStore.stealthModeEnabled
             )
             .frame(width: 0, height: 0)
         }
         .onAppear {
             mainWindowController.setOpacity(settingsStore.windowOpacity)
             mainWindowController.setAppearance(settingsStore.colorSchemeMode)
+            mainWindowController.setStealthMode(settingsStore.stealthModeEnabled)
             mainWindowController.setReopenAction {
                 openWindow(id: "main")
             }
@@ -66,6 +70,16 @@ struct RootChatView: View {
         }
         .onChange(of: settingsStore.globalShortcutChoice) { _, newChoice in
             onApplyGlobalShortcut(newChoice.spec)
+        }
+        .onChange(of: settingsStore.stealthModeEnabled) { _, newStealth in
+            mainWindowController.setStealthMode(newStealth)
+            capturePrivacyController.setStealthMode(newStealth)
+        }
+        .onChange(of: settingsStore.autoSubmitClipboard) { _, _ in
+            clipboardMonitor.syncWithSettings()
+        }
+        .onChange(of: settingsStore.autoAnalyzeScreenshots) { _, _ in
+            screenshotMonitor.syncWithSettings()
         }
         .textSelection(.enabled)
     }

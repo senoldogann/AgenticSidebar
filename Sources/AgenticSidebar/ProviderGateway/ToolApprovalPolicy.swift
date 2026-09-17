@@ -70,7 +70,7 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
         case .ask:
             "Reads and in-folder edits run without a prompt. Every shell command, every path outside this folder and every network call waits for your decision. Takes effect on the next tool call, including mid-turn."
         case .approveSafe:
-            "Reads, in-folder edits, the agent's own inspection commands (git status, ls, rg, find …) and this project's build and test commands run unattended. Everything else — external paths, other shell commands, webfetch, the authority lease for computer use — asks. Takes effect on the next tool call, including mid-turn."
+            "Reads, in-folder edits, a limited set of exact inspection commands (git status, git diff, ls, pwd) and exact build and test commands run unattended. Everything else — external paths, other shell commands, webfetch, the authority lease for computer use — asks. Takes effect on the next tool call, including mid-turn."
         case .fullAccess:
             "No approval is requested for anything, including shell commands and paths outside this folder. This answers the requests the agent raises; a `deny` in your own `~/.config/opencode/opencode.json`, and the app's own `deny` for the computer-use file, git, terminal and JavaScript tools, still apply — a denied tool is never asked about, so no level can allow it. Takes effect on the next tool call, including mid-turn."
         }
@@ -113,7 +113,7 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
     func automaticReply(
         for toolName: String,
         patterns: [String] = []
-    ) -> OpenCodePermissionReply? {
+    ) -> ProviderPermissionReply? {
         switch self {
         case .ask:
             return nil
@@ -176,9 +176,8 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
     ///
     /// - the request must carry the command text, and every command in it must match;
     /// - the text must be one simple command — no `;`, `&&`, `|`, redirection,
-    ///   substitution, subshell or newline. Without that check, `npm run test &&
-    ///   curl …` would match the trusted `npm run test*` prefix and the whole
-    ///   chain would run unattended;
+    ///   substitution, subshell or newline. Commands must match exact trusted
+    ///   patterns (no wildcard globbing) so chained sub-commands cannot run unattended;
     /// - paths must stay inside the working directory, so a trusted read-only
     ///   command cannot be aimed at `~/.ssh/id_rsa` or `/etc` either.
     ///
@@ -204,13 +203,21 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
         }
     }
 
-    /// OpenCode names the shell tool `bash`; MCP and future providers suffix it.
+    /// OpenCode names the shell tool `bash`; MCP and future providers suffix it or name it `command`, `exec`, `terminal`, etc.
     private static func isShellToolName(_ toolName: String) -> Bool {
         let name = toolName.lowercased()
         return name == "bash"
             || name == "shell"
+            || name == "command"
+            || name == "terminal"
+            || name == "exec"
+            || name == "run_command"
             || name.hasSuffix("_bash")
             || name.hasSuffix("_shell")
+            || name.hasSuffix("_command")
+            || name.hasSuffix("_terminal")
+            || name.hasSuffix("_exec")
+            || name.hasSuffix("_run_command")
     }
 
     /// Rejects anything that could chain, redirect, substitute or nest commands.
@@ -308,31 +315,14 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
     /// why they are limited to the working directory by
     /// ``staysInsideWorkingDirectory(_:)``.
     static let trustedCommandPatterns: [String] = [
-        "git status*",
-        "git diff*",
-        "git log*",
-        "git show*",
-        "git branch*",
-        "ls",
-        "ls *",
-        "pwd",
-        "pwd *",
-        "cat *",
-        "head *",
-        "tail *",
-        "wc *",
-        "which *",
-        "echo *",
-        "find *",
-        "rg *",
-        "grep *",
-        "swift build*",
-        "swift test*",
-        "npm test*",
-        "npm run build*",
-        "npm run test*",
-        "npm run lint*",
-        "npm run typecheck*"
+        // Exact commands only: suffix globs admit mutating flags such as --output.
+        "git status", "git status --short",
+        "git diff", "git diff --stat", "git diff --cached",
+        "git log", "git log --oneline -5", "git show",
+        "git branch", "git branch --show-current",
+        "ls", "ls -la", "pwd",
+        "swift build", "swift test", "npm test",
+        "npm run build", "npm run test", "npm run lint", "npm run typecheck"
     ]
 
     // MARK: - Generated configuration

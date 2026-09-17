@@ -45,9 +45,18 @@ enum OpenCodeServerLedger {
         let directory = directoryURL(in: workingDirectoryURL)
 
         do {
-            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try fileManager.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
             let data = try JSONEncoder().encode(lease)
-            try data.write(to: fileURL(for: lease.pid, in: directory) , options: .atomic)
+            let leaseURL = fileURL(for: lease.pid, in: directory)
+            try data.write(to: leaseURL, options: .atomic)
+            try? fileManager.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: leaseURL.path
+            )
             return true
         } catch {
             AppLog.openCode.error(

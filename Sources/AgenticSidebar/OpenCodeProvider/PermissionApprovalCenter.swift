@@ -19,6 +19,9 @@ final class PermissionApprovalCenter {
     struct PendingRequest: Identifiable, Equatable, Sendable {
         let id: String
         let remoteSessionID: String
+        let appSessionID: UUID?
+        /// Raised by a session this turn delegated to — a subagent.
+        let isDelegatedSession: Bool
         let toolName: String
         let title: String
         let detail: String?
@@ -33,7 +36,11 @@ final class PermissionApprovalCenter {
             if name.contains("computer") || name.contains("session_authority") {
                 return "cursorarrow.motionlines"
             }
-            if name.contains("bash") || name.contains("shell") || name.contains("task") {
+            // `task` is the subagent delegation tool: a branch, not a shell.
+            if name == "task" {
+                return "arrow.triangle.branch"
+            }
+            if name.contains("bash") || name.contains("shell") {
                 return "terminal"
             }
             if name.contains("webfetch") || name.contains("websearch") {
@@ -90,7 +97,7 @@ final class PermissionApprovalCenter {
     /// Araç adı ve isteğin desenleri (komut ya da yol) verilir, çünkü seviye artık
     /// komut sınıflandırmasını kendisi yapıyor.
     @ObservationIgnored
-    private let automaticReplyProvider: @MainActor (String, [String]) -> OpenCodePermissionReply?
+    private let automaticReplyProvider: @MainActor (String, [String]) -> ProviderPermissionReply?
 
     @ObservationIgnored
     private let decisionTimeout: Duration
@@ -100,13 +107,18 @@ final class PermissionApprovalCenter {
     private let auditLog: ToolAuditLog?
 
     @ObservationIgnored
-    private var continuations: [String: CheckedContinuation<OpenCodePermissionReply, Never>] = [:]
+    private var continuations: [String: [CheckedContinuation<OpenCodePermissionReply, Never>]] = [:]
+
+    /// Aynı isteğin kaç kez ikinci bir koşudan ulaştığı; testler karar
+    /// paylaşımını bununla kanıtlar.
+    @ObservationIgnored
+    private(set) var duplicateJoinCount = 0
 
     @ObservationIgnored
     private var timeoutTasks: [String: Task<Void, Never>] = [:]
 
     init(
-        automaticReplyProvider: @escaping @MainActor (String, [String]) -> OpenCodePermissionReply?,
+        automaticReplyProvider: @escaping @MainActor (String, [String]) -> ProviderPermissionReply?,
         decisionTimeout: Duration,
         auditLog: ToolAuditLog? = nil
     ) {
@@ -124,23 +136,29 @@ final class PermissionApprovalCenter {
         }
 
         if let automaticReply = automaticReplyProvider(request.toolName, request.patterns) {
-            await record(request, source: .policy, reply: automaticReply)
-            return automaticReply
+            let reply = OpenCodePermissionReply(automaticReply)
+            await record(request, source: .policy, reply: reply)
+            return reply
         }
 
         if continuations[request.id] != nil {
-            AppLog.openCode.error(
-                "Duplicate permission request id \(request.id, privacy: .public) was rejected"
-            )
-            return .reject
+            // Aynı istek ikinci bir koşudan da ulaşabilir (alt ajan izinleri üst
+            // oturumun akışına düşer). Erken bir yanıt üretmek kullanıcının
+            // kararını ezebileceği için ikinci çağrı aynı karara ortak olur.
+            duplicateJoinCount += 1
+            return await withCheckedContinuation { continuation in
+                continuations[request.id]?.append(continuation)
+            }
         }
 
         return await withCheckedContinuation { continuation in
-            continuations[request.id] = continuation
+            continuations[request.id] = [continuation]
             pending.append(
                 PendingRequest(
                     id: request.id,
                     remoteSessionID: request.remoteSessionID,
+                    appSessionID: request.appSessionID,
+                    isDelegatedSession: request.isDelegatedSession,
                     toolName: request.toolName,
                     title: OpenCodePermissionRequest.title(for: request.toolName),
                     detail: request.detail,
@@ -167,11 +185,11 @@ final class PermissionApprovalCenter {
         let requests = pending
         for request in requests where continuations[request.id] != nil {
             guard
-                let reply = automaticReplyProvider(request.toolName, request.patterns)
+                let automaticReply = automaticReplyProvider(request.toolName, request.patterns)
             else {
                 continue
             }
-            resolve(id: request.id, reply: reply, source: .policy)
+            resolve(id: request.id, reply: OpenCodePermissionReply(automaticReply), source: .policy)
         }
     }
 
@@ -180,7 +198,7 @@ final class PermissionApprovalCenter {
         reply: OpenCodePermissionReply,
         source: ToolAuditLog.Source
     ) {
-        guard let continuation = continuations.removeValue(forKey: id) else {
+        guard let waiters = continuations.removeValue(forKey: id) else {
             return
         }
         timeoutTasks.removeValue(forKey: id)?.cancel()
@@ -191,7 +209,9 @@ final class PermissionApprovalCenter {
             rememberGrant(for: request)
         }
 
-        continuation.resume(returning: reply)
+        for waiter in waiters {
+            waiter.resume(returning: reply)
+        }
 
         if let request {
             // Recorded after the turn is released: the audit write must never be
@@ -206,7 +226,7 @@ final class PermissionApprovalCenter {
                         detail: request.detail,
                         patterns: request.patterns,
                         source: source,
-                        reply: reply
+                        reply: reply.providerReply
                     )
                 )
             }
@@ -238,11 +258,28 @@ final class PermissionApprovalCenter {
         return await auditLog.recent(limit: limit)
     }
 
+    /// Actual tool starts and completions, including actions needing no prompt.
+    func recentExecutions(limit: Int = 20) async -> [ToolAuditLog.ExecutionRecord] {
+        guard let auditLog else {
+            return []
+        }
+        return await auditLog.recentExecutions(limit: limit)
+    }
+
     /// Tur iptal edilince bekleyen istekler reddedilir; aksi halde sunucu
     /// tarafında askıda kalan bir izin bir sonraki tura taşınır.
-    func rejectAll(remoteSessionID: String) {
+    ///
+    /// A subagent's request carries the child session's id, so matching on the
+    /// remote session alone would leave exactly the prompts that are easiest to
+    /// miss: the user stops the turn, the subagent is aborted with it, and the
+    /// question stays on screen until the timeout expires. The conversation the
+    /// request was attributed to is the identity that covers both.
+    func rejectAll(remoteSessionID: String, appSessionID: UUID? = nil) {
         let ids = pending
-            .filter { $0.remoteSessionID == remoteSessionID }
+            .filter { request in
+                request.remoteSessionID == remoteSessionID
+                    || (appSessionID != nil && request.appSessionID == appSessionID)
+            }
             .map(\.id)
         for id in ids {
             resolve(id: id, reply: .reject, source: .cancellation)
@@ -320,7 +357,7 @@ final class PermissionApprovalCenter {
                 detail: request.detail,
                 patterns: request.patterns,
                 source: source,
-                reply: reply
+                reply: reply.providerReply
             )
         )
     }

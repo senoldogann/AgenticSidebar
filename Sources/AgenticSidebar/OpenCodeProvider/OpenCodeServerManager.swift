@@ -147,7 +147,8 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         // ones it must not load.
         let configurationPath = try Self.writeManagedConfiguration(
             computerUse: computerUse,
-            extensions: extensionConfiguration
+            extensions: extensionConfiguration,
+            workingDirectoryURL: workingDirectoryURL
         )
 
         var lastError = ProviderRuntimeError.startupFailure
@@ -303,12 +304,10 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
 
     private func resolveServerPassword() async throws -> String {
         do {
-            if let existing = try credentialStore.read(.openCodeServerPassword),
-               !existing.isEmpty
-            {
-                return existing
-            }
-
+            // Her başlatmada rotasyon: eski şifre süresiz geçerli kalmasın.
+            // `opencode serve` harici binary'si stdin ile şifre almadığı için
+            // şifre `OPENCODE_SERVER_PASSWORD` ortam değişkeniyle taşınmaya
+            // devam eder; daralan pencere rotasyondan gelir, aktarımdan değil.
             let generated = try await passwordGenerator()
             guard !generated.isEmpty else {
                 throw ProviderRuntimeError.authenticationFailure
@@ -346,7 +345,8 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     /// okunur, böylece tur ortasında değiştirilebilir.
     private static func writeManagedConfiguration(
         computerUse: ComputerUseConfiguration?,
-        extensions: ExtensionRuntimeSnapshot
+        extensions: ExtensionRuntimeSnapshot,
+        workingDirectoryURL: URL
     ) throws -> String {
         do {
             if let computerUse {
@@ -358,7 +358,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             }
 
             return try ManagedOpenCodeConfiguration.write(
-                in: managedWorkingDirectoryURL(),
+                in: workingDirectoryURL,
                 instructionPaths: [],
                 permissionRules: [],
                 extensions: extensions
@@ -372,13 +372,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     }
 
     static func managedWorkingDirectoryURL() -> URL {
-        let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? FileManager.default.homeDirectoryForCurrentUser
-        return applicationSupport
-            .appendingPathComponent(AppIdentity.name, isDirectory: true)
-            .appendingPathComponent("OpenCode", isDirectory: true)
+        ManagedAppDirectories.openCodeWorkingDirectory()
     }
 
     /// Creates the managed working directory and its default OpenCode project

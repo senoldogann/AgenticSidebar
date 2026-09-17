@@ -50,7 +50,7 @@ struct ProviderModelCapability: Equatable, Sendable {
         let thinkingTokens = [
             "r1", "reasoning", "thinking", "qwq", "o1", "o3",
             "deepseek-r1", "deepseek r1", "claude-3-7-sonnet",
-            "flash-thinking"
+            "flash-thinking",
         ]
 
         return thinkingTokens.contains { token in
@@ -84,4 +84,33 @@ struct SessionConfiguration: Equatable, Codable, Sendable {
     var providerID: ProviderID
     var modelID: ProviderModelID
     var variantID: ProviderVariantID?
+}
+
+/// Provider-nötr izin yanıtı: `once` / `always` / `reject`.
+///
+/// Somut sağlayıcı yanıtıyla aynı ham değerleri taşır, böylece daha önce
+/// `audit.jsonl` dosyasına yazılmış kayıtlar çözümlenmeye devam eder. Somut
+/// sağlayıcı tipine bu katman içinden başvurulmaz; dönüşüm sınırda yapılır.
+enum ProviderPermissionReply: String, Codable, Equatable, Sendable {
+    case once
+    case always
+    case reject
+}
+
+/// Uygulamanın yönetilen dosyalarının konumu için sağlayıcı-nötr erişim.
+///
+/// `ManagedOpenCodeServerManager.managedWorkingDirectoryURL()` buraya delege
+/// eder; SwiftUI sunum katmanı somut sunucu yöneticisine değil buna başvurur.
+enum ManagedAppDirectories {
+    static func openCodeWorkingDirectory() -> URL {
+        let applicationSupport =
+            FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first ?? FileManager.default.homeDirectoryForCurrentUser
+        return
+            applicationSupport
+            .appendingPathComponent(AppIdentity.name, isDirectory: true)
+            .appendingPathComponent("OpenCode", isDirectory: true)
+    }
 }

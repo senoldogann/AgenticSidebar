@@ -138,11 +138,24 @@ final class ScreenshotMonitorService {
 
     init(
         sessionService: AgentSessionService,
+        settingsStore: SettingsStore
+    ) {
+        self.sessionService = sessionService
+        self.settingsStore = settingsStore
+        self.textRecognizer = VisionScreenshotTextRecognizer()
+        self.pasteboard = SystemPasteboardReader()
+        self.screenshotsDirectoryURL = Self.defaultScreenshotsDirectoryURL
+        self.temporaryDirectoryURL = Self.defaultTemporaryDirectoryURL
+        self.lastPasteboardChangeCount = pasteboard.snapshot().changeCount
+    }
+
+    init(
+        sessionService: AgentSessionService,
         settingsStore: SettingsStore,
-        textRecognizer: any ScreenshotTextRecognizing = VisionScreenshotTextRecognizer(),
-        pasteboard: any PasteboardReading = SystemPasteboardReader(),
-        screenshotsDirectoryURL: URL? = nil,
-        temporaryDirectoryURL: URL? = nil
+        textRecognizer: any ScreenshotTextRecognizing,
+        pasteboard: any PasteboardReading,
+        screenshotsDirectoryURL: URL?,
+        temporaryDirectoryURL: URL?
     ) {
         self.sessionService = sessionService
         self.settingsStore = settingsStore
@@ -158,9 +171,15 @@ final class ScreenshotMonitorService {
         lastPasteboardChangeCount = pasteboard.snapshot().changeCount
         pendingSubmissions = []
         trackedFilePaths = []
-        // Startup seeding is the one scan that stays synchronous: it happens
-        // once, and it is what stops a folder full of yesterday's screenshots
-        // from being analysed on the first tick.
+        trackedFilePathSet = []
+
+        guard settingsStore.autoAnalyzeScreenshots else {
+            return
+        }
+
+        // Startup seeding happens only when the feature is enabled: it stops
+        // a folder full of yesterday's screenshots from being analysed on the
+        // first tick.
         trackedFilePathSet = Set(Self.scanRecentScreenshots(
             in: screenshotsDirectoryURL,
             now: Date()
@@ -181,6 +200,16 @@ final class ScreenshotMonitorService {
     func stop() {
         timer?.invalidate()
         timer = nil
+    }
+
+    func syncWithSettings() {
+        if settingsStore.autoAnalyzeScreenshots {
+            if timer == nil {
+                start()
+            }
+        } else {
+            stop()
+        }
     }
 
     /// One polling step. Kept internal so tests can drive the monitor without
@@ -283,9 +312,14 @@ final class ScreenshotMonitorService {
         do {
             try FileManager.default.createDirectory(
                 at: temporaryDirectoryURL,
-                withIntermediateDirectories: true
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             try pngData.write(to: fileURL, options: .atomic)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fileURL.path
+            )
             return fileURL.path
         } catch {
             AppLog.automation.error(

@@ -187,15 +187,31 @@ extension SettingsView {
     @ViewBuilder
     var toolDecisionLogCard: some View {
         collapsibleSettingsCard(
-            title: "Recent tool decisions",
-            subtitle: "Every approval the app answered for the agent, newest first, kept in the app's own folder.",
+            title: "Recent tool activity",
+            subtitle: "Observed executions and permission decisions are recorded separately, newest first.",
             icon: "list.bullet.rectangle",
             isExpanded: $isToolDecisionLogExpanded,
-            trailingText: recentDecisions.isEmpty ? nil : "\(recentDecisions.count)"
+            trailingText: recentDecisions.isEmpty && recentExecutions.isEmpty
+                ? nil : "\(recentDecisions.count + recentExecutions.count)"
         ) {
             VStack(alignment: .leading, spacing: 8) {
+                Text("Observed executions")
+                    .font(.system(size: 12, weight: .semibold))
+                if recentExecutions.isEmpty {
+                    Text("No tool execution has been observed yet.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(recentExecutions.reversed()) { record in
+                        toolExecutionRow(record)
+                    }
+                }
+
+                Divider().opacity(0.3)
+                Text("Permission decisions")
+                    .font(.system(size: 12, weight: .semibold))
                 if recentDecisions.isEmpty {
-                    Text("Nothing has been decided yet this session.")
+                    Text("No permission decisions have been recorded yet.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else {
@@ -209,7 +225,7 @@ extension SettingsView {
                         title: "Refresh",
                         icon: "arrow.clockwise"
                     ) {
-                        Task { await reloadRecentDecisions() }
+                        Task { await reloadRecentToolActivity() }
                     }
 
                     secondaryActionButton(
@@ -223,7 +239,7 @@ extension SettingsView {
         }
         // Kart kapalıyken de başlıktaki sayı güncel kalsın diye kuyruk kart
         // görünür olduğunda okunur; satırlar yalnız açılınca kurulur.
-        .task { await reloadRecentDecisions() }
+        .task { await reloadRecentToolActivity() }
     }
 
     @ViewBuilder
@@ -260,7 +276,32 @@ extension SettingsView {
         }
     }
 
-    private func toolDecisionTint(_ reply: OpenCodePermissionReply) -> Color {
+    @ViewBuilder
+    private func toolExecutionRow(_ record: ToolAuditLog.ExecutionRecord) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(record.event == .failed ? Color.red : Color.secondary)
+                    .frame(width: 6, height: 6)
+                Text(record.title ?? record.toolKind.rawValue.capitalized)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(record.event.rawValue.capitalized)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(record.event == .failed ? .red : .secondary)
+                Spacer(minLength: 8)
+                Text(record.timestamp.formatted(date: .omitted, time: .standard))
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+            Text(record.detail ?? record.toolKind.rawValue)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func toolDecisionTint(_ reply: ProviderPermissionReply) -> Color {
         switch reply {
         case .once, .always:
             return .green
@@ -270,17 +311,18 @@ extension SettingsView {
     }
 
     private var policyConfigurationURL: URL {
-        ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+        ManagedAppDirectories.openCodeWorkingDirectory()
             .appendingPathComponent(ManagedOpenCodeConfiguration.fileName)
     }
 
     private var toolAuditLogURL: URL {
-        ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+        ManagedAppDirectories.openCodeWorkingDirectory()
             .appendingPathComponent("audit.jsonl")
     }
 
-    private func reloadRecentDecisions() async {
+    private func reloadRecentToolActivity() async {
         recentDecisions = await permissionApprovalCenter.recentDecisions(limit: 20)
+        recentExecutions = await permissionApprovalCenter.recentExecutions(limit: 20)
     }
 
     @ViewBuilder

@@ -66,12 +66,8 @@ struct URLSessionHTTPTransport: ProviderHTTPTransport {
                 throw ProviderRuntimeError.unexpectedResponse
             }
             return HTTPResponse(statusCode: response.statusCode, data: data)
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw ProviderRuntimeError.transport
+            throw ProviderRuntimeError.mapTransportError(error)
         }
     }
 
@@ -108,12 +104,8 @@ struct URLSessionHTTPTransport: ProviderHTTPTransport {
                     await channel.finish(throwing: CancellationError())
                 }
             )
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw ProviderRuntimeError.transport
+            throw ProviderRuntimeError.mapTransportError(error)
         }
     }
 }

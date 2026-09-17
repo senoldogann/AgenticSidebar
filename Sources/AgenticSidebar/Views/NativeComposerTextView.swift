@@ -5,9 +5,54 @@ import SwiftUI
 final class NativeComposerTextView: NSTextView {
     var submissionAvailability = ComposerSubmissionAvailability.unavailable
     var onSubmit: (() -> Void)?
+    /// A long paste becomes a file attachment instead of draft text. Return
+    /// `true` when the paste was handled so nothing is inserted; `false` falls
+    /// back to the platform paste and the text lands inline.
+    var onSpillLargePaste: ((String) -> Bool)?
     /// Escape önce öneri panelini kapatır; kapatacak bir panel yoksa `false`
     /// döner ve tuş sistemin varsayılanına bırakılır.
     var onCancelSuggestions: (() -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        guard !spillLargePasteIfNeeded() else {
+            return
+        }
+        super.paste(sender)
+    }
+
+    override func pasteAsPlainText(_ sender: Any?) {
+        guard !spillLargePasteIfNeeded() else {
+            return
+        }
+        super.pasteAsPlainText(sender)
+    }
+
+    override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
+        if let handler = onSpillLargePaste,
+           let text = pboard.string(forType: .string),
+           PastedTextAttachment.shouldSpillToFile(text) {
+            if handler(text) {
+                return true
+            }
+        }
+        return super.readSelection(from: pboard, type: type)
+    }
+
+    /// Panodaki metin dosya eşiğini aşarsa işleyiciye verir.
+    ///
+    /// Kısa yapıştırmalar her zamanki yoldan gider: her Cmd+V'de pano okumak
+    /// yerine önce uzunluk bakılır, eşik altı metin dokunulmadan geçer.
+    private func spillLargePasteIfNeeded() -> Bool {
+        guard
+            let handler = onSpillLargePaste,
+            let text = NSPasteboard.general.string(forType: .string),
+            PastedTextAttachment.shouldSpillToFile(text)
+        else {
+            return false
+        }
+
+        return handler(text)
+    }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
@@ -81,6 +126,8 @@ struct ComposerTextEditor: NSViewRepresentable {
     let onSubmit: @MainActor () -> Void
     /// Öneri paneli açıkken Escape'in onu kapatıp kapatmadığını bildirir.
     let onCancelSuggestions: @MainActor () -> Bool
+    /// Eşik üstü yapıştırma dosya eki olur; `true` ekler, `false` satıra yazar.
+    let onSpillLargePaste: @MainActor (String) -> Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text)
@@ -180,6 +227,7 @@ struct ComposerTextEditor: NSViewRepresentable {
         textView.submissionAvailability = submissionAvailability
         textView.onSubmit = onSubmit
         textView.onCancelSuggestions = onCancelSuggestions
+        textView.onSpillLargePaste = onSpillLargePaste
     }
 
     private func textView(in scrollView: NSScrollView) -> NativeComposerTextView? {

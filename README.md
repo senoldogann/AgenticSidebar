@@ -43,6 +43,14 @@ archive stays bounded: the newest 120 activities per conversation are kept, each
 result is capped at 4,000 characters with the truncation marked, and a timeline whose
 message is gone is dropped.
 
+Context survives an interruption, not just the transcript on screen. Prompts still
+waiting in the queue and the text you had typed but not sent are archived with the
+conversation and come back on the next launch. The OpenCode server, however, keeps its
+own copy of a conversation and forgets it when the app stops it, so the first turn of
+a fresh backend session carries the earlier turns as quoted history inside the prompt
+— the model reads what happened before it answers, and no restored tool is re-run.
+Later turns need nothing, because the backend session holds them from then on.
+
 Long conversations are trimmed to a request budget (the newest messages are kept and
 the window starts on a user turn); the chat view says how many messages were left out,
 and the stored transcript always stays complete.
@@ -88,6 +96,28 @@ filled with the theme accent. Clicking a bar scrolls that prompt to the top of t
 transcript; hovering shows the prompt itself. The column appears once a conversation
 has more than one prompt, and the transcript reserves its width so the bars never sit
 over the text.
+
+The transcript follows a streaming answer to the bottom on its own, and stops only
+when you scroll away. Follow mode is changed by your own scrolling — never by the
+answer growing underneath it — so a long conversation cannot strand the view halfway
+up its own history. Two details make that rule hold on a real trackpad and a real
+mouse wheel. Ownership of the position is yours the moment the measured offset
+*falls*: content growing below never lowers the offset, so a fall cannot be
+mistaken for growth, and it works whether or not the input device reports a scroll
+phase at all. And "at the bottom" means within 40 points of it, not 120: at 120 a
+few lines scrolled up were still close enough for the answer to keep pulling the
+reader back down.
+
+The transcript is rendered lazily and the lazy stack is not given an implicit
+animation, because animating it made SwiftUI lay out every row on every change and
+lock up on a long conversation.
+
+While an answer streams, only the blocks that changed are re-typeset and re-laid
+out. Rebuilding the whole run on every flush cost 10–41 ms of typesetting plus
+7–27 ms of layout at 4–27k characters, against a 16–40 ms flush cadence — the main
+thread never idled, which is what made scrolling stutter and feel held. Measured
+over 30 flushes of a growing answer, the old path went 2.7 → 15.1 ms per flush and
+the new one stayed at 0.6 → 0.8 ms.
 
 ## One backend per app, and nothing left behind
 
@@ -216,14 +246,14 @@ deletes its own throwaway item in the login keychain.
   control in the composer and on a waiting approval card:
   - **Ask** — reads and in-folder edits run; every shell command, every path
     outside the working folder and every network call waits for your decision.
-  - **Approve for me** — a short list of exact inspection commands (`git status`,
-    `git diff`, `ls`, `pwd` and selected fixed variants) and exact build/test
-    commands run unattended within the working folder. Other commands, including
-    arbitrary flags, commands that can change state, external paths and network
-    access, require approval.
-  - **Full access** — nothing asks. **This is the default**, matching how the app
-    behaved before the level existed; two stricter levels are one click away.
-    It answers the requests the agent raises; a `deny` in the user's own
+  - **Approve for me** — **this is the default**, so a fresh install asks about
+    anything potentially unsafe without burying the user in prompts. A short
+    list of exact inspection commands (`git status`, `git diff`, `ls`, `pwd`
+    and selected fixed variants) and exact build/test commands run unattended
+    within the working folder. Other commands, including arbitrary flags,
+    commands that can change state, external paths and network access, require
+    approval.
+  - **Full access** — nothing asks. It answers the requests the agent raises; a `deny` in the user's own
     `opencode.json`, and the app's own `deny` for the computer-use file, git,
     terminal and JavaScript tools, still apply — a denied tool is never asked
     about, so no level can allow it.
@@ -237,6 +267,49 @@ deletes its own throwaway item in the login keychain.
   only runs unattended when it is a *single* simple command whose paths stay
   inside the working folder — a trusted prefix chained with `&&`, `;`, `|` or a
   redirect asks instead.
+
+  ### What the level can and cannot decide
+
+  The level decides the requests that **reach the app**, and the app's
+  configuration is one of the files OpenCode merges — not the last word. Two
+  other sources produce rules that outrank it, and a capability either of them
+  allows never raises a request, so no level can ask about it:
+
+  - an `agent` definition's `tools` map. OpenCode turns every enabled tool into
+    an agent-level `allow` (`bash: true` becomes `permission.bash: allow`), and
+    that rule is applied after the configuration. The built-in `build` agent
+    enables the shell, edits and reads; subagents likewise inherit whatever their
+    own definition enables.
+  - the user's own `~/.config/opencode/opencode.json` and
+    `~/.opencode/opencode.json`, which are merged after the app's file.
+
+  Measured on OpenCode 1.18.31: with only the app's configuration in play, an
+  explicit `bash: ask` does raise a request (`bash(echo probe-one)`); with the
+  machine's own `~/.opencode/opencode.json` in place, the same command resolves to
+  `allow` and no request is ever raised — in the parent session and in a
+  delegated subagent alike. The approval level therefore governs the families the
+  agent does not declare: paths outside the working folder, `todowrite`, `skill`,
+  `task` (the subagent delegation itself), web fetches and searches, the
+  doom-loop guard, MCP tools and every `computer_*` tool. Settings → AI & Models →
+  Recent tool activity shows which requests actually arrived.
+
+  The Plan agent is unaffected by that precedence: it is defined by the app with
+  an explicit `permission` block and no `tools` map, so its read-only boundary is
+  enforced by the backend rather than asked about.
+- **Delegated subagents**: the agent can hand a piece of work to a subagent
+  through the `task` tool, and that subagent runs in an OpenCode child session of
+  its own. Its permission requests carry the child session's id rather than the
+  turn's, so the app treats them as first-class rather than foreign: they are
+  delivered no matter which session raised them, they are answered by the same
+  level (or by hand, from the approval card), and the card says *Delegated
+  subagent* so a question asked on the agent's behalf is not mistaken for the
+  turn's own. Stopping a turn clears the requests a delegated session left
+  waiting, so nothing stays on screen after the work behind it is gone. Two limits
+  are worth knowing: a subagent's own definition decides what it may do without
+  asking (see above), and Plan mode refuses `task` itself, so delegating is
+  unavailable there rather than merely asked about — a child session runs with its
+  own definition's tools, which would otherwise be a way around the read-only
+  boundary.
 - **Audit trail**: permission decisions and observed tool execution events are
   distinct JSONL records in
   `~/Library/Application Support/AgenticSidebar/OpenCode/audit.jsonl` (rotated at

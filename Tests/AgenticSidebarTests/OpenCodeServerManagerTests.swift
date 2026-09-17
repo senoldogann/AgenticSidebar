@@ -12,7 +12,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             portAllocator: StubOpenCodePortAllocator(port: 51160),
             listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: InMemoryOpenCodeCredentialStore(),
-            workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
+            workingDirectoryURL: makeWorkingDirectory(),
             passwordGenerator: { "generated-password" }
         )
 
@@ -28,10 +28,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
     func testStartLaunchesAuthenticatedLoopbackServerAndReportsVersion() async throws {
         let launcher = RecordingOpenCodeProcessLauncher()
         let credentialStore = InMemoryOpenCodeCredentialStore()
-        let workingDirectoryURL = URL(
-            fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests",
-            isDirectory: true
-        )
+        let workingDirectoryURL = makeWorkingDirectory()
         let manager = ManagedOpenCodeServerManager(
             executableLocator: StubOpenCodeExecutableLocator(
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
@@ -57,6 +54,11 @@ final class OpenCodeServerManagerTests: XCTestCase {
         XCTAssertEqual(request.environment["OPENCODE_SERVER_USERNAME"], "opencode")
         XCTAssertEqual(request.environment["OPENCODE_SERVER_PASSWORD"], "generated-password")
         XCTAssertEqual(request.workingDirectoryURL, workingDirectoryURL)
+        XCTAssertEqual(
+            request.environment["OPENCODE_CONFIG"],
+            workingDirectoryURL.appendingPathComponent(ManagedOpenCodeConfiguration.fileName).path,
+            "Injected working directory must also scope the generated configuration"
+        )
         XCTAssertEqual(connection.baseURL.absoluteString, "http://127.0.0.1:51161")
         XCTAssertEqual(connection.username, "opencode")
         XCTAssertEqual(connection.password, "generated-password")
@@ -68,12 +70,12 @@ final class OpenCodeServerManagerTests: XCTestCase {
         XCTAssertEqual(status, .running(version: "1.18.31", baseURL: connection.baseURL))
     }
 
-    func testStoredServerPasswordIsReusedAcrossManagedRestarts() async throws {
+    func testServerPasswordRotatesOnEveryStart() async throws {
         let launcher = RecordingOpenCodeProcessLauncher()
         let credentialStore = InMemoryOpenCodeCredentialStore(
             values: [.openCodeServerPassword: "stored-password"]
         )
-        let generator = PasswordGenerationProbe()
+        let generator = RotatingPasswordGenerator(passwords: ["first-password", "second-password"])
         let manager = ManagedOpenCodeServerManager(
             executableLocator: StubOpenCodeExecutableLocator(
                 url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
@@ -83,26 +85,26 @@ final class OpenCodeServerManagerTests: XCTestCase {
             portAllocator: StubOpenCodePortAllocator(port: 51162),
             listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: credentialStore,
-            workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
+            workingDirectoryURL: makeWorkingDirectory(),
             passwordGenerator: {
-                await generator.record()
-                return "new-password"
+                await generator.next()
             }
         )
 
-        _ = try await manager.start(computerUse: nil)
+        let first = try await manager.start(computerUse: nil)
         await manager.stop()
-        _ = try await manager.start(computerUse: nil)
+        let second = try await manager.start(computerUse: nil)
 
+        XCTAssertEqual(first.password, "first-password")
+        XCTAssertEqual(second.password, "second-password")
         let requests = await launcher.requests()
         XCTAssertEqual(requests.count, 2)
-        XCTAssertTrue(
-            requests.allSatisfy {
-                $0.environment["OPENCODE_SERVER_PASSWORD"] == "stored-password"
-            }
+        XCTAssertEqual(requests[0].environment["OPENCODE_SERVER_PASSWORD"], "first-password")
+        XCTAssertEqual(requests[1].environment["OPENCODE_SERVER_PASSWORD"], "second-password")
+        XCTAssertEqual(
+            try credentialStore.read(.openCodeServerPassword),
+            "second-password"
         )
-        let generationCount = await generator.count()
-        XCTAssertEqual(generationCount, 0)
     }
 
     func testHealthFailureTerminatesChildAndClearsConnection() async {
@@ -116,7 +118,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             portAllocator: StubOpenCodePortAllocator(port: 51163),
             listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: InMemoryOpenCodeCredentialStore(),
-            workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
+            workingDirectoryURL: makeWorkingDirectory(),
             passwordGenerator: { "generated-password" }
         )
 
@@ -159,7 +161,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             portAllocator: StubOpenCodePortAllocator(port: 51165),
             listenerVerifier: StubListenerVerifier(owns: false),
             credentialStore: InMemoryOpenCodeCredentialStore(),
-            workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
+            workingDirectoryURL: makeWorkingDirectory(),
             passwordGenerator: { "generated-password" }
         )
 
@@ -196,7 +198,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             portAllocator: StubOpenCodePortAllocator(port: 51164),
             listenerVerifier: StubListenerVerifier(owns: true),
             credentialStore: InMemoryOpenCodeCredentialStore(),
-            workingDirectoryURL: URL(fileURLWithPath: "/tmp/AgenticSidebar-OpenCode-tests", isDirectory: true),
+            workingDirectoryURL: makeWorkingDirectory(),
             passwordGenerator: { "generated-password" }
         )
 
@@ -216,6 +218,11 @@ final class OpenCodeServerManagerTests: XCTestCase {
         let status = await manager.status()
         XCTAssertEqual(status, .stopped)
     }
+}
+
+private func makeWorkingDirectory() -> URL {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent("AgenticSidebar-OpenCode-tests-\(UUID().uuidString)", isDirectory: true)
 }
 
 private struct StubOpenCodeExecutableLocator: OpenCodeExecutableLocating {
@@ -327,10 +334,17 @@ private final class InMemoryOpenCodeCredentialStore: CredentialStore, @unchecked
     }
 }
 
-private actor PasswordGenerationProbe {
-    private var generationCount = 0
-    func record() { generationCount += 1 }
-    func count() -> Int { generationCount }
+private actor RotatingPasswordGenerator {
+    private var passwords: [String]
+    init(passwords: [String]) {
+        self.passwords = passwords
+    }
+    func next() -> String {
+        guard !passwords.isEmpty else {
+            return "fallback-password"
+        }
+        return passwords.removeFirst()
+    }
 }
 
 private func XCTAssertThrowsErrorAsync<T>(

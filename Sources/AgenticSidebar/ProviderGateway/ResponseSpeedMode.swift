@@ -41,11 +41,10 @@ enum ResponseSpeedMode: String, CaseIterable, Codable, Identifiable, Sendable {
             nil
         case .fast:
             """
-            FAST MODE: Answer immediately with the final result. Do not greet, do not \
-            restate the request, do not describe your plan, and do not summarize at the \
-            end. Use tools only when the answer truly depends on them; otherwise answer \
-            directly from what you already know. Keep the reply as short as the question \
-            allows.
+            FAST MODE: Prioritize immediate time-to-first-token and maximum velocity without compromising code correctness or engineering quality.
+            - Deliver the same thorough, high-caliber, and accurate solution as normal mode, with zero preamble, no greeting, and no filler summary.
+            - Start outputting the concrete solution and code changes directly.
+            - When tools are required, execute them decisively and concisely.
             """
         }
     }

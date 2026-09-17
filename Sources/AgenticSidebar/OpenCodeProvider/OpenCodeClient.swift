@@ -71,6 +71,13 @@ protocol OpenCodeClientProtocol: Sendable {
         variant: String?,
         parts: [OpenCodePromptPart]
     ) async throws
+    func sendPromptAsync(
+        sessionID: String,
+        model: OpenCodeModelReference,
+        variant: String?,
+        parts: [OpenCodePromptPart],
+        agent: String?
+    ) async throws
     func abort(sessionID: String) async throws
     func eventStream() async throws -> OpenCodeLineStream
     func replyPermission(requestID: String, reply: String) async throws
@@ -89,6 +96,22 @@ protocol OpenCodeClientProtocol: Sendable {
 }
 
 extension OpenCodeClientProtocol {
+    // Older adapters can continue to handle the default build agent, but a
+    // read-only plan is a security boundary. Never silently drop a custom agent
+    // selection and execute its prompt under the default (possibly writable) one.
+    func sendPromptAsync(
+        sessionID: String,
+        model: OpenCodeModelReference,
+        variant: String?,
+        parts: [OpenCodePromptPart],
+        agent: String?
+    ) async throws {
+        guard agent == nil || agent == "build" else {
+            throw ProviderRuntimeError.unavailable
+        }
+        try await sendPromptAsync(sessionID: sessionID, model: model, variant: variant, parts: parts)
+    }
+
     // Fakes in tests only ever answer the calls their test exercises; a server
     // that asks for no authorization is the honest default for them.
     func startMCPAuthorization(name: String) async throws -> URL? { nil }
@@ -209,6 +232,18 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         variant: String?,
         parts: [OpenCodePromptPart]
     ) async throws {
+        try await sendPromptAsync(
+            sessionID: sessionID, model: model, variant: variant, parts: parts, agent: nil
+        )
+    }
+
+    func sendPromptAsync(
+        sessionID: String,
+        model: OpenCodeModelReference,
+        variant: String?,
+        parts: [OpenCodePromptPart],
+        agent: String?
+    ) async throws {
         let request = try makeJSONRequest(
             pathComponents: ["session", sessionID, "prompt_async"],
             method: "POST",
@@ -218,6 +253,7 @@ struct OpenCodeClient: OpenCodeClientProtocol {
                     modelID: model.modelID
                 ),
                 variant: variant,
+                agent: agent,
                 parts: parts
             )
         )
@@ -331,12 +367,8 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             let stream = try await transport.stream(request)
             try validate(statusCode: stream.statusCode)
             return stream
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw ProviderRuntimeError.transport
+            throw ProviderRuntimeError.mapTransportError(error)
         }
     }
 
@@ -345,12 +377,8 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             let response = try await transport.send(request)
             try validate(statusCode: response.statusCode, body: response.data)
             return response
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw ProviderRuntimeError.transport
+            throw ProviderRuntimeError.mapTransportError(error)
         }
     }
 
@@ -440,6 +468,7 @@ struct OpenCodeClient: OpenCodeClientProtocol {
     private struct PromptBody: Encodable {
         let model: PromptModel
         let variant: String?
+        let agent: String?
         let parts: [OpenCodePromptPart]
     }
 

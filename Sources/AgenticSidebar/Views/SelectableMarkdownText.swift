@@ -139,22 +139,41 @@ enum MarkdownTextRunBuilder {
         let result = NSMutableAttributedString()
 
         for (offset, block) in blocks.enumerated() {
-            if offset > 0 {
-                result.append(NSAttributedString(string: "\n"))
-            }
-
-            // The gap *between* blocks is the paragraph spacing, and the gap to
-            // whatever follows the run is the enclosing stack's spacing — so the
-            // last paragraph must not add one of its own.
-            let isLast = offset == blocks.count - 1
             result.append(
-                paragraph(
+                piece(
                     for: block,
-                    typography: typography,
-                    isLast: isLast
+                    isFirst: offset == 0,
+                    isLast: offset == blocks.count - 1,
+                    typography: typography
                 )
             )
         }
+
+        return result
+    }
+
+    /// One block's contribution to the run, its separator included.
+    ///
+    /// A run is updated block by block while an answer streams, and only the
+    /// blocks that changed are re-typeset. That is why the pieces are exposed: the
+    /// text view can replace the tail of what it already holds instead of
+    /// rebuilding — and re-laying out — the whole answer on every flush.
+    static func piece(
+        for block: MarkdownBlock,
+        isFirst: Bool,
+        isLast: Bool,
+        typography: MarkdownRunTypography
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+
+        if !isFirst {
+            result.append(NSAttributedString(string: "\n"))
+        }
+
+        // The gap *between* blocks is the paragraph spacing, and the gap to
+        // whatever follows the run is the enclosing stack's spacing — so the
+        // last paragraph must not add one of its own.
+        result.append(paragraph(for: block, typography: typography, isLast: isLast))
 
         return result
     }
@@ -342,26 +361,119 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSTextView {
         let textView = Self.makeTextView()
         textView.delegate = context.coordinator
-        textView.textStorage?.setAttributedString(
-            MarkdownTextRunBuilder.attributedString(blocks: blocks, typography: typography)
-        )
-        context.coordinator.token = MarkdownTextRunBuilder.token(
+        Self.apply(
             blocks: blocks,
-            typography: typography
+            typography: typography,
+            to: textView,
+            coordinator: context.coordinator
         )
         return textView
     }
 
     func updateNSView(_ textView: NSTextView, context: Context) {
-        let token = MarkdownTextRunBuilder.token(blocks: blocks, typography: typography)
-        guard context.coordinator.token != token else {
+        Self.apply(
+            blocks: blocks,
+            typography: typography,
+            to: textView,
+            coordinator: context.coordinator
+        )
+    }
+
+    /// Writes a run into the text view, re-typesetting only what changed.
+    ///
+    /// A streaming answer rewrites its *last* block several times a second. The
+    /// whole run used to be rebuilt and laid out on every one of those flushes —
+    /// measured here at 10–41 ms of attributed-string building plus 7–27 ms of
+    /// layout for a 4–27k character answer, on the main thread, and it grows with
+    /// the answer. At a 16–40 ms flush cadence that saturates the main thread, and
+    /// the pinch is felt as a scroll that stutters and seems to be held by
+    /// something else.
+    ///
+    /// Now the unchanged prefix keeps the text storage (and the layout) it already
+    /// has: only the blocks from the first change onwards are replaced. Two side
+    /// effects follow. A selection made in an earlier paragraph survives an answer
+    /// that keeps growing below it, which `setAttributedString` used to throw away
+    /// on every flush.
+    static func apply(
+        blocks: [MarkdownBlock],
+        typography: MarkdownRunTypography,
+        to textView: NSTextView,
+        coordinator: Coordinator
+    ) {
+        let previousBlocks = coordinator.blocks
+        let typographyChanged = coordinator.typography != typography
+
+        guard typographyChanged || previousBlocks != blocks else {
             return
         }
 
-        context.coordinator.token = token
-        textView.textStorage?.setAttributedString(
-            MarkdownTextRunBuilder.attributedString(blocks: blocks, typography: typography)
+        let startIndex = typographyChanged
+            ? 0
+            : Self.firstChangedBlockIndex(previous: previousBlocks, next: blocks)
+
+        guard let storage = textView.textStorage else {
+            return
+        }
+
+        let oldLength = storage.length
+        let replacementStart = min(
+            startIndex < coordinator.pieceOffsets.count
+                ? coordinator.pieceOffsets[startIndex]
+                : coordinator.writtenLength,
+            oldLength
         )
+        let replacedLength = oldLength - replacementStart
+
+        let replacement = NSMutableAttributedString()
+        var offsets = Array(coordinator.pieceOffsets.prefix(startIndex))
+
+        for index in startIndex..<blocks.count {
+            offsets.append(replacementStart + replacement.length)
+            replacement.append(
+                MarkdownTextRunBuilder.piece(
+                    for: blocks[index],
+                    isFirst: index == 0,
+                    isLast: index == blocks.count - 1,
+                    typography: typography
+                )
+            )
+        }
+
+        storage.beginEditing()
+        storage.replaceCharacters(
+            in: NSRange(location: replacementStart, length: replacedLength),
+            with: replacement
+        )
+        storage.endEditing()
+
+        coordinator.blocks = blocks
+        coordinator.typography = typography
+        coordinator.pieceOffsets = offsets
+        coordinator.writtenLength = replacementStart + replacement.length
+        coordinator.lastEdit = NSRange(location: replacementStart, length: replacedLength)
+
+        if startIndex == 0 {
+            coordinator.fullRebuilds += 1
+        } else {
+            coordinator.incrementalEdits += 1
+        }
+    }
+
+    /// The first block whose text differs, pulled back far enough to re-typeset the
+    /// block that lost its "last" status.
+    ///
+    /// The final block carries no paragraph spacing and every earlier one does, so
+    /// appending a block also changes the one before it. The rebuild starts there.
+    private static func firstChangedBlockIndex(
+        previous: [MarkdownBlock],
+        next: [MarkdownBlock]
+    ) -> Int {
+        var index = 0
+        while index < previous.count, index < next.count, previous[index] == next[index] {
+            index += 1
+        }
+
+        return max(0, min(index, next.count - 2))
     }
 
     func sizeThatFits(
@@ -441,7 +553,18 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
-        var token: String?
+        var blocks: [MarkdownBlock] = []
+        var typography: MarkdownRunTypography?
+
+        /// Where each block's piece starts in the text storage.
+        var pieceOffsets: [Int] = []
+        /// The length of the run as last written.
+        var writtenLength = 0
+        /// The range the last write replaced; `location > 0` means only the tail
+        /// was touched. Used by the tests to prove the incremental path.
+        fileprivate(set) var lastEdit = NSRange(location: 0, length: 0)
+        fileprivate(set) var fullRebuilds = 0
+        fileprivate(set) var incrementalEdits = 0
 
         func textView(
             _ textView: NSTextView,

@@ -8,6 +8,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var contentBuilder: (@MainActor () -> AnyView)?
     var isWindowOpen: Bool = false
+    private var stealthModeEnabled: Bool = true
 
     /// Which tab the window shows and which card it scrolls to. Read by
     /// `SettingsView`, written by whoever opens the window.
@@ -21,13 +22,23 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         self.contentBuilder = contentBuilder
     }
 
-    /// Opens the window, optionally on a specific tab and card.
-    ///
-    /// The navigation is set before the window is brought forward so that a first
-    /// open lands on the right card, and an already-open window still moves: a
-    /// link that silently did nothing on the second press would be worse than no
-    /// link at all.
-    func show(tab: SettingsTab? = nil, anchor: SettingsAnchor? = nil) {
+    func setStealthMode(_ enabled: Bool) {
+        stealthModeEnabled = enabled
+        window?.sharingType = enabled ? .none : .readOnly
+    }
+
+    /// Opens the window without navigating to a specific tab or card.
+    func show() {
+        show(tab: nil, anchor: nil)
+    }
+
+    /// Opens the window on a specific tab.
+    func show(tab: SettingsTab?) {
+        show(tab: tab, anchor: nil)
+    }
+
+    /// Opens the window on a specific tab and card.
+    func show(tab: SettingsTab?, anchor: SettingsAnchor?) {
         if tab != nil || anchor != nil {
             navigation.open(tab: tab ?? navigation.tab, anchor: anchor)
         }
@@ -37,7 +48,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 existing.center()
             }
             existing.makeKeyAndOrderFront(nil)
-            NSApp.activate()
+            NSApp.activate(ignoringOtherApps: true)
             isWindowOpen = true
             return
         }
@@ -63,11 +74,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         newWindow.isReleasedWhenClosed = false
         newWindow.contentViewController = hostingController
         newWindow.delegate = self
+        newWindow.sharingType = stealthModeEnabled ? .none : .readOnly
         newWindow.center()
 
         self.window = newWindow
         newWindow.makeKeyAndOrderFront(nil)
-        NSApp.activate()
+        NSApp.activate(ignoringOtherApps: true)
         isWindowOpen = true
     }
 

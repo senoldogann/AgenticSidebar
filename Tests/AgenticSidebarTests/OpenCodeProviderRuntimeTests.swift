@@ -94,6 +94,21 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         )
     }
 
+    func testPlanAndBuildTurnsSelectDistinctBackendAgents() async throws {
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            completedLineStream(sessionID: "ses_remote"),
+            completedLineStream(sessionID: "ses_remote")
+        ])
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let sessionID = UUID()
+        let plan = try await runtime.startStream(for: makeRequest(sessionID: sessionID, text: "Plan", mode: .plan))
+        _ = try await collect(plan.events)
+        let build = try await runtime.startStream(for: makeRequest(sessionID: sessionID, text: "Build", mode: .build))
+        _ = try await collect(build.events)
+        let agents = await client.agents()
+        XCTAssertEqual(agents, [ManagedOpenCodeConfiguration.planAgentName, "build"])
+    }
+
     func testRuntimeNormalizesTextToolAndCompletionEvents() async throws {
         let linePair = AsyncThrowingStream<String, Error>.makeStream()
         linePair.continuation.yield(
@@ -145,6 +160,72 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
                 .completed
             ]
         )
+    }
+
+    func testToolActivityIsAuditedWithoutAnApprovalRequest() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tool-runtime-audit-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audit = ToolAuditLog(fileURL: directory.appendingPathComponent("audit.jsonl"))
+        let lines = AsyncThrowingStream<String, Error>.makeStream()
+        lines.continuation.yield(
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"part-read","type":"tool","tool":"read","state":{"status":"running","input":{"filePath":"source.swift"}}}}}"#
+        )
+        lines.continuation.yield(
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"part-read","type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"source.swift"},"output":"private content"}}}}"#
+        )
+        lines.continuation.yield(
+            #"data: {"type":"session.idle","properties":{"sessionID":"ses_remote"}}"#
+        )
+        lines.continuation.finish()
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            OpenCodeLineStream(statusCode: 200, lines: lines.stream)
+        ])
+        let runtime = makeRuntime(
+            client: client, permissionHandler: nil, cancelPendingPermissions: nil, auditLog: audit
+        )
+        let stream = try await runtime.startStream(for: makeRequest(sessionID: UUID(), text: "Read"))
+        _ = try await collect(stream.events)
+
+        let execution = await audit.recentExecutions(limit: 10)
+        XCTAssertEqual(execution.map(\.event), [.started, .completed])
+        XCTAssertEqual(execution.map(\.activityID), ["part-read", "part-read"])
+        XCTAssertEqual(execution.map(\.toolKind), [.read, .read])
+        let decisions = await audit.recent(limit: 10)
+        XCTAssertTrue(decisions.isEmpty, "An allowed tool does not create a fictitious approval")
+        let disk = try String(contentsOf: audit.fileURL, encoding: .utf8)
+        XCTAssertFalse(disk.contains("private content"), "Tool output must not be copied into audit")
+    }
+
+    func testExecutionAuditNeverPersistsCommandArguments() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("private-tool-audit-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audit = ToolAuditLog(fileURL: directory.appendingPathComponent("audit.jsonl"))
+        let lines = AsyncThrowingStream<String, Error>.makeStream()
+        lines.continuation.yield(
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"part-command","type":"tool","tool":"bash","state":{"status":"running","input":{"command":"API_TOKEN=private-value swift test"}}}}}"#
+        )
+        lines.continuation.yield(
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_remote","part":{"id":"part-command","type":"tool","tool":"bash","state":{"status":"completed","input":{},"output":"ok"}}}}"#
+        )
+        lines.continuation.yield(
+            #"data: {"type":"session.idle","properties":{"sessionID":"ses_remote"}}"#
+        )
+        lines.continuation.finish()
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            OpenCodeLineStream(statusCode: 200, lines: lines.stream)
+        ])
+        let runtime = makeRuntime(
+            client: client, permissionHandler: nil, cancelPendingPermissions: nil, auditLog: audit
+        )
+        let stream = try await runtime.startStream(for: makeRequest(sessionID: UUID(), text: "Inspect"))
+        _ = try await collect(stream.events)
+        let entries = await audit.recentExecutions(limit: 10)
+        XCTAssertEqual(entries.map(\.event), [.started, .completed])
+        XCTAssertEqual(entries.map(\.toolKind), [.command, .command])
+        let content = try String(contentsOf: audit.fileURL, encoding: .utf8)
+        XCTAssertFalse(content.contains("private-value"), "Sensitive shell arguments must not enter the persistent audit")
     }
 
     func testCompletionCancelsUnderlyingEventStream() async throws {
@@ -251,9 +332,11 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
                 OpenCodeLineStream(statusCode: 200, lines: linePair.stream)
             ]
         )
+        let owningSessionID = UUID()
         let runtime = makeRuntime(
             client: client,
             permissionHandler: { request in
+                XCTAssertEqual(request.appSessionID, owningSessionID)
                 XCTAssertEqual(request.toolName, "chatgpt-system_computer_click")
                 return .reject
             },
@@ -261,7 +344,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         )
 
         let stream = try await runtime.startStream(
-            for: makeRequest(sessionID: UUID(), text: "Click Run")
+            for: makeRequest(sessionID: owningSessionID, text: "Click Run")
         )
         _ = try await collect(stream.events)
 
@@ -317,18 +400,23 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         let runtime = makeRuntime(
             client: client,
             permissionHandler: { _ in .once },
-            cancelPendingPermissions: { remoteSessionID in
-                await probe.record(remoteSessionID: remoteSessionID)
+            cancelPendingPermissions: { remoteSessionID, appSessionID in
+                await probe.record(remoteSessionID: remoteSessionID, appSessionID: appSessionID)
             }
         )
+        let appSessionID = UUID()
 
         let stream = try await runtime.startStream(
-            for: makeRequest(sessionID: UUID(), text: "Long task")
+            for: makeRequest(sessionID: appSessionID, text: "Long task")
         )
         await stream.cancel()
 
         let sessionIDs = await probe.sessionIDs()
         XCTAssertEqual(sessionIDs, ["ses_remote"])
+        // Bir alt ajanın isteği çocuk oturumun kimliğini taşır; hangi sohbete ait
+        // olduğunu yalnız bu ikinci kimlik söyler.
+        let conversations = await probe.conversationIDs()
+        XCTAssertEqual(conversations, [appSessionID])
     }
 
     func testReleasingASessionDeletesTheRemoteSessionAndForgetsIt() async throws {
@@ -374,10 +462,97 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         XCTAssertTrue(calls.isEmpty)
     }
 
+    func testFirstTurnOnAFreshBackendSessionCarriesRestoredHistory() async throws {
+        let client = RuntimeMockOpenCodeClient(
+            eventStreams: [completedLineStream(sessionID: "ses_remote")]
+        )
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let appSessionID = UUID()
+        let request = ProviderRequest(
+            sessionID: appSessionID,
+            configuration: SessionConfiguration(
+                providerID: ProviderID("opencode"),
+                modelID: ProviderModelID("anthropic/claude/opus"),
+                variantID: ProviderVariantID("high")
+            ),
+            messages: [
+                ChatMessage(role: .user, text: "Old question"),
+                ChatMessage(role: .assistant, text: "Old answer"),
+                ChatMessage(role: .user, text: "New question")
+            ],
+            speedMode: .normal,
+            mode: .build
+        )
+
+        let stream = try await runtime.startStream(for: request)
+        _ = try await collect(stream.events)
+
+        let texts = await client.calls().compactMap { call -> String? in
+            if case let .prompt(_, _, _, text) = call { return text }
+            return nil
+        }
+        XCTAssertEqual(texts.count, 1)
+        let prompt = try XCTUnwrap(texts.first)
+        XCTAssertTrue(prompt.contains("Old question"), "restored user turn must ride along")
+        XCTAssertTrue(prompt.contains("Old answer"), "restored assistant turn must ride along")
+        XCTAssertTrue(prompt.contains("New question"), "the new turn is still the prompt")
+        XCTAssertTrue(
+            prompt.contains("Conversation history restored"),
+            "the model must know this is restored history, not a replay to act on"
+        )
+    }
+
+    func testSecondTurnOnTheSameBackendSessionRepeatsNoHistory() async throws {
+        let client = RuntimeMockOpenCodeClient(
+            eventStreams: [
+                completedLineStream(sessionID: "ses_remote"),
+                completedLineStream(sessionID: "ses_remote")
+            ]
+        )
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let appSessionID = UUID()
+
+        let first = try await runtime.startStream(
+            for: makeRequest(sessionID: appSessionID, text: "First")
+        )
+        _ = try await collect(first.events)
+
+        // The transcript now holds the first turn, but the backend session is
+        // the same one — so the second turn must not quote it back.
+        let secondRequest = ProviderRequest(
+            sessionID: appSessionID,
+            configuration: SessionConfiguration(
+                providerID: ProviderID("opencode"),
+                modelID: ProviderModelID("anthropic/claude/opus"),
+                variantID: ProviderVariantID("high")
+            ),
+            messages: [
+                ChatMessage(role: .user, text: "First"),
+                ChatMessage(role: .assistant, text: "First answer"),
+                ChatMessage(role: .user, text: "Second")
+            ],
+            speedMode: .normal,
+            mode: .build
+        )
+        let second = try await runtime.startStream(for: secondRequest)
+        _ = try await collect(second.events)
+
+        let texts = await client.calls().compactMap { call -> String? in
+            if case let .prompt(_, _, _, text) = call { return text }
+            return nil
+        }
+        XCTAssertEqual(texts.count, 2)
+        XCTAssertFalse(
+            texts[1].contains("Conversation history restored"),
+            "history rides exactly once, on the fresh session's first turn"
+        )
+    }
+
     private func makeRuntime(
         client: RuntimeMockOpenCodeClient,
         permissionHandler: OpenCodeProviderRuntime.PermissionHandler?,
-        cancelPendingPermissions: OpenCodeProviderRuntime.PermissionCancellationHandler?
+        cancelPendingPermissions: OpenCodeProviderRuntime.PermissionCancellationHandler?,
+        auditLog: ToolAuditLog? = nil
     ) -> OpenCodeProviderRuntime {
         OpenCodeProviderRuntime(
             serverManager: StubRuntimeOpenCodeServerManager(
@@ -389,7 +564,8 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             ),
             clientFactory: { _ in client },
             permissionHandler: permissionHandler,
-            cancelPendingPermissions: cancelPendingPermissions
+            cancelPendingPermissions: cancelPendingPermissions,
+            auditLog: auditLog
         )
     }
 
@@ -410,7 +586,8 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
 
     private func makeRequest(
         sessionID: UUID,
-        text: String
+        text: String,
+        mode: AgentMode = .build
     ) -> ProviderRequest {
         ProviderRequest(
             sessionID: sessionID,
@@ -420,7 +597,8 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
                 variantID: ProviderVariantID("high")
             ),
             messages: [ChatMessage(role: .user, text: text)],
-            speedMode: .normal
+            speedMode: .normal,
+            mode: mode
         )
     }
 
@@ -496,6 +674,7 @@ private actor RuntimeMockOpenCodeClient: OpenCodeClientProtocol {
     private var streams: [OpenCodeLineStream]
     private let promptError: Error?
     private var recordedCalls: [RuntimeOpenCodeCall] = []
+    private var selectedAgents: [String?] = []
 
     init(
         capabilities: ProviderCapabilities = ProviderCapabilities(
@@ -558,6 +737,19 @@ private actor RuntimeMockOpenCodeClient: OpenCodeClientProtocol {
         }
     }
 
+    func sendPromptAsync(
+        sessionID: String,
+        model: OpenCodeModelReference,
+        variant: String?,
+        parts: [OpenCodePromptPart],
+        agent: String?
+    ) async throws {
+        selectedAgents.append(agent)
+        try await sendPromptAsync(sessionID: sessionID, model: model, variant: variant, parts: parts)
+    }
+
+    func agents() -> [String?] { selectedAgents }
+
     func abort(sessionID: String) async throws {
         recordedCalls.append(.abort(sessionID: sessionID))
     }
@@ -607,8 +799,15 @@ private actor RuntimeOpenCodeCancellationProbe {
 
 private actor RuntimePermissionCancellationProbe {
     private var cancelledSessionIDs: [String] = []
-    func record(remoteSessionID: String) { cancelledSessionIDs.append(remoteSessionID) }
+    private var cancelledConversationIDs: [UUID] = []
+
+    func record(remoteSessionID: String, appSessionID: UUID) {
+        cancelledSessionIDs.append(remoteSessionID)
+        cancelledConversationIDs.append(appSessionID)
+    }
+
     func sessionIDs() -> [String] { cancelledSessionIDs }
+    func conversationIDs() -> [UUID] { cancelledConversationIDs }
 }
 
 private func XCTAssertThrowsErrorAsync<T>(

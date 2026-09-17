@@ -169,13 +169,13 @@ final class TranscriptIndexTests: XCTestCase {
             ChatMessage(role: .assistant, text: "The")
         ]
 
-        _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60)
+        _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60, activityRevision: 0)
         let promptRebuildsAfterFirstPass = cache.promptRebuilds
 
         // Twenty-five frames of a streaming answer.
         for index in 1...25 {
             messages[1].text = String(repeating: "token ", count: index)
-            _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60)
+            _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60, activityRevision: 0)
         }
 
         XCTAssertEqual(
@@ -189,12 +189,12 @@ final class TranscriptIndexTests: XCTestCase {
         let cache = TranscriptIndexCache()
         var messages = [ChatMessage(role: .user, text: "one")]
 
-        _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60)
+        _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60, activityRevision: 0)
         XCTAssertEqual(cache.promptRebuilds, 1)
         XCTAssertEqual(cache.groupRebuilds, 1)
 
         messages.append(ChatMessage(role: .user, text: "two"))
-        let index = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60)
+        let index = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60, activityRevision: 0)
 
         XCTAssertEqual(cache.promptRebuilds, 2)
         XCTAssertEqual(cache.groupRebuilds, 1, "Nothing about the activities changed")
@@ -205,7 +205,7 @@ final class TranscriptIndexTests: XCTestCase {
         let cache = TranscriptIndexCache()
         let messages = [ChatMessage(role: .user, text: "one")]
 
-        _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60)
+        _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60, activityRevision: 0)
 
         let group = AgentTurnActivityGroup(
             id: UUID(),
@@ -221,12 +221,63 @@ final class TranscriptIndexTests: XCTestCase {
         let index = cache.index(
             messages: messages,
             activityGroups: [group],
-            maximumPromptCount: 60
+            maximumPromptCount: 60,
+            activityRevision: 0
         )
 
         XCTAssertEqual(cache.groupRebuilds, 2)
         XCTAssertEqual(cache.promptRebuilds, 1)
         XCTAssertEqual(index.activityGroup(after: messages[0].id)?.id, group.id)
+    }
+
+    func testAnActivityContentChangeRebuildsTheGroupHalf() {
+        let cache = TranscriptIndexCache()
+        let messages = [ChatMessage(role: .user, text: "one")]
+
+        let group = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: messages[0].id,
+            activities: [
+                AgentActivity(
+                    id: ProviderActivityID(UUID().uuidString),
+                    kind: .subagent,
+                    phase: .running,
+                    title: "Delegated to explore",
+                    detail: "1 tool call · last: Read",
+                    output: "… Read — Analyzed Session.swift",
+                    startedAt: Date(),
+                    completedAt: nil
+                )
+            ]
+        )
+
+        _ = cache.index(
+            messages: messages,
+            activityGroups: [group],
+            maximumPromptCount: 60,
+            activityRevision: 0
+        )
+
+        var updated = group
+        updated.activities[0].output = "✓ Read — Analyzed Session.swift"
+        updated.activities[0].detail = "2 tool calls · last: Bash"
+
+        let index = cache.index(
+            messages: messages,
+            activityGroups: [updated],
+            maximumPromptCount: 60,
+            activityRevision: 1
+        )
+
+        XCTAssertEqual(
+            cache.groupRebuilds,
+            2,
+            "Canlı içerik değişimi önbelleği tazelemeli; yoksa kart donar"
+        )
+        XCTAssertEqual(
+            index.activityGroup(after: messages[0].id)?.activities.first?.output,
+            "✓ Read — Analyzed Session.swift"
+        )
     }
 }
 

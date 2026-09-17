@@ -237,8 +237,7 @@ final class ComputerUseStatus {
 
     func copySetupCommand(for step: ComputerUseSetupStep, rootPath: String) {
         let command = "cd \(rootPath) && \(step.command)"
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(command, forType: .string)
+        Pasteboard.copy(command)
     }
 
     // MARK: - Setup

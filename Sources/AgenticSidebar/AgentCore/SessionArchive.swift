@@ -15,6 +15,9 @@ struct SessionSnapshot: Codable, Equatable, Sendable {
     var customTitle: String? = nil
     /// Sabitli oturumlar budamada korunur.
     var isPinned: Bool = false
+    /// Tur çalışırken gelen mesajlar: kapanışta kaybolmamaları için arşivlenir,
+    /// açılışta kuyruk aynen geri gelir.
+    var queuedPrompts: [QueuedPrompt] = []
 }
 
 extension SessionSnapshot {
@@ -35,7 +38,8 @@ extension SessionSnapshot {
                 forKey: .activityGroups
             ) ?? [],
             customTitle: try container.decodeIfPresent(String.self, forKey: .customTitle),
-            isPinned: try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+            isPinned: try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false,
+            queuedPrompts: try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
         )
     }
 
@@ -353,9 +357,14 @@ actor SessionArchiveWriter {
 
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             try fitted.data.write(to: fileURL, options: .atomic)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fileURL.path
+            )
             lastWritten = archive
         } catch {
             AppLog.agentSession.error(

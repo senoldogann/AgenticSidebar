@@ -52,6 +52,8 @@ enum ThemeIdentifier: String, CaseIterable, Identifiable, Sendable {
     case ember = "ember"
     case iris = "iris"
     case auroraNocturne = "auroraNocturne"
+    case codex = "codex"
+    case claude = "claude"
 
     var id: String { rawValue }
 
@@ -64,6 +66,8 @@ enum ThemeIdentifier: String, CaseIterable, Identifiable, Sendable {
         case .ember: "Ember"
         case .iris: "Iris"
         case .auroraNocturne: "Aurora Nocturne"
+        case .codex: "Codex"
+        case .claude: "Claude"
         }
     }
 }
@@ -245,6 +249,40 @@ enum AppThemes {
             assistantBubbleLight: Color(red: 0.94, green: 0.97, blue: 0.97),
             borderSubtleDark: Color(red: 0.20, green: 0.85, blue: 0.75).opacity(0.20),
             borderSubtleLight: Color(red: 0.20, green: 0.85, blue: 0.75).opacity(0.22)
+        ),
+        AppThemePreset(
+            id: .codex,
+            displayName: "Codex",
+            lightSwatchColors: [Color(white: 1.0), Color(red: 0.06, green: 0.64, blue: 0.50)],
+            darkSwatchColors: [Color(red: 0.09, green: 0.09, blue: 0.09), Color(red: 0.06, green: 0.64, blue: 0.50)],
+            accentGradient: [Color(red: 0.06, green: 0.64, blue: 0.50), Color(red: 0.08, green: 0.72, blue: 0.58)],
+            backgroundDark: Color(red: 0.09, green: 0.09, blue: 0.09),
+            backgroundLight: Color(white: 1.0),
+            surfaceDark: Color(red: 0.12, green: 0.12, blue: 0.12),
+            surfaceLight: Color(red: 0.97, green: 0.97, blue: 0.98),
+            userBubbleDark: [Color(red: 0.18, green: 0.18, blue: 0.20), Color(red: 0.14, green: 0.14, blue: 0.16)],
+            userBubbleLight: [Color(red: 0.94, green: 0.94, blue: 0.96), Color(red: 0.90, green: 0.90, blue: 0.93)],
+            assistantBubbleDark: Color(red: 0.09, green: 0.09, blue: 0.09),
+            assistantBubbleLight: Color(white: 1.0),
+            borderSubtleDark: Color(white: 0.20).opacity(0.4),
+            borderSubtleLight: Color(white: 0.85).opacity(0.8)
+        ),
+        AppThemePreset(
+            id: .claude,
+            displayName: "Claude",
+            lightSwatchColors: [Color(red: 0.98, green: 0.97, blue: 0.93), Color(red: 0.85, green: 0.47, blue: 0.34)],
+            darkSwatchColors: [Color(red: 0.12, green: 0.12, blue: 0.11), Color(red: 0.85, green: 0.47, blue: 0.34)],
+            accentGradient: [Color(red: 0.85, green: 0.47, blue: 0.34), Color(red: 0.79, green: 0.39, blue: 0.26)],
+            backgroundDark: Color(red: 0.12, green: 0.12, blue: 0.11),
+            backgroundLight: Color(red: 0.98, green: 0.97, blue: 0.93),
+            surfaceDark: Color(red: 0.16, green: 0.15, blue: 0.13),
+            surfaceLight: Color(red: 0.95, green: 0.93, blue: 0.88),
+            userBubbleDark: [Color(red: 0.22, green: 0.21, blue: 0.18), Color(red: 0.18, green: 0.17, blue: 0.15)],
+            userBubbleLight: [Color(red: 0.92, green: 0.90, blue: 0.84), Color(red: 0.88, green: 0.85, blue: 0.79)],
+            assistantBubbleDark: Color(red: 0.12, green: 0.12, blue: 0.11),
+            assistantBubbleLight: Color(red: 0.98, green: 0.97, blue: 0.93),
+            borderSubtleDark: Color(red: 0.85, green: 0.47, blue: 0.34).opacity(0.18),
+            borderSubtleLight: Color(red: 0.85, green: 0.47, blue: 0.34).opacity(0.20)
         )
     ]
 

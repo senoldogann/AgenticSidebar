@@ -142,9 +142,7 @@ struct PlanDocumentView: View {
     }
 
     private func copyToClipboard() {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(markdown, forType: .string)
+        Pasteboard.copy(markdown)
 
         withAnimation(.easeInOut(duration: 0.15)) {
             isCopied = true

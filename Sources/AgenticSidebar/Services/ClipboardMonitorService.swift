@@ -20,8 +20,18 @@ final class ClipboardMonitorService {
 
     init(
         sessionService: AgentSessionService,
+        settingsStore: SettingsStore
+    ) {
+        self.sessionService = sessionService
+        self.settingsStore = settingsStore
+        self.pasteboard = SystemPasteboardReader()
+        self.lastChangeCount = pasteboard.snapshot().changeCount
+    }
+
+    init(
+        sessionService: AgentSessionService,
         settingsStore: SettingsStore,
-        pasteboard: any PasteboardReading = SystemPasteboardReader()
+        pasteboard: any PasteboardReading
     ) {
         self.sessionService = sessionService
         self.settingsStore = settingsStore
@@ -33,7 +43,12 @@ final class ClipboardMonitorService {
         stop()
         lastChangeCount = pasteboard.snapshot().changeCount
         pendingSubmissions = []
-        let timer = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
+
+        guard settingsStore.autoSubmitClipboard else {
+            return
+        }
+
+        let timer = Timer(timeInterval: 0.8, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.tick()
             }
@@ -47,6 +62,16 @@ final class ClipboardMonitorService {
     func stop() {
         timer?.invalidate()
         timer = nil
+    }
+
+    func syncWithSettings() {
+        if settingsStore.autoSubmitClipboard {
+            if timer == nil {
+                start()
+            }
+        } else {
+            stop()
+        }
     }
 
     /// One polling step. Kept internal so tests can drive the monitor without

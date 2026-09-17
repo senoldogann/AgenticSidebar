@@ -5,7 +5,7 @@ import Foundation
 /// Everything the turn will need is captured when the user sends it — including
 /// the mode and speed that were selected at that moment — so a prompt cannot be
 /// altered by the controls the user touches while it waits.
-struct QueuedPrompt: Identifiable, Equatable, Sendable {
+struct QueuedPrompt: Identifiable, Equatable, Codable, Sendable {
     let id: UUID
     let text: String
     let attachmentPaths: [String]

@@ -38,7 +38,7 @@ final class SettingsNavigation {
     }
 
     /// Selects a tab, and optionally asks the view to scroll to a card on it.
-    func open(tab: SettingsTab, anchor: SettingsAnchor? = nil) {
+    func open(tab: SettingsTab, anchor: SettingsAnchor?) {
         self.tab = tab
 
         guard let anchor else {
@@ -49,5 +49,10 @@ final class SettingsNavigation {
             anchor: anchor,
             sequence: (scrollRequest?.sequence ?? 0) + 1
         )
+    }
+
+    /// Selects a tab without requesting a scroll to a specific card.
+    func open(tab: SettingsTab) {
+        open(tab: tab, anchor: nil)
     }
 }

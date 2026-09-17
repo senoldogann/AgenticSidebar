@@ -491,6 +491,56 @@ final class PromptQueueTests: XCTestCase {
         let settled = await waitUntil { !service.isBusy }
         XCTAssertTrue(settled)
     }
+
+    func testSendingWithExistingQueueOnIdleSessionPreservesFIFOOrder() async {
+        let gate = GatedProviderRuntime()
+        let snapshot = SessionSnapshot(
+            id: UUID(),
+            createdAt: Date(),
+            configuration: SessionConfiguration(
+                providerID: gate.runtime.id,
+                modelID: ProviderModelID("test-model"),
+                variantID: nil
+            ),
+            messages: [],
+            activityGroups: [],
+            queuedPrompts: [
+                QueuedPrompt(text: "existing queue 1"),
+                QueuedPrompt(text: "existing queue 2")
+            ]
+        )
+        let session = AgentSession(runtimes: [gate.runtime], snapshot: snapshot)
+
+        XCTAssertFalse(session.isBusy)
+        XCTAssertEqual(session.queuedPrompts.map(\.text), ["existing queue 1", "existing queue 2"])
+
+        let acceptance = session.send("new incoming")
+        XCTAssertEqual(acceptance, .started)
+
+        let startedFirst = await waitUntil {
+            session.state.messages.contains { $0.text == "existing queue 1" }
+        }
+        XCTAssertTrue(startedFirst)
+        XCTAssertEqual(session.queuedPrompts.map(\.text), ["existing queue 2", "new incoming"])
+
+        gate.completeNext()
+        let startedSecond = await waitUntil {
+            session.state.messages.contains { $0.text == "existing queue 2" }
+        }
+        XCTAssertTrue(startedSecond)
+        XCTAssertEqual(session.queuedPrompts.map(\.text), ["new incoming"])
+
+        gate.completeNext()
+        let startedThird = await waitUntil {
+            session.state.messages.contains { $0.text == "new incoming" }
+        }
+        XCTAssertTrue(startedThird)
+        XCTAssertTrue(session.queuedPrompts.isEmpty)
+
+        gate.completeNext()
+        let settled = await waitUntil { !session.isBusy }
+        XCTAssertTrue(settled)
+    }
 }
 
 /// Holds one continuation per turn. Synchronous on purpose: the stream factory

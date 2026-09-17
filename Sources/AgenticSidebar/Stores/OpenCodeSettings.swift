@@ -28,7 +28,14 @@ final class OpenCodeSettings {
     @ObservationIgnored
     private var client: (any OpenCodeClientProtocol)?
 
+    @ObservationIgnored
+    private var inFlightStartTask: Task<Bool, Never>?
+
     private(set) var isInstalled = false
+    /// Yayınlanan durumun tek doğruluk kaynağı `serverManager` aktörüdür.
+    /// Bu özellik yalnızca son eşitleme anındaki önbellektir; her yazma
+    /// `syncServerStatus()` üzerinden yapılır, böylece Settings ekranı
+    /// yöneticinin bildirdiğinden farklı bir durum gösteremez.
     private(set) var serverStatus: OpenCodeServerStatus = .stopped
     private(set) var authMethods: [String: [OpenCodeAuthMethod]] = [:]
     var selectedProviderID: String?
@@ -89,12 +96,18 @@ final class OpenCodeSettings {
         }
     }
 
+    /// Yönetim katmanındaki gerçek durumu yayınlanan önbelleğe yazar.
+    /// Durum okuyan her yol buradan geçer; doğrudan atama yapılmaz.
+    private func syncServerStatus() async {
+        serverStatus = await serverManager.status()
+    }
+
     func refreshStatus() async {
         isInstalled = executableLocator.locate() != nil
         if case let .untrusted(path, reason) = executableLocator.resolution() {
             errorMessage = "The opencode at \(path) was not run because \(reason)."
         }
-        serverStatus = await serverManager.status()
+        await syncServerStatus()
 
         guard
             case .running = serverStatus,
@@ -111,12 +124,30 @@ final class OpenCodeSettings {
 
     @discardableResult
     func start() async -> Bool {
+        if let inFlightStartTask {
+            return await inFlightStartTask.value
+        }
+
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else {
+                return false
+            }
+            return await self.performStart()
+        }
+        inFlightStartTask = task
+
+        let result = await task.value
+        inFlightStartTask = nil
+        return result
+    }
+
+    private func performStart() async -> Bool {
         switch executableLocator.resolution() {
         case .found:
             isInstalled = true
         case .notFound:
             isInstalled = false
-            serverStatus = .stopped
+            await syncServerStatus()
             errorMessage = "OpenCode executable was not found."
             return false
         case let .untrusted(path, reason):
@@ -124,7 +155,7 @@ final class OpenCodeSettings {
             // password in its environment, so a file another account can rewrite
             // is not something to run quietly.
             isInstalled = false
-            serverStatus = .stopped
+            await syncServerStatus()
             errorMessage = "The opencode at \(path) was not run because \(reason)."
             AppLog.openCode.error(
                 "Refused an untrusted opencode binary at \(path, privacy: .public): \(reason, privacy: .public)"
@@ -158,7 +189,7 @@ final class OpenCodeSettings {
                 await registerComputerUse(configuration, connection: connection)
             }
 
-            serverStatus = await serverManager.status()
+            await syncServerStatus()
             let resolvedClient = clientFactory(connection)
             client = resolvedClient
             await loadAuthMethods(using: resolvedClient)
@@ -166,23 +197,28 @@ final class OpenCodeSettings {
         } catch is CancellationError {
             // A cancelled start is not a failed one: reporting "could not start" for
             // the user's own stop made an ordinary cancellation look like a defect.
-            serverStatus = await serverManager.status()
+            await syncServerStatus()
             errorMessage = nil
             return false
         } catch let error as ProviderRuntimeError {
-            serverStatus = await serverManager.status()
+            await syncServerStatus()
             errorMessage = safeServerMessage(for: error)
             return false
         } catch {
-            serverStatus = await serverManager.status()
+            await syncServerStatus()
             errorMessage = "OpenCode could not start."
+            AppLog.openCode.error(
+                "OpenCode start failed with an unexpected error: \(error.localizedDescription, privacy: .public)"
+            )
             return false
         }
     }
 
     func stop() async {
+        inFlightStartTask?.cancel()
+        inFlightStartTask = nil
         await serverManager.stop()
-        serverStatus = .stopped
+        await syncServerStatus()
         runningComputerUseEnabled = false
         computerUseRegistration = .serverStopped
         computerUseErrorMessage = nil
@@ -208,7 +244,7 @@ final class OpenCodeSettings {
     /// başlatıldı) istemci `nil` kalırdı ve kayıt "Server stopped" görünürdü —
     /// yani çalışan bir sunucu için yanlış cevap.
     func refreshComputerUseStatus() async {
-        serverStatus = await serverManager.status()
+        await syncServerStatus()
 
         guard
             case .running = serverStatus,

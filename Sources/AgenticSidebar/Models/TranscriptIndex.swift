@@ -91,10 +91,11 @@ final class TranscriptIndexCache {
     func index(
         messages: [ChatMessage],
         activityGroups: [AgentTurnActivityGroup],
-        maximumPromptCount: Int
+        maximumPromptCount: Int,
+        activityRevision: Int
     ) -> TranscriptIndex {
         let newPromptKey = PromptKey(messages: messages, maximumPromptCount: maximumPromptCount)
-        let newGroupKey = GroupKey(groups: activityGroups)
+        let newGroupKey = GroupKey(groups: activityGroups, activityRevision: activityRevision)
 
         if newPromptKey != promptKey {
             promptKey = newPromptKey
@@ -142,19 +143,35 @@ final class TranscriptIndexCache {
         }
     }
 
-    /// The group dictionary changes when a turn is added, or when one of its
-    /// activities changes phase or count — never while an answer streams.
+    /// The group dictionary changes when a turn is added, when one of its
+    /// activities changes phase or count — or when an activity's content is
+    /// rewritten while it runs (a live subagent step, a growing tool output).
+    /// The revision counter is what makes the last case visible; without it the
+    /// row kept rendering the cached copy and the card froze until the phase
+    /// changed.
     private struct GroupKey: Equatable {
         let turnCount: Int
         let lastTurnID: UUID?
-        let activityCount: Int
+        let totalActivityCount: Int
+        let runningCount: Int
         let lastPhase: AgentActivityPhase?
+        let activityRevision: Int
 
-        init(groups: [AgentTurnActivityGroup]) {
+        init(groups: [AgentTurnActivityGroup], activityRevision: Int) {
             turnCount = groups.count
             lastTurnID = groups.last?.id
-            activityCount = groups.last?.activities.count ?? 0
+            var total = 0
+            var running = 0
+            for group in groups {
+                total += group.activities.count
+                for activity in group.activities where activity.phase == .running {
+                    running += 1
+                }
+            }
+            totalActivityCount = total
+            runningCount = running
             lastPhase = groups.last?.activities.last?.phase
+            self.activityRevision = activityRevision
         }
     }
 }

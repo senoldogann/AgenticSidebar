@@ -66,8 +66,6 @@ final class ToolApprovalPolicyTests: XCTestCase {
             "git log --oneline -5",
             "ls -la",
             "pwd",
-            "cat Sources/main.swift",
-            "rg -n TODO Sources",
             "swift build",
             "swift test",
             "npm test"
@@ -144,6 +142,22 @@ final class ToolApprovalPolicyTests: XCTestCase {
         XCTAssertFalse(ToolApprovalPolicy.globMatches(pattern: "pwd", text: "pwdx"))
         XCTAssertTrue(ToolApprovalPolicy.globMatches(pattern: "ls *", text: "ls -la"))
         XCTAssertTrue(ToolApprovalPolicy.globMatches(pattern: "git diff*", text: "git diff --stat"))
+    }
+
+    func testTrustedCommandListRejectsMutatingFlagsAndExecutablePreprocessors() {
+        for command in [
+            "find . -delete",
+            "git branch -D main",
+            "git diff --output=changes.patch",
+            "git log --output=history.txt",
+            "rg --pre sh pattern .",
+            "swift test --scratch-path .build-alt"
+        ] {
+            XCTAssertNil(
+                ToolApprovalPolicy.approveSafe.automaticReply(for: "bash", patterns: [command]),
+                "A shell command with side effects or arbitrary flags must wait for approval: \(command)"
+            )
+        }
     }
 
     func testAnEmptyPatternListNeverRunsUnattended() {

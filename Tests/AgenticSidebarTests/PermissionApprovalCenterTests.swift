@@ -26,7 +26,21 @@ final class PermissionApprovalCenterTests: XCTestCase {
         XCTAssertTrue(center.pending.isEmpty)
     }
 
-    func testDuplicateRequestIDIsRejectedInsteadOfHanging() async {
+    func testPendingPermissionPreservesOwningConversation() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil }, decisionTimeout: .seconds(60)
+        )
+        let ownerID = UUID()
+        var request = makeRequest(id: "owned", sessionID: "ses_owned")
+        request.appSessionID = ownerID
+        let pending = Task { await center.submit(request) }
+        await waitUntil { center.pending.count == 1 }
+        XCTAssertEqual(center.pending.first?.appSessionID, ownerID)
+        center.resolve(id: "owned", reply: .reject)
+        _ = await pending.value
+    }
+
+    func testDuplicateRequestIDSharesTheSameDecision() async {
         let center = PermissionApprovalCenter(
             automaticReplyProvider: { _, _ in nil },
             decisionTimeout: .seconds(60)
@@ -36,12 +50,18 @@ final class PermissionApprovalCenterTests: XCTestCase {
         let decision = Task { await center.submit(first) }
         await waitUntil { center.pending.count == 1 }
 
-        let duplicate = await center.submit(first)
-        XCTAssertEqual(duplicate, .reject)
-        XCTAssertEqual(center.pending.count, 1)
+        // Aynı istek ikinci bir koşudan da ulaşırsa erken bir yanıt üretilmez;
+        // ikinci çağrı ilk karara ortak olur ve fazladan bekleyen açmaz.
+        let duplicate = Task { await center.submit(first) }
+        await waitUntil { center.duplicateJoinCount == 1 }
 
-        center.resolve(id: "per_dup", reply: .reject)
-        _ = await decision.value
+        center.resolve(id: "per_dup", reply: .once)
+
+        let firstReply = await decision.value
+        let duplicateReply = await duplicate.value
+        XCTAssertEqual(firstReply, .once)
+        XCTAssertEqual(duplicateReply, .once)
+        XCTAssertTrue(center.pending.isEmpty)
     }
 
     func testRejectAllForOneSessionLeavesOtherSessionsAlone() async {
@@ -66,6 +86,42 @@ final class PermissionApprovalCenterTests: XCTestCase {
         center.resolve(id: "per_2", reply: .always)
         let secondReply = await secondDecision.value
         XCTAssertEqual(secondReply, .always)
+    }
+
+    func testRejectAllForAConversationAlsoClearsItsSubagentsRequests() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+        let conversation = UUID()
+
+        // The turn's own request and one raised by a session it delegated to: the
+        // delegated one carries the child session's id, so a cancellation that
+        // only knew the parent's remote session would leave it on screen.
+        var parentRequest = makeRequest(id: "per_parent", sessionID: "ses_parent")
+        parentRequest.appSessionID = conversation
+        var childRequest = makeRequest(id: "per_child", sessionID: "ses_child")
+        childRequest.appSessionID = conversation
+        childRequest.isDelegatedSession = true
+        var foreignRequest = makeRequest(id: "per_other", sessionID: "ses_other")
+        foreignRequest.appSessionID = UUID()
+
+        let parentDecision = Task { await center.submit(parentRequest) }
+        let childDecision = Task { await center.submit(childRequest) }
+        let foreignDecision = Task { await center.submit(foreignRequest) }
+        await waitUntil { center.pending.count == 3 }
+        XCTAssertEqual(center.pending.first { $0.id == "per_child" }?.isDelegatedSession, true)
+
+        center.rejectAll(remoteSessionID: "ses_parent", appSessionID: conversation)
+
+        let parentReply = await parentDecision.value
+        let childReply = await childDecision.value
+        XCTAssertEqual(parentReply, .reject)
+        XCTAssertEqual(childReply, .reject)
+        XCTAssertEqual(center.pending.map(\.id), ["per_other"])
+
+        center.resolve(id: "per_other", reply: .once)
+        _ = await foreignDecision.value
     }
 
     func testResolvingAnUnknownRequestIsIgnored() {
@@ -161,7 +217,7 @@ final class PermissionApprovalCenterTests: XCTestCase {
     func testAGrantDoesNotCoverADifferentCommand() async {
         let center = PermissionApprovalCenter(
             automaticReplyProvider: { _, _ in nil },
-            decisionTimeout: .milliseconds(60)
+            decisionTimeout: .seconds(60)
         )
 
         let first = Task {
@@ -180,18 +236,23 @@ final class PermissionApprovalCenterTests: XCTestCase {
         center.resolve(id: "per_bash_1", reply: .always)
         _ = await first.value
 
-        let reply = await center.submit(
-            OpenCodePermissionRequest(
-                id: "per_bash_2",
-                remoteSessionID: "ses_1",
-                toolName: "bash",
-                patterns: ["rm -rf build"],
-                alwaysPatterns: ["rm -rf build"],
-                detail: nil
+        let second = Task {
+            await center.submit(
+                OpenCodePermissionRequest(
+                    id: "per_bash_2",
+                    remoteSessionID: "ses_1",
+                    toolName: "bash",
+                    patterns: ["rm -rf build"],
+                    alwaysPatterns: ["rm -rf build"],
+                    detail: nil
+                )
             )
-        )
-
-        XCTAssertEqual(reply, .reject, "An unanswered different command still times out")
+        }
+        await waitUntil { center.pending.map(\.id) == ["per_bash_2"] }
+        XCTAssertEqual(center.pending.first?.patterns, ["rm -rf build"])
+        center.resolve(id: "per_bash_2", reply: .reject)
+        let reply = await second.value
+        XCTAssertEqual(reply, .reject, "An unrelated command still requires a decision")
     }
 
     func testRevokingGrantsBringsTheQuestionsBack() async {
@@ -265,6 +326,25 @@ final class PermissionApprovalCenterTests: XCTestCase {
         let reply = await decision.value
         XCTAssertEqual(reply, .always)
         XCTAssertTrue(center.pending.isEmpty)
+    }
+
+    func testExecutionHistoryIsAvailableWithoutInventingPermissionDecisions() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("audit-centre-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audit = ToolAuditLog(fileURL: directory.appendingPathComponent("audit.jsonl"))
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60), auditLog: audit
+        )
+        await audit.recordExecution(ToolAuditLog.ExecutionRecord(
+            timestamp: Date(), sessionID: "ses_1", activityID: "part_1",
+            toolKind: .read, title: "Read file", detail: "source.swift", event: .completed
+        ))
+        let executions = await center.recentExecutions(limit: 10)
+        XCTAssertEqual(executions.map(\.activityID), ["part_1"])
+        let decisions = await center.recentDecisions(limit: 10)
+        XCTAssertTrue(decisions.isEmpty)
     }
 
     private func makeRequest(id: String, sessionID: String) -> OpenCodePermissionRequest {

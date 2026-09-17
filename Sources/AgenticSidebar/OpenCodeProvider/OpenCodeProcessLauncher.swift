@@ -332,9 +332,14 @@ extension FileHandle {
         do {
             try FileManager.default.createDirectory(
                 at: directoryURL,
-                withIntermediateDirectories: true
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
             )
             try header.write(to: logURL, options: .atomic)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: logURL.path
+            )
         } catch {
             AppLog.openCode.error(
                 "Could not open the OpenCode server log: \(error.localizedDescription, privacy: .public)"

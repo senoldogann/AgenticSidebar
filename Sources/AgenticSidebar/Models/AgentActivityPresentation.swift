@@ -39,10 +39,22 @@ struct AgentActivityPresentation: Equatable, Sendable {
             title = "Updating the task list"
             runningStatusName = "To-dos"
             symbolName = "checklist"
+        case .subagent:
+            title = "Delegated to subagent"
+            runningStatusName = "Running subagent"
+            symbolName = "arrow.triangle.branch"
+        case .mcp:
+            title = "Using MCP tool"
+            runningStatusName = "MCP tool"
+            symbolName = "server.rack"
         case .tool:
             title = "Using a tool"
             runningStatusName = "Tool"
             symbolName = "wrench.and.screwdriver"
+        case .question:
+            title = "Asking a question"
+            runningStatusName = "Question"
+            symbolName = "questionmark.bubble.fill"
         }
     }
 }

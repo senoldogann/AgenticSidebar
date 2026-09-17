@@ -28,10 +28,35 @@ actor ToolAuditLog {
         let detail: String?
         let patterns: [String]
         let source: Source
-        let reply: OpenCodePermissionReply
+        let reply: ProviderPermissionReply
 
         var id: String {
             "\(timestamp.timeIntervalSince1970)-\(toolName)-\(patterns.joined(separator: ","))"
+        }
+    }
+
+    /// Observed tool lifecycle, not a permission decision. Outputs and diffs are
+    /// intentionally excluded; the event records what ran without copying data.
+    struct ExecutionRecord: Codable, Equatable, Sendable, Identifiable {
+        enum Event: String, Codable, Sendable {
+            case started
+            case completed
+            case failed
+        }
+
+        let timestamp: Date
+        let sessionID: String
+        let activityID: String
+        let toolKind: ProviderActivityKind
+        /// Optional human-readable title. Intentionally omitted (nil) by the runtime
+        /// to prevent potential credentials or arguments from leaking into audit files.
+        let title: String?
+        /// Optional detail summary. Intentionally omitted (nil) by the runtime for privacy.
+        let detail: String?
+        let event: Event
+
+        var id: String {
+            "\(sessionID)-\(activityID)-\(event.rawValue)-\(timestamp.timeIntervalSince1970)"
         }
     }
 
@@ -95,12 +120,20 @@ actor ToolAuditLog {
     /// (which is `.public` by design) and out of the user's own files.
     static func live() -> ToolAuditLog {
         ToolAuditLog(
-            fileURL: ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+            fileURL: ManagedAppDirectories.openCodeWorkingDirectory()
                 .appendingPathComponent("audit.jsonl")
         )
     }
 
     func record(_ record: Record) {
+        append(record)
+    }
+
+    func recordExecution(_ record: ExecutionRecord) {
+        append(record)
+    }
+
+    private func append<Entry: Encodable>(_ record: Entry) {
         do {
             try fileManager.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
@@ -155,6 +188,19 @@ actor ToolAuditLog {
             records.append(record)
         }
 
+        return Array(records.suffix(limit))
+    }
+
+    /// Tool starts and completions share the same bounded JSONL file as decisions,
+    /// but have their own schema so an approval is never mistaken for execution.
+    func recentExecutions(limit: Int) -> [ExecutionRecord] {
+        guard limit > 0, let data = tailData(maximumBytes: 512 * 1024) else {
+            return []
+        }
+
+        let records = data.split(separator: 0x0A).compactMap { line in
+            try? Self.decoder.decode(ExecutionRecord.self, from: Data(line))
+        }
         return Array(records.suffix(limit))
     }
 

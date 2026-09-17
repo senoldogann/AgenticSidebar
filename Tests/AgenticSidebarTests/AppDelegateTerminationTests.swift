@@ -29,7 +29,10 @@ final class AppDelegateTerminationTests: XCTestCase {
         XCTAssertEqual(firstReply, .terminateLater)
         XCTAssertEqual(secondReply, .terminateLater)
 
-        for _ in 0..<100 where probe.replyValues.isEmpty {
+        // 100 yield yetmezse yanlış fail olurdu; süre dolumlu bekleme yavaş
+        // makinede de doğru sonucu verir.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while probe.replyValues.isEmpty && ContinuousClock.now < deadline {
             await Task.yield()
         }
 

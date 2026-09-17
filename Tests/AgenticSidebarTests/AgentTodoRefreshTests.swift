@@ -21,7 +21,12 @@ final class AgentTodoRefreshTests: XCTestCase {
         XCTAssertEqual(session.state.todos, newer)
 
         await runtime.respond(to: 0, with: older)
-        try? await Task.sleep(for: .milliseconds(50))
+        // Yokluk iddiası tek uykuyla değil pencereyle sınanır: bayat yazı
+        // belirirse erken çıkılır, yoksa yavaş makineye de süre tanınır.
+        let staleDeadline = ContinuousClock.now + .milliseconds(250)
+        while session.state.todos == newer && ContinuousClock.now < staleDeadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
         XCTAssertEqual(session.state.todos, newer, "A late older result must never revert the task list")
     }
 
@@ -39,7 +44,10 @@ final class AgentTodoRefreshTests: XCTestCase {
             to: 0,
             with: [AgentTodo(id: "previous", content: "Previous turn", status: .pending)]
         )
-        try? await Task.sleep(for: .milliseconds(50))
+        let invalidatedDeadline = ContinuousClock.now + .milliseconds(250)
+        while session.state.todos.isEmpty && ContinuousClock.now < invalidatedDeadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
         XCTAssertTrue(session.state.todos.isEmpty, "The new turn must invalidate earlier requests")
         await runtime.respond(to: 1, with: [])
     }

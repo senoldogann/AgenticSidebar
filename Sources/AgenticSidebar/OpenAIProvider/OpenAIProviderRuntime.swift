@@ -24,12 +24,8 @@ struct OpenAIProviderRuntime: ProviderRuntime {
 
         do {
             response = try await transport.send(request)
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw ProviderRuntimeError.transport
+            throw ProviderRuntimeError.mapTransportError(error)
         }
 
         guard (200..<300).contains(response.statusCode) else {
@@ -71,12 +67,8 @@ struct OpenAIProviderRuntime: ProviderRuntime {
         let lineStream: OpenAILineStream
         do {
             lineStream = try await transport.stream(urlRequest)
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw ProviderRuntimeError.transport
+            throw ProviderRuntimeError.mapTransportError(error)
         }
 
         guard (200..<300).contains(lineStream.statusCode) else {
@@ -141,6 +133,9 @@ struct OpenAIProviderRuntime: ProviderRuntime {
                 }
             }
         } catch {
+            AppLog.openAI.error(
+                "Error-body preview was cut short while reading: \(error.localizedDescription, privacy: .public)"
+            )
             return preview
         }
 

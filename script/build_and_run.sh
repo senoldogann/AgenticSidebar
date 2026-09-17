@@ -12,6 +12,7 @@ DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
+APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 
@@ -36,8 +37,13 @@ BUILD_BINARY="$(swift build --product "$APP_NAME" --show-bin-path)/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS"
+mkdir -p "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
+
+if [[ -f "$ROOT_DIR/Resources/AppIcon.icns" ]]; then
+  cp "$ROOT_DIR/Resources/AppIcon.icns" "$APP_RESOURCES/AppIcon.icns"
+fi
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -46,6 +52,10 @@ cat >"$INFO_PLIST" <<PLIST
 <dict>
   <key>CFBundleExecutable</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIconName</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
   <key>CFBundleName</key>
@@ -61,6 +71,8 @@ cat >"$INFO_PLIST" <<PLIST
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
   <key>LSUIElement</key>
+  <true/>
+  <key>LSMultipleInstancesProhibited</key>
   <true/>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
@@ -103,13 +115,30 @@ sign_app() {
 
 sign_app
 
+install_to_applications() {
+  local target_app="/Applications/$APP_NAME.app"
+  echo "Installing $APP_NAME to /Applications..."
+  rm -rf "$target_app"
+  cp -R "$APP_BUNDLE" "$target_app"
+  xattr -cr "$target_app" 2>/dev/null || true
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$target_app" 2>/dev/null || true
+  touch "$target_app"
+  echo "Installed $APP_NAME.app to /Applications successfully."
+}
+
 open_app() {
-  /usr/bin/open -n "$APP_BUNDLE"
+  install_to_applications
+  /usr/bin/open "/Applications/$APP_NAME.app"
 }
 
 case "$MODE" in
-  run)
+  run|install)
     open_app
+    ;;
+  build|--build)
+    # Derle, paketle, imzala; kurma ve açma. `/Applications` yazılamadığı
+    # makinelerde ve yalnızca derleme doğrulamasında kullanılır.
+    echo "Built $APP_BUNDLE without installing."
     ;;
   --debug|debug)
     lldb -- "$APP_BINARY"
@@ -124,11 +153,16 @@ case "$MODE" in
     ;;
   --verify|verify)
     open_app
-    sleep 1
+    # Açılış + pencere + sunucu ayağa kalkması 1 sn'yi aşabilir; sabit uyku
+    # yerine süre dolumlu yoklama yanlış negatifi önler.
+    for _ in $(seq 1 40); do
+      pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
+      sleep 0.25
+    done
     pgrep -x "$APP_NAME" >/dev/null
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|build|--debug|--logs|--telemetry|--verify]" >&2
     exit 2
     ;;
 esac

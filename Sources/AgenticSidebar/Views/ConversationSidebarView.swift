@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ConversationSidebarView: View {
-    let sessionService: AgentSessionService
+    let sessionService: any AgentSessionServiceProtocol
 
     @Environment(SettingsStore.self) private var settingsStore
     @Environment(SettingsWindowController.self) private var settingsWindowController: SettingsWindowController?
@@ -33,9 +33,15 @@ struct ConversationSidebarView: View {
         settingsStore.currentThemePreset
     }
 
-    /// Arama + filtre + sıralama uygulanmış liste; sabitliler üstte.
-    private var filteredSessions: [SessionSummary] {
-        filterSortSessions(
+    private struct CategorizedSessions {
+        let all: [SessionSummary]
+        let pinned: [SessionSummary]
+        let regular: [SessionSummary]
+    }
+
+    /// Single pass filtering and partitioning into pinned and regular sessions.
+    private var categorizedSessions: CategorizedSessions {
+        let all = filterSortSessions(
             sessionService.sessionList,
             query: searchText,
             sort: sortOption,
@@ -43,47 +49,66 @@ struct ConversationSidebarView: View {
             now: Date(),
             calendar: .current
         )
+        var pinned: [SessionSummary] = []
+        var regular: [SessionSummary] = []
+        pinned.reserveCapacity(all.count)
+        regular.reserveCapacity(all.count)
+        for session in all {
+            if session.isPinned {
+                pinned.append(session)
+            } else {
+                regular.append(session)
+            }
+        }
+        return CategorizedSessions(all: all, pinned: pinned, regular: regular)
     }
 
-    private var pinnedSessions: [SessionSummary] {
-        filteredSessions.filter(\.isPinned)
-    }
-
-    private var regularSessions: [SessionSummary] {
-        filteredSessions.filter { !$0.isPinned }
+    private var filteredSessions: [SessionSummary] {
+        categorizedSessions.all
     }
 
     var body: some View {
+        let sessions = categorizedSessions
+        let pinned = sessions.pinned
+        let regular = sessions.regular
+
         List {
             Section("Sessions") {
                 Button {
                     sessionService.createSession()
                 } label: {
-                    HStack(spacing: 7) {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 14, weight: .semibold))
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.primary)
 
                         Text("New session")
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.primary)
 
                         Spacer(minLength: 0)
+
+                        Text("⌘N")
+                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(
+                                isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.06),
+                                in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            )
+                            .foregroundStyle(.secondary)
                     }
-                    .foregroundStyle(.white)
                     .padding(.vertical, 7)
                     .padding(.horizontal, 10)
                     .background(
-                        LinearGradient(
-                            colors: currentTheme.accentGradient,
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        ),
+                        isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05),
                         in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                     )
-                    .interactiveHoverOutline(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .interactiveHoverPill(cornerRadius: 8)
                 }
                 .buttonStyle(.plain)
                 .pointingHandCursor()
-                .help("Start a new session")
+                .help("Start a new session (⌘N)")
                 .accessibilityLabel("New session")
 
                 searchAndFilterControls
@@ -92,18 +117,18 @@ struct ConversationSidebarView: View {
                     selectionToolbar
                 }
 
-                if !pinnedSessions.isEmpty {
-                    Section("Pinned · \(pinnedSessions.count)") {
-                        ForEach(pinnedSessions) { session in
+                if !pinned.isEmpty {
+                    Section("Pinned · \(pinned.count)") {
+                        ForEach(pinned) { session in
                             sessionRow(session)
                         }
                     }
                 }
 
-                if regularSessions.isEmpty, pinnedSessions.isEmpty {
+                if regular.isEmpty && pinned.isEmpty {
                     emptyStateRow
                 } else {
-                    ForEach(regularSessions) { session in
+                    ForEach(regular) { session in
                         sessionRow(session)
                     }
                 }
@@ -141,8 +166,9 @@ struct ConversationSidebarView: View {
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "gearshape")
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.system(size: 13, weight: .regular))
                             .foregroundStyle(.secondary)
+                            .frame(width: 18)
 
                         Text("Settings")
                             .font(.system(size: 13, weight: .medium))
@@ -151,9 +177,9 @@ struct ConversationSidebarView: View {
                         Spacer()
 
                         Text("⌘,")
-                            .font(.caption2.weight(.medium))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
+                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
                             .background(
                                 isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.06),
                                 in: RoundedRectangle(cornerRadius: 4, style: .continuous)
@@ -234,13 +260,13 @@ struct ConversationSidebarView: View {
     @ViewBuilder
     private var searchAndFilterControls: some View {
         VStack(spacing: 6) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                TextField("Search sessions", text: $searchText)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.secondary.opacity(0.8))
+                TextField("Search sessions...", text: $searchText)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 13))
+                    .font(.system(size: 12.5))
                     .foregroundStyle(.primary)
                     .accessibilityLabel("Search sessions")
                 if !searchText.isEmpty {
@@ -249,7 +275,7 @@ struct ConversationSidebarView: View {
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.secondary.opacity(0.8))
                     }
                     .buttonStyle(.plain)
                     .pointingHandCursor()
@@ -257,15 +283,15 @@ struct ConversationSidebarView: View {
                     .accessibilityLabel("Clear search")
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6.5)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(currentTheme.surface(isDark: isDarkMode))
+                    .fill(isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(currentTheme.border(isDark: isDarkMode), lineWidth: 1)
+                    .stroke(isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.06), lineWidth: 0.5)
             )
 
             HStack(spacing: 6) {
@@ -316,7 +342,11 @@ struct ConversationSidebarView: View {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: "ellipsis.circle")
                             .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(hasActiveFilters ? (currentTheme.accentGradient.first ?? .primary) : .secondary)
+                            .foregroundStyle(
+                                hasActiveFilters
+                                    ? (currentTheme.accentGradient.first ?? .accentColor)
+                                    : (isDarkMode ? Color.white.opacity(0.85) : Color.primary.opacity(0.70))
+                            )
                             .frame(width: 24, height: 24)
                             .background(
                                 RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -336,6 +366,8 @@ struct ConversationSidebarView: View {
                     }
                 }
                 .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .colorScheme(isDarkMode ? .dark : .light)
                 .pointingHandCursor()
                 .help("Sort and filter sessions")
                 .accessibilityLabel("Session options, sort \(sortOption.displayName), date \(dateFilter.displayName)")
@@ -632,27 +664,27 @@ struct ConversationSidebarView: View {
                 }
 
                 Image(systemName: isActive ? "bubble.left.and.text.bubble.right.fill" : "bubble.left.and.text.bubble.right")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(isActive ? (currentTheme.accentGradient.first ?? .primary) : .secondary)
-                    .frame(width: 16)
+                    .font(.system(size: 13, weight: isActive ? .medium : .regular))
+                    .foregroundStyle(isActive ? .primary : .secondary)
+                    .frame(width: 18)
 
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 4) {
                         Text(session.displayTitle)
-                            .font(.system(size: 13, weight: isActive ? .semibold : .regular))
+                            .font(.system(size: 13, weight: isActive ? .medium : .regular))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                         if session.isPinned {
                             Image(systemName: "pin.fill")
                                 .font(.system(size: 10, weight: .medium))
-                                .foregroundStyle(currentTheme.accentGradient.first ?? .secondary)
+                                .foregroundStyle(.secondary)
                                 .help("Pinned session")
                         }
                     }
 
                     Text(sessionSubtitle(session))
-                        .font(.caption2)
+                        .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -660,21 +692,26 @@ struct ConversationSidebarView: View {
                 Spacer(minLength: 0)
 
                 if session.isBusy {
+                    // `scaleEffect` yalnız çizimi küçültür; yerleşim boyutu
+                    // AppKit göstergesinin kendi ölçüsüdür. Sabit bir
+                    // `frame(width: 12)` bu yüzden min > max yapar ve SwiftUI
+                    // "has a maximum length that doesn't satisfy min <= max"
+                    // diye hata basar — ölçü alt sınırla verilir.
                     ProgressView()
                         .controlSize(.small)
                         .scaleEffect(0.6)
-                        .frame(width: 12, height: 12)
+                        .frame(minWidth: 12, minHeight: 12)
                 }
             }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 10)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isActive ? activeRowBackground : (isSelected ? activeRowBackground.opacity(0.6) : Color.clear))
+                    .fill(isActive ? activeRowBackground : (isSelected ? activeRowBackground.opacity(0.7) : Color.clear))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(isActive ? activeRowBorder : (isSelected ? activeRowBorder.opacity(0.7) : Color.clear), lineWidth: 1)
+                    .stroke(isActive ? activeRowBorder : (isSelected ? activeRowBorder.opacity(0.7) : Color.clear), lineWidth: 0.5)
             )
             .contentShape(Rectangle())
             .interactiveHoverPill(cornerRadius: 8)
@@ -703,16 +740,13 @@ struct ConversationSidebarView: View {
         }
     }
 
-    /// The selected conversation gets a soft theme-tinted plate, so the active
-    /// session is obvious at a glance without looking like a system selection.
+    /// The selected conversation gets a soft frosted translucent pill, matching the reference styling.
     private var activeRowBackground: Color {
-        (currentTheme.accentGradient.first ?? .accentColor)
-            .opacity(isDarkMode ? 0.22 : 0.14)
+        isDarkMode ? Color.white.opacity(0.12) : Color.black.opacity(0.07)
     }
 
     private var activeRowBorder: Color {
-        (currentTheme.accentGradient.first ?? .accentColor)
-            .opacity(isDarkMode ? 0.34 : 0.26)
+        isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.04)
     }
 
     private func accessibilityLabel(

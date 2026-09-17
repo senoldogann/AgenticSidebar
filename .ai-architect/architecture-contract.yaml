@@ -1,5 +1,5 @@
 schema_version: 1.0.0
-revision: 1
+revision: 2
 scope: agentic-sidebar-macos-first-milestone
 architecture_style: native-modular-monolith-with-provider-ports
 quality_attributes:
@@ -74,6 +74,28 @@ components:
     owns_data: []
     public_interfaces:
       - capture-privacy-control
+  - id: extension-store
+    responsibility: Own the MCP/plugin/skill registry, on-disk discovery, and the runtime snapshot handed to the managed server. Restart flows one way only: extension-store -> settings-store -> opencode-adapter. The opencode-adapter reads the snapshot through the ExtensionSnapshotBox provider installed at construction, never by calling back into the store.
+    owns_data:
+      - extension-registry
+    public_interfaces:
+      - extension-runtime-snapshot
+  - id: computer-use
+    responsibility: Own computer-use configuration, readiness probing, and the managed MCP registration payload. Exposes only computer_* and session_authority_* capabilities; filesystem, git, terminal and browser tools stay denied.
+    owns_data:
+      - computer-use-configuration
+    public_interfaces:
+      - computer-use-configuration
+  - id: clipboard-monitor
+    responsibility: Observe pasteboard changes when the user opts in and submit new content as turns. Ignores concealed/transient content and never sends while disabled.
+    owns_data: []
+    public_interfaces:
+      - automation-events
+  - id: screenshot-monitor
+    responsibility: Observe screenshot-folder changes when the user opts in and submit new captures as turns. Seeds existing files on first scan so old screenshots are never analysed.
+    owns_data: []
+    public_interfaces:
+      - automation-events
 external_boundaries:
   - id: openai-responses-api
     responsibility: Execute direct OpenAI requests and stream results.
@@ -129,6 +151,31 @@ dependency_rules:
     policy: allow-via-interface
     via_interface: capture-privacy-control
     rationale: Capture policy is applied at window boundaries without entering chat/session logic.
+  - source: chat-presentation
+    target: provider-port
+    policy: allow-via-interface
+    via_interface: provider-permission-reply
+    rationale: Presentation renders permission decisions through the provider-neutral reply and directory helpers, never concrete OpenCode transport code.
+  - source: extension-store
+    target: settings-store
+    policy: allow-via-interface
+    via_interface: agent-restart
+    rationale: Extension changes restart the agent through settings; settings never calls back into the store except through the snapshot provider installed at construction.
+  - source: opencode-adapter
+    target: extension-store
+    policy: allow-via-interface
+    via_interface: extension-runtime-snapshot
+    rationale: The managed server reads the extension snapshot through the provider installed at construction; no other direction is allowed.
+  - source: clipboard-monitor
+    target: agent-core
+    policy: allow-via-interface
+    via_interface: agent-session-service
+    rationale: Automation submits turns through the session service like any other sender.
+  - source: screenshot-monitor
+    target: agent-core
+    policy: allow-via-interface
+    via_interface: agent-session-service
+    rationale: Automation submits turns through the session service like any other sender.
 required_practices:
   - Derive model-specific effort or variant choices from backend capabilities; do not expose invalid combinations.
   - Use structured concurrency for request, stream, cancellation, and process-lifecycle tasks.

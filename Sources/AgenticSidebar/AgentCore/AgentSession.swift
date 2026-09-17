@@ -23,6 +23,9 @@ final class AgentSession {
     private(set) var activeTurnID: UUID?
 
     @ObservationIgnored
+    private var activeTurnSpeedMode: ResponseSpeedMode = .normal
+
+    @ObservationIgnored
     private var activeAssistantMessageID: UUID?
 
     /// Invalidates older asynchronous todo reads, including reads from previous turns.
@@ -35,15 +38,40 @@ final class AgentSession {
     @ObservationIgnored
     private var streamingTextFlushTask: Task<Void, Never>?
 
+    @ObservationIgnored
+    private var pendingActivityUpdates: [ProviderActivityID: (descriptor: ProviderActivityDescriptor, turnID: UUID)] = [:]
+
+    @ObservationIgnored
+    private var activityUpdateFlushTask: Task<Void, Never>?
+
     /// Called after every transcript/status change so the owner can debounce a
     /// persistence write. Streaming flushes fire often, hence the debounce.
     @ObservationIgnored
     var onPersistentChange: (@MainActor () -> Void)?
+    var onImmediatePersistentChange: (@MainActor () -> Void)?
+    var onTurnFinished: (@MainActor (_ sessionID: UUID, _ sessionTitle: String, _ status: AgentSessionStatus, _ lastMessageSnippet: String?) -> Void)?
 
     @ObservationIgnored
     private let budget: TranscriptBudget
 
-    private static let streamingTextUpdateInterval = Duration.milliseconds(40)
+    /// Determines the streaming UI flush interval. In Fast mode, flushes occur at 16ms
+    /// (60fps) for an instantaneous typewriter streaming experience.
+    static func streamingTextInterval(forMessageLength length: Int, speedMode: ResponseSpeedMode) -> Duration {
+        switch speedMode {
+        case .fast:
+            switch length {
+            case ..<30_000: .milliseconds(16)
+            case ..<80_000: .milliseconds(40)
+            default: .milliseconds(80)
+            }
+        case .normal:
+            switch length {
+            case ..<20_000: .milliseconds(40)
+            case ..<80_000: .milliseconds(90)
+            default: .milliseconds(180)
+            }
+        }
+    }
 
     /// Bellekte tutulan aktivite sayısı, arşivdekiyle aynı sınıra budanır.
     /// Budanmazsa uzun bir sohbette bütün tur geçmişi RAM'de birikir.
@@ -120,6 +148,9 @@ final class AgentSession {
         self.budget = budget
         self.customTitle = snapshot.customTitle
         self.isPinned = snapshot.isPinned
+        // Kuyruk, kesintiden sağ çıkar: kapanışta tur ortasında bekleyen mesaj,
+        // açılışta yine bekliyor olur — kullanıcı gönderdiği işi geri yazar.
+        self.queuedPrompts = Array(snapshot.queuedPrompts.prefix(Self.maximumQueuedPrompts))
         self.state = AgentSessionState(
             id: snapshot.id,
             configuration: snapshot.configuration,
@@ -144,7 +175,8 @@ final class AgentSession {
             messages: state.messages,
             activityGroups: state.activityGroups,
             customTitle: customTitle,
-            isPinned: isPinned
+            isPinned: isPinned,
+            queuedPrompts: queuedPrompts
         )
     }
 
@@ -416,20 +448,6 @@ final class AgentSession {
             return .rejected
         }
 
-        if canSubmit {
-            return startTurn(for: queuedPrompt) == nil ? .rejected : .started
-        }
-
-        // A session with no usable configuration could never run the prompt
-        // later, so only a genuinely busy session accepts a queued message.
-        guard
-            isBusy,
-            let configuration = state.configuration,
-            runtime(for: configuration.providerID) != nil
-        else {
-            return .rejected
-        }
-
         guard queuedPrompts.count < Self.maximumQueuedPrompts else {
             AppLog.agentSession.error(
                 "The prompt queue already holds \(Self.maximumQueuedPrompts, privacy: .public) messages; the new one was refused"
@@ -437,12 +455,42 @@ final class AgentSession {
             return .rejected
         }
 
+        if canSubmit, queuedPrompts.isEmpty {
+            return startTurn(for: queuedPrompt) == nil ? .rejected : .started
+        }
+
+        // A session with no usable configuration could never run the prompt
+        // later, so only a session that can run or is genuinely busy accepts a queued message.
+        guard
+            canSubmit || (isBusy && state.configuration.flatMap { runtime(for: $0.providerID) } != nil)
+        else {
+            return .rejected
+        }
+
         queuedPrompts.append(queuedPrompt)
+        noteQueueChange()
+
+        if canSubmit {
+            startNextQueuedTurn()
+            return .started
+        }
         return .queued
     }
 
+    /// Runs the oldest queued prompt if the session is free.
+    func drainQueueIfPossible() {
+        guard canSubmit, !queuedPrompts.isEmpty else {
+            return
+        }
+        startNextQueuedTurn()
+    }
+
     func removeQueuedPrompt(_ id: UUID) {
+        let count = queuedPrompts.count
         queuedPrompts.removeAll { $0.id == id }
+        if queuedPrompts.count != count {
+            noteQueueChange()
+        }
     }
 
     /// Rewrites a queued message, keeping its place in line.
@@ -472,6 +520,7 @@ final class AgentSession {
             speedMode: existing.speedMode,
             mode: existing.mode
         )
+        noteQueueChange()
         return true
     }
 
@@ -490,11 +539,67 @@ final class AgentSession {
         let prompt = queuedPrompts.remove(at: sourceIndex)
         let clamped = min(max(destinationIndex, 0), queuedPrompts.count)
         queuedPrompts.insert(prompt, at: clamped)
+        if clamped != sourceIndex {
+            noteQueueChange()
+        }
         return clamped != sourceIndex
     }
 
     func clearQueuedPrompts() {
+        guard !queuedPrompts.isEmpty else {
+            return
+        }
         queuedPrompts.removeAll()
+        noteQueueChange()
+    }
+
+    // MARK: - Interactive Questions
+
+    /// Presents an interactive question to the user during an active turn or upon completion.
+    func askQuestion(_ question: AgentQuestion) {
+        state.activeQuestion = question
+    }
+
+    /// Resolves the active question with the user's answer and continues the conversation.
+    func answerActiveQuestion(_ answer: AgentQuestionAnswer) {
+        guard var question = state.activeQuestion else {
+            return
+        }
+
+        question.status = .answered(answer)
+        state.questionHistory.append(question)
+        state.activeQuestion = nil
+
+        // If the session is currently idle, send the formatted response as the next turn prompt.
+        if !isBusy {
+            let mode = state.configuration?.providerID == nil ? AgentMode.build : AgentMode.build
+            send(
+                answer.formattedResponse,
+                attachmentPaths: [],
+                speedMode: activeTurnSpeedMode,
+                mode: mode,
+                tags: []
+            )
+        }
+    }
+
+    /// Dismisses or skips the active question.
+    func dismissActiveQuestion() {
+        guard var question = state.activeQuestion else {
+            return
+        }
+
+        question.status = .dismissed
+        state.questionHistory.append(question)
+        state.activeQuestion = nil
+    }
+
+    /// Kuyruk `state` dışında durur, o yüzden değişimi kalıcılığa elle bildirir.
+    ///
+    /// Bildirilmezse kapanışta tur ortasında bekleyen mesajlar yazılmadan kalır
+    /// ve açılışta kuyruk boş gelir.
+    private func noteQueueChange() {
+        onPersistentChange?()
     }
 
     /// Sends the oldest queued prompt, if the session is free again.
@@ -504,6 +609,10 @@ final class AgentSession {
         }
 
         let next = queuedPrompts.removeFirst()
+        // Kuyruktan düşen mesaj ya tura dönüşür (o zaman `state` değişimi
+        // kalıcılığı tetikler) ya da başlayamaz — ikinci hâlde düşüşün kendisi
+        // yazılmalı, yoksa mesaj ne turda ne kuyruktadır.
+        noteQueueChange()
         if startTurn(for: next) == nil {
             AppLog.agentSession.error(
                 "A queued prompt could not start because the session has no usable provider"
@@ -564,11 +673,13 @@ final class AgentSession {
             messages: selection.messages,
             speedMode: queuedPrompt.speedMode,
             mode: queuedPrompt.mode,
-            extensionContext: queuedPrompt.extensionTags.turnInstruction
+            extensionContext: queuedPrompt.extensionTags.turnInstruction,
+            activityGroups: state.activityGroups
         )
         activeTurnID = turnID
+        activeTurnSpeedMode = queuedPrompt.speedMode
 
-        let task = Task { [weak self] in
+        let task = Task { @MainActor [weak self] in
             guard let self else {
                 return
             }
@@ -613,6 +724,7 @@ final class AgentSession {
         activeTask = nil
         activeStream = nil
         activeTurnID = nil
+        onImmediatePersistentChange?()
         startNextQueuedTurn()
     }
 
@@ -667,9 +779,24 @@ final class AgentSession {
                     // it is to see the work move, not to read it afterwards.
                     if activity.kind == .todo {
                         refreshTodos()
+                    } else if activity.kind == .question {
+                        let parsedQuestion = AgentQuestionParser.parseFromToolInput(
+                            toolCallID: activity.id.rawValue,
+                            input: [
+                                "prompt": activity.title ?? "Question from assistant",
+                                "detail": activity.detail as Any
+                            ]
+                        )
+                        if let parsedQuestion {
+                            askQuestion(parsedQuestion)
+                        }
                     }
 
+                case let .activityUpdated(activity):
+                    enqueueActivityUpdate(activity, turnID: turnID)
+
                 case let .activityFinished(activityID, outcome, output, diff):
+                    flushPendingActivityUpdates(turnID: turnID)
                     flushPendingAssistantText(turnID: turnID)
                     finishActivity(
                         activityID,
@@ -685,12 +812,14 @@ final class AgentSession {
                     state.status = .waiting
 
                 case .completed:
+                    flushPendingActivityUpdates(turnID: turnID)
                     flushPendingAssistantText(turnID: turnID)
                     finishRunningActivities(
                         turnID: turnID,
                         phase: .completed
                     )
                     didComplete = true
+                    offerQuickReplyOptionsIfAvailable()
                 }
 
                 if didComplete {
@@ -762,8 +891,42 @@ final class AgentSession {
             // same event, so the list is read once more at the end: the checklist
             // left on screen has to be the state the agent actually stopped in.
             refreshTodos()
+            onImmediatePersistentChange?()
+            let lastSnippet = state.messages.last(where: { $0.role == .assistant })?.text
+            onTurnFinished?(id, title, state.status, lastSnippet)
             startNextQueuedTurn()
         }
+    }
+
+    /// Tamamlanan turun sonunda hızlı-yanıt seçenekleri varsa soru olarak sunar.
+    ///
+    /// Olay döngüsünün `.completed` dalından çıkarılmıştır; döngü yalnızca
+    /// olayı ilgili yönteme yönlendirir.
+    private func offerQuickReplyOptionsIfAvailable() {
+        guard
+            let lastAssistant = state.messages.last,
+            lastAssistant.role == .assistant
+        else {
+            return
+        }
+
+        let quickOptions = AgentQuestionParser.parseQuickReplyOptions(from: lastAssistant.text)
+        guard !quickOptions.isEmpty, state.activeQuestion == nil else {
+            return
+        }
+
+        askQuestion(
+            AgentQuestion(
+                id: UUID(),
+                toolCallID: nil,
+                prompt: "Choose an option or type an answer:",
+                options: quickOptions,
+                allowCustomAnswer: true,
+                isMultiSelect: false,
+                createdAt: Date(),
+                status: .pending
+            )
+        )
     }
 
     /// Re-reads the agent's task list for this session.
@@ -780,7 +943,7 @@ final class AgentSession {
         todoRefreshGeneration &+= 1
         let generation = todoRefreshGeneration
         let sessionID = state.id
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let todos = await runtime.sessionTodos(sessionID: sessionID) else {
                 return
             }
@@ -818,9 +981,14 @@ final class AgentSession {
             return
         }
 
-        streamingTextFlushTask = Task { [weak self] in
+        let interval = Self.streamingTextInterval(
+            forMessageLength: activeAssistantTextLength,
+            speedMode: activeTurnSpeedMode
+        )
+
+        streamingTextFlushTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(for: Self.streamingTextUpdateInterval)
+                try await Task.sleep(for: interval)
             } catch {
                 return
             }
@@ -831,6 +999,22 @@ final class AgentSession {
 
             self?.flushPendingAssistantText(turnID: turnID)
         }
+    }
+
+    /// Akış hedefi asistan mesajının şu anki uzunluğu; yoksa sıfır.
+    ///
+    /// Boşaltma aralığı buna göre seçilir. `utf8.count` (karakter sayımının
+    /// aksine) sabit zamanlıdır ve karakter sayısından küçük olamaz, yani eşik
+    /// ön elemesi için yeterlidir.
+    private var activeAssistantTextLength: Int {
+        guard
+            let id = activeAssistantMessageID,
+            let index = messageIndex(id: id)
+        else {
+            return 0
+        }
+
+        return state.messages[index].text.utf8.count
     }
 
     private func flushPendingAssistantText(turnID: UUID) {
@@ -865,6 +1049,9 @@ final class AgentSession {
         streamingTextFlushTask?.cancel()
         streamingTextFlushTask = nil
         streamingTextAccumulator = .empty
+        activityUpdateFlushTask?.cancel()
+        activityUpdateFlushTask = nil
+        pendingActivityUpdates.removeAll(keepingCapacity: false)
     }
 
     /// Aktif turun grubu listenin sonundadır; her aktivite olayında bütün
@@ -897,6 +1084,15 @@ final class AgentSession {
     ///
     /// Dosya içerikleri ve terminal çıktıları sınırsızdır; tek bir uzun tur
     /// bunların tamamını RAM'de biriktirebilir.
+    /// Aktivite içeriği her değiştiğinde artan sayaç.
+    ///
+    /// `TranscriptIndexCache` anahtarı yalnız sayı ve fazlara baktığı için, akan
+    /// bir aracın başlığı/çıktısı güncellendiğinde anahtar değişmiyor ve satır
+    /// önbellekteki eski kopyayla çiziliyordu.
+    private func noteActivityChange() {
+        state.activityRevision &+= 1
+    }
+
     private static func boundedForMemory(_ text: String) -> String {
         // `count` bütün metni dolaşır; bir aracın her güncellemesinde 10 MB'lık
         // bir çıktıyı saymak ana iş parçacığını meşgul eder. Bayt sayısı sabit
@@ -991,6 +1187,86 @@ final class AgentSession {
         state.status = .runningTool(
             AgentActivityPresentation(kind: descriptor.kind).runningStatusName
         )
+        noteActivityChange()
+    }
+
+    private func enqueueActivityUpdate(_ descriptor: ProviderActivityDescriptor, turnID: UUID) {
+        guard activeTurnID == turnID else {
+            return
+        }
+        pendingActivityUpdates[descriptor.id] = (descriptor: descriptor, turnID: turnID)
+
+        guard activityUpdateFlushTask == nil else {
+            return
+        }
+
+        activityUpdateFlushTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            self?.flushPendingActivityUpdates(turnID: turnID)
+        }
+    }
+
+    private func flushPendingActivityUpdates(turnID: UUID) {
+        activityUpdateFlushTask?.cancel()
+        activityUpdateFlushTask = nil
+
+        guard !pendingActivityUpdates.isEmpty else {
+            return
+        }
+
+        let updates = pendingActivityUpdates
+        pendingActivityUpdates.removeAll(keepingCapacity: true)
+
+        var didChange = false
+        for (_, item) in updates {
+            if applyActivityUpdate(item.descriptor, turnID: item.turnID) {
+                didChange = true
+            }
+        }
+
+        if didChange {
+            noteActivityChange()
+        }
+    }
+
+    @discardableResult
+    private func applyActivityUpdate(_ descriptor: ProviderActivityDescriptor, turnID: UUID) -> Bool {
+        guard
+            let groupIndex = activityGroupIndex(turnID: turnID),
+            let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
+                where: { $0.id == descriptor.id }
+            )
+        else {
+            return false
+        }
+
+        var activity = state.activityGroups[groupIndex].activities[activityIndex]
+        if let title = descriptor.title {
+            activity.title = title
+        }
+        if let detail = descriptor.detail {
+            activity.detail = detail
+        }
+        if let output = descriptor.output {
+            activity.output = Self.boundedForMemory(output)
+        }
+        if let diff = descriptor.diff {
+            activity.diff = Self.boundedForMemory(diff)
+        }
+        guard activity != state.activityGroups[groupIndex].activities[activityIndex] else {
+            return false
+        }
+        state.activityGroups[groupIndex].activities[activityIndex] = activity
+        return true
     }
 
     private func finishActivity(
@@ -1028,6 +1304,7 @@ final class AgentSession {
 
         activity.completedAt = Date()
         state.activityGroups[groupIndex].activities[activityIndex] = activity
+        noteActivityChange()
     }
 
     /// A finished activity must not overwrite a newer session status such as

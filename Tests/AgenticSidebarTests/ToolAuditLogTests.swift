@@ -22,6 +22,30 @@ final class ToolAuditLogTests: XCTestCase {
         XCTAssertEqual(recent.last?.source, .user)
     }
 
+    func testExecutionEventsAreRecordedSeparatelyFromPermissionDecisions() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let log = ToolAuditLog(fileURL: directory.appendingPathComponent("audit.jsonl"))
+
+        await log.recordExecution(ToolAuditLog.ExecutionRecord(
+            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+            sessionID: "ses_remote", activityID: "part-1", toolKind: .edit,
+            title: "Edited source.swift", detail: "source.swift", event: .started
+        ))
+        await log.recordExecution(ToolAuditLog.ExecutionRecord(
+            timestamp: Date(timeIntervalSince1970: 1_700_000_001),
+            sessionID: "ses_remote", activityID: "part-1", toolKind: .edit,
+            title: "Edited source.swift", detail: "source.swift", event: .completed
+        ))
+
+        let executions = await log.recentExecutions(limit: 10)
+        XCTAssertEqual(executions.map(\.event), [.started, .completed])
+        XCTAssertEqual(executions.map(\.activityID), ["part-1", "part-1"])
+        XCTAssertEqual(executions.first?.sessionID, "ses_remote")
+        let decisions = await log.recent(limit: 10)
+        XCTAssertTrue(decisions.isEmpty)
+    }
+
     func testTheLimitKeepsTheNewestRecords() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -116,7 +140,7 @@ final class ToolAuditLogTests: XCTestCase {
     private func record(
         toolName: String,
         patterns: [String],
-        reply: OpenCodePermissionReply
+        reply: ProviderPermissionReply
     ) -> ToolAuditLog.Record {
         ToolAuditLog.Record(
             timestamp: Date(),

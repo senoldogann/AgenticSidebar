@@ -13,9 +13,14 @@ enum OpenAIResponsesRequest {
             // The Responses API persists responses by default; this app keeps the
             // transcript local, so storage is explicitly disabled.
             store: false,
-            reasoning: providerRequest.configuration.variantID.map {
-                Reasoning(effort: $0.rawValue)
-            },
+            reasoning: {
+                if let variant = providerRequest.configuration.variantID {
+                    return Reasoning(effort: variant.rawValue)
+                } else if providerRequest.speedMode == .fast {
+                    return Reasoning(effort: "low")
+                }
+                return nil
+            }(),
             instructions: providerRequest.mode.instructions(
                 speedMode: providerRequest.speedMode,
                 extensionContext: providerRequest.extensionContext

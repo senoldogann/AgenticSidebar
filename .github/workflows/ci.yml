@@ -6,9 +6,11 @@ on:
   pull_request:
 
 # A superseded push has nothing to prove, and leaving it running burns runner
-# minutes while the newer commit waits behind it.
+# minutes while the newer commit waits behind it. Push and pull_request runs
+# for the same branch share a ref, so the group keeps them apart: a push must
+# not cancel the PR run that reviews it, only an earlier run of the same kind.
 concurrency:
-  group: ${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -27,6 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No toolchain pin: macos-26 defines the Xcode/Swift on the runner, and a
+      # new warning fails the build below instead of joining a pile nobody
+      # reads. Accepted risk: the next Xcode can turn a previously clean tree
+      # red with a new warning; that failure is the signal to fix it, not noise.
       - name: Toolchain
         run: |
           swift --version
@@ -36,7 +42,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.SWIFT_SCRATCH }}
-          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
@@ -55,11 +61,11 @@ jobs:
             --scratch-path "$SWIFT_SCRATCH" \
             -Xswiftc -warnings-as-errors
 
-  # Advisory: `swift-format` is not configured for this repository yet (there is
-  # no `.swift-format` to state the 4-space, 100-column style the code already
-  # follows by hand), so a failure here is a report, not a gate. Making it
-  # blocking would fail every build until the whole tree is reformatted, which is
-  # a separate decision from this workflow.
+  # Advisory, but visible: `.swift-format` states the 4-space style the code
+  # follows by hand, so this report is meaningful. It stays a report rather
+  # than a gate because the tree has pre-existing violations; reformatting the
+  # whole tree is a separate decision. `continue-on-error` is the single
+  # tolerance — a failure shows as an orange job instead of a silent green.
   format-report:
     runs-on: macos-26
     timeout-minutes: 15
@@ -70,5 +76,5 @@ jobs:
 
       - name: Format report
         run: |
-          brew install swift-format || true
-          swift-format lint -r Sources Tests || true
+          brew install swift-format
+          swift-format lint -r Sources Tests

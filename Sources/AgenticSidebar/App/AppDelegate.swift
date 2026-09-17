@@ -31,8 +31,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyGlobalShortcut(launchShortcut)
         installTerminationSignalHandlers()
 
-        NSApp.activate()
-        AppLog.lifecycle.info("Application launched with accessory activation policy")
+        NSApp.activate(ignoringOtherApps: true)
+        mainWindowController.show()
+        AppLog.lifecycle.info("Application launched with accessory activation policy (Dock-less)")
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            mainWindowController.show()
+        }
+        return true
     }
 
     /// Runs the managed shutdown when the process is asked to end by signal.

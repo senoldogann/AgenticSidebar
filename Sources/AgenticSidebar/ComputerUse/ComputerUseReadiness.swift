@@ -256,6 +256,9 @@ struct ComputerUseHelperProbe: ComputerUsePermissionProbing {
         do {
             try process.run()
         } catch {
+            AppLog.automation.error(
+                "Computer-use helper probe could not launch the helper: \(error.localizedDescription, privacy: .public)"
+            )
             return nil
         }
 
@@ -269,6 +272,9 @@ struct ComputerUseHelperProbe: ComputerUsePermissionProbing {
         do {
             try standardInput.fileHandleForWriting.write(contentsOf: request)
         } catch {
+            AppLog.automation.error(
+                "Computer-use helper probe could not write the health request: \(error.localizedDescription, privacy: .public)"
+            )
             return nil
         }
 
@@ -278,6 +284,9 @@ struct ComputerUseHelperProbe: ComputerUsePermissionProbing {
                 timeoutMilliseconds: timeoutMilliseconds
             )
         else {
+            AppLog.automation.error(
+                "Computer-use helper probe received no answer within the budget"
+            )
             return nil
         }
 

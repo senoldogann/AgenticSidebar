@@ -60,12 +60,22 @@ enum PromptRailSelection {
                 continue
             }
 
-            if highest == nil || offset < highest!.offset {
+            if let currentHighest = highest {
+                if offset < currentHighest.offset {
+                    highest = (id, offset)
+                }
+            } else {
                 highest = (id, offset)
             }
 
-            if offset <= threshold, nearestAbove == nil || offset > nearestAbove!.offset {
-                nearestAbove = (id, offset)
+            if offset <= threshold {
+                if let currentNearestAbove = nearestAbove {
+                    if offset > currentNearestAbove.offset {
+                        nearestAbove = (id, offset)
+                    }
+                } else {
+                    nearestAbove = (id, offset)
+                }
             }
         }
 

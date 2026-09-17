@@ -133,6 +133,24 @@ final class BackendRestartResilienceTests: XCTestCase {
         XCTAssertEqual(prompts.first, prompts.last)
     }
 
+    func testClientWithoutAgentSelectionRefusesReadOnlyPlan() async {
+        let legacyClient = RestartRecordingOpenCodeClient()
+        do {
+            try await legacyClient.sendPromptAsync(
+                sessionID: "ses_1",
+                model: OpenCodeModelReference(providerID: "anthropic", modelID: "claude/opus"),
+                variant: nil,
+                parts: [.text("Inspect only")],
+                agent: ManagedOpenCodeConfiguration.planAgentName
+            )
+            XCTFail("A client that cannot select the read-only agent must not submit the prompt")
+        } catch {
+            XCTAssertEqual(error as? ProviderRuntimeError, .unavailable)
+        }
+        let submitted = await legacyClient.prompts()
+        XCTAssertTrue(submitted.isEmpty, "The unsafe fallback must never send a plan prompt")
+    }
+
     private func makeManager(
         launcher: ScriptedOpenCodeProcessLauncher,
         healthChecker: any OpenCodeHealthChecking = ScriptedOpenCodeHealthChecker(

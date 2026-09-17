@@ -7,15 +7,18 @@ final class MainWindowController {
     private let activateApplication: @MainActor () -> Void
     private var currentOpacity: Double = 0.95
     private var colorSchemeMode: ColorSchemeMode = .system
+    private var stealthModeEnabled: Bool = true
 
     // Retained strongly so the window delegate is not released.
     private var hideOnCloseDelegate: HideOnCloseWindowDelegate?
 
-    init(
-        activateApplication: @escaping @MainActor () -> Void = {
-            NSApp.activate()
+    init() {
+        self.activateApplication = {
+            NSApp.activate(ignoringOtherApps: true)
         }
-    ) {
+    }
+
+    init(activateApplication: @escaping @MainActor () -> Void) {
         self.activateApplication = activateApplication
     }
 
@@ -29,6 +32,7 @@ final class MainWindowController {
 
         applyOpacity(currentOpacity, to: window)
         window.appearance = colorSchemeMode.windowAppearance
+        applyStealthMode(stealthModeEnabled, to: window)
     }
 
     func setOpacity(_ opacity: Double) {
@@ -51,6 +55,22 @@ final class MainWindowController {
     private func applyOpacity(_ opacity: Double, to window: NSWindow) {
         let clamped = CGFloat(max(0.40, min(1.00, opacity)))
         window.alphaValue = clamped
+    }
+
+    /// Sets whether the window is excluded from screen recordings and screenshots.
+    func setStealthMode(_ enabled: Bool) {
+        stealthModeEnabled = enabled
+        if let window {
+            applyStealthMode(enabled, to: window)
+        }
+    }
+
+    private func applyStealthMode(_ enabled: Bool, to window: NSWindow) {
+        let targetType: NSWindow.SharingType = enabled ? .none : .readOnly
+        window.sharingType = targetType
+        for child in window.childWindows ?? [] {
+            child.sharingType = targetType
+        }
     }
 
     func setReopenAction(_ action: @escaping () -> Void) {

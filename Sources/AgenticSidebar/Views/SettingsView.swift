@@ -3,7 +3,9 @@ import SwiftUI
 enum SettingsTab: String, CaseIterable, Identifiable {
     case appearance = "Appearance"
     case ai = "AI & Models"
-    case extensions = "MCP & Plugins"
+    case skills = "Skills"
+    case mcp = "MCP Servers"
+    case plugins = "Plugins"
     case automation = "Automation"
     case computerUse = "Computer Use"
     case general = "General"
@@ -14,7 +16,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         switch self {
         case .appearance: "paintpalette.fill"
         case .ai: "cpu.fill"
-        case .extensions: "puzzlepiece.extension.fill"
+        case .skills: "sparkles"
+        case .mcp: "server.rack"
+        case .plugins: "puzzlepiece.extension.fill"
         case .automation: "bolt.fill"
         case .computerUse: "cursorarrow.rays"
         case .general: "gearshape.fill"
@@ -50,6 +54,8 @@ struct SettingsView: View {
 
     /// The audit log's tail, loaded when the tool-approval card appears.
     @State var recentDecisions: [ToolAuditLog.Record] = []
+    /// Observed tool lifecycle, distinct from permission decisions.
+    @State var recentExecutions: [ToolAuditLog.ExecutionRecord] = []
     /// "Recent tool decisions" kartı kapalı başlar: kayıt dosyası zaten
     /// tutuluyor, kart yalnız kuyruğunu gösteren bir görüntüleyici.
     @State var isToolDecisionLogExpanded: Bool = false
@@ -97,48 +103,48 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             // Left Sidebar Navigation
-            VStack(alignment: .leading, spacing: 14) {
-                Text("SETTINGS")
-                    .font(.system(size: 10.5, weight: .bold))
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 4)
-                    .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Settings")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary.opacity(0.8))
+                    .padding(.horizontal, 10)
+                    .padding(.top, 4)
 
                 // Vertical Tab Items
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     ForEach(SettingsTab.allCases) { tab in
+                        let isSelected = navigation.tab == tab
+
                         Button {
                             withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                                 navigation.tab = tab
                             }
                         } label: {
-                            HStack(spacing: 9) {
+                            HStack(spacing: 10) {
                                 Image(systemName: tab.iconName)
-                                    .font(.system(size: 12.5, weight: navigation.tab == tab ? .semibold : .medium))
+                                    .font(.system(size: 13, weight: isSelected ? .medium : .regular))
                                     .frame(width: 18)
+                                    .foregroundStyle(isSelected ? .primary : .secondary)
 
                                 Text(tab.rawValue)
-                                    .font(.system(size: 13, weight: navigation.tab == tab ? .semibold : .medium))
+                                    .font(.system(size: 13, weight: isSelected ? .medium : .regular))
+                                    .foregroundStyle(
+                                        isSelected
+                                            ? Color.primary
+                                            : (isDarkMode ? Color.white.opacity(0.82) : Color.black.opacity(0.78))
+                                    )
 
                                 Spacer()
                             }
-                            .foregroundStyle(
-                                navigation.tab == tab
-                                    ? Color.white
-                                    : (isDarkMode ? Color.white.opacity(0.75) : Color.black.opacity(0.75))
-                            )
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 6.5)
                             .background {
-                                if navigation.tab == tab {
-                                    LinearGradient(
-                                        colors: currentTheme.accentGradient,
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                if isSelected {
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(isDarkMode ? Color.white.opacity(0.12) : Color.black.opacity(0.07))
                                 }
                             }
+                            .contentShape(Rectangle())
                             .interactiveHoverPill(cornerRadius: 8)
                         }
                         .buttonStyle(.plain)
@@ -158,19 +164,23 @@ struct SettingsView: View {
                                 endPoint: .bottomTrailing
                             )
                         )
-                        .frame(width: 14, height: 14)
+                        .frame(width: 12, height: 12)
 
                     Text(currentTheme.displayName)
-                        .font(.caption.weight(.medium))
+                        .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(.secondary)
 
                     Spacer()
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.vertical, 6)
+                .background(
+                    isDarkMode ? Color.white.opacity(0.05) : Color.black.opacity(0.03),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 38)
+            .padding(.horizontal, 12)
+            .padding(.top, 36)
             .padding(.bottom, 14)
             .frame(width: 220)
             .background(
@@ -188,11 +198,11 @@ struct SettingsView: View {
                 HStack {
                     HStack(spacing: 8) {
                         Image(systemName: navigation.tab.iconName)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundStyle(.secondary)
 
                         Text(navigation.tab.rawValue)
-                            .font(.system(size: 16, weight: .bold))
+                            .font(.system(size: 15.5, weight: .semibold))
                             .foregroundStyle(.primary)
                     }
 
@@ -221,8 +231,12 @@ struct SettingsView: View {
                                 appearanceTabContent
                             case .ai:
                                 aiTabContent
-                            case .extensions:
-                                extensionsTabContent
+                            case .skills:
+                                skillsTabContent
+                            case .mcp:
+                                mcpServersTabContent
+                            case .plugins:
+                                pluginsTabContent
                             case .automation:
                                 automationTabContent
                             case .computerUse:
@@ -256,6 +270,8 @@ struct SettingsView: View {
                 )
             }
         }
+        .environment(settingsStore)
+        .environment(extensionStore)
         .background(
             currentTheme.background(isDark: isDarkMode)
         )

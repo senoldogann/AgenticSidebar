@@ -87,15 +87,15 @@ struct ComposerDropdownRow<Icon: View>: View {
 
     var body: some View {
         Button {
-            dismissPopover()
             action()
+            dismissPopover()
         } label: {
             HStack(spacing: 8) {
                 icon
-                    .frame(width: 14, alignment: .center)
+                    .frame(width: 16, alignment: .center)
 
                 Text(title)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
 
@@ -103,15 +103,15 @@ struct ComposerDropdownRow<Icon: View>: View {
 
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5.5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .interactiveHoverPill(cornerRadius: 6)
+            .interactiveHoverPill(cornerRadius: 7)
         }
         .buttonStyle(.plain)
         .pointingHandCursor()

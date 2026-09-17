@@ -24,16 +24,17 @@ extension SettingsView {
         settingsCardChrome {
             HStack(spacing: 10) {
                 Image(systemName: icon)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 13.5, weight: .semibold))
                         .foregroundStyle(.primary)
 
                     Text(subtitle)
-                        .font(.system(size: 11))
+                        .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
 
@@ -66,16 +67,17 @@ extension SettingsView {
             } label: {
                 HStack(spacing: 10) {
                     Image(systemName: icon)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(currentTheme.accentGradient.first ?? .primary)
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18)
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text(title)
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.system(size: 13.5, weight: .semibold))
                             .foregroundStyle(.primary)
 
                         Text(subtitle)
-                            .font(.system(size: 11))
+                            .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                     }
 
@@ -88,7 +90,7 @@ extension SettingsView {
                     }
 
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.tertiary)
                         .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
                 }
@@ -113,21 +115,21 @@ extension SettingsView {
         VStack(alignment: .leading, spacing: 14) {
             content()
         }
-        .padding(18)
+        .padding(16)
         .background(
             currentTheme.surface(isDark: isDarkMode)
                 .opacity(settingsStore.glassOpacity),
-            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(
                     currentTheme.border(isDark: isDarkMode)
                         .opacity(settingsStore.contrast),
-                    lineWidth: 1
+                    lineWidth: 0.5
                 )
         )
-        .shadow(color: Color.black.opacity(isDarkMode ? 0.20 : 0.04), radius: 6, x: 0, y: 2)
+        .shadow(color: Color.black.opacity(isDarkMode ? 0.12 : 0.03), radius: 4, x: 0, y: 1)
     }
 
     @ViewBuilder
@@ -172,13 +174,22 @@ extension SettingsView {
         .disabled(isDisabled)
     }
 
+    @ViewBuilder
+    func secondaryActionButton(
+        title: String,
+        icon: String?,
+        action: @escaping () -> Void
+    ) -> some View {
+        secondaryActionButton(title: title, icon: icon, isDisabled: false, action: action)
+    }
+
     /// The quiet counterpart to `primaryActionButton`: for a card that offers an
     /// action without proposing one (refresh, revoke, reveal in Finder).
     @ViewBuilder
     func secondaryActionButton(
         title: String,
         icon: String?,
-        isDisabled: Bool = false,
+        isDisabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
         let accent = currentTheme.accentGradient.first ?? .accentColor
@@ -187,7 +198,7 @@ extension SettingsView {
             HStack(spacing: 6) {
                 if let icon {
                     Image(systemName: icon)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 11.5, weight: .medium))
                 }
                 Text(title)
                     .font(.system(size: 12, weight: .medium))
@@ -196,14 +207,14 @@ extension SettingsView {
             .padding(.horizontal, 11)
             .padding(.vertical, 6)
             .background(
-                accent.opacity(isDarkMode ? 0.20 : 0.12),
+                isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05),
                 in: RoundedRectangle(cornerRadius: 8, style: .continuous)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(accent.opacity(0.32), lineWidth: 1)
+                    .stroke(isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05), lineWidth: 0.5)
             )
-            .interactiveHoverOutline(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .interactiveHoverPill(cornerRadius: 8)
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
@@ -241,6 +252,68 @@ extension SettingsView {
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .pointingHandCursor()
+    }
+
+    @ViewBuilder
+    func settingsTextField(_ placeholder: String, text: Binding<String>) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 12.5))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6.5)
+            .background(
+                isDarkMode ? Color.white.opacity(0.06) : Color.black.opacity(0.04),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.06), lineWidth: 0.5)
+            )
+    }
+
+    @ViewBuilder
+    func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9, weight: .semibold))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1.5)
+            .foregroundStyle(color)
+            .background(
+                color.opacity(0.14),
+                in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+            )
+    }
+
+    @ViewBuilder
+    func emptyRow(_ text: String) -> some View {
+        HStack {
+            Text(text)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.tertiary)
+            Spacer()
+        }
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    func statusCard(_ status: ExtensionStatus) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: status.isFailure ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                .font(.system(size: 12))
+                .foregroundStyle(status.isFailure ? Color.orange : Color.secondary)
+
+            Text(status.message)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(
+            Color.primary.opacity(0.04),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
     }
 }
 

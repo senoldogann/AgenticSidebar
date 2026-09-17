@@ -3,15 +3,23 @@ import Foundation
 actor OpenCodeProviderRuntime: ProviderRuntime {
     nonisolated let id = ProviderID("opencode")
 
-    /// Kullanıcı kararını bekler; nil ise eski davranış korunur (otomatik onay).
+    /// Kullanıcı kararını bekler; işleyici yoksa istek güvenli biçimde reddedilir.
     typealias PermissionHandler = @Sendable (OpenCodePermissionRequest) async -> OpenCodePermissionReply
     /// Tur iptalinde askıda kalan izinleri temizler.
-    typealias PermissionCancellationHandler = @Sendable (String) async -> Void
+    ///
+    /// Both identities are handed over because a turn's requests are not all
+    /// tagged with its own remote session: a subagent's request carries the child
+    /// session's id instead, and only the conversation it was attributed to can
+    /// recognise it. A cancellation that knew merely the parent's remote session
+    /// left a subagent's prompt on screen — and its waiter unreleased — until the
+    /// decision timeout expired on its own.
+    typealias PermissionCancellationHandler = @Sendable (String, UUID) async -> Void
 
     private let serverManager: any OpenCodeServerManaging
     private let clientFactory: @Sendable (OpenCodeServerConnection) -> any OpenCodeClientProtocol
     private let permissionHandler: PermissionHandler?
     private let cancelPendingPermissions: PermissionCancellationHandler?
+    private let auditLog: ToolAuditLog?
     private var remoteSessionIDs: [UUID: String] = [:]
 
     /// The server that owns `remoteSessionIDs`. Remote sessions live inside a
@@ -23,19 +31,22 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         serverManager: any OpenCodeServerManaging,
         clientFactory: @escaping @Sendable (OpenCodeServerConnection) -> any OpenCodeClientProtocol,
         permissionHandler: PermissionHandler?,
-        cancelPendingPermissions: PermissionCancellationHandler?
+        cancelPendingPermissions: PermissionCancellationHandler?,
+        auditLog: ToolAuditLog? = nil
     ) {
         self.serverManager = serverManager
         self.clientFactory = clientFactory
         self.permissionHandler = permissionHandler
         self.cancelPendingPermissions = cancelPendingPermissions
+        self.auditLog = auditLog
     }
 
     static func live(
         serverManager: any OpenCodeServerManaging,
         transport: any OpenCodeTransport,
         permissionHandler: PermissionHandler?,
-        cancelPendingPermissions: PermissionCancellationHandler?
+        cancelPendingPermissions: PermissionCancellationHandler?,
+        auditLog: ToolAuditLog? = nil
     ) -> OpenCodeProviderRuntime {
         OpenCodeProviderRuntime(
             serverManager: serverManager,
@@ -46,7 +57,8 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 )
             },
             permissionHandler: permissionHandler,
-            cancelPendingPermissions: cancelPendingPermissions
+            cancelPendingPermissions: cancelPendingPermissions,
+            auditLog: auditLog
         )
     }
 
@@ -68,8 +80,16 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
 
         // A missing list is not an error worth surfacing: an older backend has no
         // such endpoint, and the checklist is an addition to the transcript, not
-        // part of the turn.
-        return try? await clientFactory(connection).sessionTodos(sessionID: remoteSessionID)
+        // part of the turn. The failure is still logged so an empty checklist
+        // stays diagnosable.
+        do {
+            return try await clientFactory(connection).sessionTodos(sessionID: remoteSessionID)
+        } catch {
+            AppLog.openCode.error(
+                "Session todo list could not be read; showing no checklist: \(error.localizedDescription, privacy: .public)"
+            )
+            return nil
+        }
     }
 
     func startStream(for request: ProviderRequest) async throws -> ProviderStream {
@@ -92,25 +112,43 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         }
 
         let client = clientFactory(connection)
-        var remoteSessionID = try await remoteSessionID(
+        var resolution = try await remoteSessionID(
             for: request.sessionID,
             client: client,
             connection: connection
         )
-        let parts = OpenCodePromptBuilder.parts(
+        // A backend session that starts now has none of the shared past, so the
+        // first turn carries the transcript as quoted history. Without it the
+        // agent answers a restored conversation with a fresh memory.
+        let preambleBudget = max(
+            20_000,
+            OpenCodeHistoryPreamble.maximumCharacters - lastUserMessage.text.count
+        )
+        var parts = OpenCodePromptBuilder.parts(
             for: lastUserMessage,
             speedMode: request.speedMode,
-            mode: request.mode
+            mode: request.mode,
+            historyPreamble: resolution.isFresh
+                ? OpenCodeHistoryPreamble.make(
+                    from: request.messages,
+                    activityGroups: request.activityGroups,
+                    newMessageID: lastUserMessage.id,
+                    maximumCharacters: preambleBudget
+                )
+                : nil
         )
+        let agentName = request.mode == .plan
+            ? ManagedOpenCodeConfiguration.planAgentName : "build"
 
         // Subscribe before submitting so fast backend events cannot be missed.
         let lineStream = try await client.eventStream()
         do {
             try await client.sendPromptAsync(
-                sessionID: remoteSessionID,
+                sessionID: resolution.id,
                 model: model,
                 variant: request.configuration.variantID?.rawValue,
-                parts: parts
+                parts: parts,
+                agent: agentName
             )
         } catch let error as ProviderRuntimeError where error == .unexpectedResponse {
             // The backend no longer knows this session (for example after a restart
@@ -121,16 +159,30 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             )
             remoteSessionIDs[request.sessionID] = nil
             do {
-                remoteSessionID = try await self.remoteSessionID(
+                resolution = try await self.remoteSessionID(
                     for: request.sessionID,
                     client: client,
                     connection: connection
                 )
+                // The recreated session is fresh by construction: the history
+                // that the rejected session held has to ride along again.
+                parts = OpenCodePromptBuilder.parts(
+                    for: lastUserMessage,
+                    speedMode: request.speedMode,
+                    mode: request.mode,
+                    historyPreamble: OpenCodeHistoryPreamble.make(
+                        from: request.messages,
+                        activityGroups: request.activityGroups,
+                        newMessageID: lastUserMessage.id,
+                        maximumCharacters: preambleBudget
+                    )
+                )
                 try await client.sendPromptAsync(
-                    sessionID: remoteSessionID,
+                    sessionID: resolution.id,
                     model: model,
                     variant: request.configuration.variantID?.rawValue,
-                    parts: parts
+                    parts: parts,
+                    agent: agentName
                 )
             } catch {
                 await lineStream.cancel()
@@ -141,19 +193,24 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             throw error
         }
 
-        let activeSessionID = remoteSessionID
+        let activeSessionID = resolution.id
         // Bounded: a burst of backend events suspends the reader instead of
         // piling up while the session applies them one by one.
         let channel = BoundedChannel<ProviderEvent>(capacity: 128)
         let permissionHandler = self.permissionHandler
+        let appSessionID = request.sessionID
+        let auditLog = self.auditLog
         let forwardingTask = Task {
+            var auditActivities: [ProviderActivityID: ProviderActivityDescriptor] = [:]
             var normalizer = OpenCodeStreamNormalizer(
                 sessionID: activeSessionID,
                 onPermissionRequest: { request in
                     Task {
                         let reply: OpenCodePermissionReply
                         if let permissionHandler {
-                            reply = await permissionHandler(request)
+                            var attributedRequest = request
+                            attributedRequest.appSessionID = appSessionID
+                            reply = await permissionHandler(attributedRequest)
                         } else {
                             // Fail closed. A missing decision surface is not consent,
                             // and `.always` is not "just this once": OpenCode keeps
@@ -179,6 +236,33 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 streamLoop: for try await line in lineStream.lines {
                     try Task.checkCancellation()
                     for event in try normalizer.consume(line: line) {
+                        // The provider emits execution even for tools pre-allowed by
+                        // configuration. Permission decisions alone cannot audit them.
+                        if let auditLog {
+                            switch event {
+                            case let .activityStarted(activity):
+                                auditActivities[activity.id] = activity
+                                await auditLog.recordExecution(ToolAuditLog.ExecutionRecord(
+                                    timestamp: Date(), sessionID: activeSessionID,
+                                    activityID: activity.id.rawValue, toolKind: activity.kind,
+                                    // Titles and details originate in model/tool input and
+                                    // may contain credentials. Keep only safe identifiers.
+                                    title: nil, detail: nil,
+                                    event: .started
+                                ))
+                            case let .activityFinished(activityID, outcome, _, _):
+                                let activity = auditActivities.removeValue(forKey: activityID)
+                                await auditLog.recordExecution(ToolAuditLog.ExecutionRecord(
+                                    timestamp: Date(), sessionID: activeSessionID,
+                                    activityID: activityID.rawValue,
+                                    toolKind: activity?.kind ?? .tool,
+                                    title: nil, detail: nil,
+                                    event: outcome == .completed ? .completed : .failed
+                                ))
+                            default:
+                                break
+                            }
+                        }
                         try await channel.send(event)
                         if event == .completed {
                             break streamLoop
@@ -202,7 +286,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             events: channel.makeStream(),
             cancellation: {
                 forwardingTask.cancel()
-                await self.cancelPendingPermissions?(activeSessionID)
+                await self.cancelPendingPermissions?(activeSessionID, appSessionID)
                 try? await client.abort(sessionID: activeSessionID)
                 await lineStream.cancel()
                 await channel.finish(throwing: CancellationError())
@@ -237,18 +321,18 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         for appSessionID: UUID,
         client: any OpenCodeClientProtocol,
         connection: OpenCodeServerConnection
-    ) async throws -> String {
+    ) async throws -> (id: String, isFresh: Bool) {
         if sessionConnection != connection {
             remoteSessionIDs.removeAll()
             sessionConnection = connection
         }
 
         if let existing = remoteSessionIDs[appSessionID] {
-            return existing
+            return (existing, false)
         }
 
         let created = try await client.createSession()
         remoteSessionIDs[appSessionID] = created
-        return created
+        return (created, true)
     }
 }

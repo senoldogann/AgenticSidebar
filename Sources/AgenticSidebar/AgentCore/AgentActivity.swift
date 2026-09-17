@@ -11,8 +11,8 @@ struct AgentActivity: Identifiable, Equatable, Codable, Sendable {
     let id: ProviderActivityID
     let kind: ProviderActivityKind
     var phase: AgentActivityPhase
-    let title: String?
-    let detail: String?
+    var title: String?
+    var detail: String?
     var output: String?
     /// `+`/`-` preview of the change this activity made, when it has one.
     var diff: String?
@@ -26,7 +26,7 @@ struct AgentActivity: Identifiable, Equatable, Codable, Sendable {
         title: String?,
         detail: String?,
         output: String?,
-        diff: String? = nil,
+        diff: String?,
         startedAt: Date,
         completedAt: Date?
     ) {
@@ -39,6 +39,29 @@ struct AgentActivity: Identifiable, Equatable, Codable, Sendable {
         self.diff = diff
         self.startedAt = startedAt
         self.completedAt = completedAt
+    }
+
+    init(
+        id: ProviderActivityID,
+        kind: ProviderActivityKind,
+        phase: AgentActivityPhase,
+        title: String?,
+        detail: String?,
+        output: String?,
+        startedAt: Date,
+        completedAt: Date?
+    ) {
+        self.init(
+            id: id,
+            kind: kind,
+            phase: phase,
+            title: title,
+            detail: detail,
+            output: output,
+            diff: nil,
+            startedAt: startedAt,
+            completedAt: completedAt
+        )
     }
 
     init(

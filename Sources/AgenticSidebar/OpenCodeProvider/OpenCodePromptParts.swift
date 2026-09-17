@@ -51,6 +51,7 @@ enum OpenCodePromptBuilder {
         for message: ChatMessage,
         speedMode: ResponseSpeedMode,
         mode: AgentMode = .build,
+        historyPreamble: String? = nil,
         fileManager: FileManager = .default,
         maximumInlineBytes: Int = OpenCodePromptBuilder.maximumInlineAttachmentBytes
     ) -> [OpenCodePromptPart] {
@@ -74,6 +75,7 @@ enum OpenCodePromptBuilder {
             referencedOnly: referencedOnly,
             speedMode: speedMode,
             mode: mode,
+            historyPreamble: historyPreamble,
             extensionTags: message.extensionTags
         )
         guard !text.isEmpty else {
@@ -132,6 +134,7 @@ enum OpenCodePromptBuilder {
         referencedOnly: [String],
         speedMode: ResponseSpeedMode,
         mode: AgentMode,
+        historyPreamble: String? = nil,
         extensionTags: [ExtensionTag] = []
     ) -> String {
         let body: String
@@ -157,16 +160,26 @@ enum OpenCodePromptBuilder {
         // The backend keeps its own session, so the mode instruction has to ride
         // along with every turn that needs it — there is no system prompt slot.
         // The tagged extensions travel the same way, with the turn they belong to.
-        guard
+        // A restored history travels between them and the new message: the model
+        // reads instruction, shared past, then the turn to answer.
+        guard !body.isEmpty else {
+            return body
+        }
+
+        var sections: [String] = []
+        if
             let instruction = mode.instructions(
                 speedMode: speedMode,
                 extensionContext: extensionTags.turnInstruction
             ),
-            !body.isEmpty
-        else {
-            return body
+            !instruction.isEmpty
+        {
+            sections.append(instruction)
         }
-
-        return "\(instruction)\n\n\(body)"
+        if let historyPreamble, !historyPreamble.isEmpty {
+            sections.append(historyPreamble)
+        }
+        sections.append(body)
+        return sections.joined(separator: "\n\n")
     }
 }

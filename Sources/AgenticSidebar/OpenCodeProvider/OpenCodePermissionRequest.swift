@@ -8,10 +8,20 @@ import Foundation
 struct OpenCodePermissionRequest: Equatable, Sendable {
     let id: String
     let remoteSessionID: String
+    /// The local conversation that issued this request (filled in by the runtime).
+    var appSessionID: UUID? = nil
     let toolName: String
     let patterns: [String]
     let alwaysPatterns: [String]
     let detail: String?
+    /// Whether the request came from a session the turn did not open — in
+    /// practice a subagent the `task` tool delegated to.
+    ///
+    /// It changes nothing about the decision; it is what the approval prompt has
+    /// to say, because "may I read outside this folder?" asked on behalf of a
+    /// child session reads very differently from the same question asked by the
+    /// agent the user is talking to.
+    var isDelegatedSession: Bool = false
 
     static func make(from properties: [String: Any]) -> OpenCodePermissionRequest? {
         guard
@@ -34,10 +44,19 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
         )
     }
 
+    /// Marks the request as raised by a delegated session, judged against the
+    /// session the subscription was opened for.
+    func marked(ownedBy ownerSessionID: String) -> OpenCodePermissionRequest {
+        var copy = self
+        copy.isDelegatedSession = remoteSessionID != ownerSessionID
+        return copy
+    }
+
     /// Onay diyaloğunda gösterilecek kısa açıklama; ham metadata dökülmez.
     static func detail(from metadata: [String: Any]) -> String? {
         let preferredKeys = [
             "description",
+            "subagent_type",
             "title",
             "command",
             "path",
@@ -129,9 +148,27 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
 
 /// OpenCode izin yanıtının üç sonucu.
 ///
-/// `Codable` çünkü denetim kaydı (``ToolAuditLog``) verilen cevabı saklar.
+/// `Codable` çünkü denetim kaydı verilen cevabı saklar. `ProviderGateway`
+/// içindeki nötr karşılığı ``ProviderPermissionReply`` ile aynı ham değerleri
+/// taşır; dönüşüm sınırda yapılır.
 enum OpenCodePermissionReply: String, Codable, Equatable, Sendable {
     case once
     case always
     case reject
+
+    init(_ reply: ProviderPermissionReply) {
+        switch reply {
+        case .once: self = .once
+        case .always: self = .always
+        case .reject: self = .reject
+        }
+    }
+
+    var providerReply: ProviderPermissionReply {
+        switch self {
+        case .once: return .once
+        case .always: return .always
+        case .reject: return .reject
+        }
+    }
 }

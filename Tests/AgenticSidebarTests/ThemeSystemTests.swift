@@ -4,7 +4,7 @@ import XCTest
 @MainActor
 final class ThemeSystemTests: XCTestCase {
     func testAllPresetsContainExpectedThemes() {
-        XCTAssertEqual(AppThemes.allPresets.count, 7)
+        XCTAssertEqual(AppThemes.allPresets.count, 9)
 
         let identifiers = Set(AppThemes.allPresets.map(\.id))
         XCTAssertTrue(identifiers.contains(.monolith))
@@ -14,6 +14,8 @@ final class ThemeSystemTests: XCTestCase {
         XCTAssertTrue(identifiers.contains(.ember))
         XCTAssertTrue(identifiers.contains(.iris))
         XCTAssertTrue(identifiers.contains(.auroraNocturne))
+        XCTAssertTrue(identifiers.contains(.codex))
+        XCTAssertTrue(identifiers.contains(.claude))
     }
 
     /// `System` has to reach the scene as `nil`, not as the mode it currently

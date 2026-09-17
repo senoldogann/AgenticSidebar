@@ -858,3 +858,322 @@ computer-use chain rather than a proof of its flags.
 - [ ] **Open — needs the user**: the app cannot grant itself Screen Recording.
   Pressing **Grant Screen Recording…** lists AgenticSidebar in the pane; toggling
   it on is the remaining step, and the card's Ready line is the confirmation.
+
+---
+
+# Round 5 — delegated subagents and the approval level (2026-09-17)
+
+Scope: the report that subagents are not covered by the app's permissions, and
+that they start but stay stuck in the UI. Evidence:
+`docs/verification/2026-09-17-subagent-permissions.md`.
+
+## Fixed
+
+- [x] **CR-ITEM-5.1 (Critical) A subagent's permission request was dropped, and
+  the subagent hung forever.** `OpenCodeStreamNormalizer` delivered
+  `permission.asked` only for the session the subscription was opened for; a
+  child session's request carries the child's id. Production: the child's
+  `external_directory` asks at 08:48:06/07 have no audit record of any kind, and
+  the subagent blocked for 104 s until it was aborted with the parent.
+  **Fix (applied)**: permission events are exempt from the session filter, and the
+  two-arrivals-of-one-request case shares a single decision. Verified end to end
+  by `script/verify-subagent-permissions.mjs` against a real server and a real
+  `task` delegation (4/4).
+- [x] **CR-ITEM-5.2 (High) A delegated request read as the turn's own.** The
+  approval card said "Current conversation" for a question asked by a child
+  session. **Fix (applied)**: `OpenCodePermissionRequest.isDelegatedSession`,
+  set by the normalizer against the session the turn owns; the card labels it
+  *Delegated subagent*.
+- [x] **CR-ITEM-5.3 (Medium) Stopping a turn left a subagent's prompt on screen.**
+  `rejectAll` matched the parent's remote session id only, so a child's pending
+  request survived cancellation — waiter unreleased — until the 180 s timeout.
+  **Fix (applied)**: cancellation now carries the conversation as well, and a
+  request attributed to that conversation is cleared too.
+- [x] **CR-ITEM-5.4 (Medium) The app's `skill: "allow"` was silently discarded.**
+  The managed configuration wrote the `skill` key twice (routed rule, then the
+  denials). JSON keeps the last one, so every skill fell through to the
+  catch-all: `evaluated permission=skill … action.permission=* action.action=ask`.
+  **Fix (applied)**: one `skill` member, `{"*": "allow", "<off>": "deny", …}`, with
+  the denials last because the same last-rule-wins reading applies inside it.
+
+## Open
+
+- [ ] **CR-ITEM-5.5 (High) The approval level is not the last word, and the app
+  does not say so.** Measured on OpenCode 1.18.31: with the machine's own
+  `~/.opencode/opencode.json` present, an explicit `bash: ask` (string *and*
+  object form, with and without `--pure`, at the top level *and* inside the
+  agent) resolves to `allow` — OpenCode turns each agent's enabled `tools` map
+  into agent-level rules applied after the configuration. The production audit
+  has no `bash` decision at all across 832 `external_directory` ones. The level
+  does govern what reaches the app (external paths, `todowrite`, `skill`,
+  `task`, web access, the doom-loop guard, MCP and computer-use tools).
+  **Recommendation**: read `GET /config` once when the backend starts and, when a
+  resolved agent permission contradicts the selected level, say so in Settings →
+  AI & Models and on the level control — naming the file that decided it. Today
+  the only honest statement lives in the README.
+- [ ] **CR-ITEM-5.6 (Medium) A request that never arrives is invisible.**
+  `GET /permission` lists everything pending across sessions, and nothing polls
+  it. The exemption fixes the cause we found; a reconciliation pass during a turn
+  would make the class of failure self-healing rather than merely absent.
+- [ ] **CR-ITEM-5.7 (Low) The subagent card cannot show that it is waiting on a
+  decision.** The child's own transcript events are still filtered, so the card
+  shows "Subagent working (N steps)" with no hint that a prompt is the reason
+  nothing moves. The dashboard's pending count covers it only for the active
+  conversation.
+
+## Quality assurance
+
+- [x] `swift build` / `swift test` `-warnings-as-errors`: **552 tests, 2 skipped,
+  0 failures**.
+- [x] Every claim in the verification document is a command output from this
+  session; no claim about rule precedence is made without the experiment that
+  measured it.
+- [x] `script/verify-subagent-permissions.mjs` is permanent, model-free where it
+  can be (`--skip-model`) and bounded so it cannot hang a CI run.
+
+---
+
+# Round 6 — the pasted P2/P3 list, verified item by item (2026-09-17)
+
+Scope: the review report handed over as text (three P2 findings, eight P3
+bullets). Every item was checked against the working tree before anything was
+changed: several had already been fixed in the revision on disk, the rest are
+fixed in this round. Evidence:
+`docs/verification/2026-09-17-review-followups-p2-p3.md`.
+
+## Already fixed on disk (verified, no change)
+
+- [x] **CR-ITEM-6.1 (P2) Thumbnail cache ignored `maxPixelSize`.** The key is
+  `"<path>#<Int(maxPixelSize)>"` (`AttachmentPreviewCache.cacheKey`), so the
+  chip's 96 px image can no longer be handed to the transcript (520 px) or the
+  inspector (1800 px). Verified at all three call sites, PDF path included
+  (shared `imageCache`, same key builder).
+- [x] **CR-ITEM-6.2 (P2) The large-file guard in `FileInspectorPanelView`
+  really was inverted — the text half is fixed.** `readTextPrefix` reads at most
+  1 MB through `FileHandle` and truncates at 100 000 characters; the
+  `String(contentsOf:)` branch that read a whole file first is gone.
+- [x] **CR-ITEM-6.3 (P2) The "Stealth Mode" wording no longer promises a
+  guarantee.** `CapturePrivacyCapabilities.current` reports
+  `externalCaptureExclusionApplied` (not `…Guaranteed`) and names the mechanism:
+  `NSWindow.sharingType = .none`, "capture paths that do not honor the window
+  sharing setting are not covered". Settings → General renders that string.
+- [x] **CR-ITEM-6.4 (P3) A corrupt `drafts.json` is no longer overwritten.**
+  `ComposerDraftStore.moveAside()` writes `drafts.corrupt.json` before the next
+  save, the same policy the archive and the server ledger follow.
+- [x] **CR-ITEM-6.5 (P3) The README ↔ code contradiction is gone.** README
+  ("rendered lazily … not given an implicit animation") and
+  `ConversationDetailView` agree: `LazyVStack`.
+- [x] **CR-ITEM-6.6 (P3) The dead preview path is gone.** `onImageTap`,
+  `previewImagePath` and `ImagePreviewModal` no longer exist anywhere in
+  `Sources`; clicking an image opens the inspector.
+- [x] **CR-ITEM-6.7 (P3) `saveImmediately` at the end of every turn is
+  accepted and documented** at the call site: structure changes pay one archive
+  write, encoding and disk I/O happen in the archive actor.
+- [x] **CR-ITEM-6.8 (P3) `approveSafe`'s exact-match list is intentional** —
+  `swift build --product …` asks now. `ToolApprovalPolicyTests` pins it.
+- [x] **CR-ITEM-6.9 (P3) Pasted-text spills are bounded.**
+  `PastedTextAttachment.maximumStoredFiles = 50`, pruned on every write.
+
+## Fixed in this round
+
+- [x] **CR-ITEM-6.10 (P2, remainder) Stealth Mode missed every window born
+  after the setting was applied — and the rule existed four times.**
+  `sharingType` is not inherited, and each implementation only walked the
+  `childWindows` that existed *at that moment*: `CapturePrivacyController`,
+  `MainWindowController`, `WindowSharingObservationView` and
+  `SettingsWindowController` — the per-site `WindowSharingConfigurator` in the
+  MCP sheet existed precisely to work around this. **Fix (applied)**:
+  `CapturePrivacyController` is now the single owner; it records the tracked
+  window and observes `didBecomeKey` / `didBecomeMain` /
+  `didChangeOcclusionState`, applying the current preference the moment a window
+  appears (recursively to its children), in both directions. `queue: nil` keeps
+  it synchronous with the AppKit post, so the window is set in the same turn it
+  appears. Adoption also waits until the preference has been read at least once
+  (`hasReadPreference`), so the launch-time default cannot overwrite the stored
+  setting before the window registers. Tests:
+  `testWindowAppearingLaterIsAdoptedIntoStealthMode`,
+  `testWindowAppearingLaterFollowsTheDisabledSetting`,
+  `testNoWindowIsTouchedBeforeThePreferenceIsRead`.
+- [x] **CR-ITEM-6.11 (P3) A nested hover region clobbered its neighbour's
+  pointing hand.** Leaving an inner region set `NSCursor.arrow` while its
+  neighbour was still hovered, and `onHover` fires only on change, so the
+  neighbour never re-asserted its cursor. **Fix (applied)**: `HoverCursorDepth`,
+  a depth counter shared by all five hover modifier variants — the arrow is
+  restored only when the last nested region is left. Tests:
+  `HoverCursorDepthTests` (3).
+- [x] **CR-ITEM-6.12 (P2, remainder) The inspector read its text on the main
+  thread on every body pass, and its full-resolution image fallback had no size
+  bound.** `loadTextContent()` ran inside `body`, so every re-render (hover,
+  theme, resize) re-read and re-decoded 1 MB and re-split it into lines.
+  **Fix (applied)**: the prefix is read once per file (`nonisolated
+  static readTextPrefix`) on `Task.detached` behind `.task(id: url)`, rendered
+  from a `TextPreviewState`; `NSImage(contentsOf:)` is now a last resort gated at
+  24 MB. Tests: `FileInspectorTextPreviewTests` (4: bounded read of a ~3 MB
+  file, whole small file, binary, missing).
+- [x] **CR-ITEM-6.13 (P3) Restored history could forge the block markers.** A
+  transcript line containing `[End of restored history.]` produced a second
+  marker, and text after it reads like a fresh turn. **Fix (applied)**: the
+  markers are constants and restored lines are sanitized (`[…]`), so the block
+  has exactly one opening and one closing marker. Content is preserved, only the
+  delimiter is neutralised. Test:
+  `testRestoredContentCannotForgeTheBlockMarkers`.
+
+## Measured on this machine
+
+- [x] `swift build` / `swift test` `-warnings-as-errors`: **563 tests, 2 skipped
+  (opt-in), 0 failures**.
+- [x] New probe `script/verify-stealth-windows.swift` reads what the window
+  server thinks, not what the app believes: `kCGWindowSharingState` via
+  `CGWindowListCopyWindowInfo`. With the machine's own preference
+  (`settings.stealthModeEnabled = 0`) it reports `sharing=1 (read-only)` and
+  passes with `--expected 1`.
+- [x] Rebuilt, signed and reinstalled to `/Applications`; one app process, one
+  managed server, one lease (`servers/63471.json`). The two servers with
+  `PPID 1` and different signatures are the user's own and were not touched.
+
+## Open
+
+- [ ] **CR-ITEM-6.14 (Low) The probe cannot yet prove the excluded case without
+  the user's setting.** With Stealth Mode on it should print
+  `sharing=0 (excluded)`; exercising that needs the toggle flipped, so the ON
+  path rests on the two adoption tests plus the mechanism itself. A second
+  instance launched with `-settings.stealthModeEnabled YES` would prove it at the
+  cost of a second backend server for a few seconds.
+
+---
+
+# Round 7 — the crash and the scroll trouble share one cause (2026-09-17)
+
+Scope: "the app crashed suddenly, and scrolling has problems — up and down, or
+while a session is running." Evidence:
+`docs/verification/2026-09-17-scroll-layout-loop-crash.md`.
+
+## Fixed
+
+- [x] **CR-ITEM-7.1 (Critical) A layout loop aborted the app: 368
+  update-constraint passes in one display cycle (limit 367).**
+  Two reports, same signature: SIGABRT on the main thread, exception thrown from
+  `-[NSWindow(NSDisplayCycle) _postWindowNeedsUpdateConstraints]` (reported as
+  `lastExceptionBacktrace`), with AppKit's own accounting naming the loop
+  (`Marking window … (limit: 367, count: 369)`). **Fix (applied)**: the two
+  geometry callbacks in `ConversationDetailView` no longer write view state;
+  they record into `ScrollFollowState`, and `body.task` publishes what changed
+  every 90 ms — re-writing an unchanged value is itself a drawing pass that
+  produces the next measurement. The app's only two `onGeometryChange` /
+  `onScrollGeometryChange` call sites were both here (checked by grep), so no
+  such callback writes state anywhere now.
+- [x] **CR-ITEM-7.2 (High) Scrolling up during an answer did not stick.**
+  Follow mode was only ever turned off from inside the scroll callback, and the
+  new publish delay would have reopened the same hole; worse, the first version
+  of the fix discarded the measurement that arrived mid-gesture. **Fix
+  (applied)**: the decision lives with the measurement
+  (`ScrollFollowState.shouldAutoFollow`: no gesture, newest measurement at the
+  bottom, 0.12 s throttle), and a gesture's final position is honoured rather
+  than dropped.
+- [x] **CR-ITEM-7.3 (Medium) `<OnScrollGeometryChange> tried to update multiple
+  times per frame`.** Momentum scrolling changes the offset several times per
+  frame; every change was a full snapshot. **Fix (applied)**: offset and content
+  height are rounded to 4 pt before becoming the watched value — the decision
+  compares against a 120 pt threshold, so this removes noise, not information.
+  (The rail's probe already rounded to 8 pt.)
+- [x] **CR-ITEM-7.4 (Medium) A spinning indicator whose layout size could not
+  fit its frame.** `ConversationSidebarView` drew the busy marker as a `.small`
+  `ProgressView` (16.67 pt of *layout*) with `.scaleEffect(0.6)` (drawing only,
+  no layout effect) inside `.frame(width: 12, height: 12)` — min > max, logged as
+  `<AppKitProgressView …> has an maximum length (16.666667) that doesn't satisfy
+  min (16.666667) <= max (16.666667)`, and only while a session was running.
+  **Fix (applied)**: the sidebar marker and the five activity-timeline spinners
+  state a floor (`minWidth`/`minHeight`) instead of an exact size.
+- [x] **CR-ITEM-7.5 (Low) A throttle value the body never read was `@State`.**
+  `lastAutoScrollTime` was written on every streaming flush, invalidating the
+  view for a value no view reads. It now lives in `ScrollFollowState`.
+
+## Quality assurance
+
+- [x] `swift build` / `swift test` `-warnings-as-errors`: **577 tests, 2 skipped
+  (opt-in), 0 failures**.
+- [x] `ScrollFollowStateTests` (13 cases) covers the record/publish split, the
+  gesture rules and the throttle; `testScrollCallbacksDoNotWriteViewState` walks
+  each geometry callback's body by brace balance and fails on a view-state
+  assignment, so the crash's mechanism cannot return unnoticed.
+- [x] Rebuilt, signed and reinstalled to `/Applications`; app up (pid 84826), no
+  new crash report, the sidebar `AppKitProgressView` diagnostic gone.
+
+## Open
+
+- [ ] **CR-ITEM-7.6 (Low) One `<OnScrollGeometryChange>` diagnostic still fires
+  once at launch.** It appears while the initial layout settles; the named
+  callback no longer writes state, so this is SwiftUI reporting its own settling
+  rather than our loop. The streaming case is the decisive check and needs a
+  turn to run — the command is in the verification document.
+
+# Round 8 — the descent that still stuttered (2026-09-17)
+
+Same complaint, second time: *"yukarıdayken aşağıya doğru indirirken hâlâ takılmalar
+oluyor; sanki yukarıdan kaydırmayı biri tutuyor da bırakmak istemiyor gibi, ama
+iniyor."* Two mechanisms, both measured rather than reasoned about.
+
+## The streaming flush was the jank (CR-ITEM-8.1, High — fixed)
+
+- [x] Measured first, changed second. One flush of a growing answer cost, on the main
+  thread: attributed-string build 10.5 → 40.8 ms and set + full layout 19.9 → 27.0 ms
+  as the answer went 4.1k → 26.8k characters. Flushes are scheduled every 16–40 ms, so
+  work per flush exceeded the cadence and grew with the answer: the main thread never
+  idled for the length of a turn. A drag is processed in the gaps, which reads as the
+  scroll being *held*.
+- [x] `SelectableMarkdownTextView.apply(...)`: rebuild only from the first changed
+  block (pulled back one block, because the block that lost its "last" status changes
+  its paragraph spacing) and replace only that tail in the text storage. The
+  unchanged prefix keeps its attributes **and its layout**.
+- [x] Measured after: 2.7 → 15.1 ms per flush became 0.6 → 0.8 ms, flat in the answer
+  length. Over 30 flushes: **266.0 ms → 22.7 ms**.
+- [x] Side effect: a selection in an earlier paragraph now survives the tail growing.
+  `setAttributedString` destroyed it on every flush.
+- [x] `MarkdownRunIncrementalUpdateTests` (7 cases) pins it, including equivalence
+  with the old path against a **real** `NSTextStorage` (the raw builder output differs
+  at the paragraph separator in both paths — `NSTextStorage` applies the paragraph
+  style there itself).
+
+## Follow mode's ownership signal was wrong (CR-ITEM-8.2, High — fixed)
+
+- [x] Ownership is now granted by a **falling offset** (≥ 8 pt), which is
+  device-independent: growing content never lowers `contentOffset.y`, so a fall cannot
+  be mistaken for growth, and a device that reports no scroll phase is covered. The
+  SwiftUI phase signal stays, as a second input.
+- [x] "At the bottom" narrowed from 120 pt to **40 pt**. At 120 pt a reader a few
+  lines up was still inside the band and the streaming answer kept dragging them back.
+- [x] `ScrollFollowStateTests` pins the new rules (ownership without any phase report,
+  ownership surviving a non-bottom descent, returning into the band handing follow
+  back, 4 pt jitter not granting ownership).
+
+## What this round did *not* explain (CR-ITEM-8.1 open item, Medium)
+
+- [x] Found: the previous build's process (pid 84826) was alive at **99% CPU** in a
+  SwiftUI update loop — `NSHostingView.beginTransaction` 2141, `AG::Subgraph::update`
+  1336, `didRequestHoverUpdate()` 423, `-[NSClipView hitTest:]` 540 samples of 2579 —
+  with **no drawing frames and our own view bodies in single digits**. It ignored
+  SIGTERM, because its shutdown runs on the main queue and never got control.
+- [x] Killed (SIGKILL) with its orphaned server (port 50096). One app (86947) and one
+  server (50206) remain; the user's own two servers were left alone.
+- [ ] **CR-ITEM-8.3 (Medium, open) The trigger of that loop is not proven.** The fresh
+  build sits at 0.1% CPU and has not been seen entering it. Hover re-evaluation plus
+  hit testing inside a clip view is what the loop *does*; what starts it is a
+  separate investigation, and it should be reproduced before anything is changed on
+  the strength of it.
+
+## Verified
+
+- [x] `swift build`, `swift test -Xswiftc -warnings-as-errors`: **588 tests, 2 skipped,
+  0 failures**.
+- [x] Rebuilt, signed, installed to `/Applications`, launched; one instance, one
+  server, no new crash report.
+- [ ] The feel of the descent is the user's to confirm; the two mechanisms are
+  measured, and both are in the streaming path they blamed.
+
+## Open
+
+- [ ] **CR-ITEM-8.4 (Low) `PromptOffsetProbe` re-measures every user row on every
+  scroll step** (`.onGeometryChange` reading `proxy.frame(in: .named(space))`). It is
+  quantized to 8 pt and writes only a class, so it does not publish state — but it is
+  per-row work inside the scroll path, and it is the one remaining thing in the drag
+  path worth measuring on a long conversation.

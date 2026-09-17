@@ -94,6 +94,11 @@ actor BoundedChannel<Element: Sendable> {
     /// Pull-based stream over the channel. Requesting the next element is what
     /// releases a producer blocked on a full buffer, and cancelling the stream
     /// releases every waiter.
+    ///
+    /// İptal kapsamı bilinçli olarak kanal geneli: tek bir alıcı ya da
+    /// gönderici iptali bütün eşanjörü `CancellationError` ile kapatır. Bu
+    /// tek-üretici/tek-tüketici tasarımında beklenen davranıştır; çoklayıcı
+    /// kullanımda yeniden değerlendirilmelidir.
     nonisolated func makeStream() -> AsyncThrowingStream<Element, Error> {
         AsyncThrowingStream(
             unfolding: { [self] in

@@ -89,7 +89,7 @@ struct MenuBarSessionView: View {
                 // Menu Items
                 MenuBarRowButton(
                     title: "Show AgenticSidebar",
-                    icon: "sidebar.leading",
+                    icon: settingsStore.menuBarIconChoice.systemImage,
                     shortcut: settingsStore.globalShortcutChoice.displayName,
                     action: {
                         mainWindowController.show()

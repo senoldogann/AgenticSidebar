@@ -252,6 +252,40 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertNil(config["environment"])
     }
 
+    func testPlanPromptSelectsDedicatedReadOnlyAgent() async throws {
+        let transport = RecordingOpenCodeTransport { _ in
+            OpenCodeHTTPResponse(statusCode: 204, data: Data())
+        }
+        let client = makeClient(transport: transport)
+        try await client.sendPromptAsync(
+            sessionID: "plan-session",
+            model: OpenCodeModelReference(providerID: "openai", modelID: "test"),
+            variant: nil,
+            parts: [.text("Inspect only")],
+            agent: ManagedOpenCodeConfiguration.planAgentName
+        )
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first)
+        let body = try XCTUnwrap(request.httpBody)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["agent"] as? String, ManagedOpenCodeConfiguration.planAgentName)
+    }
+
+    func testPlanAgentConfigurationDeniesMutationAndDelegation() throws {
+        let json = ManagedOpenCodeConfiguration.rendered(
+            instructionPaths: [], permissionRules: [], extensions: .empty
+        )
+        let config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let agents = try XCTUnwrap(config["agent"] as? [String: Any])
+        let plan = try XCTUnwrap(agents[ManagedOpenCodeConfiguration.planAgentName] as? [String: Any])
+        let permissions = try XCTUnwrap(plan["permission"] as? [String: String])
+        XCTAssertEqual(permissions["*"], "deny")
+        XCTAssertEqual(permissions["read"], "allow")
+        XCTAssertEqual(permissions["bash"], nil)
+        XCTAssertEqual(permissions["edit"], nil)
+        XCTAssertEqual(permissions["task"], nil)
+    }
+
     private func makeClient(transport: any OpenCodeTransport) -> OpenCodeClient {
         OpenCodeClient(
             transport: transport,

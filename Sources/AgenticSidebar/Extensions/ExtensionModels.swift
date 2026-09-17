@@ -43,6 +43,14 @@ enum ExtensionKind: String, Codable, Equatable, Sendable, CaseIterable {
     var prefersLazyLoading: Bool {
         self == .skill
     }
+
+    var symbolName: String {
+        switch self {
+        case .mcp: "server.rack"
+        case .plugin: "puzzlepiece.extension"
+        case .skill: "books.vertical"
+        }
+    }
 }
 
 /// Where an extension came from, kept so the UI can say so and so a re-install

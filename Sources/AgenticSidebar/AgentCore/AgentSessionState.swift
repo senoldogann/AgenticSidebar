@@ -41,8 +41,19 @@ struct AgentSessionState: Equatable, Sendable {
     var startedAt: Date?
     var completedAt: Date?
     var activityGroups: [AgentTurnActivityGroup] = []
+    /// Aktivite içeriği her değiştiğinde artan sayaç.
+    ///
+    /// `TranscriptIndexCache` anahtarı yalnız sayı ve fazlara baktığı için akan
+    /// bir aracın çıktısı güncellendiğinde anahtar değişmiyor ve satır
+    /// önbellekteki eski kopyayla çiziliyordu; sayaç o boşluğu kapatır.
+    /// Arşive yazılmaz, yalnız bellekte yaşar.
+    var activityRevision: Int = 0
     /// The agent's own task list for this session, as the backend reports it.
     var todos: [AgentTodo] = []
+    /// The currently active question waiting for user input, if any.
+    var activeQuestion: AgentQuestion? = nil
+    /// History of questions asked and answered in this session.
+    var questionHistory: [AgentQuestion] = []
 
     init(
         id: UUID = UUID(),
@@ -52,7 +63,9 @@ struct AgentSessionState: Equatable, Sendable {
         error: AgentSessionError? = nil,
         notice: AgentSessionNotice? = nil,
         startedAt: Date? = nil,
-        completedAt: Date? = nil
+        completedAt: Date? = nil,
+        activeQuestion: AgentQuestion? = nil,
+        questionHistory: [AgentQuestion] = []
     ) {
         self.id = id
         self.configuration = configuration
@@ -62,5 +75,7 @@ struct AgentSessionState: Equatable, Sendable {
         self.notice = notice
         self.startedAt = startedAt
         self.completedAt = completedAt
+        self.activeQuestion = activeQuestion
+        self.questionHistory = questionHistory
     }
 }
