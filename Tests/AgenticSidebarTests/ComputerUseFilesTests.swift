@@ -105,4 +105,15 @@ final class ComputerUseFilesTests: XCTestCase {
         XCTAssertTrue(instructions.contains("`timeoutMs` up to 5000"))
         XCTAssertFalse(instructions.contains("`timeoutMs` up to 60000"))
     }
+
+    func testInstructionsRequireAppSelectorAndDescribeRecovery() {
+        let instructions = ComputerUseFiles.instructionsMarkdown()
+        XCTAssertTrue(instructions.contains("REQUIRES `bundleIdentifier` or `name`"))
+        XCTAssertTrue(instructions.contains("`target.by` is exactly one of"))
+        XCTAssertTrue(instructions.contains("EITHER `x`/`y` OR `target`"))
+        XCTAssertTrue(instructions.contains("`retryBudget` is allowed ONLY together with a semantic `target`"))
+        XCTAssertTrue(instructions.contains("COMPUTER_PROTOCOL_INVALID"))
+        XCTAssertTrue(instructions.contains("COMPUTER_USER_TAKEOVER"))
+        XCTAssertTrue(instructions.contains("Hands off while anything runs"))
+    }
 }

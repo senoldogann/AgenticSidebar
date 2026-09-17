@@ -167,6 +167,29 @@ final class ToolApprovalPolicyTests: XCTestCase {
         )
     }
 
+    func testFileEditsOutsideTheWorkingDirectoryAsk() {
+        for outside in ["/etc/passwd", "~/.ssh/id_rsa", "../../Secrets.txt", ".."] {
+            XCTAssertNil(
+                ToolApprovalPolicy.approveSafe.automaticReply(for: "edit", patterns: [outside]),
+                "\(outside) leaves the working directory, so an edit there must ask"
+            )
+            XCTAssertNil(
+                ToolApprovalPolicy.approveSafe.automaticReply(for: "write", patterns: [outside]),
+                "\(outside) leaves the working directory, so a write there must ask"
+            )
+        }
+        XCTAssertEqual(
+            ToolApprovalPolicy.approveSafe.automaticReply(for: "edit", patterns: ["Sources/App.swift"]),
+            .once,
+            "In-folder edits keep running unattended"
+        )
+        XCTAssertEqual(
+            ToolApprovalPolicy.approveSafe.automaticReply(for: "edit", patterns: []),
+            .once,
+            "Empty edit patterns keep their existing behaviour"
+        )
+    }
+
     /// The routed rules are what the configuration file carries, and they must be
     /// the same whichever level is selected — that is what makes the level
     /// changeable mid-turn.

@@ -59,6 +59,18 @@ enum ComputerUseSetupStep: String, CaseIterable, Equatable, Identifiable, Sendab
             true
         }
     }
+
+    /// How long `run` waits before killing the process. `npm` hanging forever
+    /// used to leave the reader task and `waitUntilExit` blocked with no way
+    /// out except the cancel button.
+    var timeout: Duration {
+        switch self {
+        case .buildCLI:
+            .seconds(120)
+        case .installHelper:
+            .seconds(600)
+        }
+    }
 }
 
 /// The result of one setup command.
@@ -125,43 +137,109 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
             currentProcess = process
         }
 
-        let reader = Task.detached(priority: .utility) { () -> Int in
-            var lines = 0
-            do {
-                for try await line in output.fileHandleForReading.bytes.lines {
-                    lines += 1
-                    onLine(String(line))
+        let timedOut = LockedFlag()
+        let outcome = await withTaskGroup(
+            of: ComputerUseSetupOutcome?.self,
+            returning: ComputerUseSetupOutcome.self
+        ) { group in
+            group.addTask {
+                let reader = Task.detached(priority: .utility) { () -> Int in
+                    var lines = 0
+                    do {
+                        for try await line in output.fileHandleForReading.bytes.lines {
+                            lines += 1
+                            onLine(String(line))
+                        }
+                    } catch {
+                        // A stream that ends badly still ends; the exit status below is
+                        // what the user is told to act on.
+                    }
+                    return lines
                 }
-            } catch {
-                // A stream that ends badly still ends; the exit status below is
-                // what the user is told to act on.
-            }
-            return lines
-        }
-        _ = await reader.value
+                _ = await reader.value
 
-        process.waitUntilExit()
-        let status = process.terminationStatus
-        let reason = process.terminationReason
+                process.waitUntilExit()
+                let status = process.terminationStatus
+                let reason = process.terminationReason
+
+                if timedOut.value {
+                    return ComputerUseSetupOutcome(
+                        step: step,
+                        exitCode: 124,
+                        didLaunch: true,
+                        didCancel: false
+                    )
+                }
+                // SIGTERM, and only SIGTERM, is this app's own cancel button.
+                let didCancel = reason == .uncaughtSignal && status == SIGTERM
+
+                return ComputerUseSetupOutcome(
+                    step: step,
+                    exitCode: didCancel ? 0 : status,
+                    didLaunch: true,
+                    didCancel: didCancel
+                )
+            }
+            group.addTask {
+                try? await Task.sleep(for: step.timeout)
+                return nil
+            }
+
+            for await result in group {
+                if let finished = result {
+                    group.cancelAll()
+                    return finished
+                }
+                // The sleeper won: the command hung. SIGTERM it; the waiter
+                // above maps the death to a 124 timeout (not a user cancel).
+                timedOut.value = true
+                process.terminate()
+            }
+            timedOut.value = true
+            process.terminate()
+            return ComputerUseSetupOutcome(
+                step: step,
+                exitCode: 124,
+                didLaunch: true,
+                didCancel: false
+            )
+        }
 
         lock.withLock {
             currentProcess = nil
         }
-
-        // SIGTERM, and only SIGTERM, is this app's own cancel button.
-        let didCancel = reason == .uncaughtSignal && status == SIGTERM
-
-        return ComputerUseSetupOutcome(
-            step: step,
-            exitCode: didCancel ? 0 : status,
-            didLaunch: true,
-            didCancel: didCancel
-        )
+        if outcome.exitCode == 124, !outcome.didCancel {
+            onLine("Timed out after \(step.timeoutDescription); the process was stopped.")
+        }
+        return outcome
     }
 
     func cancel() {
         lock.withLock {
             currentProcess?.terminate()
+        }
+    }
+}
+
+/// A boolean shared between the waiter and the timeout sleeper.
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    var value: Bool {
+        get { lock.withLock { flag } }
+        set { lock.withLock { flag = newValue } }
+    }
+}
+
+private extension ComputerUseSetupStep {
+    /// Short human text for the timeout notice line.
+    var timeoutDescription: String {
+        switch self {
+        case .buildCLI:
+            "120s"
+        case .installHelper:
+            "600s"
         }
     }
 }

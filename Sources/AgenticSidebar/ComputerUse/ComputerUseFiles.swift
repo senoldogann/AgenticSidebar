@@ -106,18 +106,34 @@ enum ComputerUseFiles {
         3. Batch Execution via `computer_run` (HIGHLY RECOMMENDED):
            - Group sequential physical interactions into a single `\(serverName)_computer_run`
              call instead of executing them as separate turn-by-turn tool calls.
-           - For example, batch: click target -> type text -> press Return.
+           - For example, batch: click target -> type text (with bundleIdentifier) -> press Return (with bundleIdentifier).
+           - Every `type_text`, `press_key`, `open_app`, `focus_app` and `wait_for_frontmost`
+             action REQUIRES `bundleIdentifier` or `name`. A call without one is rejected
+             at the schema boundary and never reaches the machine.
            - Pass `finalObservation: "observe"` in `computer_run` to automatically receive
              the updated perception tree in the same turn without an extra round-trip.
+           - Hands off while anything runs: do NOT touch the mouse, trackpad or keyboard
+             until the result returns. Physical input aborts the run as
+             `COMPUTER_USER_TAKEOVER` by design.
         4. Precise Element Grounding:
-           - Ground actions using semantic element index from the active observation:
-             `target: { by: "index", snapshotId: observation.snapshotId, index: element.index }`.
+           - `target.by` is exactly one of `index` | `role` | `text` | `label` | `ocrText` | `point`.
+             No other value validates (`.strict()` rejects even one extra key).
+           - `index` requires BOTH `snapshotId` (from the latest `computer_observe`) and
+             `index`: `target: { by: "index", snapshotId: observation.snapshotId, index: element.index }`.
+             Never reuse a snapshot after any action; re-observe first.
+           - `role` needs `role` (+ optional `name`, `exact`); `text`/`ocrText` need `text`
+             (+ optional `exact`); `label` needs `label` (+ optional `exact`); `point` needs `x` + `y`.
+           - Provide EITHER `x`/`y` OR `target` — never both, never neither.
+             `retryBudget` is allowed ONLY together with a semantic `target`, never with raw `x`/`y`.
+           - To scope a search inside a container, use `within: { by: "index", snapshotId, index }`
+             or `within: { by: "role", role, ... }`.
            - Fall back to `target: { by: "text", text: "..." }` or `target: { by: "ocrText", text: "..." }`.
            - Avoid raw screen coordinates unless canvas/visual targeting is required.
         5. Application Launching & Focus:
            - When opening applications with `\(serverName)_computer_open_app`, always prefer
              providing `bundleIdentifier` (e.g., `com.apple.Safari`, `com.google.Chrome`,
              `com.apple.calculator`, `com.apple.TextEdit`) for instant resolution.
+           - `bundleIdentifier` or `name` is required, not optional.
            - You may specify `timeoutMs` up to 5000.
         6. Approvals & Safety:
            - The selected tool approval level applies to each request. Full access answers without a prompt.
@@ -126,6 +142,12 @@ enum ComputerUseFiles {
              not one per action; Full access answers it automatically when a request is raised.
            - Never try to work around a denied action; explain what you need instead.
            - If `COMPUTER_USER_TAKEOVER` occurs, stop immediately and yield control.
+           - Recovery — never retry the identical payload:
+             `COMPUTER_PROTOCOL_INVALID` or `Input validation error` -> shrink to ONE action,
+             re-observe for a fresh snapshot, fix the schema (selector? `target.by`? `x`/`y`-vs-`target`?)
+             and send once; `STALE_SNAPSHOT`/`NEEDS_REPLAN` -> discard the old observation,
+             `computer_observe` again and re-ground; `COMPUTER_USER_TAKEOVER` -> stop, tell the user
+             physical input aborted the run, and wait.
         """
     }
 

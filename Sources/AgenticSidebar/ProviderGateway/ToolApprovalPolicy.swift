@@ -124,6 +124,14 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
             else {
                 return nil
             }
+            // `edit`/`write`/`patch`/`multiedit` are auto-approved only for
+            // in-folder paths. An absolute path, `~` or `../` is an outside
+            // write: it must ask even though the tool name alone looks safe.
+            // (`external_directory` asking separately is not relied on — the two
+            // requests are not ordered.)
+            if Self.isFileMutatingTool(toolName), Self.reachesOutsideWorkingDirectory(patterns) {
+                return nil
+            }
             return .once
         case .fullAccess:
             return .once
@@ -135,8 +143,12 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
     /// The test is deliberately about **capability, not intent**: a tool that only
     /// observes (reading a file, listing a directory, the screen-diagnostics of
     /// computer use) cannot change this machine, so asking about it only trains
-    /// the user to click Allow. Anything that can mutate state, reach the network
-    /// or leave the working directory is *not* here, and is therefore asked about.
+    /// the user to click Allow. File edits are here because in-folder edits are
+    /// what the agent is for — but ``automaticReply(for:patterns:)`` still asks
+    /// when the request's patterns reach outside the working directory, and paths
+    /// outside the folder trip `external_directory` too. Anything that can reach
+    /// the network or leave the working directory by nature is *not* here, and is
+    /// therefore asked about.
     /// We deliberately do not try to read a shell command and judge it safe — that
     /// judgement is exactly the kind of pattern matching that looks like security
     /// and is not; unrecognised commands ask instead.
@@ -231,6 +243,39 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
         ]
 
         return !command.contains { forbidden.contains($0) }
+    }
+
+    /// Whether the tool mutates files by nature (`edit` and its aliases).
+    private static func isFileMutatingTool(_ toolName: String) -> Bool {
+        let name = toolName.lowercased()
+        return name == "edit"
+            || name == "write"
+            || name == "patch"
+            || name == "multiedit"
+            || name.hasSuffix("_edit")
+            || name.hasSuffix("_write")
+            || name.hasSuffix("_patch")
+            || name.hasSuffix("_multiedit")
+    }
+
+    /// Whether any approval pattern reaches outside the working directory.
+    ///
+    /// Patterns for file tools are paths, not commands: each non-empty pattern is
+    /// one path. Absolute paths, `~` and `../` leave the folder, so they ask.
+    /// An empty pattern list means nothing to inspect — the caller (`isSafeWithoutAsking`
+    /// succeeding with `[]`) keeps its current behaviour and this returns false.
+    static func reachesOutsideWorkingDirectory(_ patterns: [String]) -> Bool {
+        patterns.contains { pattern in
+            let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            guard !trimmed.isEmpty else {
+                return false
+            }
+            return trimmed.hasPrefix("/")
+                || trimmed.hasPrefix("~")
+                || trimmed.contains("../")
+                || trimmed == ".."
+        }
     }
 
     /// Whether every whitespace-separated token stays inside the working directory.

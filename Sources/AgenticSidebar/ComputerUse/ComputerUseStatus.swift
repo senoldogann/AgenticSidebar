@@ -65,7 +65,13 @@ final class ComputerUseStatus {
     @ObservationIgnored
     private var lastRequest: Request?
 
-    private struct Request {
+    /// A refresh asked for while one was already running. Dropped silently
+    /// before; now coalesced so the card never shows a stale answer when the
+    /// user toggles twice in a row.
+    @ObservationIgnored
+    private var pendingRefresh: Request?
+
+    private struct Request: Equatable {
         var isEnabled: Bool
         var rootPath: String
     }
@@ -106,17 +112,35 @@ final class ComputerUseStatus {
     /// Resolves the configuration, inspects the installed helper and asks it
     /// what macOS has granted it.
     func refresh(isEnabled: Bool, rootPath: String) async {
-        lastRequest = Request(isEnabled: isEnabled, rootPath: rootPath)
+        let request = Request(isEnabled: isEnabled, rootPath: rootPath)
+        lastRequest = request
 
         guard !isChecking else {
+            pendingRefresh = request
             return
         }
         isChecking = true
         defer { isChecking = false }
 
+        var current = request
+        while true {
+            await performRefresh(request: current)
+            guard let pending = pendingRefresh else {
+                return
+            }
+            pendingRefresh = nil
+            guard pending != current else {
+                return
+            }
+            current = pending
+            lastRequest = pending
+        }
+    }
+
+    private func performRefresh(request: Request) async {
         let decision = ComputerUseConfiguration.decision(
-            enabled: isEnabled,
-            rootPath: rootPath,
+            enabled: request.isEnabled,
+            rootPath: request.rootPath,
             workingDirectoryURL: ManagedOpenCodeServerManager.managedWorkingDirectoryURL(),
             environment: environment,
             fileManager: fileManager
