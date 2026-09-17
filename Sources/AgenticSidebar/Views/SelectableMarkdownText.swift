@@ -99,7 +99,7 @@ enum MarkdownTextRunBuilder {
         switch block {
         case .paragraph, .heading, .bulletItem, .numberedItem, .blockquote:
             true
-        case .code, .divider, .table, .chart, .plan:
+        case .code, .divider, .table, .chart, .plan, .math:
             false
         }
     }
@@ -122,6 +122,7 @@ enum MarkdownTextRunBuilder {
             case let .table(id, _, _, _): "table:\(id)"
             case let .chart(id, _): "chart:\(id)"
             case let .plan(id, _): "plan:\(id)"
+            case let .math(id, _): "math:\(id)"
             }
         }
 
@@ -242,7 +243,7 @@ enum MarkdownTextRunBuilder {
                 style: paragraphStyle(typography: typography, indent: 12, isLast: isLast)
             )
 
-        case .code, .divider, .table, .chart, .plan:
+        case .code, .divider, .table, .chart, .plan, .math:
             // Not textual: `isTextual` keeps these out of a run, and an empty
             // paragraph is the safe answer if one ever arrives.
             return NSAttributedString()

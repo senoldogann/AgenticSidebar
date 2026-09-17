@@ -19,6 +19,8 @@ enum MarkdownBlock: Identifiable, Equatable {
     /// A `plan` fence: the assistant's proposal, rendered as a document instead
     /// of as chat prose.
     case plan(id: String, content: String)
+    /// A math formula or LaTeX block (`$$...$$` or ```math fence).
+    case math(id: String, formula: String)
 
     var id: String {
         switch self {
@@ -32,6 +34,7 @@ enum MarkdownBlock: Identifiable, Equatable {
         case let .table(id, _, _, _): id
         case let .chart(id, _): id
         case let .plan(id, _): id
+        case let .math(id, _): id
         }
     }
 }
@@ -256,6 +259,13 @@ struct MarkdownContentView: View {
 
         case let .plan(_, content):
             PlanDocumentView(markdown: content)
+
+        case let .math(_, formula):
+            MathBlockView(
+                formula: formula,
+                fontSize: fontSize.pointSize,
+                isDark: isDarkMode
+            )
         }
     }
 
@@ -365,6 +375,91 @@ private struct CodeBlockView: View {
     private func copyToClipboard() {
         Pasteboard.copy(code)
 
+        isCopied = true
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            isCopied = false
+        }
+    }
+}
+
+private struct MathBlockView: View {
+    let formula: String
+    let fontSize: CGFloat
+    let isDark: Bool
+
+    @State private var isCopied: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                HStack(spacing: 5) {
+                    Image(systemName: "function")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Formula")
+                        .font(.caption2.weight(.semibold))
+                }
+                .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button {
+                    copyToClipboard()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 10, weight: .medium))
+                        Text(isCopied ? "Copied" : "Copy")
+                            .font(.caption2.weight(.medium))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .interactiveHoverPill(cornerRadius: 6)
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .foregroundStyle(isCopied ? .green : .secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(Color.primary.opacity(0.03))
+
+            Divider()
+                .opacity(0.25)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(cleanFormula(formula))
+                    .font(.system(size: max(14, fontSize + 1.5), weight: .regular, design: .serif))
+                    .lineSpacing(4)
+                    .foregroundStyle(isDark ? Color(white: 0.92) : Color(white: 0.12))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(
+            isDark
+                ? Color(red: 0.09, green: 0.10, blue: 0.14)
+                : Color(red: 0.95, green: 0.95, blue: 0.97),
+            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+        )
+        .padding(.vertical, 3)
+    }
+
+    private func cleanFormula(_ raw: String) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("$$") && text.hasSuffix("$$") && text.count >= 4 {
+            text = String(text.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
+    private func copyToClipboard() {
+        Pasteboard.copy(cleanFormula(formula))
         isCopied = true
         Task {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -528,11 +623,14 @@ func parseMarkdownBlocks(
             blockCounter += 1
             let fenceContent = codeLines.joined(separator: "\n")
 
+            let languageLower = language.lowercased()
             if allowsPlanDocuments,
                isPlanFenceLanguage(language) {
                 blocks.append(.plan(id: "plan-\(blockCounter)", content: fenceContent))
             } else if let chartSpec = chartSpec(fromFenceLanguage: language, content: fenceContent) {
                 blocks.append(.chart(id: "chart-\(blockCounter)", spec: chartSpec))
+            } else if languageLower == "math" || languageLower == "latex" {
+                blocks.append(.math(id: "math-\(blockCounter)", formula: fenceContent))
             } else {
                 blocks.append(
                     .code(
@@ -542,6 +640,29 @@ func parseMarkdownBlocks(
                     )
                 )
             }
+            continue
+        }
+
+        if trimmed.hasPrefix("$$") {
+            if trimmed.count >= 4 && trimmed.dropFirst(2).contains("$$") {
+                blockCounter += 1
+                blocks.append(.math(id: "math-\(blockCounter)", formula: trimmed))
+                index += 1
+                continue
+            }
+
+            index += 1
+            var mathLines: [String] = [trimmed]
+            while index < lines.count {
+                let mLine = lines[index]
+                mathLines.append(mLine)
+                index += 1
+                if mLine.trimmingCharacters(in: .whitespaces).hasSuffix("$$") {
+                    break
+                }
+            }
+            blockCounter += 1
+            blocks.append(.math(id: "math-\(blockCounter)", formula: mathLines.joined(separator: "\n")))
             continue
         }
 
@@ -656,6 +777,7 @@ func parseMarkdownBlocks(
 
             if nextTrimmed.isEmpty ||
                 nextTrimmed.hasPrefix("```") ||
+                nextTrimmed.hasPrefix("$$") ||
                 nextTrimmed.hasPrefix("#") ||
                 nextTrimmed.hasPrefix("> ") ||
                 nextTrimmed.hasPrefix("- ") ||

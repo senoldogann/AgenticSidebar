@@ -218,6 +218,44 @@ final class MarkdownBlockParsingTests: XCTestCase {
         XCTAssertEqual(language, "chart")
     }
 
+    func testMathFenceAndBlockParsing() {
+        let blocks = parseMarkdownBlocks(
+            from: """
+            The quadratic formula is:
+            $$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$
+            And in a code fence:
+            ```math
+            \\int_{0}^{\\infty} e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}
+            ```
+            """
+        )
+
+        XCTAssertEqual(blocks.count, 4)
+        guard case let .paragraph(_, p1) = blocks[0] else {
+            XCTFail("Expected first paragraph")
+            return
+        }
+        XCTAssertTrue(p1.contains("quadratic formula"))
+
+        guard case let .math(_, f1) = blocks[1] else {
+            XCTFail("Expected first math block for $$ equation")
+            return
+        }
+        XCTAssertTrue(f1.contains("\\frac{-b"))
+
+        guard case let .paragraph(_, p2) = blocks[2] else {
+            XCTFail("Expected second paragraph")
+            return
+        }
+        XCTAssertTrue(p2.contains("code fence"))
+
+        guard case let .math(_, f2) = blocks[3] else {
+            XCTFail("Expected math block from ```math fence")
+            return
+        }
+        XCTAssertTrue(f2.contains("e^{-x^2}"))
+    }
+
     private func numberedItem(from block: MarkdownBlock) -> String? {
         guard case let .numberedItem(_, number, _) = block else {
             return nil

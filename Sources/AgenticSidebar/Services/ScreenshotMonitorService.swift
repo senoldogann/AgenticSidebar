@@ -240,12 +240,25 @@ final class ScreenshotMonitorService {
         flushPendingSubmissions()
     }
 
-    nonisolated static func buildIntentPrompt(fileName: String, extractedText: String) -> String {
+    nonisolated static func buildIntentPrompt(
+        fileName: String,
+        extractedText: String,
+        mode: AgentMode = .build
+    ) -> String {
         let contentSection: String
         if extractedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             contentSection = "(No machine-readable text found in screenshot)"
         } else {
             contentSection = "Extracted content from screenshot:\n\"\"\"\n\(extractedText)\n\"\"\""
+        }
+
+        if mode == .exam {
+            return """
+            [Screenshot captured: \(fileName)]
+            \(contentSection)
+
+            EXAM SOLVER: Inspect this screenshot carefully. Identify any test, exam, quiz, or homework questions visible in the image. State the direct answer first (e.g. "**Correct Answer: B**"), then provide the step-by-step mathematical derivation, reasoning, or code solution.
+            """
         }
 
         return """
@@ -262,7 +275,8 @@ final class ScreenshotMonitorService {
         enqueue(
             Self.buildIntentPrompt(
                 fileName: fileURL.lastPathComponent,
-                extractedText: extractedText
+                extractedText: extractedText,
+                mode: settingsStore.agentMode
             ),
             attachmentPath: fileURL.path
         )
@@ -296,7 +310,8 @@ final class ScreenshotMonitorService {
         enqueue(
             Self.buildIntentPrompt(
                 fileName: "Clipboard Screenshot",
-                extractedText: extractedText
+                extractedText: extractedText,
+                mode: settingsStore.agentMode
             ),
             attachmentPath: attachmentPath
         )
@@ -356,7 +371,7 @@ final class ScreenshotMonitorService {
                 next.prompt,
                 attachmentPaths: next.attachmentPath.map { [$0] } ?? [],
                 speedMode: settingsStore.responseSpeedMode,
-                mode: .build
+                mode: settingsStore.agentMode
             )
 
             guard acceptance.wasAccepted else {

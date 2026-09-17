@@ -601,6 +601,8 @@ struct ComposerView: View {
             return "Ask to plan a feature, architectural change, or refactoring…"
         case .review:
             return "Ask to review changes, branch, or target project using Alibaba OCR…"
+        case .exam:
+            return "Ask an exam question, paste a problem, or take a screenshot to solve…"
         }
     }
 

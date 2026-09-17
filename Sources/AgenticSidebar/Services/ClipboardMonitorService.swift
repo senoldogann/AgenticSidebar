@@ -132,11 +132,22 @@ final class ClipboardMonitorService {
     /// Oturumun hiç kabul edemediği bir istek sırada kalır.
     private func flushPendingSubmissions() {
         while let next = pendingSubmissions.first, sessionService.canAcceptPrompt {
+            let promptText: String
+            if settingsStore.agentMode == .exam {
+                promptText = """
+                EXAM SOLVER: Please solve the following question. State the direct answer first, followed by a step-by-step derivation:
+
+                \(next)
+                """
+            } else {
+                promptText = next
+            }
+
             let acceptance = sessionService.send(
-                next,
+                promptText,
                 attachmentPaths: [],
                 speedMode: settingsStore.responseSpeedMode,
-                mode: .build
+                mode: settingsStore.agentMode
             )
 
             guard acceptance.wasAccepted else {

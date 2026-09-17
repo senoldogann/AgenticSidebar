@@ -19,7 +19,7 @@ struct AgentModeGlyph: View {
             }
             .frame(width: size, height: size)
             .accessibilityHidden(true)
-        case .build, .review:
+        case .build, .review, .exam:
             Image(systemName: mode.symbolName)
                 .font(.system(size: size * 0.95, weight: .medium))
                 .foregroundStyle(tint)

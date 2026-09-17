@@ -134,6 +134,18 @@ final class AgentModeTests: XCTestCase {
         )
     }
 
+    func testExamModeDirectAnswersAndMathCodeGuidelines() throws {
+        let instruction = try XCTUnwrap(AgentMode.exam.instruction)
+
+        XCTAssertTrue(instruction.contains("EXAM & TEST SOLVER MODE"))
+        XCTAssertTrue(instruction.contains("DIRECT & DEFINITIVE ANSWER FIRST"))
+        XCTAssertTrue(instruction.contains("STEP-BY-STEP SOLUTION & DERIVATION"))
+        XCTAssertTrue(instruction.contains("MATHEMATICAL NOTATION & EQUATIONS"))
+        XCTAssertTrue(instruction.contains("CODE AND ALGORITHMS"))
+        XCTAssertEqual(AgentMode.exam.displayName, "Exam")
+        XCTAssertEqual(AgentMode.exam.symbolName, "graduationcap.fill")
+    }
+
     private func makeProviderRequest(mode: AgentMode) -> ProviderRequest {
         ProviderRequest(
             sessionID: UUID(),

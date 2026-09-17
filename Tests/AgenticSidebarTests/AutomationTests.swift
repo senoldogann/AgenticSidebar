@@ -24,6 +24,19 @@ final class AutomationTests: XCTestCase {
         XCTAssertTrue(prompt.contains("describe what is shown"))
     }
 
+    func testBuildIntentPromptForExamMode() {
+        let prompt = ScreenshotMonitorService.buildIntentPrompt(
+            fileName: "exam_question.png",
+            extractedText: "What is the derivative of sin(x)?\nA) cos(x)\nB) -cos(x)\nC) tan(x)",
+            mode: .exam
+        )
+
+        XCTAssertTrue(prompt.contains("[Screenshot captured: exam_question.png]"))
+        XCTAssertTrue(prompt.contains("What is the derivative of sin(x)?"))
+        XCTAssertTrue(prompt.contains("EXAM SOLVER:"))
+        XCTAssertTrue(prompt.contains("State the direct answer first"))
+    }
+
     @MainActor
     func testSettingsAutomationToggles() {
         let defaultsSuite = "test.automation.settings.\(UUID().uuidString)"

@@ -14,6 +14,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
     case build
     case plan
     case review
+    case exam
 
     var id: String { rawValue }
 
@@ -22,6 +23,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         case .build: "Build"
         case .plan: "Plan"
         case .review: "Review"
+        case .exam: "Exam"
         }
     }
 
@@ -30,6 +32,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         case .build: "hammer.fill"
         case .plan: "list.checklist"
         case .review: "checkmark.shield.fill"
+        case .exam: "graduationcap.fill"
         }
     }
 
@@ -41,6 +44,8 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             "Investigates read-only and proposes a plan; nothing changes until you approve it"
         case .review:
             "Reviews code against security, bug, and quality standards, then proposes a plan"
+        case .exam:
+            "Solves exam, test, and quiz questions with direct answers, mathematical derivations, and code"
         }
     }
 
@@ -82,6 +87,23 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             6. Code style & maintainability \
             Format your review findings grouped by severity (Critical, High, Medium, Low) with exact file and line references. \
             Conclude with a prioritized remediation plan in a fenced ```\(Self.planFenceLanguage) block so the user can review and approve fixes.
+            """
+        case .exam:
+            """
+            EXAM & TEST SOLVER MODE: \
+            You are an expert exam, test, and quiz solving assistant with rigorous domain mastery across mathematics, science, engineering, programming, logic, and general subjects. \
+            When answering any question (from an image, screenshot, copied text, or problem description): \
+            1. DIRECT & DEFINITIVE ANSWER FIRST: \
+            State the clear, unambiguous final answer at the very beginning (e.g. "**Correct Answer: C**" or "**Final Answer: 42**"). \
+            2. STEP-BY-STEP SOLUTION & DERIVATION: \
+            Provide a structured, step-by-step mathematical proof, derivation, or reasoning explaining why this answer is correct. \
+            For multiple choice questions, explain why the chosen option is correct and why tricky alternative options are incorrect. \
+            3. MATHEMATICAL NOTATION & EQUATIONS: \
+            Format mathematical equations and formulas clearly using standard Unicode symbols (e.g., √, ∛, π, ∑, ∫, ±, ≠, ≤, ≥, ≈, ×, ÷, ·, ∞, ∈, ∉, ⊂, ∪, ∩, ∂, ∇, ², ³, ⁿ, ₁, ₂, ½) alongside clear LaTeX expressions ($...$ or $$...$$). \
+            4. CODE AND ALGORITHMS: \
+            Write all code, SQL, or algorithmic solutions in fenced code blocks with explicit language identifiers (e.g., ```python, ```swift, ```sql). \
+            5. THOROUGHNESS & PRECISION: \
+            Double-check arithmetic, signs, units, edge cases, and wording before concluding.
             """
         }
     }
