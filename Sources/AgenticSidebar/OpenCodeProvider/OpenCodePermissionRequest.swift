@@ -83,7 +83,9 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
             parts.append("\(key): \(value)")
         }
 
-        if let toolName, ComputerActivityTitle.isComputerTool(toolName) {
+        if let toolName, ComputerActivityTitle.isComputerTool(toolName),
+           Self.hasComputerSignal(metadata)
+        {
             let (title, _) = ComputerActivityTitle.titleAndDetail(tool: toolName, input: metadata)
             if let title, !title.isEmpty {
                 parts.insert(title, at: 0)
@@ -98,6 +100,31 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
         return joined.count > maximumDetailLength
             ? String(joined.prefix(maximumDetailLength)) + "…"
             : joined
+    }
+
+    /// Koordinatsız bir istek ("Click …") başlığa gürültüden başka şey katmaz;
+    /// özet yalnızca girdide gerçek sinyal varsa başa eklenir.
+    private static func hasComputerSignal(_ metadata: [String: Any]) -> Bool {
+        let signalKeys = [
+            "x", "y", "from", "to", "target", "app", "actions", "text", "key",
+            "modifiers", "bundleIdentifier", "name", "vertical", "horizontal",
+            "timeoutMs",
+        ]
+        return signalKeys.contains { key in
+            guard let value = metadata[key] else {
+                return false
+            }
+            if let text = value as? String {
+                return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            if let list = value as? [Any] {
+                return !list.isEmpty
+            }
+            if let dict = value as? [String: Any] {
+                return !dict.isEmpty
+            }
+            return true
+        }
     }
 
     /// Araç adını kullanıcıya gösterilecek başlığa çevirir.

@@ -123,6 +123,16 @@ final class ComputerActivityTests: XCTestCase {
         )
     }
 
+    func testPermissionDetailSkipsPlaceholderTitleWithoutSignal() {
+        XCTAssertEqual(
+            OpenCodePermissionRequest.detail(
+                from: ["description": "Click the Run button"],
+                toolName: "chatgpt-system_computer_click"
+            ),
+            "description: Click the Run button"
+        )
+    }
+
     // MARK: - HUD
 
     @MainActor
