@@ -13,6 +13,7 @@ import Foundation
 enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
     case build
     case plan
+    case review
 
     var id: String { rawValue }
 
@@ -20,6 +21,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         switch self {
         case .build: "Build"
         case .plan: "Plan"
+        case .review: "Review"
         }
     }
 
@@ -27,6 +29,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         switch self {
         case .build: "hammer.fill"
         case .plan: "list.checklist"
+        case .review: "checkmark.shield.fill"
         }
     }
 
@@ -36,6 +39,8 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             "Changes files and runs tools to finish the task"
         case .plan:
             "Investigates read-only and proposes a plan; nothing changes until you approve it"
+        case .review:
+            "Reviews code against security, bug, and quality standards, then proposes a plan"
         }
     }
 
@@ -61,6 +66,22 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             risks, and how the result will be verified. Write nothing outside that \
             block — no preamble and no closing summary. Do not start implementing: \
             the user approves the plan first.
+            """
+        case .review:
+            """
+            REVIEW MODE (Alibaba Open Code Review standard): \
+            Perform a thorough, read-only code review on the repository, target project, or Git diff. \
+            Do not create, edit, or delete any files, and do not run destructive commands. \
+            Inspect the code using read-only tools and skills. \
+            Analyze for: \
+            1. Correctness & logic bugs \
+            2. Null Pointer / Optional safety \
+            3. Thread safety, race conditions & concurrency issues \
+            4. Security vulnerabilities (injection, XSS, insecure deserialization, credentials) \
+            5. Performance bottlenecks \
+            6. Code style & maintainability \
+            Format your review findings grouped by severity (Critical, High, Medium, Low) with exact file and line references. \
+            Conclude with a prioritized remediation plan in a fenced ```\(Self.planFenceLanguage) block so the user can review and approve fixes.
             """
         }
     }

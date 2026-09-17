@@ -110,6 +110,28 @@ final class AgentModeTests: XCTestCase {
             SettingsStore(defaults: defaults).agentMode,
             .plan
         )
+
+        store.agentMode = .review
+
+        XCTAssertEqual(
+            SettingsStore(defaults: defaults).agentMode,
+            .review
+        )
+    }
+
+    func testReviewModeIsReadOnlyAndEnforcesAlibabaCodeReviewPlan() throws {
+        let instruction = try XCTUnwrap(AgentMode.review.instruction)
+
+        XCTAssertTrue(instruction.contains("REVIEW MODE"))
+        XCTAssertTrue(instruction.contains("Alibaba Open Code Review"))
+        XCTAssertTrue(
+            instruction.lowercased().contains("read-only"),
+            "Review mode must be read-only"
+        )
+        XCTAssertTrue(
+            instruction.contains("```\(AgentMode.planFenceLanguage)"),
+            "Review mode must conclude with an actionable plan document"
+        )
     }
 
     private func makeProviderRequest(mode: AgentMode) -> ProviderRequest {
