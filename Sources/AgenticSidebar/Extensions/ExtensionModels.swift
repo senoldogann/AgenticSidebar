@@ -176,6 +176,22 @@ struct MCPDefinition: Codable, Equatable, Sendable {
             )
         }
     }
+
+    /// Kapalı bir sunucunun yönetilen dosyadaki izdüşümü: komut/URL iskeleti
+    /// korunur (aynı adlı kalıtılmış girdiyi geçersiz kılar), sırlar taşınmaz.
+    ///
+    /// Kayıt defteri tam tanımı saklar; kullanıcı sunucuyu yeniden açınca
+    /// sırlar oradan geri gelir. Dosya 0600 olsa da çalışmayan bir girdide
+    /// sır durmamalı.
+    func redactedForDisabled() -> MCPDefinition {
+        var copy = self
+        copy.environment = [:]
+        copy.headers = [:]
+        if case let .registered(clientID, _, scope) = copy.oauth {
+            copy.oauth = .registered(clientID: clientID, clientSecret: nil, scope: scope)
+        }
+        return copy
+    }
 }
 
 /// One MCP server the app knows about.

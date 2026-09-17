@@ -274,12 +274,92 @@ final class ManagedConfigurationTests: XCTestCase {
         XCTAssertEqual(
             (mcp["notion"] as? [String: Any])?["command"] as? [String],
             ["npx", "notion"],
-            "The definition stays complete, so the entry is valid on its own"
+            "İskelet korunur; girdi tek başına geçerli kalır"
         )
+        let notionEnv = try XCTUnwrap((mcp["notion"] as? [String: Any])?["environment"] as? [String: Any])
+        XCTAssertTrue(notionEnv.isEmpty, "Kapalı girdide sır anahtarı boş nesne olarak yazılır")
         XCTAssertEqual(
             (mcp["github"] as? [String: Any])?["enabled"] as? Bool,
             true,
             "An enabled server is written exactly as the runtime API receives it"
+        )
+    }
+
+    func testDisabledServersAreWrittenWithoutSecrets() throws {
+        let registry = ExtensionRegistry(
+            mcpServers: [
+                MCPServerRecord(
+                    name: "supabase",
+                    definition: MCPDefinition(
+                        transport: .local,
+                        command: ["npx", "-y", "@supabase/mcp-server-supabase@latest"],
+                        environment: ["SUPABASE_ACCESS_TOKEN": "sbp_gizli"]
+                    ),
+                    isEnabled: false,
+                    source: .manual,
+                    isInherited: true,
+                    installedAt: Date()
+                ),
+                MCPServerRecord(
+                    name: "remote",
+                    definition: MCPDefinition(
+                        transport: .remote,
+                        environment: ["API_KEY": "gizli"],
+                        url: "https://example.com/mcp",
+                        headers: ["Authorization": "Bearer gizli"],
+                        oauth: .registered(clientID: "istemci", clientSecret: "gizli", scope: nil)
+                    ),
+                    isEnabled: false,
+                    source: .manual,
+                    isInherited: false,
+                    installedAt: Date()
+                ),
+                MCPServerRecord(
+                    name: "acik",
+                    definition: MCPDefinition(
+                        transport: .local,
+                        command: ["npx", "acik"],
+                        environment: ["ANAHTAR": "deger"]
+                    ),
+                    isEnabled: true,
+                    source: .manual,
+                    isInherited: false,
+                    installedAt: Date()
+                )
+            ]
+        )
+
+        let rendered = ManagedOpenCodeConfiguration.rendered(
+            instructionPaths: [],
+            permissionRules: [],
+            extensions: ExtensionRuntimeSnapshot(registry: registry)
+        )
+        XCTAssertFalse(rendered.contains("gizli"), "Kapalı sunucunun sırrı dosyaya yazılmaz")
+        XCTAssertFalse(rendered.contains("sbp_gizli"))
+
+        let decoded = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(rendered.utf8)) as? [String: Any]
+        )
+        let mcp = try XCTUnwrap(decoded["mcp"] as? [String: Any])
+
+        let supabase = try XCTUnwrap(mcp["supabase"] as? [String: Any])
+        XCTAssertEqual(supabase["enabled"] as? Bool, false)
+        let supabaseEnv = try XCTUnwrap(supabase["environment"] as? [String: Any])
+        XCTAssertTrue(supabaseEnv.isEmpty, "Kapalı sunucunun ortam sırları dosyaya yazılmaz")
+        XCTAssertNotNil(supabase["command"], "İskelet korunur; kalıtılmış girdi geçersiz kılınır")
+
+        let remote = try XCTUnwrap(mcp["remote"] as? [String: Any])
+        XCTAssertEqual(remote["enabled"] as? Bool, false)
+        let remoteHeaders = try XCTUnwrap(remote["headers"] as? [String: Any])
+        XCTAssertTrue(remoteHeaders.isEmpty, "Kapalı sunucunun başlık sırları dosyaya yazılmaz")
+        XCTAssertEqual(remote["url"] as? String, "https://example.com/mcp")
+
+        let acik = try XCTUnwrap(mcp["acik"] as? [String: Any])
+        XCTAssertEqual(acik["enabled"] as? Bool, true)
+        XCTAssertEqual(
+            (acik["environment"] as? [String: Any])?["ANAHTAR"] as? String,
+            "deger",
+            "Açık sunucunun sırları aynen yazılır"
         )
     }
 

@@ -241,18 +241,24 @@ enum ManagedOpenCodeConfiguration {
         return fileURL
     }
 
-    /// An MCP entry is rendered from the same payload the runtime `POST /mcp`
-    /// call sends, so the two can never drift apart.
+    /// Bir MCP girdisi, çalışan sunucuya `POST /mcp` ile gönderilen yükün
+    /// aynısından üretilir; ikisi birbirinden sapamaz.
     ///
-    /// A disabled entry keeps its whole definition and adds `enabled: false`: the
-    /// definition makes the entry valid on its own (so it still overrides the same
-    /// server in the user's own configuration, which the app never edits), and the
-    /// flag is what stops OpenCode from starting the process behind it.
+    /// Kapalı bir girdi iskeletini (komut/URL/cwd/timeout) korur ve
+    /// `enabled: false` ekler: iskelet girdiyi tek başına geçerli kılar (böylece
+    /// uygulamanın hiç dokunmadığı, kullanıcının kendi yapılandırmasındaki aynı
+    /// sunucuyu geçersiz kılar), bayrak ise OpenCode'un ardındaki süreci
+    /// başlatmasını engeller. Sırlar dosyaya hiç ulaşmaz: önce tanım
+    /// redakte edilir, sır anahtarları ise açıkça boş nesne olarak geri yazılır;
+    /// böylece derin birleştirme yapan bir okuyucu, kullanıcının kendi
+    /// dosyasındaki sırları bu girdinin altında yaşatamaz. Tam tanım kayıt
+    /// defterinde durur; yeniden açma sırları oradan geri getirir.
     private static func mcpValue(
         _ definition: MCPDefinition,
         isEnabled: Bool = true
     ) -> JSONValue {
-        let payload = JSONValue(encoding: definition.openCodePayload)
+        let effective = isEnabled ? definition : definition.redactedForDisabled()
+        let payload = JSONValue(encoding: effective.openCodePayload)
             ?? JSONValue.object([JSONValue.Member]())
 
         guard !isEnabled, case .object(var members) = payload else {
@@ -261,6 +267,12 @@ enum ManagedOpenCodeConfiguration {
 
         members.removeAll { $0.key == "enabled" }
         members.append(JSONValue.Member("enabled", .bool(false)))
+        members.removeAll { $0.key == "environment" }
+        members.append(JSONValue.Member("environment", .object([JSONValue.Member]())))
+        if effective.transport == .remote {
+            members.removeAll { $0.key == "headers" }
+            members.append(JSONValue.Member("headers", .object([JSONValue.Member]())))
+        }
         return .object(members)
     }
 }

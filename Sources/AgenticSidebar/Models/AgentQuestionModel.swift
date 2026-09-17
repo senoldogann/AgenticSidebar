@@ -81,9 +81,25 @@ struct AgentQuestion: Identifiable, Equatable, Sendable, Codable {
         selectedIDs: [String],
         customText: String?
     ) -> AgentQuestionAnswer {
-        let chosenLabels = options
-            .filter { selectedIDs.contains($0.id) }
-            .map(\.label)
+        let chosenLabels: [String]
+        if selectedIDs.contains("__all__") || selectedIDs.contains("opt_all") {
+            let nonAll = options.filter { $0.id != "__all__" && $0.id != "opt_all" }.map(\.label)
+            if nonAll.isEmpty {
+                chosenLabels = ["Hepsi (Tümünü uygula)"]
+            } else {
+                let textSample = nonAll.joined()
+                let isTurkish = textSample.range(of: #"[üğşıçöĞÜŞİÇÖ]"#, options: .regularExpression) != nil
+                    || textSample.localizedCaseInsensitiveContains("soru")
+                    || textSample.localizedCaseInsensitiveContains("hepsi")
+                    || textSample.localizedCaseInsensitiveContains("uygula")
+                let prefix = isTurkish ? "Hepsi (Tümünü uygula): " : "All of the above: "
+                chosenLabels = [prefix + nonAll.joined(separator: ", ")]
+            }
+        } else {
+            chosenLabels = options
+                .filter { selectedIDs.contains($0.id) }
+                .map(\.label)
+        }
 
         let trimmedCustom = customText?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveCustom = (trimmedCustom?.isEmpty == false) ? trimmedCustom : nil

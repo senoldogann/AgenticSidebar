@@ -40,8 +40,7 @@ enum AgentQuestionParser {
         if let stringArray = raw as? [String] {
             return stringArray.enumerated().map { index, text in
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                let isRec = trimmed.lowercased().contains("(recommended)")
-                    || trimmed.lowercased().contains("(önerilen)")
+                let isRec = isRecommendedTag(trimmed)
                 return AgentQuestionOption(
                     id: "opt_\(index + 1)",
                     label: trimmed,
@@ -59,7 +58,8 @@ enum AgentQuestionParser {
                     ?? "Option \(index + 1)"
                 let desc = dict["description"] as? String
                 let isRec = (dict["isRecommended"] as? Bool)
-                    ?? label.lowercased().contains("(recommended)")
+                    ?? (dict["recommended"] as? Bool)
+                    ?? isRecommendedTag(label)
                 let id = (dict["id"] as? String) ?? "opt_\(index + 1)"
 
                 return AgentQuestionOption(
@@ -72,6 +72,18 @@ enum AgentQuestionParser {
         }
 
         return []
+    }
+
+    /// Helper to test if a text snippet contains a recommendation badge or label.
+    static func isRecommendedTag(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("(recommended)")
+            || lower.contains("(önerilen)")
+            || lower.contains("(onerilen)")
+            || lower.contains("[recommended]")
+            || lower.contains("[önerilen]")
+            || lower.contains("[onerilen]")
+            || lower.contains("(tavsiye)")
     }
 
     /// Parses numbered or labeled options from markdown text when an assistant asks a question.
@@ -93,8 +105,7 @@ enum AgentQuestionParser {
                 let candidate = String(trimmed[matchRange]).trimmingCharacters(in: .whitespacesAndNewlines)
                 if candidate.count >= 2 && candidate.count <= 60 {
                     let index = collected.count + 1
-                    let isRec = candidate.lowercased().contains("(recommended)")
-                        || candidate.lowercased().contains("(önerilen)")
+                    let isRec = isRecommendedTag(candidate)
                     collected.append(
                         AgentQuestionOption(
                             id: "quick_\(index)",

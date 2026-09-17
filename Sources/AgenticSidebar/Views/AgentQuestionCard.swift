@@ -2,6 +2,8 @@ import SwiftUI
 
 /// An interactive glassmorphic card presented to the user when the agent asks a mid-session question.
 struct AgentQuestionCard: View {
+    static let allOptionID = "__all__"
+
     let question: AgentQuestion
     let preset: AppThemePreset
     let isDark: Bool
@@ -10,9 +12,63 @@ struct AgentQuestionCard: View {
     let onAnswer: (AgentQuestionAnswer) -> Void
     let onDismiss: () -> Void
 
+    @Environment(SettingsStore.self) private var settingsStore: SettingsStore?
+
     @State private var selectedOptionIDs: Set<String> = []
     @State private var customAnswerText: String = ""
     @FocusState private var isCustomInputFocused: Bool
+
+    private var isTurkish: Bool {
+        let sample = question.prompt + " " + question.options.map(\.label).joined(separator: " ")
+        return sample.range(of: #"[üğşıçöĞÜŞİÇÖ]"#, options: .regularExpression) != nil
+            || sample.localizedCaseInsensitiveContains("soru")
+            || sample.localizedCaseInsensitiveContains("öneri")
+            || sample.localizedCaseInsensitiveContains("seç")
+            || sample.localizedCaseInsensitiveContains("uygula")
+            || sample.localizedCaseInsensitiveContains("hepsi")
+    }
+
+    private var effectiveOptions: [AgentQuestionOption] {
+        guard settingsStore?.autoOfferAllOption ?? true else {
+            return question.options
+        }
+        guard question.options.count >= 2 else {
+            return question.options
+        }
+        let hasAll = question.options.contains { opt in
+            let lower = opt.label.lowercased()
+            return lower.contains("hepsi")
+                || lower.contains("all of the above")
+                || lower.contains("tümünü uygula")
+                || lower.contains("tümünü seç")
+        }
+        guard !hasAll else {
+            return question.options
+        }
+
+        let allOption = AgentQuestionOption(
+            id: Self.allOptionID,
+            label: isTurkish ? "Hepsi (Tümünü uygula)" : "All of the above",
+            description: isTurkish
+                ? "Yukarıdaki tüm maddeleri sırayla uygula"
+                : "Apply all options listed above",
+            isRecommended: false
+        )
+        return question.options + [allOption]
+    }
+
+    private var isAllSelected: Bool {
+        let baseIDs = Set(question.options.map(\.id))
+        return !baseIDs.isEmpty && baseIDs.isSubset(of: selectedOptionIDs)
+    }
+
+    private func toggleAllSelection() {
+        if isAllSelected {
+            selectedOptionIDs.removeAll()
+        } else {
+            selectedOptionIDs = Set(effectiveOptions.map(\.id))
+        }
+    }
 
     var body: some View {
         let accent = preset.accentGradient.first ?? .accentColor
@@ -25,7 +81,7 @@ struct AgentQuestionCard: View {
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(accent)
 
-                    Text("Clarification Needed")
+                    Text(isTurkish ? "Açıklama / Seçim Gerekli" : "Clarification Needed")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(accent)
                 }
@@ -56,16 +112,39 @@ struct AgentQuestionCard: View {
                 .pointingHandCursor()
             }
 
-            // Question Prompt
-            Text(question.prompt)
-                .font(.system(size: 13.5, weight: .medium))
-                .foregroundStyle(.primary)
-                .fixedSize(horizontal: false, vertical: true)
+            // Question Prompt & Optional Select All Helper
+            HStack(alignment: .firstTextBaseline) {
+                Text(question.prompt)
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if question.isMultiSelect && question.options.count >= 2 {
+                    Spacer(minLength: 8)
+
+                    Button {
+                        toggleAllSelection()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: isAllSelected ? "checkmark.circle.fill" : "circle.dashed")
+                                .font(.system(size: 10))
+                            Text(isAllSelected ? (isTurkish ? "Temizle" : "Deselect All") : (isTurkish ? "Tümünü Seç" : "Select All"))
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundStyle(accent)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(accent.opacity(isDark ? 0.18 : 0.10), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .pointingHandCursor()
+                }
+            }
 
             // Multi-choice Option Pills
-            if !question.options.isEmpty {
+            if !effectiveOptions.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(question.options.enumerated()), id: \.element.id) { index, option in
+                    ForEach(Array(effectiveOptions.enumerated()), id: \.element.id) { index, option in
                         optionRow(
                             option: option,
                             index: index,
@@ -192,8 +271,11 @@ struct AgentQuestionCard: View {
         .padding(.bottom, 6)
         .frame(maxWidth: .infinity, alignment: .center)
         .onAppear {
-            if !question.isMultiSelect, let recommended = question.options.first(where: { $0.isRecommended }) {
-                selectedOptionIDs = [recommended.id]
+            let shouldAutoSelect = settingsStore?.autoSelectRecommendedOption ?? true
+            if shouldAutoSelect && selectedOptionIDs.isEmpty {
+                if let recommended = effectiveOptions.first(where: { $0.isRecommended }) {
+                    selectedOptionIDs = [recommended.id]
+                }
             }
         }
     }
@@ -206,11 +288,27 @@ struct AgentQuestionCard: View {
         guard canSubmit && !isSubmitting else { return }
 
         let answer = AgentQuestion.formatAnswer(
-            options: question.options,
+            options: effectiveOptions,
             selectedIDs: Array(selectedOptionIDs),
             customText: customAnswerText
         )
         onAnswer(answer)
+    }
+
+    private func cleanLabel(for raw: String) -> String {
+        var cleaned = raw
+        let tags = [
+            "(Recommended)", "(recommended)", "(RECOMMENDED)",
+            "(Önerilen)", "(önerilen)", "(ÖNERİLEN)",
+            "(onerilen)", "(Onerilen)",
+            "[Recommended]", "[recommended]",
+            "[Önerilen]", "[önerilen]", "[onerilen]",
+            "(Tavsiye Edilen)", "(tavsiye edilen)", "(tavsiye)"
+        ]
+        for tag in tags {
+            cleaned = cleaned.replacingOccurrences(of: tag, with: "")
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     @ViewBuilder
@@ -226,29 +324,48 @@ struct AgentQuestionCard: View {
         } label: {
             HStack(spacing: 8) {
                 // Number / Shortcut Badge
-                Text("\(index + 1)")
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(isSelected ? Color.white : .secondary)
-                    .frame(width: 18, height: 18)
-                    .background(
-                        isSelected ? accent : Color.primary.opacity(isDark ? 0.10 : 0.06),
-                        in: Circle()
-                    )
+                if option.id == Self.allOptionID {
+                    Image(systemName: "checklist")
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundStyle(isSelected ? Color.white : accent)
+                        .frame(width: 18, height: 18)
+                        .background(
+                            isSelected ? accent : accent.opacity(isDark ? 0.22 : 0.12),
+                            in: Circle()
+                        )
+                } else {
+                    Text("\(index + 1)")
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(isSelected ? Color.white : .secondary)
+                        .frame(width: 18, height: 18)
+                        .background(
+                            isSelected ? accent : Color.primary.opacity(isDark ? 0.10 : 0.06),
+                            in: Circle()
+                        )
+                }
 
                 // Option Label and Description
                 VStack(alignment: .leading, spacing: 1) {
                     HStack(spacing: 6) {
-                        Text(option.label)
+                        Text(cleanLabel(for: option.label))
                             .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
                             .foregroundStyle(.primary)
 
                         if option.isRecommended {
-                            Text("Recommended")
-                                .font(.system(size: 9.5, weight: .medium))
-                                .foregroundStyle(accent)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1.5)
-                                .background(accent.opacity(isDark ? 0.20 : 0.12), in: Capsule())
+                            HStack(spacing: 3) {
+                                Image(systemName: "star.fill")
+                                    .font(.system(size: 7.5))
+                                Text(isTurkish ? "Önerilen" : "Recommended")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                            }
+                            .foregroundStyle(accent)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(accent.opacity(isDark ? 0.22 : 0.12), in: Capsule())
+                            .overlay(
+                                Capsule()
+                                    .stroke(accent.opacity(0.40), lineWidth: 0.8)
+                            )
                         }
                     }
 
@@ -286,11 +403,34 @@ struct AgentQuestionCard: View {
     }
 
     private func toggleOption(_ id: String) {
+        if id == Self.allOptionID {
+            if question.isMultiSelect {
+                let baseIDs = Set(question.options.map(\.id))
+                if baseIDs.isSubset(of: selectedOptionIDs) {
+                    selectedOptionIDs.removeAll()
+                } else {
+                    selectedOptionIDs = Set(effectiveOptions.map(\.id))
+                }
+            } else {
+                if selectedOptionIDs.contains(Self.allOptionID) {
+                    selectedOptionIDs.removeAll()
+                } else {
+                    selectedOptionIDs = [Self.allOptionID]
+                }
+            }
+            return
+        }
+
         if question.isMultiSelect {
             if selectedOptionIDs.contains(id) {
                 selectedOptionIDs.remove(id)
+                selectedOptionIDs.remove(Self.allOptionID)
             } else {
                 selectedOptionIDs.insert(id)
+                let baseIDs = Set(question.options.map(\.id))
+                if baseIDs.isSubset(of: selectedOptionIDs) {
+                    selectedOptionIDs.insert(Self.allOptionID)
+                }
             }
         } else {
             if selectedOptionIDs.contains(id) {

@@ -131,11 +131,15 @@ struct OpenCodeQuestionEventRouter: Sendable {
             else { return nil }
             let options = choices.enumerated().compactMap { index, choice -> AgentQuestionOption? in
                 guard let label = choice["label"] as? String, !label.isEmpty else { return nil }
+                let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                let isRec = (choice["isRecommended"] as? Bool)
+                    ?? (choice["recommended"] as? Bool)
+                    ?? AgentQuestionParser.isRecommendedTag(trimmed)
                 return AgentQuestionOption(
                     id: "opt_\(index + 1)",
-                    label: label,
+                    label: trimmed,
                     description: choice["description"] as? String,
-                    isRecommended: false
+                    isRecommended: isRec
                 )
             }
             guard options.count == choices.count else { return nil }

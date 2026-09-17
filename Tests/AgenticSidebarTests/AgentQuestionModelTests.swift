@@ -188,4 +188,54 @@ final class AgentQuestionModelTests: XCTestCase {
         XCTAssertEqual(session.state.questionHistory.count, 1)
         XCTAssertEqual(session.state.questionHistory.first?.status, .answered(answer))
     }
+
+    func testOptionFormattingWithHepsiAllOption() {
+        let options = [
+            AgentQuestionOption(id: "opt_1", label: "Kritik - secret ve şema", description: nil, isRecommended: true),
+            AgentQuestionOption(id: "opt_2", label: "High - model çağrısı", description: nil, isRecommended: false),
+            AgentQuestionOption(id: "opt_3", label: "Medium - dayanıklılık", description: nil, isRecommended: false)
+        ]
+
+        let answer = AgentQuestion.formatAnswer(
+            options: options,
+            selectedIDs: ["__all__"],
+            customText: nil
+        )
+
+        XCTAssertEqual(answer.selectedOptionIDs, ["__all__"])
+        XCTAssertTrue(answer.formattedResponse.hasPrefix("Hepsi (Tümünü uygula): "))
+        XCTAssertTrue(answer.formattedResponse.contains("Kritik - secret ve şema"))
+        XCTAssertTrue(answer.formattedResponse.contains("High - model çağrısı"))
+        XCTAssertTrue(answer.formattedResponse.contains("Medium - dayanıklılık"))
+    }
+
+    func testParseTurkishRecommendationTags() {
+        let text = """
+        Sorunları çözmek için seçenekler:
+        1. Kritik güvenlik açığını kapat (Önerilen)
+        2. Performans iyileştirmesi yap
+        3. Testleri çalıştır
+        """
+
+        let options = AgentQuestionParser.parseQuickReplyOptions(from: text)
+        XCTAssertEqual(options.count, 3)
+        XCTAssertTrue(options[0].isRecommended)
+        XCTAssertFalse(options[1].isRecommended)
+        XCTAssertFalse(options[2].isRecommended)
+    }
+
+    @MainActor
+    func testQuestionSettingsInSettingsStore() {
+        let store = SettingsStore()
+        XCTAssertTrue(store.autoOfferAllOption)
+        XCTAssertTrue(store.autoSelectRecommendedOption)
+
+        store.autoOfferAllOption = false
+        XCTAssertFalse(store.autoOfferAllOption)
+        store.autoOfferAllOption = true
+
+        store.autoSelectRecommendedOption = false
+        XCTAssertFalse(store.autoSelectRecommendedOption)
+        store.autoSelectRecommendedOption = true
+    }
 }

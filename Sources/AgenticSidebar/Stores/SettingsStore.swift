@@ -31,6 +31,8 @@ final class SettingsStore {
         static let sessionNotificationsEnabled = "settings.sessionNotificationsEnabled"
         static let sessionNotificationSoundEnabled = "settings.sessionNotificationSoundEnabled"
         static let sessionNotificationSound = "settings.sessionNotificationSound"
+        static let autoOfferAllOption = "settings.autoOfferAllOption"
+        static let autoSelectRecommendedOption = "settings.autoSelectRecommendedOption"
         /// Önceki sürümün bilgisayar kullanımına özel onay anahtarı. Yalnızca göç
         /// için okunur; yeni değer her zaman `toolApprovalPolicy` altına yazılır.
         static let legacyComputerUseApprovalMode = "settings.computerUseApprovalMode"
@@ -222,6 +224,20 @@ final class SettingsStore {
     var sessionNotificationSound: String {
         didSet {
             defaults.set(sessionNotificationSound, forKey: Key.sessionNotificationSound)
+        }
+    }
+
+    /// Whether question cards automatically present a 'Hepsi / All' choice when 2+ options exist.
+    var autoOfferAllOption: Bool {
+        didSet {
+            defaults.set(autoOfferAllOption, forKey: Key.autoOfferAllOption)
+        }
+    }
+
+    /// Whether question cards automatically pre-select recommended options.
+    var autoSelectRecommendedOption: Bool {
+        didSet {
+            defaults.set(autoSelectRecommendedOption, forKey: Key.autoSelectRecommendedOption)
         }
     }
 
@@ -459,6 +475,18 @@ final class SettingsStore {
             sessionNotificationSound = sound
         } else {
             sessionNotificationSound = "Glass"
+        }
+
+        if defaults.object(forKey: Key.autoOfferAllOption) == nil {
+            autoOfferAllOption = true
+        } else {
+            autoOfferAllOption = defaults.bool(forKey: Key.autoOfferAllOption)
+        }
+
+        if defaults.object(forKey: Key.autoSelectRecommendedOption) == nil {
+            autoSelectRecommendedOption = true
+        } else {
+            autoSelectRecommendedOption = defaults.bool(forKey: Key.autoSelectRecommendedOption)
         }
     }
 }

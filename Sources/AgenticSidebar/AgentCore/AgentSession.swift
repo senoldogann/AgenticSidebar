@@ -652,11 +652,22 @@ final class AgentSession {
             let item = batch.request.questions[batch.index]
             let validIDs = Set(item.options.map(\.id))
             let selected = Set(answer.selectedOptionIDs)
-            guard selected.isSubset(of: validIDs),
+            let isAllSelected = selected.contains("__all__") || selected.contains("opt_all")
+            guard isAllSelected || selected.isSubset(of: validIDs),
                   item.isMultiSelect || selected.count <= 1
             else { return }
 
-            var values = item.options.filter { selected.contains($0.id) }.map(\.label)
+            var values: [String]
+            if isAllSelected {
+                if item.isMultiSelect {
+                    values = item.options.map(\.label)
+                } else {
+                    let summary = item.options.map(\.label).joined(separator: "; ")
+                    values = [summary.isEmpty ? "Hepsi" : "Hepsi (Tümünü uygula): " + summary]
+                }
+            } else {
+                values = item.options.filter { selected.contains($0.id) }.map(\.label)
+            }
             if item.allowCustomAnswer,
                let custom = answer.customText?.trimmingCharacters(in: .whitespacesAndNewlines),
                !custom.isEmpty {
@@ -1117,7 +1128,7 @@ final class AgentSession {
                 prompt: "Choose an option or type an answer:",
                 options: quickOptions,
                 allowCustomAnswer: true,
-                isMultiSelect: false,
+                isMultiSelect: true,
                 createdAt: Date(),
                 status: .pending
             )
