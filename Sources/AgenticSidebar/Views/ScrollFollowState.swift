@@ -29,12 +29,12 @@ final class ScrollFollowState {
     /// Auto-follow'un en sık kaydırma aralığı.
     static let followInterval: TimeInterval = 0.12
 
-    /// "Dipte" sayılmanın sınırı.
-    ///
-    /// Dar tutuldu. 120 pt'de birkaç satır yukarı kaydırmış okuyucu, yanıt
-    /// büyüdükçe dibe geri çekiliyordu; bu da kaydırmayı başkasının tuttuğu
-    /// hissini veriyordu. Dipten bu kadar uzaktaysa konum kullanıcının.
-    static let bottomThreshold: CGFloat = 40
+    /// "Dipte" sayılmanın sınırı (takip modunun geri verilmesi için).
+    static let bottomThreshold: CGFloat = 80
+
+    /// "Scroll to end" butonunun görünmesi için en alttan gereken asgari mesafe.
+    /// Kullanıcı dipten yeterince yukarı kaydırmadan (en az 180 pt) buton görünmez.
+    static let buttonVisibilityThreshold: CGFloat = 180
 
     /// Bir ölçümün "yukarı hareket" sayılması için konumun bu kadar düşmesi
     /// gerekir. 4 pt'lik ölçüm adımının bir katından fazlası, yani gürültü değil
@@ -112,14 +112,16 @@ final class ScrollFollowState {
             return
         }
 
-        let away = !isAtBottom
+        let isFarEnoughForButton = snapshot.distanceFromBottom >= Self.buttonVisibilityThreshold
 
-        guard away != awayFromBottom else {
-            return
+        if isFarEnoughForButton {
+            guard !awayFromBottom else { return }
+            awayFromBottom = true
+            pendingAwayFromBottom = true
+        } else if awayFromBottom && snapshot.distanceFromBottom < Self.buttonVisibilityThreshold {
+            awayFromBottom = false
+            pendingAwayFromBottom = false
         }
-
-        awayFromBottom = away
-        pendingAwayFromBottom = away
     }
 
     /// Rayın etkin prompt'u; yayın sırasına girer.

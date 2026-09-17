@@ -95,6 +95,25 @@ final class ScrollFollowStateTests: XCTestCase {
         XCTAssertTrue(state.shouldAutoFollow(now: Date()))
     }
 
+    func testButtonRequiresMinimumDistanceBufferBeforeShowing() {
+        let state = ScrollFollowState()
+        state.setScrolling(true)
+        state.record(snapshot: snapshot(offsetY: 1_600)) // bottom: distanceFromBottom = 0
+
+        // User scrolls up by 100 pt: away from bottom threshold (80 pt), but less than button visibility threshold (180 pt)
+        state.record(snapshot: snapshot(offsetY: 1_500))
+        XCTAssertTrue(state.isUserPosition)
+        XCTAssertNil(state.takePending().awayFromBottom, "100 pt is below buttonVisibilityThreshold (180 pt), no button publication")
+
+        // User scrolls up further: distanceFromBottom = 200 pt (>= 180 pt)
+        state.record(snapshot: snapshot(offsetY: 1_400))
+        XCTAssertEqual(state.takePending().awayFromBottom, true, "200 pt >= 180 pt triggers awayFromBottom publication")
+
+        // User scrolls down back to 100 pt (< 180 pt)
+        state.record(snapshot: snapshot(offsetY: 1_500))
+        XCTAssertEqual(state.takePending().awayFromBottom, false, "dropping below 180 pt hides the button")
+    }
+
     /// Altta büyüyen içerik konumu düşürmez; düşüşün kendisi tek başına
     /// kullanıcı hareketinin kanıtıdır. Küçük ölçüm titremeleri sahiplik vermez.
     func testTinyOffsetChangesDoNotTakeOwnership() {
