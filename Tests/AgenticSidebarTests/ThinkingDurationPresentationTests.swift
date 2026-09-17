@@ -44,7 +44,8 @@ final class ThinkingDurationPresentationTests: XCTestCase {
                 hasRunningChildren: true,
                 now: startedAt.addingTimeInterval(11)
             ),
-            "Thought for 4s · Working (11s)"
+            "Thought for 4s",
+            "The thought row only reports thought duration; overall work is shown in the group header"
         )
     }
 
@@ -99,7 +100,7 @@ final class ThinkingDurationPresentationTests: XCTestCase {
                 hasRunningChildren: false,
                 now: startedAt.addingTimeInterval(600)
             ),
-            "Thought for 3s · Worked 4m 12s"
+            "Thought for 3s"
         )
     }
 }

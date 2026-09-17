@@ -27,20 +27,7 @@ enum ThinkingDurationPresentation {
         }
 
         let thoughtSeconds = seconds(from: startedAt, to: completedAt ?? turnEndedAt ?? now)
-
-        if hasRunningChildren {
-            let totalSeconds = seconds(from: startedAt, to: now)
-            return "Thought for \(format(thoughtSeconds)) · Working (\(format(totalSeconds)))"
-        }
-
-        let turnEnd = turnEndedAt ?? completedAt ?? now
-        let totalSeconds = seconds(from: startedAt, to: turnEnd)
-
-        guard totalSeconds > thoughtSeconds else {
-            return "Thought for \(format(thoughtSeconds))"
-        }
-
-        return "Thought for \(format(thoughtSeconds)) · Worked \(format(totalSeconds))"
+        return "Thought for \(format(thoughtSeconds))"
     }
 
     /// Geçen saniye. Saat geri alınmış olsa bile negatif bir süre gösterilmez ve
