@@ -15,6 +15,7 @@ final class SettingsStore {
         static let glassOpacity = "settings.glassOpacity"
         static let autoSubmitClipboard = "settings.autoSubmitClipboard"
         static let autoAnalyzeScreenshots = "settings.autoAnalyzeScreenshots"
+        static let contextSnapEnabled = "settings.contextSnapEnabled"
         static let globalShortcut = "settings.globalShortcut"
         static let fontFamily = "settings.fontFamily"
         static let fontSize = "settings.fontSize"
@@ -110,6 +111,14 @@ final class SettingsStore {
     var autoAnalyzeScreenshots: Bool {
         didSet {
             defaults.set(autoAnalyzeScreenshots, forKey: Key.autoAnalyzeScreenshots)
+        }
+    }
+
+    /// Snap Context (⇧⌘D) kısayolu; ilk kez izin isteyen özellik olduğu için
+    /// varsayılan kapalıdır.
+    var contextSnapEnabled: Bool {
+        didSet {
+            defaults.set(contextSnapEnabled, forKey: Key.contextSnapEnabled)
         }
     }
 
@@ -368,6 +377,7 @@ final class SettingsStore {
 
         autoSubmitClipboard = defaults.bool(forKey: Key.autoSubmitClipboard)
         autoAnalyzeScreenshots = defaults.bool(forKey: Key.autoAnalyzeScreenshots)
+        contextSnapEnabled = defaults.bool(forKey: Key.contextSnapEnabled)
 
         if let rawFamily = defaults.string(forKey: Key.fontFamily),
            let family = AppFontFamily(rawValue: rawFamily) {

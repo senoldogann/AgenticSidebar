@@ -42,5 +42,23 @@ extension SettingsView {
                     .foregroundStyle(.secondary)
             }
         }
+
+        settingsCard(
+            title: "Snap Context (⇧⌘D)",
+            subtitle: "Capture the frontmost app's context into the composer.",
+            icon: "rectangle.dashed.badge.record"
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(
+                    "Enable Snap Context shortcut",
+                    isOn: $settings.contextSnapEnabled
+                )
+                .tint(currentTheme.accentGradient.first ?? .accentColor)
+
+                Text("Copies the frontmost app name, window title, browser URL and selected text into the composer as a reviewable draft. URL needs Automation permission, selected text needs Accessibility permission — without them the snap degrades to app and window title only.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }

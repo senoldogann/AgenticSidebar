@@ -26,9 +26,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self?.mainWindowController.toggle()
     }
 
+    /// Snap Context bağlantısı; `AgenticSidebarApp` kurup atar (tek ertelenen adım).
+    ///
+    /// Atama `didSet` üzerinden kısayolu kaydeder, çünkü atama anı
+    /// `applicationDidFinishLaunching` sırasına göre belirsizdir: hangisi önce
+    /// koşarsa koşsun kayıt yapılır, ikisi de koşarsa kayıt yenilenir.
+    var snapCoordinator: ContextSnapCoordinator? {
+        didSet {
+            applySnapShortcut()
+        }
+    }
+
+    private lazy var snapHotKeyController = GlobalHotKeyController(action: { [weak self] in
+        self?.snapCoordinator?.handleSnapHotKey()
+    }, hotKeyID: 2)
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         applyGlobalShortcut(launchShortcut)
+        applySnapShortcut()
         installTerminationSignalHandlers()
 
         NSApp.activate(ignoringOtherApps: true)
@@ -122,6 +138,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    /// Snap Context (⇧⌘D) kısayolunu kaydeder. Koordinatör henüz atanmamışsa
+    /// sessizce atlanır; atama `didSet` üzerinden yeniden dener.
+    func applySnapShortcut() {
+        guard snapCoordinator != nil else {
+            return
+        }
+        do {
+            try snapHotKeyController.register(.contextSnap)
+            AppLog.lifecycle.info("Registered Snap Context shortcut (⇧⌘D)")
+        } catch {
+            AppLog.lifecycle.error(
+                "Failed to register the Snap Context shortcut: \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

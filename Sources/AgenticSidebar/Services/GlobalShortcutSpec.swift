@@ -14,6 +14,16 @@ struct GlobalShortcutSpec: Equatable, Hashable, Sendable {
         keyCode: UInt32(kVK_ANSI_B),
         modifiers: UInt32(cmdKey | shiftKey)
     )
+
+    /// Snap Context (⇧⌘D): öndeki uygulamanın bağlamını besteciye taşır.
+    ///
+    /// D harfi "bold" gibi evrensel bir yazım kısayolu değildir, bu yüzden
+    /// global kayıtta ⇧⌘B kadar sakıncalı değildir; yine de aynı imza
+    /// ailesinden (ASBR) farklı bir kimlikle kaydedilir.
+    static let contextSnap = GlobalShortcutSpec(
+        keyCode: UInt32(kVK_ANSI_D),
+        modifiers: UInt32(cmdKey | shiftKey)
+    )
 }
 
 /// User-selectable variants of the global show/hide shortcut.

@@ -12,12 +12,15 @@ struct GlobalHotKeyRegistrationError: Error, Equatable {
 
 @MainActor
 final class GlobalHotKeyController {
-    private let identifier = EventHotKeyID(signature: 0x41534252, id: 1) // ASBR
+    private let identifier: EventHotKeyID
     private let action: @MainActor () -> Void
     private var eventHandlerRef: EventHandlerRef?
     private var hotKeyRef: EventHotKeyRef?
 
-    init(action: @escaping @MainActor () -> Void) {
+    /// - Parameter hotKeyID: Aynı imzadaki (ASBR) ek kayıtlar için farklı
+    ///   kimlik (ör. 1: göster/gizle, 2: snap). Varsayılan tekil davranışı korur.
+    init(action: @escaping @MainActor () -> Void, hotKeyID: UInt32 = 1) {
+        self.identifier = EventHotKeyID(signature: 0x41534252, id: hotKeyID)
         self.action = action
     }
 
