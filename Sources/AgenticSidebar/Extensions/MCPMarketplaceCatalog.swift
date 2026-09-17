@@ -19,11 +19,36 @@ struct MCPMarketplaceEntry: Identifiable, Equatable, Sendable {
     let publisher: String
     let category: MCPMarketplaceCategory
     let iconName: String
+    /// The command a local server is started with. Empty for a remote one.
     let command: [String]
     let environmentKeys: [String]
+    /// Set for a hosted server the agent connects to over HTTP instead of
+    /// spawning. OpenCode runs the authorization flow for these itself, which the
+    /// MCP tab surfaces as "Authorize".
+    let url: String?
     let documentationURL: String?
 
+    var isRemote: Bool { url != nil }
+
+    /// What the card shows under the summary: the command, or the endpoint.
+    var installSummary: String {
+        url ?? command.joined(separator: " ")
+    }
+
     func createDefinition() -> MCPDefinition {
+        if let url {
+            return MCPDefinition(
+                transport: .remote,
+                command: [],
+                cwd: nil,
+                environment: [:],
+                url: url,
+                headers: [:],
+                oauth: .automatic,
+                timeoutMilliseconds: 30_000
+            )
+        }
+
         var env: [String: String] = [:]
         for key in environmentKeys {
             env[key] = ""
@@ -42,150 +67,167 @@ struct MCPMarketplaceEntry: Identifiable, Equatable, Sendable {
 }
 
 enum MCPMarketplaceCatalog {
+    /// Every entry resolves: an npm or PyPI package that is published and not
+    /// archived, or a hosted endpoint that answers. The previous list had three
+    /// npm names that never existed (`server-fetch`, `server-sqlite`,
+    /// `server-sentry`) and four more the upstream project had retired, so
+    /// "Add to Agent" recorded servers OpenCode could only fail to start.
     static let entries: [MCPMarketplaceEntry] = [
         MCPMarketplaceEntry(
             id: "github",
             name: "github",
             displayName: "GitHub MCP",
-            summary: "Search repositories, read source code, inspect pull requests, and manage issues.",
-            publisher: "ModelContextProtocol",
+            summary: "Search repositories, read source, inspect pull requests and manage issues.",
+            publisher: "GitHub",
             category: .development,
             iconName: "chevron.left.forwardslash.chevron.right",
-            command: ["npx", "-y", "@modelcontextprotocol/server-github"],
-            environmentKeys: ["GITHUB_PERSONAL_ACCESS_TOKEN"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/github"
-        ),
-        MCPMarketplaceEntry(
-            id: "postgres",
-            name: "postgres",
-            displayName: "PostgreSQL MCP",
-            summary: "Read-only schema inspection, table analysis, and analytical SQL querying.",
-            publisher: "ModelContextProtocol",
-            category: .database,
-            iconName: "cylinder.split.1x2",
-            command: ["npx", "-y", "@modelcontextprotocol/server-postgres"],
-            environmentKeys: ["DATABASE_URL"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres"
-        ),
-        MCPMarketplaceEntry(
-            id: "filesystem",
-            name: "filesystem",
-            displayName: "Filesystem MCP",
-            summary: "Direct workspace directory exploration, file reading, and controlled disk operations.",
-            publisher: "ModelContextProtocol",
-            category: .system,
-            iconName: "folder.fill",
-            command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+            command: [],
             environmentKeys: [],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
+            url: "https://api.githubcopilot.com/mcp/",
+            documentationURL: "https://github.com/github/github-mcp-server"
         ),
         MCPMarketplaceEntry(
-            id: "brave-search",
-            name: "brave-search",
-            displayName: "Brave Search MCP",
-            summary: "Web search and real-time local search intelligence via Brave Search API.",
-            publisher: "ModelContextProtocol",
-            category: .webSearch,
-            iconName: "magnifyingglass",
-            command: ["npx", "-y", "@modelcontextprotocol/server-brave-search"],
-            environmentKeys: ["BRAVE_API_KEY"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search"
-        ),
-        MCPMarketplaceEntry(
-            id: "memory",
-            name: "memory",
-            displayName: "Memory Graph MCP",
-            summary: "Knowledge graph-based memory storage to retain context across conversations.",
-            publisher: "ModelContextProtocol",
-            category: .productivity,
-            iconName: "brain.head.profile",
-            command: ["npx", "-y", "@modelcontextprotocol/server-memory"],
-            environmentKeys: [],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/memory"
-        ),
-        MCPMarketplaceEntry(
-            id: "fetch",
-            name: "fetch",
-            displayName: "Web Fetch MCP",
-            summary: "Fetches and converts web pages, documentation, and HTML into clean Markdown.",
-            publisher: "ModelContextProtocol",
-            category: .webSearch,
-            iconName: "arrow.down.doc.fill",
-            command: ["npx", "-y", "@modelcontextprotocol/server-fetch"],
-            environmentKeys: [],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/fetch"
-        ),
-        MCPMarketplaceEntry(
-            id: "puppeteer",
-            name: "puppeteer",
-            displayName: "Puppeteer Browser MCP",
-            summary: "Headless Chrome browser automation, full-page screenshots, and web interaction.",
-            publisher: "ModelContextProtocol",
-            category: .webSearch,
-            iconName: "globe",
-            command: ["npx", "-y", "@modelcontextprotocol/server-puppeteer"],
-            environmentKeys: [],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/puppeteer"
-        ),
-        MCPMarketplaceEntry(
-            id: "sqlite",
-            name: "sqlite",
-            displayName: "SQLite MCP",
-            summary: "Inspect and query local SQLite database files, schemas, and table records.",
-            publisher: "ModelContextProtocol",
-            category: .database,
-            iconName: "internaldrive",
-            command: ["npx", "-y", "@modelcontextprotocol/server-sqlite"],
-            environmentKeys: ["SQLITE_DB_PATH"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/sqlite"
-        ),
-        MCPMarketplaceEntry(
-            id: "slack",
-            name: "slack",
-            displayName: "Slack MCP",
-            summary: "Search message history, inspect team channels, and post messages to Slack.",
-            publisher: "ModelContextProtocol",
-            category: .productivity,
-            iconName: "bubble.left.and.bubble.right.fill",
-            command: ["npx", "-y", "@modelcontextprotocol/server-slack"],
-            environmentKeys: ["SLACK_BOT_TOKEN"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/slack"
-        ),
-        MCPMarketplaceEntry(
-            id: "docker",
-            name: "docker",
-            displayName: "Docker MCP",
-            summary: "Inspect running Docker containers, images, volumes, and execute container commands.",
-            publisher: "Community",
-            category: .system,
-            iconName: "shippingbox.fill",
-            command: ["npx", "-y", "mcp-server-docker"],
-            environmentKeys: [],
-            documentationURL: "https://github.com/modelcontextprotocol/servers"
+            id: "context7",
+            name: "context7",
+            displayName: "Context7 Docs",
+            summary: "Up-to-date documentation and code examples for libraries and frameworks.",
+            publisher: "Upstash",
+            category: .development,
+            iconName: "book.closed.fill",
+            command: ["npx", "-y", "@upstash/context7-mcp"],
+            environmentKeys: ["CONTEXT7_API_KEY"],
+            url: nil,
+            documentationURL: "https://github.com/upstash/context7"
         ),
         MCPMarketplaceEntry(
             id: "sentry",
             name: "sentry",
             displayName: "Sentry MCP",
-            summary: "Query application error traces, exception reports, and production crash telemetry.",
-            publisher: "ModelContextProtocol",
+            summary: "Query error traces, exception reports and production crash telemetry.",
+            publisher: "Sentry",
             category: .development,
             iconName: "exclamationmark.triangle.fill",
-            command: ["npx", "-y", "@modelcontextprotocol/server-sentry"],
-            environmentKeys: ["SENTRY_AUTH_TOKEN"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/sentry"
+            command: [],
+            environmentKeys: [],
+            url: "https://mcp.sentry.dev/mcp",
+            documentationURL: "https://docs.sentry.io/product/sentry-mcp/"
         ),
         MCPMarketplaceEntry(
-            id: "google-drive",
-            name: "google-drive",
-            displayName: "Google Drive MCP",
-            summary: "Search files, read Google Docs, spreadsheets, and workspace documents.",
+            id: "postgres",
+            name: "postgres",
+            displayName: "PostgreSQL MCP",
+            summary: "Schema inspection, index tuning and analytical SQL against a Postgres database.",
+            publisher: "Crystal DBA",
+            category: .database,
+            iconName: "cylinder.split.1x2",
+            command: ["uvx", "postgres-mcp", "--access-mode=restricted"],
+            environmentKeys: ["DATABASE_URI"],
+            url: nil,
+            documentationURL: "https://github.com/crystaldba/postgres-mcp"
+        ),
+        MCPMarketplaceEntry(
+            id: "sqlite",
+            name: "sqlite",
+            displayName: "SQLite MCP",
+            summary: "Inspect and query local SQLite database files, schemas and table records.",
+            publisher: "ModelContextProtocol",
+            category: .database,
+            iconName: "internaldrive",
+            command: ["uvx", "mcp-server-sqlite", "--db-path", "./database.db"],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://pypi.org/project/mcp-server-sqlite/"
+        ),
+        MCPMarketplaceEntry(
+            id: "filesystem",
+            name: "filesystem",
+            displayName: "Filesystem MCP",
+            summary: "Directory exploration, file reading and controlled disk operations.",
+            publisher: "ModelContextProtocol",
+            category: .system,
+            iconName: "folder.fill",
+            command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem"
+        ),
+        MCPMarketplaceEntry(
+            id: "fetch",
+            name: "fetch",
+            displayName: "Web Fetch MCP",
+            summary: "Fetches web pages and documentation and converts them into clean Markdown.",
+            publisher: "ModelContextProtocol",
+            category: .webSearch,
+            iconName: "arrow.down.doc.fill",
+            command: ["uvx", "mcp-server-fetch"],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://pypi.org/project/mcp-server-fetch/"
+        ),
+        MCPMarketplaceEntry(
+            id: "brave-search",
+            name: "brave-search",
+            displayName: "Brave Search MCP",
+            summary: "Web, news and local search through the Brave Search API.",
+            publisher: "Brave",
+            category: .webSearch,
+            iconName: "magnifyingglass",
+            command: ["npx", "-y", "@brave/brave-search-mcp-server", "--transport", "stdio"],
+            environmentKeys: ["BRAVE_API_KEY"],
+            url: nil,
+            documentationURL: "https://github.com/brave/brave-search-mcp-server"
+        ),
+        MCPMarketplaceEntry(
+            id: "playwright",
+            name: "playwright",
+            displayName: "Playwright Browser MCP",
+            summary: "Drives a real browser: navigation, form filling, screenshots and assertions.",
+            publisher: "Microsoft",
+            category: .webSearch,
+            iconName: "globe",
+            command: ["npx", "-y", "@playwright/mcp"],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://github.com/microsoft/playwright-mcp"
+        ),
+        MCPMarketplaceEntry(
+            id: "memory",
+            name: "memory",
+            displayName: "Memory Graph MCP",
+            summary: "Knowledge-graph memory that retains context across conversations.",
             publisher: "ModelContextProtocol",
             category: .productivity,
-            iconName: "doc.text.fill",
-            command: ["npx", "-y", "@modelcontextprotocol/server-gdrive"],
-            environmentKeys: ["GDRIVE_CREDENTIALS_PATH"],
-            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive"
+            iconName: "brain.head.profile",
+            command: ["npx", "-y", "@modelcontextprotocol/server-memory"],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/memory"
+        ),
+        MCPMarketplaceEntry(
+            id: "sequential-thinking",
+            name: "sequential-thinking",
+            displayName: "Sequential Thinking MCP",
+            summary: "A structured scratchpad for breaking a hard problem into revisable steps.",
+            publisher: "ModelContextProtocol",
+            category: .productivity,
+            iconName: "list.number",
+            command: ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking"
+        ),
+        MCPMarketplaceEntry(
+            id: "time",
+            name: "time",
+            displayName: "Time & Timezone MCP",
+            summary: "Current time and timezone conversion, so the agent never guesses a date.",
+            publisher: "ModelContextProtocol",
+            category: .system,
+            iconName: "clock.fill",
+            command: ["uvx", "mcp-server-time"],
+            environmentKeys: [],
+            url: nil,
+            documentationURL: "https://pypi.org/project/mcp-server-time/"
         )
     ]
 }

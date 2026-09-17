@@ -346,7 +346,7 @@ struct SettingsMCPServersView: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 8) {
-                    Text(entry.command.joined(separator: " "))
+                    Text(entry.installSummary)
                         .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)

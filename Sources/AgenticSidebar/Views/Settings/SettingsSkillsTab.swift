@@ -403,8 +403,9 @@ struct SettingsSkillsView: View {
 
     private func installCuratedSkill(_ skill: CuratedSkillEntry) {
         Task {
-            // Curated skills are typically available in public repos or skills.sh
-            await extensionStore.installSkill(named: skill.name, from: "anthropics/skills")
+            // The entry's own repository, not a guess: every card names the
+            // `owner/repo/path` its files actually live at.
+            await extensionStore.installSkill(named: skill.name, from: skill.repository)
         }
     }
 

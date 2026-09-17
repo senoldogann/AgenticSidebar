@@ -105,7 +105,21 @@ struct OpenCodeStreamNormalizer: Sendable {
             {
                 return []
             }
-            throw Self.error(fromSessionError: properties)
+            let failure = Self.error(fromSessionError: properties)
+            if failure == .unexpectedResponse {
+                // Without this the turn ended on "The provider returned a response
+                // this app could not interpret." and nothing else — the same
+                // sentence for a rejected model, an unsupported attachment and a
+                // backend bug. The backend's own words are the only thing that
+                // tells them apart, so they travel the same bounded, truncated
+                // channel an unreadable HTTP body already uses.
+                ProviderResponseDiagnostics.shared.record(
+                    provider: "OpenCode",
+                    statusCode: nil,
+                    body: Self.summary(ofSessionError: properties)
+                )
+            }
+            throw failure
         case "permission.asked":
             if let request = OpenCodePermissionRequest.make(from: properties) {
                 if request.remoteSessionID == sessionID
@@ -126,8 +140,10 @@ struct OpenCodeStreamNormalizer: Sendable {
 
     /// OpenCode reports backend failures through `session.error`. A context
     /// overflow is worth telling apart from a generic failure: the fix is a
-    /// shorter conversation, not a retry. Only the error envelope is inspected,
-    /// and its text is never surfaced to the user.
+    /// shorter conversation, not a retry. Only the error envelope is inspected.
+    ///
+    /// Pure on purpose: the caller decides what to do with the answer, including
+    /// whether to record the backend's wording for the error banner.
     static func error(fromSessionError properties: [String: Any]) -> ProviderRuntimeError {
         guard
             let data = try? JSONSerialization.data(withJSONObject: properties),
@@ -147,6 +163,26 @@ struct OpenCodeStreamNormalizer: Sendable {
         return markers.contains { serialized.contains($0) }
             ? .contextLimitExceeded
             : .unexpectedResponse
+    }
+
+    /// What the backend said went wrong, as one line.
+    ///
+    /// `session.error` carries `{name, data: {message}}`; both are kept because
+    /// the name alone ("UnknownError") explains nothing and the message alone can
+    /// be missing. An envelope with neither yields an empty string, which
+    /// ``ProviderResponseDiagnostics`` drops rather than showing.
+    static func summary(ofSessionError properties: [String: Any]) -> String {
+        guard let error = properties["error"] as? [String: Any] else {
+            return ""
+        }
+
+        let name = error["name"] as? String
+        let message = (error["data"] as? [String: Any])?["message"] as? String
+
+        return [name, message]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: ": ")
     }
 
     private mutating func consumePartDelta(

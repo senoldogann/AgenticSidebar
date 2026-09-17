@@ -146,11 +146,74 @@ final class OpenCodePromptPartTests: XCTestCase {
 
     func testMimeTypeOnlyInlinesMediaTheBackendCanForward() {
         XCTAssertEqual(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.png"), "image/png")
-        XCTAssertEqual(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.txt"), "text/plain")
         XCTAssertEqual(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.pdf"), "application/pdf")
+        XCTAssertNil(
+            OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.txt"),
+            "A text file part is rejected by the model layer; text is quoted into the prompt instead"
+        )
+        XCTAssertNil(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.md"))
         XCTAssertNil(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.zip"))
         XCTAssertNil(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/a.unknownextension"))
         XCTAssertNil(OpenCodePromptBuilder.inlineMIMEType(forPath: "/tmp/noextension"))
+    }
+
+    /// The regression this guards: a pasted document was attached as
+    /// `{"type":"file","mime":"text/markdown"}`, the provider refused the turn with
+    /// `'media type: text/markdown' functionality not supported.`, and because the
+    /// rejected part stayed in the backend session every later turn of that
+    /// conversation failed too — including ones with no attachment.
+    func testTextAttachmentsAreQuotedIntoThePromptRatherThanSentAsFileParts() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let documentURL = directory.appendingPathComponent("readme.md")
+        try Data("# Plan\n\nStep one.".utf8).write(to: documentURL)
+
+        let parts = OpenCodePromptBuilder.parts(
+            for: ChatMessage(
+                role: .user,
+                text: "Summarise this",
+                attachmentPaths: [documentURL.path]
+            ),
+            speedMode: .normal
+        )
+
+        XCTAssertEqual(parts.count, 1, "A text attachment adds no file part")
+        guard case let .text(text) = try XCTUnwrap(parts.first) else {
+            return XCTFail("Expected a text part")
+        }
+
+        XCTAssertTrue(text.contains("Summarise this"))
+        XCTAssertTrue(text.contains("readme.md"))
+        XCTAssertTrue(text.contains("Step one."), "The document travels as prompt text")
+        XCTAssertFalse(
+            parts.contains { part in
+                if case .file = part { return true }
+                return false
+            }
+        )
+    }
+
+    func testTextTooLongToQuoteIsReferencedByPathInstead() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let documentURL = directory.appendingPathComponent("huge.txt")
+        try Data(String(repeating: "a", count: 64).utf8).write(to: documentURL)
+
+        XCTAssertNil(
+            OpenCodePromptBuilder.quotedDocument(
+                forPath: documentURL.path,
+                maximumCharacters: 8
+            )
+        )
+
+        XCTAssertNotNil(
+            OpenCodePromptBuilder.quotedDocument(
+                forPath: documentURL.path,
+                maximumCharacters: 128
+            )
+        )
     }
 
     private func makeTemporaryDirectory() throws -> URL {

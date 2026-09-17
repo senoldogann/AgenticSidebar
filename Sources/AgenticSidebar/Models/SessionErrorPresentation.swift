@@ -32,9 +32,9 @@ extension AgentSessionError {
             // gives the user nothing to act on; the status and the body are
             // usually enough to tell a stale session from a rejected model.
             if let detail = ProviderResponseDiagnostics.shared.detail() {
-                "The provider returned a response this app could not interpret: \(detail)"
+                "Provider error: \(detail)"
             } else {
-                "The provider returned a response this app could not interpret."
+                "The provider returned an unreadable response. Check your provider settings or server logs."
             }
         }
     }

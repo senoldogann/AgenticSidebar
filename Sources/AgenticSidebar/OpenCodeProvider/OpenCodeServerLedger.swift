@@ -13,6 +13,10 @@ struct OpenCodeProcessFacts: Equatable, Sendable {
     /// `nil` when nothing is running under this pid any more.
     var parent: Int32?
     var arguments: [String]?
+    /// The launch environment, which carries the `OPENCODE_CONFIG` that proves
+    /// the process is one of ours. `nil` is unreadable, and unreadable is a
+    /// reason to leave a process alone.
+    var environment: [String: String]?
 
     /// A process the kernel has re-parented to `launchd` belongs to no running
     /// app, which is what makes it a leftover rather than somebody's server.
@@ -141,7 +145,14 @@ enum OpenCodeServerLedger {
                 release(pid: lease.pid, in: workingDirectoryURL, fileManager: fileManager)
             }
 
-            guard shouldReap(lease, facts: facts[lease.pid]) else {
+            guard
+                shouldReap(
+                    lease,
+                    facts: facts[lease.pid],
+                    configurationPath: ManagedOpenCodeConfiguration
+                        .fileURL(in: workingDirectoryURL).path
+                )
+            else {
                 continue
             }
 
@@ -157,7 +168,11 @@ enum OpenCodeServerLedger {
         }
 
         if includeUnownedScan {
-            killed += reapUnownedServers(excluding: [])
+            killed += reapUnownedServers(
+                excluding: [],
+                configurationPath: ManagedOpenCodeConfiguration
+                    .fileURL(in: workingDirectoryURL).path
+            )
         }
 
         return killed
@@ -168,9 +183,12 @@ enum OpenCodeServerLedger {
     /// A process whose parent is `launchd` has been orphaned: it cannot belong to
     /// a running app, because a running app is its parent. That is the whole
     /// reason this is safe to do at launch, and why the fingerprint requires the
-    /// app's own `--pure` flag — a server the user started in a terminal is not
-    /// ours to kill.
-    static func reapUnownedServers(excluding pids: Set<Int32>) -> Int {
+    /// app's own `OPENCODE_CONFIG` — a server the user started in a terminal is
+    /// not ours to kill.
+    static func reapUnownedServers(
+        excluding pids: Set<Int32>,
+        configurationPath: String
+    ) -> Int {
         let ownPid = getpid()
         var killed = 0
 
@@ -179,8 +197,12 @@ enum OpenCodeServerLedger {
                 process.parent == 1,
                 process.pid != ownPid,
                 !pids.contains(process.pid),
-                let arguments = OpenCodeProcessTree.arguments(of: process.pid),
-                OpenCodeProcessTree.isManagedServerCommand(arguments)
+                let invocation = OpenCodeProcessTree.invocation(of: process.pid),
+                OpenCodeProcessTree.isManagedServer(
+                    arguments: invocation.arguments,
+                    environment: invocation.environment,
+                    configurationPath: configurationPath
+                )
             else {
                 continue
             }
@@ -205,21 +227,26 @@ enum OpenCodeServerLedger {
     /// rests on, and it is checkable without a process table.
     static func shouldReap(
         _ lease: OpenCodeServerLease,
-        facts: OpenCodeProcessFacts?
+        facts: OpenCodeProcessFacts?,
+        configurationPath: String
     ) -> Bool {
         // A pid is reused. "The pid in the file is alive" is not evidence that
-        // the process is our server, and not even the lease is: the command line
-        // and the parent are what answer.
+        // the process is our server, and not even the lease is: the command line,
+        // the launch environment and the parent are what answer.
         guard
             let facts,
             facts.isOrphaned,
-            let arguments = facts.arguments
+            let arguments = facts.arguments,
+            let environment = facts.environment
         else {
             return false
         }
 
-        return OpenCodeProcessTree.isManagedServerCommand(arguments)
-            && arguments.contains(String(lease.port))
+        return OpenCodeProcessTree.isManagedServer(
+            arguments: arguments,
+            environment: environment,
+            configurationPath: configurationPath
+        ) && arguments.contains(String(lease.port))
     }
 
     /// The process facts the app uses, read in one pass over the process table.
@@ -237,12 +264,19 @@ enum OpenCodeServerLedger {
         var facts: [Int32: OpenCodeProcessFacts] = [:]
         for pid in pids {
             guard let parent = parentByPid[pid] else {
-                facts[pid] = OpenCodeProcessFacts(parent: nil, arguments: nil)
+                facts[pid] = OpenCodeProcessFacts(
+                    parent: nil,
+                    arguments: nil,
+                    environment: nil
+                )
                 continue
             }
+
+            let invocation = OpenCodeProcessTree.invocation(of: pid)
             facts[pid] = OpenCodeProcessFacts(
                 parent: parent,
-                arguments: OpenCodeProcessTree.arguments(of: pid)
+                arguments: invocation?.arguments,
+                environment: invocation?.environment
             )
         }
 

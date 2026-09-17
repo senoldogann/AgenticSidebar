@@ -6,8 +6,12 @@ import Foundation
 /// turn; Codex and ChatGPT attach it as a file (`readme.md`-style) so the chat
 /// stays fluid and the agent reads a file. Pasted text over
 /// ``thresholdCharacters`` is written as markdown under Application Support and
-/// attached like any dropped file — the prompt builder already inlines text
-/// files, so no provider change is needed.
+/// attached like any dropped file.
+///
+/// What reaches the provider is the document *quoted into the prompt*, not a
+/// `file` part — see ``OpenCodePromptBuilder``. Sending it as a file part is what
+/// made the provider reject the whole turn with
+/// `'media type: text/markdown' functionality not supported.`
 enum PastedTextAttachment {
     /// Pastes up to this length stay inline; longer ones spill to a file.
     static let thresholdCharacters = 1_000

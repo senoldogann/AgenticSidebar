@@ -197,24 +197,54 @@ final class ExtensionStore {
             )
         )
         persist()
-        status = .info("“\(trimmed)” added. Restart the agent to load it.")
+        Task {
+            await applyToAgent()
+            if let client = await currentClient() {
+                do {
+                    _ = try await client.addMCPServer(name: trimmed, config: definition.openCodePayload)
+                    status = .info("“\(trimmed)” added and loaded into agent.")
+                } catch {
+                    status = .info("“\(trimmed)” added. Restart the agent if needed to connect.")
+                }
+            } else {
+                status = .info("“\(trimmed)” added. Will load when agent starts.")
+            }
+        }
         return true
     }
 
     func setMCPEnabled(_ name: String, _ isEnabled: Bool) {
         registry.setMCPEnabled(name, isEnabled)
         persist()
-        status = .info(
-            isEnabled
-                ? "“\(name)” will be registered on the next agent start."
-                : "“\(name)” will be silenced on the next agent start."
-        )
+        Task {
+            await applyToAgent()
+            if let client = await currentClient() {
+                if isEnabled {
+                    if let record = registry.mcpServers.first(where: { $0.name == name }) {
+                        _ = try? await client.addMCPServer(name: name, config: record.definition.openCodePayload)
+                    }
+                } else {
+                    try? await client.disconnectMCPServer(name: name)
+                }
+            }
+            status = .info(
+                isEnabled
+                    ? "“\(name)” enabled."
+                    : "“\(name)” silenced."
+            )
+        }
     }
 
     func removeMCPServer(named name: String) {
         registry.removeMCP(named: name)
         persist()
-        status = .info("“\(name)” removed.")
+        Task {
+            await applyToAgent()
+            if let client = await currentClient() {
+                try? await client.disconnectMCPServer(name: name)
+            }
+            status = .info("“\(name)” removed.")
+        }
     }
 
     /// What OpenCode says about each server it knows: connected, failed, or
@@ -289,6 +319,9 @@ final class ExtensionStore {
             )
         )
         persist()
+        Task {
+            await applyToAgent()
+        }
         status = .info("“\(trimmed)” added. Restart the agent to load it.")
         return true
     }
@@ -316,6 +349,9 @@ final class ExtensionStore {
     func setPluginEnabled(_ module: String, _ isEnabled: Bool) {
         registry.setPluginEnabled(module, isEnabled)
         persist()
+        Task {
+            await applyToAgent()
+        }
         status = .info(
             isEnabled
                 ? "“\(module)” will run on the next agent start."
@@ -326,6 +362,9 @@ final class ExtensionStore {
     func removePlugin(module: String) {
         registry.removePlugin(module: module)
         persist()
+        Task {
+            await applyToAgent()
+        }
         status = .info("“\(module)” removed.")
     }
 
@@ -366,6 +405,7 @@ final class ExtensionStore {
             from: reference,
             source: source
         )
+        await applyToAgent()
         status = record.map { .info("“\($0.name)” installed.") }
     }
 
@@ -398,12 +438,16 @@ final class ExtensionStore {
             from: reference,
             source: .skillsSh(source: entry.source, skillID: entry.skillID)
         )
+        await applyToAgent()
         status = record.map { .info("“\($0.name)” installed from skills.sh.") }
     }
 
     func setSkillEnabled(_ name: String, _ isEnabled: Bool) {
         registry.setSkillEnabled(name, isEnabled)
         persist()
+        Task {
+            await applyToAgent()
+        }
         status = .info(
             isEnabled
                 ? "The agent will see “\(name)” again."
@@ -438,6 +482,7 @@ final class ExtensionStore {
         registry.removeSkill(named: name)
         persist()
         await discover()
+        await applyToAgent()
         status = .info("“\(name)” deleted.")
     }
 

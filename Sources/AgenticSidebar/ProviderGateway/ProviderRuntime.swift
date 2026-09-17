@@ -41,6 +41,8 @@ enum ProviderEvent: Equatable, Sendable {
         output: String? = nil,
         diff: String? = nil
     )
+    /// One backend request can contain several ordered questions.
+    case questionAsked(OpenCodeQuestionRequest)
     case waiting
     case completed
 }
@@ -82,17 +84,36 @@ struct ProviderStream: Sendable {
     /// Tüketici akışın sınırlı olduğunu varsayar, sınır değerini değil.
     let events: AsyncThrowingStream<ProviderEvent, Error>
     private let cancellation: @Sendable () async -> Void
+    private let questionReply: @Sendable (String, [[String]]) async throws -> Void
+    private let questionRejection: @Sendable (String) async throws -> Void
 
     init(
         events: AsyncThrowingStream<ProviderEvent, Error>,
-        cancellation: @escaping @Sendable () async -> Void = {}
+        cancellation: @escaping @Sendable () async -> Void = {},
+        questionReply: @escaping @Sendable (String, [[String]]) async throws -> Void = { _, _ in
+            throw ProviderRuntimeError.unavailable
+        },
+        questionRejection: @escaping @Sendable (String) async throws -> Void = { _ in
+            throw ProviderRuntimeError.unavailable
+        }
     ) {
         self.events = events
         self.cancellation = cancellation
+        self.questionReply = questionReply
+        self.questionRejection = questionRejection
     }
 
     func cancel() async {
         await cancellation()
+    }
+
+    /// A question is an in-turn tool response, not a new user prompt.
+    func replyQuestion(requestID: String, answers: [[String]]) async throws {
+        try await questionReply(requestID, answers)
+    }
+
+    func rejectQuestion(requestID: String) async throws {
+        try await questionRejection(requestID)
     }
 }
 

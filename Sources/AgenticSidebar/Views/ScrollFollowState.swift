@@ -87,16 +87,32 @@ final class ScrollFollowState {
             isUserPosition = true
         }
 
+        // If the entire content fits within the viewport, the user cannot be scrolled away from bottom.
+        if snapshot.contentHeight <= snapshot.containerHeight + 10 {
+            isUserPosition = false
+            if awayFromBottom {
+                awayFromBottom = false
+                pendingAwayFromBottom = false
+            }
+            return
+        }
+
+        let isAtBottom = snapshot.distanceFromBottom <= Self.bottomThreshold
+
+        if isAtBottom {
+            isUserPosition = false
+            if awayFromBottom {
+                awayFromBottom = false
+                pendingAwayFromBottom = false
+            }
+            return
+        }
+
         guard isUserPosition || isUserScrolling else {
             return
         }
 
-        let away = snapshot.distanceFromBottom > Self.bottomThreshold
-
-        if !away {
-            // Kullanıcı dibe döndü: takip modu devam edebilir.
-            isUserPosition = false
-        }
+        let away = !isAtBottom
 
         guard away != awayFromBottom else {
             return

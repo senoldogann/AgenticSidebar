@@ -9,33 +9,103 @@ import XCTest
 /// the whole tree rather than just the process it launched.
 final class OpenCodeProcessTreeTests: XCTestCase {
     func testOnlyThisAppsLaunchShapeCountsAsAManagedServer() {
+        let serverArguments = ["serve", "--hostname", "127.0.0.1", "--port", "59021"]
+        let ours = ["OPENCODE_CONFIG": Self.configurationPath]
+
         XCTAssertTrue(
-            OpenCodeProcessTree.isManagedServerCommand([
-                "serve", "--hostname", "127.0.0.1", "--port", "59021", "--pure"
-            ])
+            OpenCodeProcessTree.isManagedServer(
+                arguments: serverArguments,
+                environment: ours,
+                configurationPath: Self.configurationPath
+            )
         )
 
         XCTAssertFalse(
-            OpenCodeProcessTree.isManagedServerCommand(["serve", "--port", "41231"]),
-            "A server started by hand in a terminal is not the app's to kill"
+            OpenCodeProcessTree.isManagedServer(
+                arguments: serverArguments,
+                environment: [:],
+                configurationPath: Self.configurationPath
+            ),
+            "A server started by hand in a terminal carries no managed configuration"
         )
 
         XCTAssertFalse(
-            OpenCodeProcessTree.isManagedServerCommand([
-                "serve", "--hostname=127.0.0.1", "--port=60848"
-            ]),
-            "The flag order and syntax the app writes are part of the fingerprint"
+            OpenCodeProcessTree.isManagedServer(
+                arguments: serverArguments,
+                environment: ["OPENCODE_CONFIG": "/Users/someone/.config/opencode/opencode.json"],
+                configurationPath: Self.configurationPath
+            ),
+            "Another configuration is another owner"
         )
 
-        XCTAssertFalse(OpenCodeProcessTree.isManagedServerCommand(["serve"]))
-        XCTAssertFalse(OpenCodeProcessTree.isManagedServerCommand([]))
         XCTAssertFalse(
-            OpenCodeProcessTree.isManagedServerCommand([
-                "auth", "login", "--hostname", "127.0.0.1", "--port", "1", "--pure"
-            ]),
+            OpenCodeProcessTree.isManagedServer(
+                arguments: ["serve", "--hostname=127.0.0.1", "--port=60848"],
+                environment: ours,
+                configurationPath: Self.configurationPath
+            ),
+            "The flag syntax the app writes is part of the fingerprint"
+        )
+
+        XCTAssertFalse(
+            OpenCodeProcessTree.isManagedServer(
+                arguments: ["serve"],
+                environment: ours,
+                configurationPath: Self.configurationPath
+            )
+        )
+        XCTAssertFalse(
+            OpenCodeProcessTree.isManagedServer(
+                arguments: [],
+                environment: ours,
+                configurationPath: Self.configurationPath
+            )
+        )
+        XCTAssertFalse(
+            OpenCodeProcessTree.isManagedServer(
+                arguments: ["auth", "login", "--hostname", "127.0.0.1", "--port", "1"],
+                environment: ours,
+                configurationPath: Self.configurationPath
+            ),
             "Only a server is ever signalled"
         )
     }
+
+    /// `--pure` is what used to mark a server as ours. It also told OpenCode to
+    /// load no external plugins, which disabled the app's plugin feature outright,
+    /// so it is gone from the launch line — and a leftover that still carries it
+    /// (started by a build from before the change) is still recognisably ours.
+    func testTheFingerprintNoLongerDependsOnThePureFlag() {
+        for arguments in [
+            ["serve", "--hostname", "127.0.0.1", "--port", "59021"],
+            ["serve", "--hostname", "127.0.0.1", "--port", "59021", "--pure"]
+        ] {
+            XCTAssertTrue(
+                OpenCodeProcessTree.isManagedServer(
+                    arguments: arguments,
+                    environment: ["OPENCODE_CONFIG": Self.configurationPath],
+                    configurationPath: Self.configurationPath
+                ),
+                "\(arguments) is one of this app's servers"
+            )
+        }
+    }
+
+    func testItReadsTheEnvironmentOfARunningProcess() throws {
+        let environment = try XCTUnwrap(
+            OpenCodeProcessTree.environment(of: getpid()),
+            "A process must be able to inspect itself"
+        )
+
+        XCTAssertEqual(
+            environment["PATH"],
+            ProcessInfo.processInfo.environment["PATH"],
+            "The environment read from the kernel is the one the process holds"
+        )
+    }
+
+    static let configurationPath =
+        "/Users/someone/Library/Application Support/AgenticSidebar/OpenCode/managed-config.json"
 
     func testItReadsTheArgumentsOfARunningProcess() throws {
         let arguments = try XCTUnwrap(
@@ -146,12 +216,19 @@ final class OpenCodeServerLedgerTests: XCTestCase {
             executablePath: "/opt/homebrew/bin/opencode",
             startedAt: Date()
         )
-        let serverArguments = ["serve", "--hostname", "127.0.0.1", "--port", "59021", "--pure"]
+        let serverArguments = ["serve", "--hostname", "127.0.0.1", "--port", "59021"]
+        let configurationPath = OpenCodeProcessTreeTests.configurationPath
+        let ours = ["OPENCODE_CONFIG": configurationPath]
 
         XCTAssertTrue(
             OpenCodeServerLedger.shouldReap(
                 lease,
-                facts: OpenCodeProcessFacts(parent: 1, arguments: serverArguments)
+                facts: OpenCodeProcessFacts(
+                    parent: 1,
+                    arguments: serverArguments,
+                    environment: ours
+                ),
+                configurationPath: configurationPath
             ),
             "An orphaned server this app started is exactly a leftover"
         )
@@ -159,7 +236,12 @@ final class OpenCodeServerLedgerTests: XCTestCase {
         XCTAssertFalse(
             OpenCodeServerLedger.shouldReap(
                 lease,
-                facts: OpenCodeProcessFacts(parent: 4242, arguments: serverArguments)
+                facts: OpenCodeProcessFacts(
+                    parent: 4242,
+                    arguments: serverArguments,
+                    environment: ours
+                ),
+                configurationPath: configurationPath
             ),
             "A server a running app still owns must survive a launch's leftover sweep"
         )
@@ -169,8 +251,10 @@ final class OpenCodeServerLedgerTests: XCTestCase {
                 lease,
                 facts: OpenCodeProcessFacts(
                     parent: 1,
-                    arguments: ["serve", "--hostname", "127.0.0.1", "--port", "59022", "--pure"]
-                )
+                    arguments: ["serve", "--hostname", "127.0.0.1", "--port", "59022"],
+                    environment: ours
+                ),
+                configurationPath: configurationPath
             ),
             "A different port is a different server"
         )
@@ -178,7 +262,12 @@ final class OpenCodeServerLedgerTests: XCTestCase {
         XCTAssertFalse(
             OpenCodeServerLedger.shouldReap(
                 lease,
-                facts: OpenCodeProcessFacts(parent: 1, arguments: ["serve", "--port", "59021"])
+                facts: OpenCodeProcessFacts(
+                    parent: 1,
+                    arguments: ["serve", "--port", "59021"],
+                    environment: ours
+                ),
+                configurationPath: configurationPath
             ),
             "A server the user started by hand is not the app's to kill"
         )
@@ -186,13 +275,35 @@ final class OpenCodeServerLedgerTests: XCTestCase {
         XCTAssertFalse(
             OpenCodeServerLedger.shouldReap(
                 lease,
-                facts: OpenCodeProcessFacts(parent: 1, arguments: nil)
+                facts: OpenCodeProcessFacts(
+                    parent: 1,
+                    arguments: serverArguments,
+                    environment: [:]
+                ),
+                configurationPath: configurationPath
+            ),
+            "A server carrying no managed configuration belongs to somebody else"
+        )
+
+        XCTAssertFalse(
+            OpenCodeServerLedger.shouldReap(
+                lease,
+                facts: OpenCodeProcessFacts(
+                    parent: 1,
+                    arguments: nil,
+                    environment: ours
+                ),
+                configurationPath: configurationPath
             ),
             "An unreadable command line is a reason to leave the process alone"
         )
 
         XCTAssertFalse(
-            OpenCodeServerLedger.shouldReap(lease, facts: nil),
+            OpenCodeServerLedger.shouldReap(
+                lease,
+                facts: nil,
+                configurationPath: configurationPath
+            ),
             "A pid that is gone is not a server"
         )
     }
@@ -227,7 +338,17 @@ final class OpenCodeServerLedgerTests: XCTestCase {
             // ran it would clean up the machine it is running on.
             includeUnownedScan: false,
             factsProvider: { _ in
-                [pid: OpenCodeProcessFacts(parent: 1, arguments: OpenCodeProcessTree.arguments(of: pid))]
+                let invocation = OpenCodeProcessTree.invocation(of: pid)
+                let environment = (invocation?.environment.isEmpty ?? true)
+                    ? ["OPENCODE_CONFIG": ManagedOpenCodeConfiguration.fileURL(in: directory).path]
+                    : invocation?.environment
+                return [
+                    pid: OpenCodeProcessFacts(
+                        parent: 1,
+                        arguments: invocation?.arguments,
+                        environment: environment
+                    )
+                ]
             }
         )
 
@@ -295,10 +416,16 @@ final class OpenCodeServerLedgerTests: XCTestCase {
         return condition()
     }
 
+    /// A real process with the app's launch fingerprint: the command shape *and*
+    /// the `OPENCODE_CONFIG` of the directory this test sweeps. `yes` simply stays
+    /// alive and ignores everything it is given.
     private func launchManagedLookingProcess() throws -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/yes")
-        process.arguments = ["serve", "--hostname", "127.0.0.1", "--port", "59021", "--pure"]
+        process.arguments = ["serve", "--hostname", "127.0.0.1", "--port", "59021"]
+        process.environment = [
+            "OPENCODE_CONFIG": ManagedOpenCodeConfiguration.fileURL(in: directory).path
+        ]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()

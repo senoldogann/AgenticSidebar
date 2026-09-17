@@ -317,6 +317,49 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         XCTAssertEqual(cancellationCount, 1)
     }
 
+    func testQuestionEventsKeepRequestIDsAndReplyOrRejectOnTheActiveStream() async throws {
+        let linePair = AsyncThrowingStream<String, Error>.makeStream()
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            OpenCodeLineStream(statusCode: 200, lines: linePair.stream)
+        ])
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let stream = try await runtime.startStream(
+            for: makeRequest(sessionID: UUID(), text: "Ask me two questions")
+        )
+        var events = stream.events.makeAsyncIterator()
+
+        linePair.continuation.yield(
+            #"data: {"type":"question.asked","properties":{"id":"que_answer","sessionID":"ses_remote","questions":[{"question":"Which database?","header":"Database","options":[{"label":"SQLite","description":"Local"}],"multiple":false,"custom":true}]}}"#
+        )
+        let first = try await events.next()
+        guard case let .questionAsked(firstQuestion) = first else {
+            XCTFail("The original backend request must reach the UI, not a synthetic tool title")
+            await stream.cancel()
+            return
+        }
+        XCTAssertEqual(firstQuestion.requestID, "que_answer")
+        XCTAssertEqual(firstQuestion.questions.first?.options.first?.label, "SQLite")
+        try await stream.replyQuestion(requestID: firstQuestion.requestID, answers: [["SQLite"]])
+
+        linePair.continuation.yield(
+            #"data: {"type":"question.asked","properties":{"id":"que_reject","sessionID":"ses_remote","questions":[{"question":"Proceed?","header":"Confirm","options":[],"custom":true}]}}"#
+        )
+        let second = try await events.next()
+        guard case let .questionAsked(secondQuestion) = second else {
+            XCTFail("The second question must reach the same active turn")
+            await stream.cancel()
+            return
+        }
+        try await stream.rejectQuestion(requestID: secondQuestion.requestID)
+        let calls = await client.calls()
+        XCTAssertTrue(calls.contains(.replyQuestion(requestID: "que_answer", answers: [["SQLite"]])))
+        XCTAssertTrue(calls.contains(.rejectQuestion(requestID: "que_reject")))
+
+        linePair.continuation.yield(#"data: {"type":"session.idle","properties":{"sessionID":"ses_remote"}}"#)
+        linePair.continuation.finish()
+        while try await events.next() != nil {}
+    }
+
     func testPermissionRequestWaitsForTheInjectedHandler() async throws {
         let linePair = AsyncThrowingStream<String, Error>.makeStream()
         linePair.continuation.yield(
@@ -666,6 +709,8 @@ private enum RuntimeOpenCodeCall: Equatable, Sendable {
     )
     case abort(sessionID: String)
     case replyPermission(requestID: String, reply: String)
+    case replyQuestion(requestID: String, answers: [[String]])
+    case rejectQuestion(requestID: String)
     case deleteSession(sessionID: String)
 }
 
@@ -756,6 +801,14 @@ private actor RuntimeMockOpenCodeClient: OpenCodeClientProtocol {
 
     func replyPermission(requestID: String, reply: String) async throws {
         recordedCalls.append(.replyPermission(requestID: requestID, reply: reply))
+    }
+
+    func replyQuestion(requestID: String, answers: [[String]]) async throws {
+        recordedCalls.append(.replyQuestion(requestID: requestID, answers: answers))
+    }
+
+    func rejectQuestion(requestID: String) async throws {
+        recordedCalls.append(.rejectQuestion(requestID: requestID))
     }
 
     func sessionTodos(sessionID: String) async throws -> [AgentTodo] {

@@ -287,6 +287,29 @@ struct FoundationOpenCodeProcessLauncher: OpenCodeProcessLaunching {
             environment[key] = parent[key]
         }
 
+        let home = parent["HOME"] ?? ("~" as NSString).expandingTildeInPath
+        var paths = (environment["PATH"] ?? "").split(separator: ":").map(String.init)
+        let candidateDirectories = [
+            home + "/.volta/bin",
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            home + "/.bun/bin",
+            home + "/.cargo/bin",
+            home + "/.local/bin",
+            home + "/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+        for dir in candidateDirectories {
+            if FileManager.default.fileExists(atPath: dir) && !paths.contains(dir) {
+                paths.append(dir)
+            }
+        }
+        environment["PATH"] = paths.joined(separator: ":")
+
         environment.merge(overrides, uniquingKeysWith: { _, new in new })
         return environment
     }

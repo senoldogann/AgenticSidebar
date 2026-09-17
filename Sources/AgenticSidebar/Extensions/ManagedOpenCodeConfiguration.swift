@@ -72,6 +72,15 @@ enum ManagedOpenCodeConfiguration {
     static let schemaURL = "https://opencode.ai/config.json"
     static let planAgentName = "agenticsidebar-readonly"
 
+    /// Where the configuration lives for a given managed directory.
+    ///
+    /// This path is also the app's launch fingerprint: it is handed to every
+    /// server the app starts as `OPENCODE_CONFIG`, and that is how a leftover of
+    /// ours is told apart from a server the user started themselves.
+    static func fileURL(in directoryURL: URL) -> URL {
+        directoryURL.appendingPathComponent(fileName)
+    }
+
     /// Builds the configuration OpenCode reads, with empty sections left out.
     ///
     /// No approval level is a parameter here. The permission rules are the same
@@ -209,7 +218,7 @@ enum ManagedOpenCodeConfiguration {
         permissionRules: [JSONValue.Member],
         extensions: ExtensionRuntimeSnapshot
     ) throws -> URL {
-        let fileURL = directoryURL.appendingPathComponent(fileName)
+        let fileURL = fileURL(in: directoryURL)
         let contents = rendered(
             instructionPaths: instructionPaths,
             permissionRules: permissionRules,

@@ -54,7 +54,7 @@ struct TranscriptBudget: Equatable, Sendable {
 
         // Start the window on a user turn when possible: an assistant reply with
         // no question in front of it reads like a stray assertion to the model.
-        if kept.count > 1, kept.first?.role == .assistant {
+        while kept.count > 1, kept.first?.role == .assistant {
             kept.removeFirst()
         }
 

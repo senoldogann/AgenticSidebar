@@ -129,6 +129,42 @@ struct AgentTurnActivityGroup: Identifiable, Equatable, Codable, Sendable {
     let id: UUID
     let anchorMessageID: UUID
     var activities: [AgentActivity]
+    var turnID: UUID?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case anchorMessageID
+        case activities
+        case turnID
+    }
+
+    init(
+        id: UUID,
+        anchorMessageID: UUID,
+        activities: [AgentActivity],
+        turnID: UUID? = nil
+    ) {
+        self.id = id
+        self.anchorMessageID = anchorMessageID
+        self.activities = activities
+        self.turnID = turnID
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        anchorMessageID = try container.decode(UUID.self, forKey: .anchorMessageID)
+        activities = try container.decode([AgentActivity].self, forKey: .activities)
+        turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(anchorMessageID, forKey: .anchorMessageID)
+        try container.encode(activities, forKey: .activities)
+        try container.encodeIfPresent(turnID, forKey: .turnID)
+    }
 }
 
 extension AgentTurnActivityGroup {
@@ -188,7 +224,8 @@ extension Array where Element == AgentTurnActivityGroup {
                 AgentTurnActivityGroup(
                     id: group.id,
                     anchorMessageID: group.anchorMessageID,
-                    activities: storedActivities
+                    activities: storedActivities,
+                    turnID: group.turnID
                 )
             )
         }

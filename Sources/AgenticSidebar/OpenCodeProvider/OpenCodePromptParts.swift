@@ -42,10 +42,27 @@ enum OpenCodePromptPart: Encodable, Equatable, Sendable {
 /// user turn is submitted. Attachments that cannot be safely inlined stay
 /// referenced by path in the prompt text — the managed agent can read local files
 /// itself — so a single oversized or unsupported file never breaks a turn.
+///
+/// A `file` part is only ever a medium the model layer accepts as an attachment:
+/// an image or a PDF. A text document is *quoted into the prompt* instead. That
+/// distinction is not cosmetic — sending `{"type":"file","mime":"text/markdown"}`
+/// made the provider fail the turn with
+/// `'media type: text/markdown' functionality not supported.`, which reached the
+/// user as "The provider returned a response this app could not interpret."
+/// Worse, the rejected part stayed in the backend session's history, so every
+/// later turn of that conversation failed the same way — including ones with no
+/// attachment at all.
 enum OpenCodePromptBuilder {
     /// The OpenCode CLI refuses local attachments above 10 MiB; the server path
     /// has the same practical limit, so larger files are referenced instead.
     static let maximumInlineAttachmentBytes = 10 * 1024 * 1024
+
+    /// How much of a text attachment is quoted into the prompt.
+    ///
+    /// Proportional to ``OpenCodeHistoryPreamble/maximumCharacters``: an
+    /// attachment is one part of a turn, not the whole context window. A longer
+    /// document is referenced by path and the agent reads it with its own tool.
+    static let maximumInlineTextCharacters = 64_000
 
     static func parts(
         for message: ChatMessage,
@@ -56,6 +73,7 @@ enum OpenCodePromptBuilder {
         maximumInlineBytes: Int = OpenCodePromptBuilder.maximumInlineAttachmentBytes
     ) -> [OpenCodePromptPart] {
         var parts: [OpenCodePromptPart] = []
+        var quotedDocuments: [QuotedDocument] = []
         var referencedOnly: [String] = []
 
         for path in message.attachmentPaths {
@@ -65,6 +83,12 @@ enum OpenCodePromptBuilder {
                 maximumInlineBytes: maximumInlineBytes
             ) {
                 parts.append(part)
+            } else if let document = quotedDocument(
+                forPath: path,
+                fileManager: fileManager,
+                maximumCharacters: maximumInlineTextCharacters
+            ) {
+                quotedDocuments.append(document)
             } else {
                 referencedOnly.append(path)
             }
@@ -72,6 +96,7 @@ enum OpenCodePromptBuilder {
 
         let text = promptText(
             message.text,
+            quotedDocuments: quotedDocuments,
             referencedOnly: referencedOnly,
             speedMode: speedMode,
             mode: mode,
@@ -109,8 +134,10 @@ enum OpenCodePromptBuilder {
         )
     }
 
-    /// Only media types the server can forward to a model are inlined. Anything
-    /// else (archives, binaries, unknown extensions) is referenced by path so the
+    /// Only media the model layer accepts as an attachment becomes a `file` part:
+    /// images and PDFs. Text is not one of them — it is quoted into the prompt by
+    /// ``quotedDocument(forPath:fileManager:maximumCharacters:)`` — and anything
+    /// else (archives, binaries, unknown extensions) is referenced by path, so the
     /// backend never has to reject an unsupported media type.
     static func inlineMIMEType(forPath path: String) -> String? {
         let fileExtension = URL(fileURLWithPath: path).pathExtension
@@ -122,40 +149,91 @@ enum OpenCodePromptBuilder {
             return nil
         }
 
-        let isSupported = type.conforms(to: .image)
-            || type.conforms(to: .text)
-            || type.conforms(to: .pdf)
+        let isSupported = type.conforms(to: .image) || type.conforms(to: .pdf)
 
         return isSupported ? mimeType : nil
     }
 
+    /// A text attachment small enough to travel inside the prompt.
+    ///
+    /// This is the path a pasted document takes (``PastedTextAttachment`` spills
+    /// long pastes to `readme.md`): the model reads the text in the turn it was
+    /// attached to, with no tool call and no permission prompt for a file outside
+    /// the project. `nil` means "not text, unreadable, empty, or too long" — all
+    /// of which fall back to a path reference.
+    static func quotedDocument(
+        forPath path: String,
+        fileManager: FileManager = .default,
+        maximumCharacters: Int = OpenCodePromptBuilder.maximumInlineTextCharacters
+    ) -> QuotedDocument? {
+        guard
+            isTextAttachment(path: path),
+            let data = fileManager.contents(atPath: path),
+            !data.isEmpty,
+            let text = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= maximumCharacters else {
+            return nil
+        }
+
+        return QuotedDocument(
+            filename: URL(fileURLWithPath: path).lastPathComponent,
+            path: path,
+            text: trimmed
+        )
+    }
+
+    /// Whether the file at `path` is text the prompt can quote.
+    static func isTextAttachment(path: String) -> Bool {
+        let fileExtension = URL(fileURLWithPath: path).pathExtension
+        guard
+            !fileExtension.isEmpty,
+            let type = UTType(filenameExtension: fileExtension)
+        else {
+            return false
+        }
+
+        return type.conforms(to: .text) && !type.conforms(to: .pdf)
+    }
+
+    /// One text attachment as it appears inside the prompt.
+    struct QuotedDocument: Equatable, Sendable {
+        let filename: String
+        let path: String
+        let text: String
+    }
+
     private static func promptText(
         _ text: String,
+        quotedDocuments: [QuotedDocument],
         referencedOnly: [String],
         speedMode: ResponseSpeedMode,
         mode: AgentMode,
         historyPreamble: String? = nil,
         extensionTags: [ExtensionTag] = []
     ) -> String {
-        let body: String
-        if referencedOnly.isEmpty {
-            body = text
-        } else {
+        var sections: [String] = text.isEmpty ? [] : [text]
+
+        sections.append(contentsOf: quotedDocuments.map(quotedSection))
+
+        if !referencedOnly.isEmpty {
             let list = referencedOnly
                 .map { "- \($0)" }
                 .joined(separator: "\n")
 
-            let composed = """
-            \(text)
-
+            sections.append("""
             Attached files on this machine (read them directly when needed):
             \(list)
-            """
-
-            body = text.isEmpty
-                ? composed.trimmingCharacters(in: .whitespacesAndNewlines)
-                : composed
+            """)
         }
+
+        let body = sections
+            .joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
         // The backend keeps its own session, so the mode instruction has to ride
         // along with every turn that needs it — there is no system prompt slot.
@@ -166,7 +244,7 @@ enum OpenCodePromptBuilder {
             return body
         }
 
-        var sections: [String] = []
+        var composed: [String] = []
         if
             let instruction = mode.instructions(
                 speedMode: speedMode,
@@ -174,12 +252,43 @@ enum OpenCodePromptBuilder {
             ),
             !instruction.isEmpty
         {
-            sections.append(instruction)
+            composed.append(instruction)
         }
         if let historyPreamble, !historyPreamble.isEmpty {
-            sections.append(historyPreamble)
+            composed.append(historyPreamble)
         }
-        sections.append(body)
-        return sections.joined(separator: "\n\n")
+        composed.append(body)
+        return composed.joined(separator: "\n\n")
+    }
+
+    /// One quoted attachment, fenced so its own markdown cannot be read as part
+    /// of the message, and labelled with the path so the agent can still open the
+    /// file when it needs more than the quoted text.
+    private static func quotedSection(_ document: QuotedDocument) -> String {
+        let fence = self.fence(for: document.text)
+
+        return """
+        Attached file “\(document.filename)” (\(document.path)):
+
+        \(fence)
+        \(document.text)
+        \(fence)
+        """
+    }
+
+    /// A fence longer than any backtick run in the document.
+    ///
+    /// The common case for a quoted attachment is a pasted `readme.md`, which
+    /// almost always contains fenced code of its own. A fixed ```` ``` ```` would
+    /// be closed by the document's first fence and the rest of it would read as
+    /// the user's own message.
+    static func fence(for text: String) -> String {
+        let longestRun: Int = text
+            .components(separatedBy: "\n")
+            .reduce(0) { longest, line in
+                max(longest, line.prefix { $0 == "`" }.count)
+            }
+
+        return String(repeating: "`", count: max(3, longestRun + 1))
     }
 }

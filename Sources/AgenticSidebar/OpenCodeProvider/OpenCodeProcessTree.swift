@@ -115,10 +115,30 @@ enum OpenCodeProcessTree {
     }
 
     /// The arguments a process is running with.
-    ///
-    /// The kernel hands these over as one buffer: the argument count, the
-    /// executable path, then `argc` NUL-terminated arguments.
     static func arguments(of processIdentifier: Int32) -> [String]? {
+        let invocation = self.invocation(of: processIdentifier)
+        return invocation?.arguments.isEmpty == false ? invocation?.arguments : nil
+    }
+
+    /// The environment a process was launched with.
+    static func environment(of processIdentifier: Int32) -> [String: String]? {
+        invocation(of: processIdentifier)?.environment
+    }
+
+    /// How a process was started, as far as the kernel will tell us.
+    struct ProcessInvocation: Equatable, Sendable {
+        let arguments: [String]
+        let environment: [String: String]
+    }
+
+    /// Reads one process's command line and environment.
+    ///
+    /// The kernel hands both over as a single buffer: the argument count, the
+    /// executable path, padding, `argc` NUL-terminated arguments, and then the
+    /// environment as `KEY=VALUE` strings until the buffer runs out. Only a
+    /// process of the same user can be read this way, which is exactly the set
+    /// this app ever signals.
+    static func invocation(of processIdentifier: Int32) -> ProcessInvocation? {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, processIdentifier]
         var size = 0
 
@@ -146,36 +166,70 @@ enum OpenCodeProcessTree {
             index += 1
         }
 
-        var arguments: [String] = []
-        while arguments.count < Int(argumentCount), index < size {
+        func nextString() -> String? {
+            guard index < size else {
+                return nil
+            }
+
             var end = index
             while end < size, buffer[end] != 0 {
                 end += 1
             }
 
-            if let argument = String(bytes: buffer[index..<end], encoding: .utf8) {
-                arguments.append(argument)
-            }
+            let value = String(bytes: buffer[index..<end], encoding: .utf8)
             index = end + 1
+            return value
         }
 
-        return arguments.isEmpty ? nil : arguments
+        var arguments: [String] = []
+        while arguments.count < Int(argumentCount), let argument = nextString() {
+            arguments.append(argument)
+        }
+
+        var environment: [String: String] = [:]
+        while let entry = nextString() {
+            guard let separator = entry.firstIndex(of: "=") else {
+                continue
+            }
+            environment[String(entry[..<separator])] =
+                String(entry[entry.index(after: separator)...])
+        }
+
+        return ProcessInvocation(arguments: arguments, environment: environment)
     }
 
-    /// Whether a command line is one of the servers this app starts.
+    /// Whether a process is one of the servers this app starts.
     ///
-    /// The fingerprint is the exact argument shape the app launches with —
-    /// including `--pure`, which is the app's own flag — so a server the user
-    /// started themselves in a terminal is never mistaken for a leftover of ours.
-    static func isManagedServerCommand(_ arguments: [String]) -> Bool {
+    /// Two things have to agree. The command line has to be a server on
+    /// authenticated loopback, and `OPENCODE_CONFIG` has to name *this app's own*
+    /// managed configuration — a file the app writes inside its own Application
+    /// Support folder and hands to no other process. A server the user started in
+    /// a terminal is never launched that way, so it is never mistaken for a
+    /// leftover of ours.
+    ///
+    /// The flags alone used to be the fingerprint, with `--pure` standing in for
+    /// "ours". That flag also told OpenCode to load **no external plugins**, which
+    /// silently disabled the app's entire plugin feature: the managed
+    /// configuration listed the plugins, the UI said "Restart the agent to load
+    /// it", and the server then ignored every one of them.
+    static func isManagedServer(
+        arguments: [String],
+        environment: [String: String],
+        configurationPath: String
+    ) -> Bool {
         guard let serveIndex = arguments.firstIndex(of: "serve") else {
             return false
         }
 
         let tail = arguments[serveIndex...]
-        return tail.contains("--hostname")
-            && tail.contains("127.0.0.1")
-            && tail.contains("--port")
-            && tail.contains("--pure")
+        guard
+            tail.contains("--hostname"),
+            tail.contains("127.0.0.1"),
+            tail.contains("--port")
+        else {
+            return false
+        }
+
+        return environment["OPENCODE_CONFIG"] == configurationPath
     }
 }

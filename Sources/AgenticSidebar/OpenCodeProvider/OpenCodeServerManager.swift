@@ -75,8 +75,15 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         )
     }
 
+    private var activeComputerUse: ComputerUseConfiguration?
+
     func setExtensionConfiguration(_ configuration: ExtensionRuntimeSnapshot) async {
         extensionConfiguration = configuration
+        _ = try? Self.writeManagedConfiguration(
+            computerUse: activeComputerUse,
+            extensions: configuration,
+            workingDirectoryURL: workingDirectoryURL
+        )
     }
 
     func setExtensionConfigurationProvider(
@@ -108,6 +115,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     func start(
         computerUse: ComputerUseConfiguration?
     ) async throws -> OpenCodeServerConnection {
+        activeComputerUse = computerUse
         let hasLiveChild = await currentProcessIsRunning()
 
         if let connection, hasLiveChild {
@@ -176,11 +184,14 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             )
             let request = OpenCodeProcessLaunchRequest(
                 executableURL: executableURL,
+                // No `--pure`: that flag means "run without external plugins",
+                // so it silently disabled every plugin the app writes into the
+                // managed configuration. The app's own servers are recognised by
+                // `OPENCODE_CONFIG` instead (``OpenCodeProcessTree/isManagedServer``).
                 arguments: [
                     "serve",
                     "--hostname", "127.0.0.1",
-                    "--port", String(port),
-                    "--pure"
+                    "--port", String(port)
                 ],
                 environment: Self.launchEnvironment(
                     connection: candidateConnection,

@@ -49,7 +49,8 @@ final class OpenCodeServerManagerTests: XCTestCase {
         XCTAssertEqual(request.executableURL.path, "/opt/homebrew/bin/opencode")
         XCTAssertEqual(
             request.arguments,
-            ["serve", "--hostname", "127.0.0.1", "--port", "51161", "--pure"]
+            ["serve", "--hostname", "127.0.0.1", "--port", "51161"],
+            "`--pure` means \"no external plugins\": it would disable every plugin the app configures"
         )
         XCTAssertEqual(request.environment["OPENCODE_SERVER_USERNAME"], "opencode")
         XCTAssertEqual(request.environment["OPENCODE_SERVER_PASSWORD"], "generated-password")

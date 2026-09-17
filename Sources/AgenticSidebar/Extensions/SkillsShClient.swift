@@ -12,6 +12,18 @@ struct SkillsShEntry: Identifiable, Equatable, Sendable, Codable {
     /// `owner/repo` the skill lives in.
     let source: String
 
+    /// The directory answers with `skillId`, and Swift's synthesised keys would
+    /// look for `skillID`. Every search failed on that one letter — a decode
+    /// error the store reported as "skills.sh could not be reached", so the whole
+    /// skill catalogue looked like an outage.
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case skillID = "skillId"
+        case name
+        case installs
+        case source
+    }
+
     var installsText: String {
         installs.formatted(.number.notation(.compactName))
     }
