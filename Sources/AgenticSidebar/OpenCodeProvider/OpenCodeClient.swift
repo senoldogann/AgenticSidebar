@@ -298,12 +298,25 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             method: "GET"
         )
         let response = try await send(request)
-        guard
-            let json = try? JSONSerialization.jsonObject(with: response.data) as? [[String: Any]]
-        else {
-            return []
+        // Bozuk gövde sessizce boş liste olmamalı: güvenlik yolunda
+        // sessizlik, bekleyen iznin görünmez kalması demektir.
+        guard let json = try? JSONSerialization.jsonObject(with: response.data) as? [[String: Any]] else {
+            ProviderResponseDiagnostics.shared.record(
+                provider: "OpenCode",
+                statusCode: response.statusCode,
+                body: String(data: response.data.prefix(400), encoding: .utf8) ?? "<\(response.data.count) bytes>"
+            )
+            throw ProviderRuntimeError.unexpectedResponse
         }
-        return json.compactMap { OpenCodePermissionRequest.make(from: $0) }
+        let requests = json.compactMap { OpenCodePermissionRequest.make(from: $0) }
+        if requests.count != json.count {
+            ProviderResponseDiagnostics.shared.record(
+                provider: "OpenCode",
+                statusCode: response.statusCode,
+                body: "Dropped \(json.count - requests.count) of \(json.count) permission entries (unrecognized shape)"
+            )
+        }
+        return requests
     }
 
     func replyQuestion(requestID: String, answers: [[String]]) async throws {

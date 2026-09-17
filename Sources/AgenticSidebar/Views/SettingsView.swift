@@ -56,6 +56,12 @@ struct SettingsView: View {
     @State var recentDecisions: [ToolAuditLog.Record] = []
     /// Observed tool lifecycle, distinct from permission decisions.
     @State var recentExecutions: [ToolAuditLog.ExecutionRecord] = []
+    /// Harici `opencode.json` ezmesi, diskten bir kez okunur.
+    ///
+    /// Kart gövdesinde eşzamanlı okumak her render'da dosya I/O demekti;
+    /// o yüzden ilk görünümde arka planda yüklenip burada tutulur.
+    @State var externalPermissionOverride: GlobalOpenCodeConfigReader.GlobalPermissionOverride?
+    @State var externalPermissionOverrideChecked = false
     /// "Recent tool decisions" kartı kapalı başlar: kayıt dosyası zaten
     /// tutuluyor, kart yalnız kuyruğunu gösteren bir görüntüleyici.
     @State var isToolDecisionLogExpanded: Bool = false

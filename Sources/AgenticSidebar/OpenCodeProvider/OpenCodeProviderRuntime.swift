@@ -216,7 +216,10 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             Task {
                 let reply: OpenCodePermissionReply
                 if let permissionHandler {
-                    var attributedRequest = request
+                    // Sahiplik her iki kaynaktan gelen istek için yeniden hesaplanır:
+                    // olay akışı zaten işaretli gelir, yoklama ham gelir. İkisi de
+                    // aynı kuraldan geçerse delege etiketi yalan söylemez.
+                    var attributedRequest = request.marked(ownedBy: activeSessionID)
                     attributedRequest.appSessionID = appSessionID
                     reply = await permissionHandler(attributedRequest)
                 } else {
@@ -241,12 +244,31 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         }
 
         let reconciliationTask = Task {
+            // Yoklama yalnızca bu turun oturumunu kapsar: `/permission` bütün
+            // sohbetlerin bekleyenlerini döner, başka turun iznini bu tura
+            // atfetmek çift yanıt ve yanlış-sohbet onayı demektir. Delege çocuk
+            // oturumlar olay akışından (tamponlu) gelir; yoklama yedeği ana
+            // oturum içindir.
+            var consecutiveFailures = 0
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                let delayNanoseconds: UInt64 = consecutiveFailures == 0
+                    ? 1_500_000_000
+                    : min(12_000_000_000, 1_500_000_000 * UInt64(1 << min(consecutiveFailures, 3)))
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
                 guard !Task.isCancelled else { break }
-                guard let pending = try? await client.pendingPermissions() else { continue }
-                for req in pending {
-                    handlePermissionRequest(req)
+                do {
+                    let pending = try await client.pendingPermissions()
+                    consecutiveFailures = 0
+                    for req in pending where req.remoteSessionID == activeSessionID {
+                        handlePermissionRequest(req)
+                    }
+                } catch is CancellationError {
+                    break
+                } catch {
+                    consecutiveFailures += 1
+                    AppLog.openCode.error(
+                        "Permission reconciliation failed (\(consecutiveFailures, privacy: .public) in a row): \(error.localizedDescription, privacy: .public)"
+                    )
                 }
             }
         }

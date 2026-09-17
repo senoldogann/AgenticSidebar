@@ -133,9 +133,16 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         // behind is ended. A relaunch (the development script, a crash, a forced
         // shutdown) is the normal case here, not the exception: without this, each
         // one added a whole MCP tree that nothing would ever stop.
+        //
+        // Süreç taraması (`sysctl` turu) actor'ı kilitlemesin diye ayrı
+        // görevde koşar; sonuç beklenir çünkü yeni sunucu eski kalıntının
+        // portunu almadan süpürme bitmelidir.
         if !hasReapedOrphans {
             hasReapedOrphans = true
-            OpenCodeServerLedger.reapOrphans(in: workingDirectoryURL)
+            let directory = workingDirectoryURL
+            _ = await Task.detached(priority: .utility) {
+                OpenCodeServerLedger.reapOrphans(in: directory)
+            }.value
         }
 
         guard let executableURL = executableLocator.locate() else {

@@ -35,30 +35,101 @@ struct GlobalOpenCodeConfigReader: Sendable {
         )
     }
 
+    /// Harici dosyada bulunan ve uygulama seviyesini ezebilen kurallar.
+    ///
+    /// `permission` tek biçim değildir: `"bash": "allow"` yanında
+    /// `"bash": {"*": "allow"}` gibi desen-haritaları da yazılır. İkincisi
+    /// eskiden sessizce atlanıyordu; uyarı kaybolurken ezme sürüyordu.
+    /// Üst seviye `tools` haritası ve `agent.<ad>.permission` da aynı
+    /// öncelikle uygulanır, o yüzden hepsi burada toplanır.
+    struct GlobalPermissionOverride: Equatable, Sendable {
+        let rules: [String: String]
+        let complexPermissionKeys: [String]
+        let toolRules: [String: String]
+        let agentRules: [String: String]
+        let sourceURL: URL
+
+        var isEmpty: Bool {
+            rules.isEmpty && complexPermissionKeys.isEmpty && toolRules.isEmpty && agentRules.isEmpty
+        }
+
+        /// Uyarı satırında gösterilecek tek satırlık özet.
+        var displayText: String {
+            var parts = rules.map { "\($0.key): \($0.value)" }
+            parts += complexPermissionKeys.sorted().map { "\($0): (custom rules)" }
+            parts += toolRules.map { "tools.\($0.key): \($0.value)" }
+            parts += agentRules.map { "agent.\($0.key): \($0.value)" }
+            return parts.sorted().joined(separator: ", ")
+        }
+    }
+
     /// Permission rules declared in the user's global configuration files,
     /// along with the file URL they were read from.
-    func globalPermissionOverrides() -> (rules: [String: String], sourceURL: URL)? {
+    func globalPermissionOverrides() -> GlobalPermissionOverride? {
         for url in configURLs {
             guard
                 fileManager.fileExists(atPath: url.path),
                 let raw = try? String(contentsOf: url, encoding: .utf8),
-                let object = Self.decodeObject(raw),
-                let permissions = object["permission"] as? [String: Any]
+                let object = Self.decodeObject(raw)
             else {
                 continue
             }
 
             var rules: [String: String] = [:]
-            for (key, value) in permissions {
-                if let str = value as? String {
-                    rules[key] = str
-                } else if let boolVal = value as? Bool {
-                    rules[key] = boolVal ? "allow" : "deny"
+            var complexKeys: [String] = []
+            if let permissions = object["permission"] as? [String: Any] {
+                for (key, value) in permissions {
+                    if let str = value as? String {
+                        rules[key] = str
+                    } else if let boolVal = value as? Bool {
+                        rules[key] = boolVal ? "allow" : "deny"
+                    } else {
+                        complexKeys.append(key)
+                    }
                 }
             }
 
-            if !rules.isEmpty {
-                return (rules: rules, sourceURL: url)
+            var toolRules: [String: String] = [:]
+            if let tools = object["tools"] as? [String: Any] {
+                for (key, value) in tools {
+                    if let str = value as? String {
+                        toolRules[key] = str
+                    } else if let boolVal = value as? Bool {
+                        toolRules[key] = boolVal ? "allow" : "deny"
+                    } else {
+                        toolRules[key] = "custom"
+                    }
+                }
+            }
+
+            var agentRules: [String: String] = [:]
+            if let agents = object["agent"] as? [String: Any] {
+                for (agentName, agentValue) in agents {
+                    guard let agentObject = agentValue as? [String: Any] else {
+                        continue
+                    }
+                    let permissionMap = agentObject["permission"] as? [String: Any] ?? [:]
+                    for (key, value) in permissionMap {
+                        if let str = value as? String {
+                            agentRules["\(agentName).\(key)"] = str
+                        } else if let boolVal = value as? Bool {
+                            agentRules["\(agentName).\(key)"] = boolVal ? "allow" : "deny"
+                        } else {
+                            agentRules["\(agentName).\(key)"] = "custom"
+                        }
+                    }
+                }
+            }
+
+            let override = GlobalPermissionOverride(
+                rules: rules,
+                complexPermissionKeys: complexKeys.sorted(),
+                toolRules: toolRules,
+                agentRules: agentRules,
+                sourceURL: url
+            )
+            if !override.isEmpty {
+                return override
             }
         }
         return nil

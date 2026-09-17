@@ -62,11 +62,13 @@ enum OpenCodeProcessTree {
         }
 
         var ordered: [Int32] = []
+        var visited: Set<Int32> = [processIdentifier]
         var queue: [Int32] = [processIdentifier]
 
         while let current = queue.first {
             queue.removeFirst()
-            for child in childrenByParent[current] ?? [] where !ordered.contains(child) {
+            for child in childrenByParent[current] ?? [] where !visited.contains(child) {
+                visited.insert(child)
                 ordered.append(child)
                 queue.append(child)
             }
@@ -78,6 +80,12 @@ enum OpenCodeProcessTree {
     }
 
     /// Sends a signal to a process and everything below it.
+    ///
+    /// Yetim süpürme bilerek `SIGKILL` kullanır: sahipsiz bir MCP ağacı zaten
+    /// zarif kapanma şansını kaçırmıştır ve `SIGTERM`'i yoksayan bir çocuğa
+    /// launch sırasında saniyelerce beklemek başlangıcı geciktirir. Normal
+    /// durdurma yolu (`OpenCodeProcessLauncher`) zarif kapanmayı dener; burası
+    /// yalnızca sahipsiz kalıntılar içindir.
     ///
     /// The list is built *before* anything is signalled: once the root exits its
     /// children are re-parented to `launchd`, and they can no longer be found by

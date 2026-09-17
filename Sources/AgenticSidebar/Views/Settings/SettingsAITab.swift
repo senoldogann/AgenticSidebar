@@ -113,9 +113,9 @@ extension SettingsView {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                if let override = GlobalOpenCodeConfigReader.live().globalPermissionOverrides(),
-                   !override.rules.isEmpty {
-                    let conflictingRules = override.rules.map { "\($0.key): \($0.value)" }.sorted().joined(separator: ", ")
+                if let override = externalPermissionOverride,
+                   !override.isEmpty {
+                    let conflictingRules = override.displayText
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
@@ -208,6 +208,17 @@ extension SettingsView {
                     }
                 }
             }
+        }
+        .task {
+            // Disk okuma her render'da değil, ilk görünümde bir kez yapılır.
+            guard !externalPermissionOverrideChecked else {
+                return
+            }
+            externalPermissionOverrideChecked = true
+            let override = await Task.detached(priority: .utility) {
+                GlobalOpenCodeConfigReader.live().globalPermissionOverrides()
+            }.value
+            externalPermissionOverride = override
         }
     }
 

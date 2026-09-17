@@ -64,6 +64,12 @@ enum OpenCodePromptBuilder {
     /// document is referenced by path and the agent reads it with its own tool.
     static let maximumInlineTextCharacters = 64_000
 
+    /// Total quoted-text budget across all attachments in one turn.
+    ///
+    /// Tek belge sınırı yetmez: beş tane 64k belge tek turda 320k eder ve
+    /// bağlamı taşırır. Bütçe dolunca kalan belgeler yola düşer.
+    static let maximumQuotedTotalCharacters = 96_000
+
     static func parts(
         for message: ChatMessage,
         speedMode: ResponseSpeedMode,
@@ -74,6 +80,7 @@ enum OpenCodePromptBuilder {
     ) -> [OpenCodePromptPart] {
         var parts: [OpenCodePromptPart] = []
         var quotedDocuments: [QuotedDocument] = []
+        var quotedTotal = 0
         var referencedOnly: [String] = []
 
         for path in message.attachmentPaths {
@@ -83,11 +90,17 @@ enum OpenCodePromptBuilder {
                 maximumInlineBytes: maximumInlineBytes
             ) {
                 parts.append(part)
-            } else if let document = quotedDocument(
-                forPath: path,
-                fileManager: fileManager,
-                maximumCharacters: maximumInlineTextCharacters
-            ) {
+            } else if quotedTotal < maximumQuotedTotalCharacters,
+                let document = quotedDocument(
+                    forPath: path,
+                    fileManager: fileManager,
+                    maximumCharacters: min(
+                        maximumInlineTextCharacters,
+                        maximumQuotedTotalCharacters - quotedTotal
+                    )
+                )
+            {
+                quotedTotal += document.text.count
                 quotedDocuments.append(document)
             } else {
                 referencedOnly.append(path)
@@ -166,10 +179,21 @@ enum OpenCodePromptBuilder {
         fileManager: FileManager = .default,
         maximumCharacters: Int = OpenCodePromptBuilder.maximumInlineTextCharacters
     ) -> QuotedDocument? {
+        guard isTextAttachment(path: path) else {
+            return nil
+        }
+        // Büyük ikili dosyayı tamamını okuyup sonra elememek için önden ele:
+        // alıntı bütçesinin birkaç katından büyük dosya zaten yola düşer.
+        if let attributes = try? fileManager.attributesOfItem(atPath: path),
+            let size = attributes[.size] as? Int,
+            size > maximumCharacters * 4 + 1024
+        {
+            return nil
+        }
         guard
-            isTextAttachment(path: path),
             let data = fileManager.contents(atPath: path),
             !data.isEmpty,
+            !data.contains(0),
             let text = String(data: data, encoding: .utf8)
         else {
             return nil
@@ -188,12 +212,16 @@ enum OpenCodePromptBuilder {
     }
 
     /// Whether the file at `path` is text the prompt can quote.
+    ///
+    /// Uzantısız metin dosyaları (`README`, `Dockerfile`, `Makefile`) uzantıya
+    /// bakılarak elenemez; içerik denetimi `quotedDocument` içindedir (UTF-8 ve
+    /// NUL yok). Burada uzantısız dosya aday sayılır, ikili olduğu içerikte elenir.
     static func isTextAttachment(path: String) -> Bool {
         let fileExtension = URL(fileURLWithPath: path).pathExtension
-        guard
-            !fileExtension.isEmpty,
-            let type = UTType(filenameExtension: fileExtension)
-        else {
+        guard !fileExtension.isEmpty else {
+            return true
+        }
+        guard let type = UTType(filenameExtension: fileExtension) else {
             return false
         }
 
@@ -283,11 +311,18 @@ enum OpenCodePromptBuilder {
     /// be closed by the document's first fence and the rest of it would read as
     /// the user's own message.
     static func fence(for text: String) -> String {
-        let longestRun: Int = text
-            .components(separatedBy: "\n")
-            .reduce(0) { longest, line in
-                max(longest, line.prefix { $0 == "`" }.count)
+        // Satır-başı sayımı girintili fence'i kaçırıyordu (`"   ```"` sıfır
+        // sayılıyordu); metnin içindeki her backtick koşusu sayılır.
+        var longestRun = 0
+        var currentRun = 0
+        for character in text {
+            if character == "`" {
+                currentRun += 1
+                longestRun = max(longestRun, currentRun)
+            } else {
+                currentRun = 0
             }
+        }
 
         return String(repeating: "`", count: max(3, longestRun + 1))
     }

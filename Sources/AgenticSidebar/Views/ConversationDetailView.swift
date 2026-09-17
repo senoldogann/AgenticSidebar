@@ -279,14 +279,11 @@ struct ConversationDetailView: View {
             }
 
             if let activityGroup {
-                let hasPending = permissionApprovalCenter.pending.contains {
-                    $0.appSessionID == sessionService.activeSessionID
-                } || !permissionApprovalCenter.pending.isEmpty
                 AgentActivityTimelineView(
                     group: activityGroup,
                     isTurnActive: isTurnActive(for: activityGroup),
                     isSessionBusy: sessionService.isBusy,
-                    hasPendingApproval: hasPending,
+                    hasPendingApproval: hasPendingApproval(for: activityGroup),
                     onOpenReport: { activity in
                         openSubagentReportInInspector(activity: activity)
                     },
@@ -741,6 +738,21 @@ struct ConversationDetailView: View {
         return sessionService.state.activityGroups.last?.id == group.id
     }
 
+    /// Bu grubun kartında "onay bekliyor" rozeti görünsün mü?
+    ///
+    /// Rozet sohbet-bazlıdır, grup-bazlı değil: bekleyen istek bu aktif sohbete
+    /// aitse ve grup aktif turunsa gösterilir. Başka sohbetin isteği bu sohbetin
+    /// bitmiş gruplarına asla yansımaz.
+    private func hasPendingApproval(for group: AgentTurnActivityGroup) -> Bool {
+        let hasPendingForActiveSession = permissionApprovalCenter.pending.contains { request in
+            request.appSessionID == sessionService.activeSessionID
+        }
+        guard hasPendingForActiveSession else {
+            return false
+        }
+        return isTurnActive(for: group)
+    }
+
     private func activityGroup(after messageID: UUID) -> AgentTurnActivityGroup? {
         transcriptIndex.activityGroup(after: messageID)
     }
@@ -1075,30 +1087,45 @@ private struct PromptOffsetProbe: ViewModifier {
 /// mutasyonları SwiftUI'ı invalidate etmez; yalnızca değişen aktif prompt
 /// kimliği yayınlanır.
 private final class PromptOffsetTracker {
+    private var offsets: [UUID: CGFloat] = [:]
     private var lastActiveID: UUID?
 
     func clear() {
+        offsets.removeAll()
         lastActiveID = nil
     }
 
-    /// En üstte veya ona en yakın olan prompt'u seçer.
+    /// Ölçülen konumların içinden okunan prompt'u seçer.
+    ///
+    /// Basitleştirilmiş "0..<300 penceresine giren" kuralı alta kaydırınca
+    /// bayat kalıyordu: görünürde prompt yokken son kimlik aynen duruyordu.
+    /// Doğru kural `PromptRailSelection` içindedir (eşik üstü en yakın,
+    /// yoksa ölçülen en üst); burada yalnızca değişince yayınlanır.
     func update(
         messageID: UUID,
         offset: CGFloat,
         items: [PromptNavigatorRail.Item]
     ) -> UUID? {
-        guard let item = items.first(where: { $0.id == messageID }) else {
+        guard items.contains(where: { $0.id == messageID }) else {
             return nil
         }
-
-        // Görünür alanın üst kenarına en yakın olan prompt aktif sayılır.
-        if offset >= 0 && offset < 300 {
-            if lastActiveID != item.id {
-                lastActiveID = item.id
-                return item.id
-            }
+        guard offsets[messageID] != offset else {
+            return nil
         }
-        return nil
+        offsets[messageID] = offset
+        if offsets.count > items.count + 8 {
+            let valid = Set(items.map(\.id))
+            offsets = offsets.filter { valid.contains($0.key) }
+        }
+        let active = PromptRailSelection.activeID(
+            among: items.map(\.id),
+            offsets: offsets
+        )
+        guard active != lastActiveID else {
+            return nil
+        }
+        lastActiveID = active
+        return active
     }
 }
 
