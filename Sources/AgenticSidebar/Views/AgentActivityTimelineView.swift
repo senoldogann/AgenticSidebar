@@ -397,6 +397,11 @@ struct AgentActivityTimelineView: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 16)
+        case .computer:
+            Image(systemName: "computermouse")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
         case .thinking:
             Image(systemName: "brain")
                 .font(.system(size: 11, weight: .medium))

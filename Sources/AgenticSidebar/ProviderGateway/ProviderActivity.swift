@@ -40,6 +40,10 @@ enum ProviderActivityKind: String, Equatable, Codable, Sendable {
     /// A tool served by an MCP server (`mcp__server__tool`). The server name is
     /// part of what the row shows, so a generic wrench hides who ran what.
     case mcp
+    /// A computer-use step (`chatgpt-system_computer_click`, `press_key`, …).
+    /// Without its own kind these fell into generic tool/command rows and the
+    /// pointer action (coordinates, key combo) was invisible in the timeline.
+    case computer
     case tool
     /// An interactive question posed to the user mid-turn.
     case question
@@ -121,6 +125,13 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
 
     private static func sanitizedKind(for toolName: String) -> ProviderActivityKind {
         let normalizedName = toolName.lowercased()
+
+        // Checked first: computer-use pointer/keyboard steps. Bare names like
+        // `run` or `observe` would otherwise fall into command/read buckets and
+        // the pointer action would vanish from the timeline.
+        if ComputerActivityTitle.isComputerTool(toolName) {
+            return .computer
+        }
 
         // Checked first: `task` and other subagent delegation tools. They run
         // their own tools in a child session, so without their own kind they

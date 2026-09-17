@@ -40,7 +40,7 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
             toolName: toolName,
             patterns: stringArray(from: properties["patterns"]),
             alwaysPatterns: stringArray(from: properties["always"]),
-            detail: detail(from: metadata)
+            detail: detail(from: metadata, toolName: toolName)
         )
     }
 
@@ -54,6 +54,12 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
 
     /// Onay diyaloğunda gösterilecek kısa açıklama; ham metadata dökülmez.
     static func detail(from metadata: [String: Any]) -> String? {
+        detail(from: metadata, toolName: nil)
+    }
+
+    /// - Parameter toolName: Bilgisayar adımıysa (`computer_*`) koordinat ve
+    ///   hedef de eklenir; `nil` ise eski anahtar listesiyle çalışır.
+    static func detail(from metadata: [String: Any], toolName: String?) -> String? {
         let preferredKeys = [
             "description",
             "subagent_type",
@@ -75,6 +81,13 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
                 continue
             }
             parts.append("\(key): \(value)")
+        }
+
+        if let toolName, ComputerActivityTitle.isComputerTool(toolName) {
+            let (title, _) = ComputerActivityTitle.titleAndDetail(tool: toolName, input: metadata)
+            if let title, !title.isEmpty {
+                parts.insert(title, at: 0)
+            }
         }
 
         guard !parts.isEmpty else {

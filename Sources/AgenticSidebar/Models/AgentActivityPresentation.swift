@@ -47,6 +47,10 @@ struct AgentActivityPresentation: Equatable, Sendable {
             title = "Using MCP tool"
             runningStatusName = "MCP tool"
             symbolName = "server.rack"
+        case .computer:
+            title = "Controlling computer"
+            runningStatusName = "Computer"
+            symbolName = "computermouse"
         case .tool:
             title = "Using a tool"
             runningStatusName = "Tool"

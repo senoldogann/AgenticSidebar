@@ -919,6 +919,19 @@ struct OpenCodeStreamNormalizer: Sendable {
         mcpTitleAndDetail(tool: tool, input: [:])
     }
 
+    /// Computer-use title and detail with tool and input explicitly provided.
+    static func computerTitleAndDetail(
+        tool: String,
+        input: [String: Any]
+    ) -> (String?, String?) {
+        ComputerActivityTitle.titleAndDetail(tool: tool, input: input)
+    }
+
+    /// Computer-use title and detail without input dictionary.
+    static func computerTitleAndDetail(tool: String) -> (String?, String?) {
+        computerTitleAndDetail(tool: tool, input: [:])
+    }
+
     /// Maximum inner summary steps shown in the subagent card.
     private static let maximumSubagentSummarySteps = 20
 
@@ -941,6 +954,11 @@ struct OpenCodeStreamNormalizer: Sendable {
         // MCP tools arrive namespaced or via wrappers like `call_mcp_tool`.
         if kind == .mcp {
             return mcpTitleAndDetail(tool: tool, input: input)
+        }
+
+        // Computer-use pointer/keyboard steps: coordinates and key combos.
+        if kind == .computer {
+            return computerTitleAndDetail(tool: tool, input: input)
         }
 
         let normalizedTool = tool.lowercased()
