@@ -189,10 +189,10 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** `TaskRecovery.reconcile(projectID:) async -> RecoveryReport` inspects persisted attempts, provider session identity and workspace ownership through injected ports; unverified in-flight attempts become `blocked(uncertainExecution)`. No side-effectful retry during launch.
 
-- [ ] Step 1: RED tests for crash after claim, after provider submission, after edit before evidence, orphan process with foreign owner, expired lease and delayed callback after retry.
-- [ ] Step 2: Run `swift test --filter TaskRecoveryTests` and capture RED.
-- [ ] Step 3: Implement conservative reconciliation, nonce/executable ownership checks, explicit user recovery choice and generation invalidation. Unknown PID alone is never enough to terminate a process.
-- [ ] Step 4: GREEN, simulate close/reopen against real temporary SQLite store, run full `swift test`.
+- [x] Step 1: RED tests for crash after claim, after provider submission, after edit before evidence, orphan process with foreign owner, expired lease and delayed callback after retry.
+- [x] Step 2: Run `swift test --filter TaskRecoveryTests` and capture RED.
+- [x] Step 3: Implement conservative reconciliation, nonce/executable ownership checks, explicit user recovery choice and generation invalidation. Unknown PID alone is never enough to terminate a process.
+- [x] Step 4: GREEN, simulate close/reopen against real temporary SQLite store, run full `swift test`.
 
 **Gate:** uncertain side effects never trigger automatic duplicated execution.
 
