@@ -8,6 +8,7 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
     case repositoryLeaseConflict(repositoryPath: String, heldByTaskID: UUID)
     case attemptNotActive(taskID: UUID, attemptID: UUID)
     case nonMonotonicGeneration(taskID: UUID, minimumExclusive: Int, actual: Int)
+    case taskNotClaimable(taskID: UUID, status: TaskStatus)
     case foreignKeyViolation(String)
     case storeCorrupt(String)
     case readOnly(String)
@@ -27,6 +28,8 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
             return "Attempt \(attemptID) is not active for task \(taskID)"
         case .nonMonotonicGeneration(let taskID, let minimumExclusive, let actual):
             return "Attempt generation for task \(taskID) must exceed \(minimumExclusive), got \(actual)"
+        case .taskNotClaimable(let taskID, let status):
+            return "Task \(taskID) cannot claim an attempt from status \(status.rawValue)"
         case .foreignKeyViolation(let message):
             return "Foreign key constraint violation: \(message)"
         case .storeCorrupt(let message):
@@ -166,11 +169,13 @@ public protocol CodingTaskRepository: Sendable {
     func acquireRepositoryLease(
         repositoryPath: String,
         taskID: UUID,
+        attemptID: UUID,
         leaseTimeoutSeconds: TimeInterval
     ) async throws
     func releaseRepositoryLease(
         repositoryPath: String,
-        taskID: UUID
+        taskID: UUID,
+        attemptID: UUID
     ) async throws
     func appendEvent(_ event: CodingTaskEvent) async throws
     func recordEvidence(_ evidence: VerificationEvidence) async throws

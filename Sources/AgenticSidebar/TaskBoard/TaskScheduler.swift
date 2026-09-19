@@ -116,9 +116,16 @@ struct TaskScheduleReport: Sendable, Equatable {
     }
 }
 
+/// Bookkeeping concern recorded after an attempt already reached a terminal outcome.
+enum TaskCompletionConcern: Sendable, Equatable {
+    case supersededByConcurrentActivity
+    case bookkeepingRejected
+}
+
 /// Lease validation outcome for a completion callback.
 enum TaskCompletionDisposition: Sendable, Equatable {
     case accepted
+    case acceptedWithBookkeepingConcern(TaskCompletionConcern)
     case stale
 }
 
@@ -176,6 +183,14 @@ actor TaskScheduler {
         let lease: TaskLease
         let workspace: TaskWorkspaceDescriptor
         let startedAt: Date
+    }
+
+    private struct PendingAttemptIdentity: Sendable {
+        let attemptID: UUID
+        let generation: Int
+        let ownerNonce: String
+        let startedAt: Date
+        let lease: TaskLease
     }
 
     private enum TaskBudgetState: Equatable {
@@ -266,8 +281,8 @@ actor TaskScheduler {
             throw TaskSchedulerError.noActiveAttempt(taskID)
         }
         pausedTaskIDs.insert(taskID)
-        activeAttempts[taskID] = nil
-        await releaseLease(for: record.workspace.repositoryPath, taskID: taskID)
+        clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
+        await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
 
         guard let task = try await repository.task(id: taskID) else {
             throw TaskSchedulerError.taskNotFound(taskID)
@@ -283,8 +298,8 @@ actor TaskScheduler {
         pausedTaskIDs.remove(taskID)
 
         if let record = activeAttempts[taskID] {
-            activeAttempts[taskID] = nil
-            await releaseLease(for: record.workspace.repositoryPath, taskID: taskID)
+            clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
+            await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
             try await cancelAttempt(taskID: taskID, attemptID: record.attempt.id)
         } else if try await repository.task(id: taskID) != nil {
             let history = try await repository.attemptHistory(taskID: taskID)
@@ -315,8 +330,8 @@ actor TaskScheduler {
         stoppedTaskIDs.remove(taskID)
 
         if let record = activeAttempts[taskID] {
-            activeAttempts[taskID] = nil
-            await releaseLease(for: record.workspace.repositoryPath, taskID: taskID)
+            clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
+            await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
             try await cancelAttempt(taskID: taskID, attemptID: record.attempt.id)
         }
 
@@ -349,6 +364,10 @@ actor TaskScheduler {
     }
 
     /// Validates lease ownership and records the terminal outcome of an attempt.
+    ///
+    /// The attempt record is only cleared and its repository lease only released while the
+    /// stored record still belongs to this attempt, so concurrent retry/stop/pause activity
+    /// can never lose the newer attempt nor delete its lease.
     @discardableResult
     func attemptDidComplete(
         taskID: UUID,
@@ -358,10 +377,13 @@ actor TaskScheduler {
         outcome: AttemptOutcome,
         usage: TaskAttemptUsage
     ) async throws -> TaskAttemptCompletionReport {
-        let now = clock.now()
-        guard let record = activeAttempts[taskID],
-            record.attempt.id == attemptID,
-            record.lease.isHeld(by: ownerNonce, attemptID: attemptID, generation: generation, at: now)
+        guard
+            let record = ownedAttemptRecord(
+                taskID: taskID,
+                attemptID: attemptID,
+                generation: generation,
+                ownerNonce: ownerNonce
+            )
         else {
             return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .stale)
         }
@@ -371,36 +393,65 @@ actor TaskScheduler {
         guard let task = try await repository.task(id: taskID) else {
             throw TaskSchedulerError.taskNotFound(taskID)
         }
+        guard
+            ownedAttemptRecord(taskID: taskID, attemptID: attemptID, generation: generation, ownerNonce: ownerNonce) != nil
+        else {
+            return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .stale)
+        }
 
         let previousDurations = try await repository.attemptHistory(taskID: taskID)
             .filter { $0.id != attemptID }
             .compactMap(\.durationSeconds)
-        let duration = usage.durationSeconds ?? max(0, Int(now.timeIntervalSince(record.startedAt)))
-        let endedTask = try await repository.endAttempt(
-            taskID: taskID,
-            attemptID: attemptID,
-            expectedVersion: task.version,
-            outcome: outcome,
-            toolCallCount: usage.toolCallCount,
-            durationSeconds: duration
-        )
+        let duration = usage.durationSeconds ?? max(0, Int(clock.now().timeIntervalSince(record.startedAt)))
 
-        activeAttempts[taskID] = nil
-        await releaseLease(for: record.workspace.repositoryPath, taskID: taskID)
+        let endedTask: CodingTask
+        do {
+            endedTask = try await repository.endAttempt(
+                taskID: taskID,
+                attemptID: attemptID,
+                expectedVersion: task.version,
+                outcome: outcome,
+                toolCallCount: usage.toolCallCount,
+                durationSeconds: duration
+            )
+        } catch let error as TaskRepositoryError where Self.isTerminalEndRejection(error) {
+            return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .stale)
+        }
+
+        let supersededByConcurrentActivity = hasNewerActivity(taskID: taskID, attemptID: attemptID)
+        clearActiveAttemptIfOwned(taskID: taskID, attemptID: attemptID)
+        await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: attemptID)
+
+        if supersededByConcurrentActivity {
+            return TaskAttemptCompletionReport(
+                taskID: taskID,
+                attemptID: attemptID,
+                disposition: .acceptedWithBookkeepingConcern(.supersededByConcurrentActivity)
+            )
+        }
 
         if let toolCallCount = usage.toolCallCount, toolCallCount > task.budget.maxToolCallsPerAttempt {
-            try await block(endedTask, reason: .custom("toolCallBudgetExceeded"))
-            return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .accepted)
+            return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                try await self.block(endedTask, reason: .custom("toolCallBudgetExceeded"))
+            }
         }
         let accumulatedSeconds = previousDurations.reduce(0, +) + duration
         if accumulatedSeconds >= task.budget.maxTaskDurationSeconds {
-            try await block(endedTask, reason: .custom("timeBudgetExhausted"))
-            return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .accepted)
+            return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                try await self.block(endedTask, reason: .custom("timeBudgetExhausted"))
+            }
         }
 
         switch outcome {
         case .succeeded:
             let report = await verifier.verify(task: task, attempt: record.attempt, workspace: record.workspace)
+            guard !hasNewerActivity(taskID: taskID, attemptID: attemptID) else {
+                return TaskAttemptCompletionReport(
+                    taskID: taskID,
+                    attemptID: attemptID,
+                    disposition: .acceptedWithBookkeepingConcern(.supersededByConcurrentActivity)
+                )
+            }
             if report.passed {
                 let evidence = VerificationEvidence(
                     taskID: taskID,
@@ -408,33 +459,87 @@ actor TaskScheduler {
                     recipeName: report.recipeName,
                     passed: true,
                     detailsRedacted: report.detailsRedacted,
-                    recordedAt: now
+                    recordedAt: clock.now()
                 )
-                try await repository.recordEvidence(evidence)
-                _ = try await repository.transition(
-                    taskID: taskID,
-                    expectedVersion: endedTask.version,
-                    action: .submitForReview,
-                    context: TaskTransitionContext(
-                        fingerprint: attemptID.uuidString,
-                        actor: schedulerID,
-                        evidenceIDs: [evidence.id]
+                return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                    try await self.repository.recordEvidence(evidence)
+                    _ = try await self.repository.transition(
+                        taskID: taskID,
+                        expectedVersion: endedTask.version,
+                        action: .submitForReview,
+                        context: TaskTransitionContext(
+                            fingerprint: attemptID.uuidString,
+                            actor: self.schedulerID,
+                            evidenceIDs: [evidence.id]
+                        )
                     )
-                )
-            } else {
-                try await block(endedTask, reason: .verificationFailed(report.detailsRedacted))
+                }
+            }
+            return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                try await self.block(endedTask, reason: .verificationFailed(report.detailsRedacted))
             }
         case .failed:
-            try await block(endedTask, reason: .custom("attemptFailed"))
+            return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                try await self.block(endedTask, reason: .custom("attemptFailed"))
+            }
         case .timedOut:
-            try await block(endedTask, reason: .custom("attemptTimedOut"))
+            return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                try await self.block(endedTask, reason: .custom("attemptTimedOut"))
+            }
         case .cancelled:
-            try await block(endedTask, reason: .custom("attemptCancelled"))
+            return try await performBookkeeping(taskID: taskID, attemptID: attemptID) {
+                try await self.block(endedTask, reason: .custom("attemptCancelled"))
+            }
         case .inProgress:
-            break
+            return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .accepted)
         }
+    }
 
-        return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .accepted)
+    /// Runs post-terminal bookkeeping; a rejected transition yields a defined concern, never a stale failure.
+    private func performBookkeeping(
+        taskID: UUID,
+        attemptID: UUID,
+        _ work: () async throws -> Void
+    ) async throws -> TaskAttemptCompletionReport {
+        do {
+            try await work()
+            return TaskAttemptCompletionReport(taskID: taskID, attemptID: attemptID, disposition: .accepted)
+        } catch let error as TaskRepositoryError where Self.isContention(error) {
+            return TaskAttemptCompletionReport(
+                taskID: taskID,
+                attemptID: attemptID,
+                disposition: .acceptedWithBookkeepingConcern(.bookkeepingRejected)
+            )
+        }
+    }
+
+    private func ownedAttemptRecord(
+        taskID: UUID,
+        attemptID: UUID,
+        generation: Int,
+        ownerNonce: String
+    ) -> ActiveAttemptRecord? {
+        guard !pausedTaskIDs.contains(taskID),
+            let record = activeAttempts[taskID],
+            record.attempt.id == attemptID,
+            record.lease.isHeld(by: ownerNonce, attemptID: attemptID, generation: generation, at: clock.now())
+        else {
+            return nil
+        }
+        return record
+    }
+
+    private func hasNewerActivity(taskID: UUID, attemptID: UUID) -> Bool {
+        if pausedTaskIDs.contains(taskID) || stoppedTaskIDs.contains(taskID) {
+            return true
+        }
+        guard let record = activeAttempts[taskID] else { return false }
+        return record.attempt.id != attemptID
+    }
+
+    private func clearActiveAttemptIfOwned(taskID: UUID, attemptID: UUID) {
+        guard activeAttempts[taskID]?.attempt.id == attemptID else { return }
+        activeAttempts[taskID] = nil
     }
 
     // MARK: - Eligibility and budgeting
@@ -474,10 +579,12 @@ actor TaskScheduler {
                 return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "workspaceNotOwned"))
             }
 
+            let identity = makePendingIdentity(for: task, history: history)
             do {
                 try await repository.acquireRepositoryLease(
                     repositoryPath: workspace.repositoryPath,
                     taskID: task.id,
+                    attemptID: identity.attemptID,
                     leaseTimeoutSeconds: TimeInterval(task.budget.maxTaskDurationSeconds) + Self.repositoryLeaseGraceSeconds
                 )
             } catch let error as TaskRepositoryError where Self.isContention(error) {
@@ -490,26 +597,24 @@ actor TaskScheduler {
                     workspace: workspace,
                     runtimeID: runtimeID,
                     modelID: modelID,
-                    history: history
+                    history: history,
+                    identity: identity
                 )
                 return TaskScheduleEntry(
                     taskID: task.id,
                     disposition: .claimed(attemptID: attempt.id, generation: attempt.generation)
                 )
-            } catch let error as TaskRepositoryError where Self.isContention(error) {
-                await releaseLease(for: workspace.repositoryPath, taskID: task.id)
-                return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "claimRejected"))
+            } catch {
+                await releaseLease(for: workspace.repositoryPath, taskID: task.id, attemptID: identity.attemptID)
+                if let repositoryError = error as? TaskRepositoryError, Self.isContention(repositoryError) {
+                    return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "claimRejected"))
+                }
+                throw error
             }
         }
     }
 
-    private func claimAttempt(
-        task: CodingTask,
-        workspace: TaskWorkspaceDescriptor,
-        runtimeID: String,
-        modelID: String,
-        history: [TaskAttempt]
-    ) async throws -> TaskAttempt {
+    private func makePendingIdentity(for task: CodingTask, history: [TaskAttempt]) -> PendingAttemptIdentity {
         let attemptID = UUID()
         let generation = (history.map(\.generation).max() ?? 0) + 1
         let now = clock.now()
@@ -521,19 +626,36 @@ actor TaskScheduler {
             ownerNonce: ownerNonce,
             expiration: now.addingTimeInterval(leaseDuration)
         )
+        return PendingAttemptIdentity(
+            attemptID: attemptID,
+            generation: generation,
+            ownerNonce: ownerNonce,
+            startedAt: now,
+            lease: lease
+        )
+    }
+
+    private func claimAttempt(
+        task: CodingTask,
+        workspace: TaskWorkspaceDescriptor,
+        runtimeID: String,
+        modelID: String,
+        history: [TaskAttempt],
+        identity: PendingAttemptIdentity
+    ) async throws -> TaskAttempt {
         let attempt = TaskAttempt(
-            id: attemptID,
+            id: identity.attemptID,
             taskID: task.id,
             attemptSequence: history.count + 1,
             role: Self.role(for: task.stage),
             providerID: runtimeID,
             modelID: modelID,
             workspaceID: workspace.workspaceID,
-            generation: generation,
+            generation: identity.generation,
             leaseOwner: schedulerID,
-            leaseToken: ownerNonce,
-            leaseExpiry: lease.expiration,
-            startedAt: now,
+            leaseToken: identity.ownerNonce,
+            leaseExpiry: identity.lease.expiration,
+            startedAt: identity.startedAt,
             endedAt: nil,
             outcome: .inProgress,
             toolCallCount: nil,
@@ -544,9 +666,9 @@ actor TaskScheduler {
             taskID: task.id,
             projectID: task.projectID,
             attempt: claimed,
-            lease: lease,
+            lease: identity.lease,
             workspace: workspace,
-            startedAt: now
+            startedAt: identity.startedAt
         )
         return claimed
     }
@@ -624,13 +746,22 @@ actor TaskScheduler {
         TaskTransitionContext(fingerprint: schedulerID, actor: schedulerID)
     }
 
-    private func releaseLease(for repositoryPath: String, taskID: UUID) async {
-        try? await repository.releaseRepositoryLease(repositoryPath: repositoryPath, taskID: taskID)
+    private func releaseLease(for repositoryPath: String, taskID: UUID, attemptID: UUID) async {
+        try? await repository.releaseRepositoryLease(repositoryPath: repositoryPath, taskID: taskID, attemptID: attemptID)
     }
 
     private static func isContention(_ error: TaskRepositoryError) -> Bool {
         switch error {
-        case .staleVersion, .activeAttemptConflict, .repositoryLeaseConflict, .nonMonotonicGeneration:
+        case .staleVersion, .activeAttemptConflict, .repositoryLeaseConflict, .nonMonotonicGeneration, .taskNotClaimable:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isTerminalEndRejection(_ error: TaskRepositoryError) -> Bool {
+        switch error {
+        case .staleVersion, .attemptNotActive:
             return true
         default:
             return false

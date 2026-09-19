@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 import XCTest
 
 @testable import AgenticSidebar
@@ -71,5 +72,81 @@ final class TaskStoreMigrationTests: XCTestCase {
         storeAfter.closeSync()
 
         XCTAssertNotEqual(currentVersion, 999, "Failed migration must rollback and not advance schema version")
+    }
+
+    func testV1ToLatestMigrationPreservesPopulatedAttemptUsage() async throws {
+        let dbURL = tempDirectory.appendingPathComponent("v1-populated.sqlite")
+        try TaskStoreMigrations.apply(migrations: Array(TaskStoreMigrations.standardMigrations.prefix(1)), to: dbURL)
+
+        let projectID = UUID()
+        let taskID = UUID()
+        let attemptID = UUID()
+        try withRawDatabase(at: dbURL) { db in
+            try TaskStoreMigrations.execute(
+                """
+                INSERT INTO tasks (
+                    id, project_id, title, objective, priority, status, stage,
+                    block_reason, previous_stage, version, budget, current_attempt_id,
+                    created_at, updated_at
+                ) VALUES (
+                    '\(taskID.uuidString)', '\(projectID.uuidString)', 'Legacy Task', 'Legacy Objective', 1, 'running', 'implementation',
+                    NULL, NULL, 3, '{}', '\(attemptID.uuidString)',
+                    1700000000, 1700000000
+                );
+
+                INSERT INTO task_attempts (
+                    id, task_id, attempt_sequence, role, provider_id, model_id,
+                    variant_snapshot, workspace_id, generation, lease_owner,
+                    lease_token, lease_expiry, started_at, ended_at, outcome,
+                    tool_call_count, duration_seconds
+                ) VALUES (
+                    '\(attemptID.uuidString)', '\(taskID.uuidString)', 1, 'developer', 'runtime', 'model',
+                    NULL, NULL, 1, 'scheduler', 'nonce', 1700001000, 1700000000, NULL, 'inProgress',
+                    0, NULL
+                );
+                """,
+                on: db
+            )
+        }
+
+        let store = try SQLiteTaskStore.open(at: dbURL)
+        let version = store.currentSchemaVersionSync()
+        XCTAssertEqual(version, TaskStoreMigrations.standardMigrations.count)
+        XCTAssertGreaterThanOrEqual(version, 2)
+
+        let reloaded = try await store.task(id: taskID)
+        XCTAssertEqual(reloaded?.title, "Legacy Task")
+        XCTAssertEqual(reloaded?.version, 3)
+        let history = try await store.attemptHistory(taskID: taskID)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history.first?.toolCallCount, 0, "A persisted legacy zero must stay zero, never become nil")
+        XCTAssertNotNil(history.first?.toolCallCount)
+        await store.close()
+
+        try withRawDatabase(at: dbURL) { db in
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "PRAGMA table_info(repository_leases);", -1, &stmt, nil) == SQLITE_OK else {
+                throw TaskRepositoryError.underlying("Unable to inspect repository_leases schema")
+            }
+            defer { sqlite3_finalize(stmt) }
+            var columnNames: [String] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let name = sqlite3_column_text(stmt, 1) {
+                    columnNames.append(String(cString: name))
+                }
+            }
+            XCTAssertTrue(columnNames.contains("attempt_id"), "repository_leases must bind leases to an owning attempt")
+        }
+    }
+
+    private func withRawDatabase(at url: URL, _ body: (OpaquePointer) throws -> Void) throws {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db else {
+            let message = db != nil ? String(cString: sqlite3_errmsg(db)) : "Unable to open database"
+            if let db { sqlite3_close(db) }
+            throw TaskRepositoryError.underlying(message)
+        }
+        defer { sqlite3_close(db) }
+        try body(db)
     }
 }

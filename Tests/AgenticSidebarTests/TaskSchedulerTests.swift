@@ -703,4 +703,377 @@ final class TaskSchedulerTests: XCTestCase {
             XCTAssertEqual(error, .retryNotAvailable(taskID: task.id, status: .review))
         }
     }
+
+    // MARK: - Contention cleanup and completion reentrancy regressions
+
+    private actor HookingTaskRepository: CodingTaskRepository {
+        private let base: CodingTaskRepository
+        private var endAttemptDelay: Duration?
+        private var claimAttemptError: TaskRepositoryError?
+        private var evidenceWrites: Int = 0
+
+        init(base: CodingTaskRepository) {
+            self.base = base
+        }
+
+        func setEndAttemptDelay(_ delay: Duration?) {
+            endAttemptDelay = delay
+        }
+
+        func setClaimAttemptError(_ error: TaskRepositoryError?) {
+            claimAttemptError = error
+        }
+
+        func recordedEvidenceCount() -> Int {
+            evidenceWrites
+        }
+
+        func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot {
+            try await base.snapshot(projectID: projectID)
+        }
+
+        func createTask(_ task: CodingTask) async throws {
+            try await base.createTask(task)
+        }
+
+        func addDependency(_ dependency: TaskDependency) async throws {
+            try await base.addDependency(dependency)
+        }
+
+        func task(id: UUID) async throws -> CodingTask? {
+            try await base.task(id: id)
+        }
+
+        func attemptHistory(taskID: UUID) async throws -> [TaskAttempt] {
+            try await base.attemptHistory(taskID: taskID)
+        }
+
+        func transition(
+            taskID: UUID,
+            expectedVersion: Int,
+            action: TaskAction,
+            context: TaskTransitionContext
+        ) async throws -> CodingTask {
+            try await base.transition(taskID: taskID, expectedVersion: expectedVersion, action: action, context: context)
+        }
+
+        func claimAttempt(taskID: UUID, expectedVersion: Int, attempt: TaskAttempt) async throws -> TaskAttempt {
+            let injected = claimAttemptError
+            claimAttemptError = nil
+            if let injected {
+                throw injected
+            }
+            return try await base.claimAttempt(taskID: taskID, expectedVersion: expectedVersion, attempt: attempt)
+        }
+
+        func endAttempt(
+            taskID: UUID,
+            attemptID: UUID,
+            expectedVersion: Int,
+            outcome: AttemptOutcome,
+            toolCallCount: Int?,
+            durationSeconds: Int?
+        ) async throws -> CodingTask {
+            let delay = endAttemptDelay
+            let task = try await base.endAttempt(
+                taskID: taskID,
+                attemptID: attemptID,
+                expectedVersion: expectedVersion,
+                outcome: outcome,
+                toolCallCount: toolCallCount,
+                durationSeconds: durationSeconds
+            )
+            if let delay {
+                try? await Task.sleep(for: delay)
+            }
+            return task
+        }
+
+        func acquireRepositoryLease(
+            repositoryPath: String,
+            taskID: UUID,
+            attemptID: UUID,
+            leaseTimeoutSeconds: TimeInterval
+        ) async throws {
+            try await base.acquireRepositoryLease(
+                repositoryPath: repositoryPath, taskID: taskID, attemptID: attemptID, leaseTimeoutSeconds: leaseTimeoutSeconds)
+        }
+
+        func releaseRepositoryLease(repositoryPath: String, taskID: UUID, attemptID: UUID) async throws {
+            try await base.releaseRepositoryLease(repositoryPath: repositoryPath, taskID: taskID, attemptID: attemptID)
+        }
+
+        func appendEvent(_ event: CodingTaskEvent) async throws {
+            try await base.appendEvent(event)
+        }
+
+        func recordEvidence(_ evidence: VerificationEvidence) async throws {
+            evidenceWrites += 1
+            try await base.recordEvidence(evidence)
+        }
+
+        func saveAgentProfile(_ profile: AgentProfile) async throws {
+            try await base.saveAgentProfile(profile)
+        }
+
+        func loadAgentProfile(id: UUID) async throws -> AgentProfile? {
+            try await base.loadAgentProfile(id: id)
+        }
+    }
+
+    private func waitForAttemptEnd(taskID: UUID, attemptID: UUID, in store: SQLiteTaskStore) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let history = try await store.attemptHistory(taskID: taskID)
+            if let attempt = history.first(where: { $0.id == attemptID }), attempt.outcome != .inProgress {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Attempt \(attemptID) did not reach a terminal outcome before timeout")
+    }
+
+    func testContendedSameTaskClaimKeepsWinnerLeaseAndDefersSecondTask() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/contended-winner-repo"
+        let contended = makeTask(projectID: projectID, title: "Contended Winner", priority: 9, status: .ready, createdAt: startDate)
+        let waiting = makeTask(
+            projectID: projectID, title: "Waiting Writer", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(contended)
+        try await store.createTask(waiting)
+
+        let schedulers = (0..<8).map { index in
+            makeScheduler(
+                store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+                workspaceOwned: true, sharedRepositoryPath: sharedPath, verifierPassed: true, schedulerID: "contender-\(index)")
+        }
+
+        let reports = try await withThrowingTaskGroup(of: TaskScheduleReport.self) { group in
+            for scheduler in schedulers {
+                group.addTask {
+                    try await scheduler.schedule(projectID: projectID)
+                }
+            }
+            var collected: [TaskScheduleReport] = []
+            for try await report in group {
+                collected.append(report)
+            }
+            return collected
+        }
+
+        XCTAssertEqual(reports.flatMap(\.claimedTaskIDs), [contended.id])
+        let snapshot = try await store.snapshot(projectID: projectID)
+        XCTAssertEqual(snapshot.activeAttempts.count, 1)
+        XCTAssertEqual(snapshot.activeAttempts.first?.taskID, contended.id)
+
+        let followUp = try await schedulers[0].schedule(projectID: projectID)
+        XCTAssertNil(claim(in: followUp, taskID: waiting.id), "Winner's repository lease must survive loser cleanup")
+        guard case .deferred = try entry(in: followUp, taskID: waiting.id).disposition else {
+            XCTFail("Second writer on the same repository must stay deferred")
+            return
+        }
+        let afterFollowUp = try await store.snapshot(projectID: projectID)
+        XCTAssertEqual(afterFollowUp.activeAttempts.count, 1)
+    }
+
+    func testSlowEndAttemptDoesNotClobberRetriedAttemptOrLease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/reentrant-repo"
+        let task = makeTask(projectID: projectID, title: "Reentrant Task", priority: 9, status: .ready, createdAt: startDate)
+        let other = makeTask(
+            projectID: projectID, title: "Other Writer", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(task)
+        try await store.createTask(other)
+
+        let repository = HookingTaskRepository(base: store)
+        await repository.setEndAttemptDelay(.milliseconds(500))
+        let scheduler = TaskScheduler(
+            repository: repository,
+            providers: TestProviderRegistry(result: .eligible(runtimeID: "runtime", modelID: "model")),
+            workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: sharedPath),
+            verifier: TestVerifier(passed: true),
+            clock: clock,
+            schedulerID: "scheduler-reentrancy"
+        )
+
+        let report = try await scheduler.schedule(projectID: projectID)
+        let firstClaim = try XCTUnwrap(claim(in: report, taskID: task.id))
+        let firstLease = try await activeLease(for: scheduler, taskID: task.id)
+
+        async let completion = scheduler.attemptDidComplete(
+            taskID: task.id, attemptID: firstClaim.attemptID, generation: firstClaim.generation,
+            ownerNonce: firstLease.ownerNonce, outcome: .failed, usage: TaskAttemptUsage(toolCallCount: nil, durationSeconds: nil))
+
+        try await waitForAttemptEnd(taskID: task.id, attemptID: firstClaim.attemptID, in: store)
+
+        let retryEntry = try await scheduler.retry(taskID: task.id)
+        guard case .claimed(let retriedAttemptID, let retriedGeneration) = retryEntry.disposition else {
+            XCTFail("Expected retry to claim a fresh attempt while completion is suspended")
+            return
+        }
+        XCTAssertEqual(retriedGeneration, 2)
+
+        let completionReport = try await completion
+        XCTAssertEqual(
+            completionReport.disposition,
+            .acceptedWithBookkeepingConcern(.supersededByConcurrentActivity),
+            "A completion that loses its record to a retry must report a defined outcome, never a failure"
+        )
+
+        let survivingLease = try await activeLease(for: scheduler, taskID: task.id)
+        XCTAssertEqual(survivingLease.attemptID, retriedAttemptID, "Completion cleanup must not release the newer attempt's lease")
+
+        let snapshot = try await store.snapshot(projectID: projectID)
+        XCTAssertEqual(snapshot.activeAttempts.count, 1)
+        XCTAssertEqual(snapshot.activeAttempts.first?.id, retriedAttemptID)
+        XCTAssertEqual(snapshot.activeAttempts.first?.outcome, .inProgress)
+
+        let followUp = try await scheduler.schedule(projectID: projectID)
+        XCTAssertNil(claim(in: followUp, taskID: other.id), "Repository must stay locked by the surviving attempt")
+    }
+
+    func testNonContentionClaimFailureReleasesRepositoryLease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/claim-failure-repo"
+        let task = makeTask(
+            projectID: projectID, title: "Failing Claim Task", priority: 9, status: .ready, createdAt: startDate)
+        let other = makeTask(
+            projectID: projectID, title: "Other Writer", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(task)
+        try await store.createTask(other)
+
+        let repository = HookingTaskRepository(base: store)
+        await repository.setClaimAttemptError(.underlying("injected claim failure"))
+        let scheduler = TaskScheduler(
+            repository: repository,
+            providers: TestProviderRegistry(result: .eligible(runtimeID: "runtime", modelID: "model")),
+            workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: sharedPath),
+            verifier: TestVerifier(passed: true),
+            clock: clock,
+            schedulerID: "scheduler-claim-failure"
+        )
+
+        do {
+            _ = try await scheduler.schedule(projectID: projectID)
+            XCTFail("Expected the injected claim failure to propagate")
+        } catch let error as TaskRepositoryError {
+            XCTAssertEqual(error, .underlying("injected claim failure"))
+        }
+
+        let replacementAttemptID = UUID()
+        try await store.acquireRepositoryLease(
+            repositoryPath: sharedPath, taskID: other.id, attemptID: replacementAttemptID, leaseTimeoutSeconds: 60)
+        try await store.releaseRepositoryLease(
+            repositoryPath: sharedPath, taskID: other.id, attemptID: replacementAttemptID)
+    }
+
+    func testUnavailableProviderDefersWithoutClaim() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let scheduler = makeScheduler(
+            store: store, clock: clock, providers: .unavailable(reason: "no-runtime"),
+            workspaceOwned: true, sharedRepositoryPath: nil, verifierPassed: true, schedulerID: "scheduler-unavailable")
+        let task = makeTask(projectID: projectID, title: "Unavailable Task", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+
+        let report = try await scheduler.schedule(projectID: projectID)
+
+        guard case .deferred(let reason) = try entry(in: report, taskID: task.id).disposition else {
+            XCTFail("Unavailable provider must defer the task")
+            return
+        }
+        XCTAssertEqual(reason, "providerUnavailable:no-runtime")
+        let snapshot = try await store.snapshot(projectID: projectID)
+        XCTAssertTrue(snapshot.activeAttempts.isEmpty)
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertTrue(history.isEmpty)
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .ready)
+    }
+
+    func testVerifierFailureBlocksWithoutEvidenceOrReviewTransition() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let repository = HookingTaskRepository(base: store)
+        let scheduler = TaskScheduler(
+            repository: repository,
+            providers: TestProviderRegistry(result: .eligible(runtimeID: "runtime", modelID: "model")),
+            workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: nil),
+            verifier: TestVerifier(passed: false),
+            clock: clock,
+            schedulerID: "scheduler-verifier-failure"
+        )
+        let task = makeTask(projectID: projectID, title: "Failing Verification", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimed = try XCTUnwrap(claim(in: report, taskID: task.id))
+        let lease = try await activeLease(for: scheduler, taskID: task.id)
+        let completion = try await finish(
+            scheduler: scheduler, taskID: task.id, attemptID: claimed.attemptID, generation: claimed.generation,
+            ownerNonce: lease.ownerNonce, outcome: .succeeded, usage: TaskAttemptUsage(toolCallCount: 1, durationSeconds: 5))
+        XCTAssertEqual(completion.disposition, .accepted)
+
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .verificationFailed("stub-details"))
+        XCTAssertEqual(stored?.stage, .analysis)
+        let recordedEvidenceCount = await repository.recordedEvidenceCount()
+        XCTAssertEqual(recordedEvidenceCount, 0)
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history.first?.outcome, .succeeded)
+    }
+
+    func testConcurrentDuplicateCompletionIsIdempotent() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/duplicate-completion-repo"
+        let task = makeTask(
+            projectID: projectID, title: "Duplicate Completion", priority: 9, status: .ready, createdAt: startDate)
+        let other = makeTask(
+            projectID: projectID, title: "Other Writer", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(task)
+        try await store.createTask(other)
+
+        let scheduler = makeScheduler(
+            store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            workspaceOwned: true, sharedRepositoryPath: sharedPath, verifierPassed: true, schedulerID: "scheduler-duplicate")
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimed = try XCTUnwrap(claim(in: report, taskID: task.id))
+        let lease = try await activeLease(for: scheduler, taskID: task.id)
+
+        async let first = scheduler.attemptDidComplete(
+            taskID: task.id, attemptID: claimed.attemptID, generation: claimed.generation,
+            ownerNonce: lease.ownerNonce, outcome: .failed, usage: TaskAttemptUsage(toolCallCount: nil, durationSeconds: nil))
+        async let second = scheduler.attemptDidComplete(
+            taskID: task.id, attemptID: claimed.attemptID, generation: claimed.generation,
+            ownerNonce: lease.ownerNonce, outcome: .failed, usage: TaskAttemptUsage(toolCallCount: nil, durationSeconds: nil))
+
+        let completions = try await [first, second]
+        XCTAssertEqual(completions.filter { $0.disposition == .accepted }.count, 1)
+        XCTAssertEqual(completions.filter { $0.disposition == .stale }.count, 1)
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history.first?.outcome, .failed)
+
+        let late = try await finish(
+            scheduler: scheduler, taskID: task.id, attemptID: claimed.attemptID, generation: claimed.generation,
+            ownerNonce: lease.ownerNonce, outcome: .failed, usage: TaskAttemptUsage(toolCallCount: nil, durationSeconds: nil))
+        XCTAssertEqual(late.disposition, .stale)
+
+        let followUp = try await scheduler.schedule(projectID: projectID)
+        XCTAssertNotNil(claim(in: followUp, taskID: other.id), "Ended completion must release the repository lease")
+    }
 }

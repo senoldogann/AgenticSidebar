@@ -154,12 +154,16 @@ final class TaskStoreTests: XCTestCase {
         let repoPath = "/Users/test/repo"
         let task1ID = UUID()
         let task2ID = UUID()
+        let task1AttemptID = UUID()
+        let task2AttemptID = UUID()
 
-        try await store.acquireRepositoryLease(repositoryPath: repoPath, taskID: task1ID, leaseTimeoutSeconds: 60)
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: task1ID, attemptID: task1AttemptID, leaseTimeoutSeconds: 60)
 
         // Second task attempting to acquire lease on the same repo path must fail
         do {
-            try await store.acquireRepositoryLease(repositoryPath: repoPath, taskID: task2ID, leaseTimeoutSeconds: 60)
+            try await store.acquireRepositoryLease(
+                repositoryPath: repoPath, taskID: task2ID, attemptID: task2AttemptID, leaseTimeoutSeconds: 60)
             XCTFail("Expected repositoryLeaseConflict error")
         } catch let error as TaskRepositoryError {
             switch error {
@@ -172,8 +176,9 @@ final class TaskStoreTests: XCTestCase {
         }
 
         // After releasing, task 2 can acquire
-        try await store.releaseRepositoryLease(repositoryPath: repoPath, taskID: task1ID)
-        try await store.acquireRepositoryLease(repositoryPath: repoPath, taskID: task2ID, leaseTimeoutSeconds: 60)
+        try await store.releaseRepositoryLease(repositoryPath: repoPath, taskID: task1ID, attemptID: task1AttemptID)
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: task2ID, attemptID: task2AttemptID, leaseTimeoutSeconds: 60)
     }
 
     func testForeignKeyViolationOnOrphanDependency() async throws {
@@ -219,5 +224,107 @@ final class TaskStoreTests: XCTestCase {
         XCTAssertEqual(loaded?.name, "Senior Coder")
         XCTAssertEqual(loaded?.role, .developer)
         XCTAssertEqual(loaded?.capabilities, ["workspaceWrite", "tools"])
+    }
+
+    func testBlockedTaskCannotBeClaimed() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let projectID = UUID()
+        let task = CodingTask(
+            id: UUID(),
+            projectID: projectID,
+            title: "Blocked Task",
+            objective: "Obj",
+            status: .blocked,
+            blockReason: .custom("paused")
+        )
+        try await store.createTask(task)
+
+        let attempt = TaskAttempt(
+            taskID: task.id,
+            attemptSequence: 1,
+            role: .developer,
+            providerID: "runtime",
+            modelID: "model",
+            workspaceID: UUID(),
+            leaseOwner: "scheduler",
+            leaseToken: "nonce",
+            leaseExpiry: Date().addingTimeInterval(300)
+        )
+
+        do {
+            _ = try await store.claimAttempt(taskID: task.id, expectedVersion: task.version, attempt: attempt)
+            XCTFail("A blocked task must not accept a new attempt")
+        } catch let error as TaskRepositoryError {
+            guard case .taskNotClaimable(let taskID, let status) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(taskID, task.id)
+            XCTAssertEqual(status, .blocked)
+        }
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertTrue(history.isEmpty)
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.version, task.version)
+    }
+
+    func testRepositoryLeaseReleaseRequiresOwningAttempt() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let repoPath = "/Users/test/attempt-bound-repo"
+        let owningTaskID = UUID()
+        let owningAttemptID = UUID()
+        let foreignAttemptID = UUID()
+        let otherTaskID = UUID()
+        let otherAttemptID = UUID()
+
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: owningTaskID, attemptID: owningAttemptID, leaseTimeoutSeconds: 60)
+
+        try await store.releaseRepositoryLease(repositoryPath: repoPath, taskID: owningTaskID, attemptID: foreignAttemptID)
+        do {
+            try await store.acquireRepositoryLease(
+                repositoryPath: repoPath, taskID: otherTaskID, attemptID: otherAttemptID, leaseTimeoutSeconds: 60)
+            XCTFail("Foreign attempt release must not free the repository lease")
+        } catch let error as TaskRepositoryError {
+            guard case .repositoryLeaseConflict(let path, let heldBy) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, repoPath)
+            XCTAssertEqual(heldBy, owningTaskID)
+        }
+
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: owningTaskID, attemptID: owningAttemptID, leaseTimeoutSeconds: 120)
+        try await store.releaseRepositoryLease(repositoryPath: repoPath, taskID: owningTaskID, attemptID: owningAttemptID)
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: otherTaskID, attemptID: otherAttemptID, leaseTimeoutSeconds: 60)
+    }
+
+    func testSameTaskSecondAttemptCannotTakeRepositoryLease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let repoPath = "/Users/test/same-task-repo"
+        let taskID = UUID()
+        let firstAttemptID = UUID()
+        let secondAttemptID = UUID()
+
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: taskID, attemptID: firstAttemptID, leaseTimeoutSeconds: 60)
+
+        do {
+            try await store.acquireRepositoryLease(
+                repositoryPath: repoPath, taskID: taskID, attemptID: secondAttemptID, leaseTimeoutSeconds: 60)
+            XCTFail("A second attempt of the same task must not take over an active repository lease")
+        } catch let error as TaskRepositoryError {
+            guard case .repositoryLeaseConflict(let path, let heldBy) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, repoPath)
+            XCTAssertEqual(heldBy, taskID)
+        }
+
+        // The owning attempt still holds the lease and can renew it.
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath, taskID: taskID, attemptID: firstAttemptID, leaseTimeoutSeconds: 120)
     }
 }

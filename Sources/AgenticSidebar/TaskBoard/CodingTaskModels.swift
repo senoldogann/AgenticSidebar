@@ -217,7 +217,7 @@ public struct TaskLease: Sendable, Codable, Equatable {
         self.ownerNonce == ownerNonce
             && self.attemptID == attemptID
             && self.generation == generation
-            && date < expiration
+            && !hasExpired(at: date)
     }
 
     /// Returns true when the lease has reached its expiration instant.

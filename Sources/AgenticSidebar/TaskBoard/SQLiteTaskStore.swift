@@ -29,7 +29,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
 
         try configurePragmas(on: db)
-        try TaskStoreMigrations.apply(migrations: SQLiteTaskStore.allMigrations, to: db)
+        try TaskStoreMigrations.apply(migrations: TaskStoreMigrations.standardMigrations, to: db)
         return SQLiteTaskStore(db: db, isMemory: true)
     }
 
@@ -46,7 +46,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
 
         try configurePragmas(on: db)
-        try TaskStoreMigrations.apply(migrations: SQLiteTaskStore.allMigrations, to: db)
+        try TaskStoreMigrations.apply(migrations: TaskStoreMigrations.standardMigrations, to: db)
         return SQLiteTaskStore(db: db, isMemory: false)
     }
 
@@ -261,6 +261,9 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                         actual: task.version
                     )
                 }
+                guard task.status == .ready || task.status == .running else {
+                    throw TaskRepositoryError.taskNotClaimable(taskID: taskID, status: task.status)
+                }
 
                 // Check for existing active attempt (outcome == .inProgress and ended_at IS NULL)
                 if let active = try loadActiveAttempt(for: taskID) {
@@ -298,6 +301,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
     public func acquireRepositoryLease(
         repositoryPath: String,
         taskID: UUID,
+        attemptID: UUID,
         leaseTimeoutSeconds: TimeInterval
     ) async throws {
         try queue.sync {
@@ -306,28 +310,38 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 let now = Date().timeIntervalSince1970
                 let expiry = now + leaseTimeoutSeconds
 
-                let checkSql = "SELECT task_id, lease_expiry FROM repository_leases WHERE repository_path = ?;"
+                let checkSql = "SELECT task_id, attempt_id FROM repository_leases WHERE repository_path = ?;"
                 var checkStmt: OpaquePointer?
                 defer { sqlite3_finalize(checkStmt) }
                 try prepare(checkSql, &checkStmt)
                 bindText(checkStmt, 1, repositoryPath)
 
                 if sqlite3_step(checkStmt) == SQLITE_ROW {
-                    let heldByStr = String(cString: sqlite3_column_text(checkStmt, 0))
-                    let existingExpiry = sqlite3_column_double(checkStmt, 1)
-                    if existingExpiry > now, let heldByUUID = UUID(uuidString: heldByStr), heldByUUID != taskID {
+                    let heldByTaskID = UUID(uuidString: String(cString: sqlite3_column_text(checkStmt, 0)))
+                    let heldByAttemptID: UUID?
+                    if let text = sqlite3_column_text(checkStmt, 1) {
+                        heldByAttemptID = UUID(uuidString: String(cString: text))
+                    } else {
+                        heldByAttemptID = nil
+                    }
+                    let isSameOwner = heldByTaskID == taskID && heldByAttemptID == attemptID
+                    if !isSameOwner {
+                        guard let heldByTaskID else {
+                            throw TaskRepositoryError.storeCorrupt("Repository lease for \(repositoryPath) has an invalid owner")
+                        }
                         throw TaskRepositoryError.repositoryLeaseConflict(
                             repositoryPath: repositoryPath,
-                            heldByTaskID: heldByUUID
+                            heldByTaskID: heldByTaskID
                         )
                     }
                 }
 
                 let replaceSql = """
-                    INSERT INTO repository_leases (repository_path, task_id, acquired_at, lease_expiry)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO repository_leases (repository_path, task_id, attempt_id, acquired_at, lease_expiry)
+                    VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(repository_path) DO UPDATE SET
                         task_id = excluded.task_id,
+                        attempt_id = excluded.attempt_id,
                         acquired_at = excluded.acquired_at,
                         lease_expiry = excluded.lease_expiry;
                     """
@@ -336,23 +350,25 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 try prepare(replaceSql, &replaceStmt)
                 bindText(replaceStmt, 1, repositoryPath)
                 bindText(replaceStmt, 2, taskID.uuidString)
-                sqlite3_bind_double(replaceStmt, 3, now)
-                sqlite3_bind_double(replaceStmt, 4, expiry)
+                bindText(replaceStmt, 3, attemptID.uuidString)
+                sqlite3_bind_double(replaceStmt, 4, now)
+                sqlite3_bind_double(replaceStmt, 5, expiry)
                 try stepDone(replaceStmt)
             }
         }
     }
 
-    public func releaseRepositoryLease(repositoryPath: String, taskID: UUID) async throws {
+    public func releaseRepositoryLease(repositoryPath: String, taskID: UUID, attemptID: UUID) async throws {
         try queue.sync {
             try checkOpen()
             try executeTransaction {
-                let sql = "DELETE FROM repository_leases WHERE repository_path = ? AND task_id = ?;"
+                let sql = "DELETE FROM repository_leases WHERE repository_path = ? AND task_id = ? AND attempt_id = ?;"
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
                 try prepare(sql, &stmt)
                 bindText(stmt, 1, repositoryPath)
                 bindText(stmt, 2, taskID.uuidString)
+                bindText(stmt, 3, attemptID.uuidString)
                 try stepDone(stmt)
             }
         }
@@ -1001,56 +1017,5 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             }
             throw TaskRepositoryError.underlying(msg)
         }
-    }
-}
-
-extension SQLiteTaskStore {
-    /// Schema v2: attempt usage columns must keep "unknown" distinct from zero.
-    static let nullableUsageMigrationV2 = TaskStoreMigration(version: 2, name: "AttemptNullableUsage_v2") { db in
-        try TaskStoreMigrations.execute(
-            """
-            CREATE TABLE task_attempts_v2 (
-                id TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                attempt_sequence INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                provider_id TEXT NOT NULL,
-                model_id TEXT NOT NULL,
-                variant_snapshot TEXT,
-                workspace_id TEXT,
-                generation INTEGER NOT NULL,
-                lease_owner TEXT,
-                lease_token TEXT,
-                lease_expiry REAL,
-                started_at REAL NOT NULL,
-                ended_at REAL,
-                outcome TEXT NOT NULL,
-                tool_call_count INTEGER,
-                duration_seconds INTEGER
-            );
-
-            INSERT INTO task_attempts_v2 (
-                id, task_id, attempt_sequence, role, provider_id, model_id,
-                variant_snapshot, workspace_id, generation, lease_owner,
-                lease_token, lease_expiry, started_at, ended_at, outcome,
-                tool_call_count, duration_seconds
-            )
-            SELECT
-                id, task_id, attempt_sequence, role, provider_id, model_id,
-                variant_snapshot, workspace_id, generation, lease_owner,
-                lease_token, lease_expiry, started_at, ended_at, outcome,
-                tool_call_count, duration_seconds
-            FROM task_attempts;
-
-            DROP TABLE task_attempts;
-            ALTER TABLE task_attempts_v2 RENAME TO task_attempts;
-            CREATE INDEX IF NOT EXISTS idx_attempts_task ON task_attempts(task_id);
-            """,
-            on: db
-        )
-    }
-
-    static var allMigrations: [TaskStoreMigration] {
-        TaskStoreMigrations.standardMigrations + [nullableUsageMigrationV2]
     }
 }
