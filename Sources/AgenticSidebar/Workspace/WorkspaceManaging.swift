@@ -83,6 +83,12 @@ enum WorkspaceGuardError: LocalizedError, Equatable, Sendable {
     case baseNotFound(sha: String)
     /// A fixed argv Git invocation failed.
     case gitCommandFailed(arguments: [String], exitCode: Int32, stderr: String)
+    /// A fixed argv invocation exceeded its wall-clock budget and was terminated.
+    case gitTimedOut(executable: String, arguments: [String], timeout: TimeInterval)
+    /// The workspace layer could not inspect the repository; the reason is not a Git exit code.
+    case inspectionUnavailable(reason: String)
+    /// The owned workspace working tree could not be read for cleanliness.
+    case cleanlinessUnreadable(reason: String)
     /// The manifest could not be recorded atomically in the task store.
     case storeRecordFailed(reason: String)
     /// The supplied approval does not authorize this retirement.
@@ -111,6 +117,9 @@ enum WorkspaceGuardError: LocalizedError, Equatable, Sendable {
         case .invalidBase: return "WORKTREE_INVALID_BASE"
         case .baseNotFound: return "WORKTREE_BASE_NOT_FOUND"
         case .gitCommandFailed: return "WORKTREE_GIT_FAILED"
+        case .gitTimedOut: return "WORKTREE_GIT_TIMEOUT"
+        case .inspectionUnavailable: return "WORKTREE_INSPECTION_UNAVAILABLE"
+        case .cleanlinessUnreadable: return "WORKTREE_CLEANLINESS_UNREADABLE"
         case .storeRecordFailed: return "WORKTREE_STORE_RECORD_FAILED"
         case .approvalRejected: return "WORKTREE_APPROVAL_REJECTED"
         case .projectNotFound: return "WORKTREE_PROJECT_UNKNOWN"
@@ -155,6 +164,12 @@ enum WorkspaceGuardError: LocalizedError, Equatable, Sendable {
             return "\(code): base commit \(sha) does not exist in the repository"
         case .gitCommandFailed(let arguments, let exitCode, let stderr):
             return "\(code): git \(arguments.joined(separator: " ")) exited \(exitCode): \(stderr)"
+        case .gitTimedOut(let executable, let arguments, let timeout):
+            return "\(code): \(executable) \(arguments.joined(separator: " ")) did not finish within \(timeout)s and was terminated"
+        case .inspectionUnavailable(let reason):
+            return "\(code): workspace inspection is unavailable: \(reason)"
+        case .cleanlinessUnreadable(let reason):
+            return "\(code): owned workspace cleanliness could not be read: \(reason)"
         case .storeRecordFailed(let reason):
             return "\(code): workspace manifest could not be recorded: \(reason)"
         case .approvalRejected(let reason):
@@ -202,11 +217,20 @@ enum WorkspaceInspection: Sendable, Equatable {
 
 // MARK: - Ports
 
-/// Managed workspace port: preflight, exact creation, inspection and guarded retirement.
+/// Managed workspace port: preflight, exact creation, inspection, release and guarded retirement.
+///
+/// Lifecycle contract: a workspace created through this port is held by the creating
+/// attempt until `releaseOwnedWorkspace` is called with the same `workspaceID` and
+/// `attemptID`. Retirement refuses a live holder with `WORKTREE_ACTIVE`, so a port-only
+/// caller completes the lifecycle as create → release → retire; release is intentionally
+/// part of the port rather than an implementation detail so that callers never need the
+/// concrete actor to finish an attempt.
 protocol WorkspaceManaging: Sendable {
     func preflight(project: CodingProject, task: CodingTask) async -> WorkspacePreflight
     func createOwnedWorkspace(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord
     func inspect(workspaceID: UUID) async -> WorkspaceInspection
+    /// Releases the live holding of a finished attempt; a mismatched attempt is a no-op.
+    func releaseOwnedWorkspace(workspaceID: UUID, attemptID: UUID) async
     func retire(workspaceID: UUID, approval: TaskApproval) async throws
 }
 
@@ -216,8 +240,11 @@ protocol WorkspaceProjectResolving: Sendable {
 }
 
 /// Resolves a task for ports that only carry a task identifier.
+///
+/// Resolution is throwing so a store failure is never flattened into "task unknown":
+/// callers can distinguish a genuinely absent task from an unreadable store.
 protocol CodingTaskResolving: Sendable {
-    func resolveTask(id: UUID) async -> CodingTask?
+    func resolveTask(id: UUID) async throws -> CodingTask?
 }
 
 /// Narrow port for the atomic persisted record of a workspace manifest.
@@ -230,8 +257,8 @@ protocol WorkspaceEventRecording: Sendable {
 }
 
 extension SQLiteTaskStore: CodingTaskResolving {
-    func resolveTask(id: UUID) async -> CodingTask? {
-        try? await task(id: id)
+    func resolveTask(id: UUID) async throws -> CodingTask? {
+        try await task(id: id)
     }
 }
 
@@ -247,9 +274,12 @@ extension SQLiteTaskStore: WorkspaceEventRecording {
 ///
 /// Ownership mapping: the scheduler leases the repository before it claims an attempt,
 /// so the repository lease — not the workspace holder — fences concurrent writers. A
-/// valid workspace (active or idle) is therefore offered as `.owned`; a guard refusal
-/// or an inspection failure becomes `.unavailable` and everything else `.notOwned`.
-/// The idle-versus-active distinction matters to the recovery adapter below, not here.
+/// valid workspace (active or idle) is therefore offered as `.owned`; the workspace
+/// manager decides ownership from the manifest and Git registration before it looks at
+/// source cleanliness, so a dirty source checkout can no longer mask an existing owned
+/// workspace as `.unavailable`. A guard refusal or an inspection failure becomes
+/// `.unavailable` and everything else `.notOwned`. The idle-versus-active distinction
+/// matters to the recovery adapter below, not here.
 struct GitWorkspaceSchedulerAdapter: TaskWorkspacePreflightPort {
     let manager: any WorkspaceManaging
     let projects: any WorkspaceProjectResolving
@@ -259,8 +289,14 @@ struct GitWorkspaceSchedulerAdapter: TaskWorkspacePreflightPort {
         guard let project = await projects.resolveProject(id: projectID) else {
             return .unavailable(reason: "project \(projectID.uuidString) is unknown")
         }
-        guard let task = await tasks.resolveTask(id: taskID) else {
-            return .unavailable(reason: "task \(taskID.uuidString) is unknown")
+        let task: CodingTask
+        do {
+            guard let resolved = try await tasks.resolveTask(id: taskID) else {
+                return .unavailable(reason: "task \(taskID.uuidString) is unknown")
+            }
+            task = resolved
+        } catch {
+            return .unavailable(reason: "task \(taskID.uuidString) resolution failed: \(error)")
         }
         switch await manager.preflight(project: project, task: task) {
         case .owned(let record, _):

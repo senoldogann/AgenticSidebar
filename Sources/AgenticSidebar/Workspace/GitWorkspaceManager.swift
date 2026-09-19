@@ -60,8 +60,9 @@ actor GitWorkspaceManager: WorkspaceManaging {
             try validateProjectIdentity(project: project, task: task)
             try assertWorkspaceRootOutsideRepository(project: project)
             try assertTargetIsSafe(projectID: task.projectID, taskID: task.id, workspaceID: nil)
-            try verifySourceIsClean(project: project)
-            try verifyBranchIsWritable(project: project)
+            // Ownership is decided from the manifest and Git registration before source
+            // cleanliness: a dirty source checkout must never mask a valid owned workspace
+            // (that would surface as WORKTREE_DIRTY and hide the workspace from recovery).
             let manifests = try publishableManifests(projectID: project.id, taskID: task.id)
             guard manifests.count <= 1 else {
                 throw WorkspaceGuardError.foreignManifest(
@@ -70,6 +71,10 @@ actor GitWorkspaceManager: WorkspaceManaging {
                 )
             }
             guard let manifestURL = manifests.first else {
+                // No owned workspace exists: this is the creation path, so the source
+                // must be clean and the branch writable before anything may be created.
+                try verifySourceIsClean(project: project)
+                try verifyBranchIsWritable(project: project)
                 return .notOwned(reason: "no owned workspace for task \(task.id.uuidString)")
             }
             // A preflight may only offer a workspace whose manifest and Git registration
@@ -110,7 +115,7 @@ actor GitWorkspaceManager: WorkspaceManaging {
         case .blocked(let error):
             throw error
         case .unavailable(let reason):
-            throw WorkspaceGuardError.gitCommandFailed(arguments: [], exitCode: -1, stderr: reason)
+            throw WorkspaceGuardError.inspectionUnavailable(reason: reason)
         case .notOwned:
             break
         }
@@ -221,11 +226,29 @@ actor GitWorkspaceManager: WorkspaceManaging {
         }
     }
 
+    /// Retires one idle owned workspace after an explicit disposal approval.
+    ///
+    /// Approval binding: the action must be the retirement action (`.discardWorkspace`;
+    /// `.accept` approvals belong to the acceptance path and never authorize disposal
+    /// here), the fingerprint must be non-empty, and the approval must bind the exact
+    /// task *and* attempt that created the workspace — a task-only match would let an
+    /// approval issued for attempt A discard the workspace of attempt B.
+    ///
+    /// The full content-fingerprint comparison is deliberately not implemented here:
+    /// it lives upstream in the AcceptanceGate (Task 12), which owns the reviewed
+    /// content digest. This layer only refuses approvals that are structurally
+    /// unbound to the workspace being disposed.
+    ///
+    /// A live holder is never implicitly released: retirement requires an explicit
+    /// `releaseOwnedWorkspace` first, so an executing attempt cannot lose its workspace.
     func retire(workspaceID: UUID, approval: TaskApproval) async throws {
         guard approval.action == .discardWorkspace else {
             throw WorkspaceGuardError.approvalRejected(
                 reason: "approval action \(approval.action.rawValue) does not authorize workspace disposal"
             )
+        }
+        guard !approval.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw WorkspaceGuardError.approvalRejected(reason: "approval fingerprint is empty")
         }
         guard let manifestURL = findManifest(workspaceID: workspaceID) else {
             throw WorkspaceGuardError.unknownWorkspace(workspaceID: workspaceID)
@@ -239,6 +262,12 @@ actor GitWorkspaceManager: WorkspaceManaging {
         guard approval.taskID == record.taskID else {
             throw WorkspaceGuardError.approvalRejected(
                 reason: "approval binds task \(approval.taskID.uuidString) but workspace belongs to task \(record.taskID.uuidString)"
+            )
+        }
+        guard approval.attemptID == record.attemptID else {
+            throw WorkspaceGuardError.approvalRejected(
+                reason: "approval binds attempt \(approval.attemptID.uuidString) but workspace belongs to "
+                    + "attempt \(record.attemptID.uuidString)"
             )
         }
         if let holding = holdings[workspaceID] {
@@ -258,7 +287,7 @@ actor GitWorkspaceManager: WorkspaceManaging {
                 manualInspectionPath: record.workspacePath
             )
         case .unreadable(let reason):
-            throw WorkspaceGuardError.gitCommandFailed(arguments: ["status"], exitCode: -1, stderr: reason)
+            throw WorkspaceGuardError.cleanlinessUnreadable(reason: reason)
         }
 
         let repositoryURL = URL(fileURLWithPath: record.repositoryPath)
@@ -288,13 +317,25 @@ actor GitWorkspaceManager: WorkspaceManaging {
         holdings[workspaceID] = nil
         removeEmptyDirectories(upTo: worktreesRoot, from: workspaceURL.deletingLastPathComponent())
         removeEmptyDirectories(upTo: registryRoot, from: manifestURL.deletingLastPathComponent())
+
+        // The retired event is recorded only after the mutation succeeded: recording it
+        // first could announce a retirement that then failed and left the manifest alive.
+        if let events {
+            do {
+                try await events.recordWorkspaceEvent(makeRetiredEvent(record: record))
+            } catch {
+                throw WorkspaceGuardError.storeRecordFailed(reason: "workspace.retired event could not be recorded: \(error)")
+            }
+        }
     }
 
     /// Releases the live holding of an attempt once its work is provably finished.
     ///
-    /// The executing layer calls this when an attempt reaches a terminal outcome; the
-    /// workspace then maps back to `.idle` for preflight and recovery.
-    func releaseOwnedWorkspace(workspaceID: UUID, attemptID: UUID) {
+    /// This is part of the `WorkspaceManaging` port so a port-only caller can complete
+    /// create → release → retire without the concrete actor. A release whose attempt does
+    /// not match the live holding is a no-op, and the workspace then maps back to `.idle`
+    /// for preflight and recovery.
+    func releaseOwnedWorkspace(workspaceID: UUID, attemptID: UUID) async {
         guard let holding = holdings[workspaceID], holding.attemptID == attemptID else { return }
         holdings[workspaceID] = nil
     }
@@ -349,6 +390,9 @@ actor GitWorkspaceManager: WorkspaceManaging {
     private func runGitAllowingFailure(_ arguments: [String], in directory: URL) throws -> GitCommandResult {
         do {
             return try runner.run(executable: "git", arguments: arguments, directory: directory)
+        } catch let error as WorkspaceGuardError {
+            // The runner's typed timeout must survive the wrap so callers can act on it.
+            throw error
         } catch {
             throw WorkspaceGuardError.gitCommandFailed(arguments: arguments, exitCode: -1, stderr: "\(error)")
         }
@@ -500,16 +544,35 @@ actor GitWorkspaceManager: WorkspaceManaging {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
+    /// Locates the manifest for one workspace identity deterministically.
+    ///
+    /// Enumeration order is not stable, so candidates are sorted by path and the one
+    /// registered at the manifest's own derived location wins; if none matches (a
+    /// dishonest or misplaced manifest), the first sorted candidate is returned so
+    /// `validatedRecord` can refuse it with a deterministic error instead of a random one.
     private func findManifest(workspaceID: UUID) -> URL? {
         let fileName = "\(workspaceID.uuidString).json"
         guard FileManager.default.fileExists(atPath: registryRoot.path) else { return nil }
         guard let enumerator = FileManager.default.enumerator(at: registryRoot, includingPropertiesForKeys: nil) else {
             return nil
         }
+        var candidates: [URL] = []
         for case let url as URL in enumerator where url.lastPathComponent == fileName {
-            return url
+            candidates.append(url)
         }
-        return nil
+        let sorted = candidates.sorted { canonicalPath($0) < canonicalPath($1) }
+        guard let first = sorted.first else { return nil }
+        return sorted.first(where: isRegisteredAtDerivedLocation) ?? first
+    }
+
+    private func isRegisteredAtDerivedLocation(_ manifestURL: URL) -> Bool {
+        guard let manifest = try? WorkspaceManifest.decode(from: Data(contentsOf: manifestURL)) else { return false }
+        let derived = self.manifestURL(
+            projectID: manifest.projectID,
+            taskID: manifest.taskID,
+            workspaceID: manifest.workspaceID
+        )
+        return canonicalPath(derived) == canonicalPath(manifestURL)
     }
 
     private func validatedRecord(
@@ -607,11 +670,7 @@ actor GitWorkspaceManager: WorkspaceManaging {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try manifest.encoded().write(to: url, options: [.atomic])
         } catch {
-            throw WorkspaceGuardError.gitCommandFailed(
-                arguments: ["manifest", "write"],
-                exitCode: -1,
-                stderr: "could not write workspace manifest: \(error)"
-            )
+            throw WorkspaceGuardError.storeRecordFailed(reason: "could not write workspace manifest: \(error)")
         }
     }
 
@@ -622,6 +681,34 @@ actor GitWorkspaceManager: WorkspaceManaging {
             timestamp: manifest.createdAt,
             kind: "workspace.created",
             redactedPayload: try manifest.payloadString()
+        )
+    }
+
+    private struct RetiredWorkspacePayload: Codable {
+        let workspaceID: UUID
+        let taskID: UUID
+        let attemptID: UUID
+        let nonce: String
+    }
+
+    private func makeRetiredEvent(record: WorkspaceRecord) throws -> CodingTaskEvent {
+        let payload = RetiredWorkspacePayload(
+            workspaceID: record.workspaceID,
+            taskID: record.taskID,
+            attemptID: record.attemptID,
+            nonce: record.nonce
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let string = String(data: try encoder.encode(payload), encoding: .utf8) else {
+            throw WorkspaceGuardError.storeRecordFailed(reason: "workspace.retired payload is not valid UTF-8")
+        }
+        return CodingTaskEvent(
+            taskID: record.taskID,
+            attemptID: record.attemptID,
+            timestamp: Date(),
+            kind: "workspace.retired",
+            redactedPayload: string
         )
     }
 

@@ -33,7 +33,16 @@ enum GitCommandRunnerError: LocalizedError, Equatable, Sendable {
 /// that resolves under `executableDirectory`, and every argument stays a separate
 /// `Process` argument. No caller string is ever interpreted by a shell, and output
 /// is captured with a hard byte budget so a noisy command cannot exhaust memory.
+///
+/// Every invocation carries a wall-clock deadline (`defaultTimeout` unless the caller
+/// overrides it). A process that overruns is terminated (SIGTERM, then SIGKILL after a
+/// short grace period), its pipes are drained, and the call throws the typed
+/// `WorkspaceGuardError.gitTimedOut` so a hung tool can never block the workspace actor
+/// forever.
 final class GitCommandRunner: Sendable {
+    static let defaultTimeout: TimeInterval = 30
+    private static let terminationGrace: TimeInterval = 2
+
     let executableDirectory: URL
     let maxOutputBytes: Int
 
@@ -44,7 +53,12 @@ final class GitCommandRunner: Sendable {
         self.maxOutputBytes = maxOutputBytes
     }
 
-    func run(executable: String, arguments: [String], directory: URL) throws -> GitCommandResult {
+    func run(
+        executable: String,
+        arguments: [String],
+        directory: URL,
+        timeout: TimeInterval = GitCommandRunner.defaultTimeout
+    ) throws -> GitCommandResult {
         guard Self.isValidExecutableName(executable) else {
             throw GitCommandRunnerError.invalidExecutableName(executable)
         }
@@ -88,6 +102,9 @@ final class GitCommandRunner: Sendable {
             drainGroup.leave()
         }
 
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exitSemaphore.signal() }
+
         do {
             try process.run()
         } catch {
@@ -95,6 +112,13 @@ final class GitCommandRunner: Sendable {
             try? stderrHandle.close()
             drainGroup.wait()
             throw GitCommandRunnerError.launchFailed(executable: executable, reason: "\(error)")
+        }
+
+        if exitSemaphore.wait(timeout: .now() + timeout) == .timedOut {
+            terminateProcess(process, exitSemaphore: exitSemaphore)
+            drainGroup.wait()
+            process.waitUntilExit()
+            throw WorkspaceGuardError.gitTimedOut(executable: executable, arguments: arguments, timeout: timeout)
         }
 
         drainGroup.wait()
@@ -108,6 +132,17 @@ final class GitCommandRunner: Sendable {
             standardError: String(decoding: stderr.data, as: UTF8.self),
             outputWasTruncated: stdout.wasTruncated || stderr.wasTruncated
         )
+    }
+
+    /// Terminates an overrunning process, escalating to SIGKILL after a grace period.
+    private func terminateProcess(_ process: Process, exitSemaphore: DispatchSemaphore) {
+        if process.isRunning {
+            process.terminate()
+        }
+        if exitSemaphore.wait(timeout: .now() + Self.terminationGrace) == .timedOut, process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            _ = exitSemaphore.wait(timeout: .now() + Self.terminationGrace)
+        }
     }
 
     private static func isValidExecutableName(_ name: String) -> Bool {

@@ -23,8 +23,14 @@ final class GitWorkspaceManagerTests: XCTestCase {
     private struct StaticTaskResolver: CodingTaskResolving {
         let tasks: [CodingTask]
 
-        func resolveTask(id: UUID) async -> CodingTask? {
+        func resolveTask(id: UUID) async throws -> CodingTask? {
             tasks.first { $0.id == id }
+        }
+    }
+
+    private struct FailingTaskResolver: CodingTaskResolving {
+        func resolveTask(id: UUID) async throws -> CodingTask? {
+            throw SpyFailure.storeUnavailable
         }
     }
 
@@ -468,13 +474,17 @@ final class GitWorkspaceManagerTests: XCTestCase {
         let manager = makeManager(fixture: fixture, projects: [project], events: nil)
 
         let workspaceID = UUID()
+        // A real directory at the derived target skips the missing-path guard so the
+        // check under test is the Git registration verification, not directory existence.
+        let target = workspaceTarget(fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: workspaceID)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
         let phantomRecord = WorkspaceRecord(
             workspaceID: workspaceID,
             projectID: project.id,
             taskID: task.id,
             attemptID: UUID(),
             repositoryPath: fixture.repositoryURL.path,
-            workspacePath: workspaceTarget(fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: workspaceID).path,
+            workspacePath: target.path,
             commonDirIdentity: try commonDirIdentity(of: fixture.repositoryURL),
             baseSHA: fixture.baseSHA,
             nonce: UUID().uuidString,
@@ -485,7 +495,38 @@ final class GitWorkspaceManagerTests: XCTestCase {
             to: manifestFile(fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: workspaceID)
         )
 
-        assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_FOREIGN_MANIFEST")
+        let preflight = await manager.preflight(project: project, task: task)
+        guard case .blocked(.foreignManifest(let rejectedID, let reason)) = preflight else {
+            XCTFail("expected foreign manifest refusal, got \(preflight)")
+            return
+        }
+        XCTAssertEqual(rejectedID, workspaceID)
+        XCTAssertTrue(reason.contains("not registered"), "expected registration reason, got: \(reason)")
+    }
+
+    func testPreflightReturnsOwnedWorkspaceEvenWhenSourceIsDirty() async throws {
+        let fixture = try makeCleanFixture(name: "owned-dirty-source")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+
+        // The owned workspace must stay visible for recovery even though the source
+        // checkout now has an untracked change; dirtiness only blocks fresh creation.
+        try Data("scratch\n".utf8).write(to: fixture.repositoryURL.appendingPathComponent("scratch.txt"))
+
+        let preflight = await manager.preflight(project: project, task: task)
+        guard case .owned(let ownedRecord, let holder) = preflight else {
+            XCTFail("expected owned workspace despite dirty source, got \(preflight)")
+            return
+        }
+        XCTAssertEqual(ownedRecord, record)
+        XCTAssertEqual(holder, .active(attemptID: attempt.id))
     }
 
     func testPreflightRefusesMultipleManifestsForOneTask() async throws {
@@ -1002,6 +1043,169 @@ final class GitWorkspaceManagerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: record.workspacePath))
     }
 
+    func testRetireRejectsApprovalWithWrongAttemptIDAndKeepsWorkspace() async throws {
+        let fixture = try makeCleanFixture(name: "retire-wrong-attempt")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+
+        // Attempt B belongs to the same task, so the task-only binding would let its
+        // approval discard attempt A's workspace; the attempt binding must refuse it.
+        let otherAttempt = makeAttempt(taskID: task.id)
+        await assertThrownGuardError(
+            {
+                try await manager.retire(
+                    workspaceID: record.workspaceID,
+                    approval: makeApproval(taskID: task.id, attemptID: otherAttempt.id)
+                )
+            },
+            code: "WORKTREE_APPROVAL_REJECTED"
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.workspacePath))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: manifestFile(
+                    fixture: fixture,
+                    projectID: project.id,
+                    taskID: task.id,
+                    workspaceID: record.workspaceID
+                ).path
+            )
+        )
+        let worktreeList = try runGit(["worktree", "list", "--porcelain"], in: fixture.repositoryURL).stdout
+        XCTAssertTrue(worktreeList.contains("\(record.workspacePath)\n"), "worktree stayed registered: \(worktreeList)")
+    }
+
+    func testRetireRejectsEmptyFingerprintApproval() async throws {
+        let fixture = try makeCleanFixture(name: "retire-empty-fingerprint")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+
+        let emptyFingerprint = TaskApproval(
+            taskID: task.id,
+            attemptID: attempt.id,
+            fingerprint: "",
+            actor: "workspace-tests",
+            timestamp: startDate,
+            action: .discardWorkspace
+        )
+        await assertThrownGuardError(
+            {
+                try await manager.retire(workspaceID: record.workspaceID, approval: emptyFingerprint)
+            },
+            code: "WORKTREE_APPROVAL_REJECTED"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.workspacePath))
+    }
+
+    func testRetireRefusesUnreadableWorkspaceCleanliness() async throws {
+        let fixture = try makeCleanFixture(name: "retire-unreadable")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+
+        // Removing the worktree's .git file makes `git status` fail, which must surface
+        // as the typed cleanliness error instead of a fabricated git invocation failure.
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: record.workspacePath).appendingPathComponent(".git"))
+
+        await assertThrownGuardError(
+            {
+                try await manager.retire(
+                    workspaceID: record.workspaceID,
+                    approval: makeApproval(taskID: task.id, attemptID: attempt.id)
+                )
+            },
+            code: "WORKTREE_CLEANLINESS_UNREADABLE"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.workspacePath))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: manifestFile(
+                    fixture: fixture,
+                    projectID: project.id,
+                    taskID: task.id,
+                    workspaceID: record.workspaceID
+                ).path
+            )
+        )
+    }
+
+    func testRetireRecordsWorkspaceRetiredEvent() async throws {
+        let fixture = try makeCleanFixture(name: "retire-event")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let events = RecordingWorkspaceEvents(failure: nil)
+        let manager = makeManager(fixture: fixture, projects: [project], events: events)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+
+        try await manager.retire(workspaceID: record.workspaceID, approval: makeApproval(taskID: task.id, attemptID: attempt.id))
+
+        XCTAssertEqual(events.events.count, 2)
+        let retired = try XCTUnwrap(events.events.last)
+        XCTAssertEqual(retired.taskID, task.id)
+        XCTAssertEqual(retired.attemptID, attempt.id)
+        XCTAssertEqual(retired.kind, "workspace.retired")
+        XCTAssertTrue(retired.redactedPayload.contains(record.workspaceID.uuidString))
+        XCTAssertTrue(retired.redactedPayload.contains(attempt.id.uuidString))
+        XCTAssertTrue(retired.redactedPayload.contains(record.nonce))
+    }
+
+    func testReleaseWithWrongAttemptIDKeepsLiveHolder() async throws {
+        let fixture = try makeCleanFixture(name: "release-wrong-attempt")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: UUID())
+        guard case .present(let stillHeld) = await manager.inspect(workspaceID: record.workspaceID) else {
+            XCTFail("expected present inspection")
+            return
+        }
+        XCTAssertEqual(stillHeld.holder, .active(attemptID: attempt.id))
+
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+        guard case .present(let released) = await manager.inspect(workspaceID: record.workspaceID) else {
+            XCTFail("expected present inspection")
+            return
+        }
+        XCTAssertEqual(released.holder, .idle)
+    }
+
     // MARK: - Port adapters
 
     func testSchedulerAdapterMapsOwnedWorkspaceToDescriptorAndDefersOtherwise() async throws {
@@ -1042,6 +1246,57 @@ final class GitWorkspaceManagerTests: XCTestCase {
             XCTFail("unknown project must be unavailable, got \(unknownProjectResult)")
             return
         }
+    }
+
+    func testSchedulerAdapterSurfacesTaskResolutionFailure() async throws {
+        let fixture = try makeCleanFixture(name: "scheduler-adapter-failure")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let adapter = GitWorkspaceSchedulerAdapter(
+            manager: manager,
+            projects: StaticProjectResolver(projects: [project]),
+            tasks: FailingTaskResolver()
+        )
+
+        let result = await adapter.preflight(projectID: project.id, taskID: task.id)
+        guard case .unavailable(let reason) = result else {
+            XCTFail("a task resolution failure must be unavailable, got \(result)")
+            return
+        }
+        XCTAssertTrue(reason.contains("storeUnavailable"), "real store error must be propagated, got: \(reason)")
+    }
+
+    func testPortTypedCreateReleaseRetireRoundTrip() async throws {
+        let fixture = try makeCleanFixture(name: "port-round-trip")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager: any WorkspaceManaging = makeManager(fixture: fixture, projects: [project], events: nil)
+
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+        guard case .owned(_, let activeHolder) = await manager.preflight(project: project, task: task) else {
+            XCTFail("expected active owned workspace through the port")
+            return
+        }
+        XCTAssertEqual(activeHolder, .active(attemptID: attempt.id))
+
+        // Release is part of the port, so a port-only caller can finish the full lifecycle.
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+        guard case .owned(_, let idleHolder) = await manager.preflight(project: project, task: task) else {
+            XCTFail("expected idle owned workspace through the port")
+            return
+        }
+        XCTAssertEqual(idleHolder, .idle)
+
+        try await manager.retire(workspaceID: record.workspaceID, approval: makeApproval(taskID: task.id, attemptID: attempt.id))
+        let retiredInspection = await manager.inspect(workspaceID: record.workspaceID)
+        XCTAssertEqual(retiredInspection, .unknown(workspaceID: record.workspaceID))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.workspacePath))
     }
 
     func testRecoveryAdapterMapsIdleWorkspaceToNotActivelyOwned() async throws {
@@ -1218,6 +1473,44 @@ final class GitWorkspaceManagerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertTrue(result.outputWasTruncated)
         XCTAssertLessThanOrEqual(result.standardOutput.utf8.count, 4_096)
+    }
+
+    func testGitCommandRunnerTimesOutHungProcessAndLeavesNoneRunning() async throws {
+        let fixture = try makeCleanFixture(name: "runner-timeout")
+        let runner = GitCommandRunner(
+            executableDirectory: URL(fileURLWithPath: "/usr/bin"),
+            maxOutputBytes: 262_144
+        )
+        let started = Date()
+
+        do {
+            _ = try runner.run(
+                executable: "tail",
+                arguments: ["-f", "/dev/null"],
+                directory: fixture.repositoryURL,
+                timeout: 0.5
+            )
+            XCTFail("expected the hung process to time out")
+        } catch let error as WorkspaceGuardError {
+            guard case .gitTimedOut(let executable, let arguments, let timeout) = error else {
+                XCTFail("unexpected guard error \(error)")
+                return
+            }
+            XCTAssertEqual(executable, "tail")
+            XCTAssertEqual(arguments, ["-f", "/dev/null"])
+            XCTAssertEqual(timeout, 0.5)
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 10, "timeout must be enforced, not hung")
+
+        var stray = try runTool("pgrep", ["-f", "tail -f /dev/null"], in: fixture.root)
+        let deadline = Date().addingTimeInterval(3)
+        while stray.exitCode == 0, Date() < deadline {
+            usleep(100_000)
+            stray = try runTool("pgrep", ["-f", "tail -f /dev/null"], in: fixture.root)
+        }
+        XCTAssertEqual(stray.exitCode, 1, "timed-out process left running: \(stray.stdout)")
     }
 
     // MARK: - Real-host smoke
