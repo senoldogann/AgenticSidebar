@@ -184,6 +184,10 @@ final class GoalOrchestratorTests: XCTestCase {
         XCTAssertTrue(session.submitted.isEmpty, "No prompt may be sent for an unpersisted goal")
         XCTAssertNil(orchestrator.engine)
         XCTAssertNotNil(orchestrator.message)
+        // Kart görünür kalmalı: panel yalnız `failedRequest` doluyken çizer ve
+        // yeniden deneme yolunu yalnız bu istek açar.
+        XCTAssertNotNil(orchestrator.failedRequest, "The panel cannot show or retry an invisible failure")
+        XCTAssertEqual(orchestrator.failedRequest?.objective, "Pencere opaklığı kaydıcısı")
     }
 
     func testFailedMidRunSaveStopsAutomaticContinuationAndPreservesLastSnapshot() throws {

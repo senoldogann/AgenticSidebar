@@ -191,11 +191,11 @@ final class SettingsStore {
 
     /// Ajanın sormadan ne kadarını yapabileceği.
     ///
-    /// Tek bir genel karardır — araç başına değil — ve her onay isteğinde okunur.
-    /// Ayarlar ekranından ya da sohbetin üst şeridinden değiştirilebilir ve
-    /// **çalışan** ajanın bir sonraki araç çağrısından itibaren geçerlidir: seviye
+    /// Tek bir genel karardır — araç başına değil — ve her turun başında anlık
+    /// görüntü olarak alınır. Ayarlar ekranından ya da sohbetin üst şeridinden
+    /// değiştirilebilir ve **bir sonraki turdan** itibaren geçerlidir: seviye
     /// yönetilen sunucunun yapılandırmasına yazılmaz, o yüzden yeniden başlatma
-    /// gerekmez.
+    /// gerekmez; ama başlamış bir tur, başladığı seviyeyle cevaplanır.
     var toolApprovalPolicy: ToolApprovalPolicy {
         didSet {
             defaults.set(toolApprovalPolicy.rawValue, forKey: Key.toolApprovalPolicy)

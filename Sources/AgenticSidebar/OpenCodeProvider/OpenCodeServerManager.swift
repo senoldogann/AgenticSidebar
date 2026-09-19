@@ -389,8 +389,8 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     ///
     /// Bilgisayar kullanımı kapalıysa yalnızca yönlendirme kuralları ve uzantı
     /// bölümleri yazılır: talimatlar ve bilgisayar kullanımı kuralları ona ait bir
-    /// katkıdır, dosyanın tamamı değil. Seviye buraya hiç girmez — her istekte
-    /// okunur, böylece tur ortasında değiştirilebilir.
+    /// katkıdır, dosyanın tamamı değil. Seviye buraya hiç girmez — tur başında
+    /// okunur, böylece yeniden başlatmadan bir sonraki turda geçerli olur.
     private static func writeManagedConfiguration(
         computerUse: ComputerUseConfiguration?,
         extensions: ExtensionRuntimeSnapshot,

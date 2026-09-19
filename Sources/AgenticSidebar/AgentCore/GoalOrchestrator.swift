@@ -196,10 +196,22 @@ final class GoalOrchestrator {
         generation += 1
         guard persist(now: now) else {
             // A goal that cannot be restored must never submit its first turn.
+            // İstek panelde görünür kalsın: hata kartını ve yeniden deneme yolunu
+            // yalnız `failedRequest` açar.
             engine = nil
             self.sessionID = nil
             self.storeURL = nil
             pendingAction = nil
+            failedRequest = FailedGoalRequest(
+                objective: trimmed,
+                sessionID: sessionID,
+                speedMode: speedMode,
+                mode: mode,
+                budget: budget,
+                runners: runners,
+                bridge: bridge,
+                storeURL: storeURL
+            )
             return false
         }
         ensurePolling()

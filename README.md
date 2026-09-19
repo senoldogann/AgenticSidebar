@@ -258,9 +258,10 @@ deletes its own throwaway item in the login keychain.
     terminal and JavaScript tools, still apply — a denied tool is never asked
     about, so no level can allow it.
 
-  The level is applied **per tool call**, not written into the agent's
-  configuration, so changing it takes effect on the running agent's next call and
-  the prompts already on screen are re-answered with the new level. "Always
+  The level is captured when a turn starts, not written into the agent's
+  configuration, so changing it applies from the **next turn**: a running turn
+  keeps answering with the level it started with, and prompts already on screen
+  are not re-answered mid-turn. "Always
   allow" from a prompt is remembered for the session and can be revoked in
   Settings. Automatic approvals are one-shot, so switching back to a stricter
   level is never silently overridden by an earlier auto-answer. A shell command
