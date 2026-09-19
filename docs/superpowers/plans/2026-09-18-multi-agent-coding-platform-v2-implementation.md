@@ -175,11 +175,11 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** `TaskScheduler.schedule(projectID:) async`, `pause(taskID:) async`, `stop(taskID:) async`, `retry(taskID:) async`; ports are injected repository, provider registry, workspace manager and verifier. `TaskLease` belongs in `CodingTaskModels.swift`: attemptID, generation, owner nonce, expiration. `schedule` is inert for live execution until Phase 4 workspace preflight returns an owned workspace.
 
-- [ ] Step 1: RED tests with fake clock/runner for dependency ordering, double scheduler race, max one active writer, maximum three attempts, time/tool-call budget, blocked unsupported runtime and stale completion.
-- [ ] Step 2: Run `swift test --filter TaskSchedulerTests`; observe test-specific RED.
-- [ ] Step 3: Implement deterministic eligibility, atomic repository claim, monotonically incremented generation and scope-limited retry policy. Error on missing usage must not be rewritten as zero; budget exhaustion blocks without infinite retry.
-- [ ] Step 4: Add repeated concurrent claim test (100 contenders, one winner) and pause-vs-stop cases; run focused GREEN then full `swift test`.
-- [ ] Step 5: Review cross-actor isolation and lifecycle ownership; keep actual filesystem writes disabled.
+- [x] Step 1: RED tests with fake clock/runner for dependency ordering, double scheduler race, max one active writer, maximum three attempts, time/tool-call budget, blocked unsupported runtime and stale completion.
+- [x] Step 2: Run `swift test --filter TaskSchedulerTests`; observe test-specific RED.
+- [x] Step 3: Implement deterministic eligibility, atomic repository claim, monotonically incremented generation and scope-limited retry policy. Error on missing usage must not be rewritten as zero; budget exhaustion blocks without infinite retry.
+- [x] Step 4: Add repeated concurrent claim test (100 contenders, one winner) and pause-vs-stop cases; run focused GREEN then full `swift test`.
+- [x] Step 5: Review cross-actor isolation and lifecycle ownership; keep actual filesystem writes disabled.
 
 **Gate:** no double claim, no late stale mutation and no unchecked write dispatch.
 
