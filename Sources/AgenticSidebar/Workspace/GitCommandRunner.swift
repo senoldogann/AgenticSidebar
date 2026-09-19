@@ -35,13 +35,19 @@ enum GitCommandRunnerError: LocalizedError, Equatable, Sendable {
 /// is captured with a hard byte budget so a noisy command cannot exhaust memory.
 ///
 /// Every invocation carries a wall-clock deadline (`defaultTimeout` unless the caller
-/// overrides it). A process that overruns is terminated (SIGTERM, then SIGKILL after a
-/// short grace period), its pipes are drained, and the call throws the typed
-/// `WorkspaceGuardError.gitTimedOut` so a hung tool can never block the workspace actor
-/// forever.
+/// overrides it). A process that overruns is terminated (SIGTERM to the process group,
+/// then SIGKILL to the whole group after a short grace period), the direct child is
+/// always reaped, and the final pipe drain is bounded as well, so a descendant that
+/// inherited the pipes and survived the group kill cannot stall `run()` past that extra
+/// grace. The call then throws the typed `WorkspaceGuardError.gitTimedOut`, so a hung
+/// tool can never block the workspace actor forever. The runner only bounds its own
+/// wait: it does not hunt down a process that escaped its process group (for example
+/// via `setsid`).
 final class GitCommandRunner: Sendable {
     static let defaultTimeout: TimeInterval = 30
     private static let terminationGrace: TimeInterval = 2
+    /// Last-resort bound on the pipe drain after the process group was killed.
+    private static let drainGrace: TimeInterval = 2
 
     let executableDirectory: URL
     let maxOutputBytes: Int
@@ -116,7 +122,15 @@ final class GitCommandRunner: Sendable {
 
         if exitSemaphore.wait(timeout: .now() + timeout) == .timedOut {
             terminateProcess(process, exitSemaphore: exitSemaphore)
-            drainGroup.wait()
+            // The drain is bounded so a descendant that inherited the pipes and survived
+            // the group kill cannot stall this call forever. Once the group is dead the
+            // pipes close and the drain finishes well inside this grace; the timeout is a
+            // last-resort bound, and reaching it means an escaped process still holds a
+            // pipe, which the runner cannot reach and does not wait for.
+            if drainGroup.wait(timeout: .now() + Self.drainGrace) == .timedOut {
+                try? stdoutHandle.close()
+                try? stderrHandle.close()
+            }
             process.waitUntilExit()
             throw WorkspaceGuardError.gitTimedOut(executable: executable, arguments: arguments, timeout: timeout)
         }
@@ -135,12 +149,22 @@ final class GitCommandRunner: Sendable {
     }
 
     /// Terminates an overrunning process, escalating to SIGKILL after a grace period.
+    ///
+    /// Foundation launches the child as its own process-group leader, so the escalation
+    /// kills the whole group when that identity holds; that is what reaches a descendant
+    /// which inherited the stdout/stderr pipes and ignored the earlier SIGTERM. If the
+    /// child is not a group leader, only its own pid can be killed.
     private func terminateProcess(_ process: Process, exitSemaphore: DispatchSemaphore) {
         if process.isRunning {
             process.terminate()
         }
         if exitSemaphore.wait(timeout: .now() + Self.terminationGrace) == .timedOut, process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
+            let pid = process.processIdentifier
+            if getpgid(pid) == pid {
+                killpg(pid, SIGKILL)
+            } else {
+                kill(pid, SIGKILL)
+            }
             _ = exitSemaphore.wait(timeout: .now() + Self.terminationGrace)
         }
     }

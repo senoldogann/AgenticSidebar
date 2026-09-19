@@ -38,6 +38,20 @@ final class GitWorkspaceManagerTests: XCTestCase {
         case storeUnavailable
     }
 
+    /// Thread-safe result slot for a runner invocation driven from a background queue.
+    private final class RunnerOutcomeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: Result<GitCommandResult, Error>?
+
+        func store(_ result: Result<GitCommandResult, Error>) {
+            lock.withLock { stored = result }
+        }
+
+        var result: Result<GitCommandResult, Error>? {
+            lock.withLock { stored }
+        }
+    }
+
     private final class RecordingWorkspaceEvents: WorkspaceEventRecording, @unchecked Sendable {
         private let lock = NSLock()
         private var stored: [CodingTaskEvent] = []
@@ -761,6 +775,46 @@ final class GitWorkspaceManagerTests: XCTestCase {
             },
             code: "WORKTREE_BASE_NOT_FOUND"
         )
+    }
+
+    func testCreateReportsTypedFailureWhenWorkspaceParentCannotBeCreated() async throws {
+        let fixture = try makeCleanFixture(name: "parent-creation-failure")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+
+        // A regular file where the task's worktree directory belongs makes the parent
+        // creation fail. No git process runs on this path, so the failure must be typed
+        // as a workspace-layer failure and carry the real reason.
+        let taskDirectory = fixture.authorizedRoot.appendingPathComponent(
+            "worktrees/\(project.id.uuidString)/\(task.id.uuidString)",
+            isDirectory: false
+        )
+        try FileManager.default.createDirectory(
+            at: taskDirectory.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("blocked\n".utf8).write(to: taskDirectory)
+
+        do {
+            _ = try await manager.createOwnedWorkspace(
+                task: task,
+                attempt: makeAttempt(taskID: task.id),
+                base: WorkspaceBase(commitSHA: fixture.baseSHA)
+            )
+            XCTFail("expected a typed parent-directory failure")
+        } catch let error as WorkspaceGuardError {
+            guard case .storeRecordFailed(let reason) = error else {
+                XCTFail("expected storeRecordFailed, got \(error)")
+                return
+            }
+            XCTAssertTrue(
+                reason.contains("parent directory"),
+                "reason must carry the real failure instead of a fabricated git exit: \(reason)"
+            )
+        } catch {
+            XCTFail("unexpected error \(error)")
+        }
     }
 
     func testCreateRollsBackWorktreeWhenStoreRecordFails() async throws {
@@ -1511,6 +1565,89 @@ final class GitWorkspaceManagerTests: XCTestCase {
             stray = try runTool("pgrep", ["-f", "tail -f /dev/null"], in: fixture.root)
         }
         XCTAssertEqual(stray.exitCode, 1, "timed-out process left running: \(stray.stdout)")
+    }
+
+    func testGitCommandRunnerTimeoutKillsPipeHoldingDescendantWithinBound() throws {
+        let fixture = try makeCleanFixture(name: "runner-descendant-timeout")
+        let directory = fixture.root
+        let runner = GitCommandRunner(
+            executableDirectory: URL(fileURLWithPath: "/usr/bin"),
+            maxOutputBytes: 262_144
+        )
+        // A validated interpreter under /usr/bin is launched argv-only (no shell): the
+        // child ignores SIGTERM, forks a descendant that inherits and keeps the stdout
+        // and stderr pipes open, and both outlive the runner's timeout.
+        let interpreter: String
+        let scriptFlag: String
+        let script: String
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/ruby") {
+            interpreter = "ruby"
+            scriptFlag = "-e"
+            script = "Signal.trap(\"TERM\", \"IGNORE\"); Process.fork; sleep 300"
+        } else if FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") {
+            interpreter = "python3"
+            scriptFlag = "-c"
+            script = "import os,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); os.fork(); time.sleep(300)"
+        } else {
+            XCTFail("no validated interpreter under /usr/bin; cannot exercise the descendant stall")
+            return
+        }
+        let marker = "agenticsidebar-descendant-\(UUID().uuidString)"
+        addTeardownBlock {
+            let pkill = Process()
+            pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            // The descendant ignores SIGTERM by construction, so the teardown must escalate.
+            pkill.arguments = ["-9", "-f", marker]
+            pkill.standardOutput = FileHandle.nullDevice
+            pkill.standardError = FileHandle.nullDevice
+            try? pkill.run()
+            pkill.waitUntilExit()
+        }
+
+        let outcome = RunnerOutcomeBox()
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try runner.run(
+                    executable: interpreter,
+                    arguments: [scriptFlag, script, marker],
+                    directory: directory,
+                    timeout: 0.5
+                )
+                outcome.store(.success(result))
+            } catch {
+                outcome.store(.failure(error))
+            }
+            finished.signal()
+        }
+
+        // The runner is synchronous, so the test bounds it from the outside: on an
+        // unbounded drain this fails on the deadline instead of hanging the suite.
+        let deadline: DispatchTime = .now() + 15
+        XCTAssertEqual(
+            finished.wait(timeout: deadline),
+            .success,
+            "run() must return within its bounded deadline instead of stalling on the drain"
+        )
+        guard let stored = outcome.result, case .failure(let error) = stored else {
+            XCTFail("expected the timed-out invocation to throw")
+            return
+        }
+        guard case WorkspaceGuardError.gitTimedOut(let executable, let arguments, let timeout) = error else {
+            XCTFail("expected gitTimedOut, got \(error)")
+            return
+        }
+        XCTAssertEqual(executable, interpreter)
+        XCTAssertEqual(arguments, [scriptFlag, script, marker])
+        XCTAssertEqual(timeout, 0.5)
+
+        var stray = try runTool("pgrep", ["-f", marker], in: fixture.root)
+        let cleanupDeadline = Date().addingTimeInterval(3)
+        while stray.exitCode == 0, Date() < cleanupDeadline {
+            usleep(100_000)
+            stray = try runTool("pgrep", ["-f", marker], in: fixture.root)
+        }
+        XCTAssertEqual(stray.exitCode, 1, "timed-out descendant left running: \(stray.stdout)")
     }
 
     // MARK: - Real-host smoke

@@ -140,10 +140,9 @@ actor GitWorkspaceManager: WorkspaceManaging {
         do {
             try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         } catch {
-            throw WorkspaceGuardError.gitCommandFailed(
-                arguments: ["worktree", "add"],
-                exitCode: -1,
-                stderr: "could not create workspace parent directory: \(error)"
+            // No git process runs on this path, so this must not masquerade as a git exit.
+            throw WorkspaceGuardError.storeRecordFailed(
+                reason: "could not create workspace parent directory \(target.deletingLastPathComponent().path): \(error)"
             )
         }
 
