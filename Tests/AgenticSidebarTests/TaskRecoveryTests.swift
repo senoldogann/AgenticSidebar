@@ -109,6 +109,53 @@ final class TaskRecoveryTests: XCTestCase {
         }
     }
 
+    /// Provider port that parks the first inspection until the test releases it.
+    ///
+    /// Later inspections answer immediately with `.active` so a concurrent reconcile can
+    /// never block on the gate. This lets a test hold one pass mid-flight while another
+    /// actor mutates the store, without the second pass hanging.
+    private final class GatedProviderSessions: TaskProviderSessionInspecting, @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: CheckedContinuation<TaskProviderSessionStatus, Never>?
+        private var inspectedOnce = false
+
+        func providerStatus(for attempt: TaskAttempt) async -> TaskProviderSessionStatus {
+            let shouldSuspend = lock.withLock { () -> Bool in
+                let firstInspection = !inspectedOnce
+                inspectedOnce = true
+                return firstInspection
+            }
+            guard shouldSuspend else { return .active }
+            return await withCheckedContinuation { continuation in
+                lock.withLock {
+                    pending = continuation
+                }
+            }
+        }
+
+        var isSuspended: Bool {
+            lock.withLock { pending != nil }
+        }
+
+        func waitUntilSuspended() async {
+            for _ in 0..<5_000 {
+                if isSuspended {
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(1))
+            }
+        }
+
+        func release(with status: TaskProviderSessionStatus) {
+            let continuation = lock.withLock { () -> CheckedContinuation<TaskProviderSessionStatus, Never>? in
+                let parked = pending
+                pending = nil
+                return parked
+            }
+            continuation?.resume(returning: status)
+        }
+    }
+
     private struct RecoveryTestProviderRegistry: TaskProviderRegistryPort {
         func candidate(for task: CodingTask, stage: TaskStage) async -> TaskProviderCandidate {
             .eligible(runtimeID: "recovery-test-runtime", modelID: "recovery-test-model")
@@ -138,6 +185,7 @@ final class TaskRecoveryTests: XCTestCase {
         private var snapshotError: TaskRepositoryError?
         private var endAttemptError: TaskRepositoryError?
         private var releaseLeaseError: TaskRepositoryError?
+        private var transitionError: TaskRepositoryError?
 
         init(base: CodingTaskRepository) {
             self.base = base
@@ -153,6 +201,10 @@ final class TaskRecoveryTests: XCTestCase {
 
         func setReleaseLeaseError(_ error: TaskRepositoryError?) {
             releaseLeaseError = error
+        }
+
+        func setTransitionError(_ error: TaskRepositoryError?) {
+            transitionError = error
         }
 
         func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot {
@@ -184,7 +236,10 @@ final class TaskRecoveryTests: XCTestCase {
             action: TaskAction,
             context: TaskTransitionContext
         ) async throws -> CodingTask {
-            try await base.transition(taskID: taskID, expectedVersion: expectedVersion, action: action, context: context)
+            if let transitionError {
+                throw transitionError
+            }
+            return try await base.transition(taskID: taskID, expectedVersion: expectedVersion, action: action, context: context)
         }
 
         func claimAttempt(taskID: UUID, expectedVersion: Int, attempt: TaskAttempt) async throws -> TaskAttempt {
@@ -1207,6 +1262,265 @@ final class TaskRecoveryTests: XCTestCase {
         XCTAssertEqual(stored?.status, .blocked)
         let challenger = try await makeChallengerTask(store: store, projectID: projectID)
         try await assertRepositoryLeaseHeld(store: store, repositoryPath: repositoryPath, challengerTaskID: challenger.id)
+    }
+
+    // MARK: - Generation fencing, single-flight and stalled-run healing
+
+    func testStaleReconcilePassDoesNotBlockNewerGeneration() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = RecoveryTestClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/task-recovery-tests/stale-pass-repo-\(UUID().uuidString)"
+        let task = makeTask(projectID: projectID, status: .ready, title: "Stale reconcile pass")
+        try await store.createTask(task)
+        let firstAttempt = makeAttempt(
+            taskID: task.id,
+            sequence: 1,
+            generation: 1,
+            workspaceID: UUID(),
+            leaseToken: "nonce-generation-one",
+            leaseExpiry: startDate.addingTimeInterval(600),
+            startedAt: startDate
+        )
+        let claimed = try await seedInFlightAttempt(
+            store: store,
+            task: task,
+            attempt: firstAttempt,
+            repositoryPath: repositoryPath,
+            leaseTimeoutSeconds: 3600
+        )
+        let gated = GatedProviderSessions()
+        let recovery = makeRecovery(
+            repository: store,
+            clock: clock,
+            providers: gated,
+            workspaces: ScriptedWorkspaces(status: .notActivelyOwned(repositoryPath: repositoryPath)),
+            processes: ScriptedProcesses(status: .absent),
+            recoveryID: "recovery-stale-pass"
+        )
+
+        let stalePass = Task { await recovery.reconcile(projectID: projectID) }
+        await gated.waitUntilSuspended()
+        XCTAssertTrue(gated.isSuspended, "The first reconcile pass must park at the provider port")
+
+        // Another actor reaps generation 1 and claims generation 2 while pass A is suspended.
+        let ended = try await store.endAttempt(
+            taskID: task.id,
+            attemptID: firstAttempt.id,
+            expectedVersion: claimed.version,
+            outcome: .cancelled,
+            toolCallCount: nil,
+            durationSeconds: nil
+        )
+        try await store.releaseRepositoryLease(
+            repositoryPath: repositoryPath,
+            taskID: task.id,
+            attemptID: firstAttempt.id
+        )
+        let secondAttempt = makeAttempt(
+            taskID: task.id,
+            sequence: 2,
+            generation: 2,
+            workspaceID: UUID(),
+            leaseToken: "nonce-generation-two",
+            leaseExpiry: startDate.addingTimeInterval(600),
+            startedAt: startDate
+        )
+        try await store.acquireRepositoryLease(
+            repositoryPath: repositoryPath,
+            taskID: task.id,
+            attemptID: secondAttempt.id,
+            leaseTimeoutSeconds: 3600
+        )
+        _ = try await store.claimAttempt(taskID: task.id, expectedVersion: ended.version, attempt: secondAttempt)
+
+        gated.release(with: .active)
+        let report = await stalePass.value
+
+        let recovered = try entry(for: task.id, in: report)
+        XCTAssertEqual(
+            recovered.disposition,
+            .noAction,
+            "A pass reconciled against generation 1 must not act on the newer generation"
+        )
+        XCTAssertTrue(recovered.userChoices.isEmpty)
+
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .running)
+        XCTAssertEqual(stored?.currentAttemptID, secondAttempt.id)
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.first { $0.id == firstAttempt.id }?.outcome, .cancelled)
+        XCTAssertEqual(history.first { $0.id == secondAttempt.id }?.outcome, .inProgress)
+        XCTAssertNil(history.first { $0.id == secondAttempt.id }?.endedAt)
+    }
+
+    func testBlockFailureAfterReapIsHealedOnNextReconcile() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = RecoveryTestClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/task-recovery-tests/heal-repo-\(UUID().uuidString)"
+        let task = makeTask(projectID: projectID, status: .ready, title: "Heal stalled run")
+        try await store.createTask(task)
+        let attempt = makeAttempt(
+            taskID: task.id,
+            sequence: 1,
+            generation: 1,
+            workspaceID: UUID(),
+            leaseToken: "nonce-heal",
+            leaseExpiry: startDate.addingTimeInterval(600),
+            startedAt: startDate
+        )
+        _ = try await seedInFlightAttempt(
+            store: store,
+            task: task,
+            attempt: attempt,
+            repositoryPath: repositoryPath,
+            leaseTimeoutSeconds: 3600
+        )
+        let hooking = RecoveryHookingRepository(base: store)
+        await hooking.setTransitionError(.underlying("transition unavailable"))
+
+        let recovery = makeRecovery(
+            repository: hooking,
+            clock: clock,
+            providers: ScriptedProviderSessions(status: .stopped),
+            workspaces: ScriptedWorkspaces(status: .notActivelyOwned(repositoryPath: repositoryPath)),
+            processes: ScriptedProcesses(status: .absent),
+            recoveryID: "recovery-heal"
+        )
+        let firstReport = await recovery.reconcile(projectID: projectID)
+
+        let firstEntry = try entry(for: task.id, in: firstReport)
+        guard case .failed(let blockFailureReason) = firstEntry.disposition else {
+            XCTFail("A block failure after a successful reap must surface explicitly")
+            return
+        }
+        XCTAssertTrue(blockFailureReason.contains("blocking failed"))
+
+        let stranded = try await store.task(id: task.id)
+        XCTAssertEqual(stranded?.status, .running, "A failed block strands the task in running")
+        XCTAssertEqual(stranded?.currentAttemptID, attempt.id)
+        let strandedHistory = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(strandedHistory.first?.outcome, .cancelled)
+        let strandedSnapshot = try await store.snapshot(projectID: projectID)
+        XCTAssertTrue(strandedSnapshot.activeAttempts.isEmpty)
+
+        await hooking.setTransitionError(nil)
+        let secondReport = await recovery.reconcile(projectID: projectID)
+
+        XCTAssertEqual(
+            try entry(for: task.id, in: secondReport).disposition,
+            .blockedUncertain(attemptID: attempt.id),
+            "The second pass must heal the stranded run"
+        )
+        XCTAssertEqual(secondReport.blockedUncertainTaskIDs, [task.id])
+        let healed = try await store.task(id: task.id)
+        XCTAssertEqual(healed?.status, .blocked)
+        XCTAssertEqual(healed?.blockReason, TaskRecovery.uncertainBlockReason(for: attempt))
+        XCTAssertEqual(healed?.currentAttemptID, attempt.id)
+    }
+
+    func testOverlappingReconcileIsSingleFlight() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = RecoveryTestClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/task-recovery-tests/single-flight-repo-\(UUID().uuidString)"
+        let task = makeTask(projectID: projectID, status: .ready, title: "Single flight reconcile")
+        try await store.createTask(task)
+        let attempt = makeAttempt(
+            taskID: task.id,
+            sequence: 1,
+            generation: 1,
+            workspaceID: UUID(),
+            leaseToken: "nonce-single-flight",
+            leaseExpiry: startDate.addingTimeInterval(600),
+            startedAt: startDate
+        )
+        let claimed = try await seedInFlightAttempt(
+            store: store,
+            task: task,
+            attempt: attempt,
+            repositoryPath: repositoryPath,
+            leaseTimeoutSeconds: 3600
+        )
+        let gated = GatedProviderSessions()
+        let recovery = makeRecovery(
+            repository: store,
+            clock: clock,
+            providers: gated,
+            workspaces: ScriptedWorkspaces(status: .notActivelyOwned(repositoryPath: repositoryPath)),
+            processes: ScriptedProcesses(status: .absent),
+            recoveryID: "recovery-single-flight"
+        )
+
+        let firstPass = Task { await recovery.reconcile(projectID: projectID) }
+        await gated.waitUntilSuspended()
+        XCTAssertTrue(gated.isSuspended, "The first reconcile pass must park at the provider port")
+
+        let busyReport = await recovery.reconcile(projectID: projectID)
+        XCTAssertEqual(busyReport.failure?.contains("reconciliation already in progress"), true)
+
+        let recovered = try entry(for: task.id, in: busyReport)
+        XCTAssertEqual(recovered.disposition, .noAction)
+        XCTAssertTrue(recovered.userChoices.isEmpty)
+        let untouched = try await store.task(id: task.id)
+        XCTAssertEqual(untouched?.status, .running)
+        XCTAssertEqual(untouched?.version, claimed.version)
+
+        gated.release(with: .active)
+        let firstReport = await firstPass.value
+        XCTAssertEqual(try entry(for: task.id, in: firstReport).disposition, .blockedUncertain(attemptID: attempt.id))
+        let blocked = try await store.task(id: task.id)
+        XCTAssertEqual(blocked?.status, .blocked)
+    }
+
+    func testLeaseReleaseFailureOffersAbandonAttemptChoice() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = RecoveryTestClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/task-recovery-tests/release-choice-repo-\(UUID().uuidString)"
+        let task = makeTask(projectID: projectID, status: .ready, title: "Lease release choice")
+        try await store.createTask(task)
+        let attempt = makeAttempt(
+            taskID: task.id,
+            sequence: 1,
+            generation: 1,
+            workspaceID: UUID(),
+            leaseToken: "nonce-release-choice",
+            leaseExpiry: startDate.addingTimeInterval(600),
+            startedAt: startDate
+        )
+        _ = try await seedInFlightAttempt(
+            store: store,
+            task: task,
+            attempt: attempt,
+            repositoryPath: repositoryPath,
+            leaseTimeoutSeconds: 3600
+        )
+        let hooking = RecoveryHookingRepository(base: store)
+        await hooking.setReleaseLeaseError(.underlying("lease release unavailable"))
+
+        let recovery = makeRecovery(
+            repository: hooking,
+            clock: clock,
+            providers: ScriptedProviderSessions(status: .stopped),
+            workspaces: ScriptedWorkspaces(status: .notActivelyOwned(repositoryPath: repositoryPath)),
+            processes: ScriptedProcesses(status: .absent),
+            recoveryID: "recovery-release-choice"
+        )
+        let report = await recovery.reconcile(projectID: projectID)
+
+        let recovered = try entry(for: task.id, in: report)
+        guard case .failed(let reason) = recovered.disposition else {
+            XCTFail("A lease release failure must surface as an explicit failed disposition")
+            return
+        }
+        XCTAssertTrue(reason.contains("lease release unavailable"))
+        XCTAssertEqual(
+            recovered.userChoices,
+            [.abandonAttempt(attemptID: attempt.id)],
+            "A held lease after a failed release must be actionable by hand"
+        )
     }
 }
 

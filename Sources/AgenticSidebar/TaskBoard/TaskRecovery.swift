@@ -158,6 +158,11 @@ actor TaskRecovery {
     private let clock: TaskSchedulerClock
     private let recoveryID: String
 
+    /// True while a reconcile pass is suspended at a port; concurrent passes are rejected.
+    private var isReconciling = false
+
+    private static let alreadyReconcilingFailure = "reconciliation already in progress"
+
     init(
         repository: CodingTaskRepository,
         providers: TaskProviderSessionInspecting,
@@ -185,8 +190,18 @@ actor TaskRecovery {
     /// and its repository lease only released when no live provider session, actively owned
     /// workspace or proved process owns it. Anything else is blocked for uncertain execution
     /// and surfaced for an explicit human choice.
+    ///
+    /// Passes are single-flight: while one pass is suspended at a port, a concurrent call
+    /// does not interleave with it and instead returns a deterministic busy report whose
+    /// per-task dispositions are `noAction` and whose failure names the busy state.
     func reconcile(projectID: UUID) async -> RecoveryReport {
         let reconciledAt = clock.now()
+        guard !isReconciling else {
+            return await busyReport(projectID: projectID, reconciledAt: reconciledAt)
+        }
+        isReconciling = true
+        defer { isReconciling = false }
+
         let snapshot: CodingBoardSnapshot
         do {
             snapshot = try await repository.snapshot(projectID: projectID)
@@ -201,13 +216,87 @@ actor TaskRecovery {
 
         var entries: [TaskRecoveryEntry] = []
         for task in snapshot.tasks {
-            guard let attempt = snapshot.activeAttempts.first(where: { $0.taskID == task.id }) else {
-                entries.append(TaskRecoveryEntry(taskID: task.id, disposition: .noAction, userChoices: []))
-                continue
+            if let attempt = snapshot.activeAttempts.first(where: { $0.taskID == task.id }) {
+                entries.append(await reconcileAttempt(attempt, task: task))
+            } else {
+                entries.append(await reconcileTaskWithoutInFlightAttempt(task))
             }
-            entries.append(await reconcileAttempt(attempt, task: task))
         }
         return RecoveryReport(projectID: projectID, reconciledAt: reconciledAt, entries: entries, failure: nil)
+    }
+
+    /// Deterministic report for a call that arrived while another pass was in flight.
+    private func busyReport(projectID: UUID, reconciledAt: Date) async -> RecoveryReport {
+        let tasks: [CodingTask]
+        do {
+            tasks = try await repository.snapshot(projectID: projectID).tasks
+        } catch {
+            return RecoveryReport(
+                projectID: projectID,
+                reconciledAt: reconciledAt,
+                entries: [],
+                failure: "\(Self.alreadyReconcilingFailure): project snapshot failed: \(error)"
+            )
+        }
+        let entries = tasks.map { task in
+            TaskRecoveryEntry(taskID: task.id, disposition: .noAction, userChoices: [])
+        }
+        return RecoveryReport(
+            projectID: projectID,
+            reconciledAt: reconciledAt,
+            entries: entries,
+            failure: Self.alreadyReconcilingFailure
+        )
+    }
+
+    /// A task with no in-flight attempt normally needs no action.
+    ///
+    /// The exception is the residue of a reap that ended its attempt and released its lease
+    /// but failed to block: a `.running` task whose `currentAttemptID` is a terminal attempt
+    /// would otherwise stall forever, because scheduling only claims `.ready` tasks. Such a
+    /// task is healed by blocking it for uncertain execution, fenced to the exact terminal
+    /// attempt so a concurrently claimed newer generation is never touched.
+    private func reconcileTaskWithoutInFlightAttempt(_ task: CodingTask) async -> TaskRecoveryEntry {
+        guard task.status == .running, let currentAttemptID = task.currentAttemptID else {
+            return TaskRecoveryEntry(taskID: task.id, disposition: .noAction, userChoices: [])
+        }
+        let history: [TaskAttempt]
+        do {
+            history = try await repository.attemptHistory(taskID: task.id)
+        } catch {
+            return TaskRecoveryEntry(
+                taskID: task.id,
+                disposition: .failed(reason: "loading attempt history for task \(task.id.uuidString) failed: \(error)"),
+                userChoices: []
+            )
+        }
+        guard
+            let currentAttempt = history.first(where: { $0.id == currentAttemptID }),
+            currentAttempt.endedAt != nil || currentAttempt.outcome != .inProgress
+        else {
+            return TaskRecoveryEntry(taskID: task.id, disposition: .noAction, userChoices: [])
+        }
+        do {
+            switch try await blockTaskForUncertainExecution(
+                attempt: currentAttempt,
+                reason: Self.uncertainBlockReason(for: currentAttempt)
+            ) {
+            case .blocked:
+                return TaskRecoveryEntry(
+                    taskID: task.id,
+                    disposition: .blockedUncertain(attemptID: currentAttempt.id),
+                    userChoices: []
+                )
+            case .staleAttempt, .alreadySettled:
+                return TaskRecoveryEntry(taskID: task.id, disposition: .noAction, userChoices: [])
+            }
+        } catch {
+            return TaskRecoveryEntry(
+                taskID: task.id,
+                disposition: .failed(reason: "blocking task \(task.id.uuidString) failed: \(error)"),
+                userChoices: [.abandonAttempt(attemptID: currentAttempt.id)]
+            )
+        }
     }
 
     // MARK: - Per-attempt reconciliation
@@ -309,8 +398,12 @@ actor TaskRecovery {
             leaseReleaseFailure = "\(error)"
         }
 
+        let blockOutcome: BlockOutcome
         do {
-            try await blockTaskForUncertainExecution(taskID: attempt.taskID, reason: Self.uncertainBlockReason(for: attempt))
+            blockOutcome = try await blockTaskForUncertainExecution(
+                attempt: attempt,
+                reason: Self.uncertainBlockReason(for: attempt)
+            )
         } catch {
             return TaskRecoveryEntry(
                 taskID: attempt.taskID,
@@ -325,24 +418,42 @@ actor TaskRecovery {
                 disposition: .failed(
                     reason: "attempt \(attempt.id.uuidString) was ended but repository lease release failed: \(leaseReleaseFailure)"
                 ),
-                userChoices: []
+                userChoices: [.abandonAttempt(attemptID: attempt.id)]
             )
         }
 
-        return TaskRecoveryEntry(
-            taskID: attempt.taskID,
-            disposition: .reconciledAndReleased(
-                attemptID: attempt.id,
-                generation: attempt.generation,
-                repositoryPath: repositoryPath
-            ),
-            userChoices: [.retryTask(taskID: attempt.taskID)]
-        )
+        switch blockOutcome {
+        case .blocked:
+            return TaskRecoveryEntry(
+                taskID: attempt.taskID,
+                disposition: .reconciledAndReleased(
+                    attemptID: attempt.id,
+                    generation: attempt.generation,
+                    repositoryPath: repositoryPath
+                ),
+                userChoices: [.retryTask(taskID: attempt.taskID)]
+            )
+        case .staleAttempt, .alreadySettled:
+            return TaskRecoveryEntry(taskID: attempt.taskID, disposition: .noAction, userChoices: [])
+        }
     }
 
     private func blockUncertain(attempt: TaskAttempt, pid: Int32?) async -> TaskRecoveryEntry {
         do {
-            try await blockTaskForUncertainExecution(taskID: attempt.taskID, reason: Self.uncertainBlockReason(for: attempt))
+            switch try await blockTaskForUncertainExecution(
+                attempt: attempt,
+                reason: Self.uncertainBlockReason(for: attempt)
+            ) {
+            case .blocked:
+                let choices: [TaskRecoveryChoice] = pid.map { [.terminateProcess(pid: $0)] } ?? []
+                return TaskRecoveryEntry(
+                    taskID: attempt.taskID,
+                    disposition: .blockedUncertain(attemptID: attempt.id),
+                    userChoices: choices
+                )
+            case .staleAttempt, .alreadySettled:
+                return TaskRecoveryEntry(taskID: attempt.taskID, disposition: .noAction, userChoices: [])
+            }
         } catch {
             return TaskRecoveryEntry(
                 taskID: attempt.taskID,
@@ -350,17 +461,27 @@ actor TaskRecovery {
                 userChoices: []
             )
         }
-        let choices: [TaskRecoveryChoice] = pid.map { [.terminateProcess(pid: $0)] } ?? []
-        return TaskRecoveryEntry(
-            taskID: attempt.taskID,
-            disposition: .blockedUncertain(attemptID: attempt.id),
-            userChoices: choices
-        )
     }
 
     private func requiresUserChoice(attempt: TaskAttempt, pid: Int32?, reason: String) async -> TaskRecoveryEntry {
         do {
-            try await blockTaskForUncertainExecution(taskID: attempt.taskID, reason: Self.uncertainBlockReason(for: attempt))
+            switch try await blockTaskForUncertainExecution(
+                attempt: attempt,
+                reason: Self.uncertainBlockReason(for: attempt)
+            ) {
+            case .blocked:
+                var choices: [TaskRecoveryChoice] = [.abandonAttempt(attemptID: attempt.id)]
+                if let pid {
+                    choices.insert(.terminateProcess(pid: pid), at: 0)
+                }
+                return TaskRecoveryEntry(
+                    taskID: attempt.taskID,
+                    disposition: .requiresUserChoice(attemptID: attempt.id, processID: pid, reason: reason),
+                    userChoices: choices
+                )
+            case .staleAttempt, .alreadySettled:
+                return TaskRecoveryEntry(taskID: attempt.taskID, disposition: .noAction, userChoices: [])
+            }
         } catch {
             return TaskRecoveryEntry(
                 taskID: attempt.taskID,
@@ -368,32 +489,40 @@ actor TaskRecovery {
                 userChoices: []
             )
         }
-        var choices: [TaskRecoveryChoice] = [.abandonAttempt(attemptID: attempt.id)]
-        if let pid {
-            choices.insert(.terminateProcess(pid: pid), at: 0)
-        }
-        return TaskRecoveryEntry(
-            taskID: attempt.taskID,
-            disposition: .requiresUserChoice(attemptID: attempt.id, processID: pid, reason: reason),
-            userChoices: choices
-        )
     }
 
-    /// Blocks a task for uncertain execution when the state machine still allows it.
+    /// Outcome of a fenced attempt to block a task for uncertain execution.
+    private enum BlockOutcome: Sendable, Equatable {
+        /// The task was transitioned into `.blocked`.
+        case blocked
+        /// The task's `currentAttemptID` no longer matches the reconciled attempt.
+        case staleAttempt(currentAttemptID: UUID?)
+        /// The task had already left the blockable statuses.
+        case alreadySettled
+    }
+
+    /// Blocks a task for uncertain execution, fenced to the reconciled attempt identity.
     ///
-    /// Already blocked or terminal tasks are left untouched; recovery never unblocks or reopens work.
-    private func blockTaskForUncertainExecution(taskID: UUID, reason: TaskBlockReason) async throws {
-        guard let task = try await repository.task(id: taskID) else {
-            throw TaskRepositoryError.taskNotFound(taskID)
+    /// The freshly-read task must still record `attempt.id` as its `currentAttemptID`: a
+    /// mismatch means a newer generation superseded the attempt this pass inspected, and
+    /// blocking it would wrongly stop healthy work. Already blocked or terminal tasks are
+    /// left untouched; recovery never unblocks or reopens work.
+    private func blockTaskForUncertainExecution(attempt: TaskAttempt, reason: TaskBlockReason) async throws -> BlockOutcome {
+        guard let task = try await repository.task(id: attempt.taskID) else {
+            throw TaskRepositoryError.taskNotFound(attempt.taskID)
+        }
+        guard task.currentAttemptID == attempt.id else {
+            return .staleAttempt(currentAttemptID: task.currentAttemptID)
         }
         guard task.status == .ready || task.status == .running || task.status == .review else {
-            return
+            return .alreadySettled
         }
         _ = try await repository.transition(
-            taskID: taskID,
+            taskID: attempt.taskID,
             expectedVersion: task.version,
             action: .block(reason: reason),
             context: TaskTransitionContext(fingerprint: recoveryID, actor: recoveryID)
         )
+        return .blocked
     }
 }
