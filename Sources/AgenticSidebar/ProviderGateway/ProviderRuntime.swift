@@ -12,6 +12,9 @@ enum ProviderRuntimeError: Error, Equatable, Sendable {
     case contextLimitExceeded
     case transport
     case unexpectedResponse
+    /// Sağlayıcı yan soruyu (`/btw`) desteklemiyor. Yeni providerlar
+    /// `answerSideQuestion` override edene kadar bu döner.
+    case unsupported
 
     /// Taşıma katmanındaki üç dallı `catch` zincirinin tek karşılığı:
     /// bilinen sağlayıcı hatası aynen, iptal aynen, diğer her şey `.transport`.
@@ -29,6 +32,16 @@ enum ProviderRuntimeError: Error, Equatable, Sendable {
 
 enum ProviderEvent: Equatable, Sendable {
     case assistantTextDelta(String)
+    /// Düşünme içeriği: akıl yürüten modellerin ara adımları. Asistan
+    /// metninden ayrı kanaldır — transkripte ve geçmişe asla karışmaz,
+    /// yalnız turdaki `.thinking` aktivitesinde birikir ve kartta gösterilir.
+    /// OpenCode `reasoning` parçası, OpenAI reasoning-summary deltasıdır.
+    case thinkingDelta(String)
+    /// Sağlayıcının bildirdiği tur jeton kullanımı: OpenAI `response.completed`
+    /// içindeki `response.usage`, OpenCode `message.updated` içindeki asistan
+    /// mesajı `tokens` alanıdır. Her iki kaynak da toleranslı okunur; alan
+    /// yoksa olay üretilmez, akış aynen sürer.
+    case turnUsage(TurnTokenUsage)
     case activityStarted(ProviderActivityDescriptor)
     /// An in-progress activity (such as a subagent) received an update (e.g. inner tool calls or intermediate output).
     case activityUpdated(ProviderActivityDescriptor)
@@ -47,6 +60,16 @@ enum ProviderEvent: Equatable, Sendable {
     case completed
 }
 
+/// Tek turun sağlayıcı-tarafı jeton sayımı. `inputTokens` o adımdaki bağlam
+/// boyutuna denktir (OpenCode durumlu oturumda sunucu tarafındaki birikim,
+/// OpenAI durumsuz istekte gönderilen girdidir).
+struct TurnTokenUsage: Equatable, Sendable {
+    /// Bağlamda taşınan girdi jetonu.
+    let inputTokens: Int
+    /// Üretilen çıktı jetonu (akıl yürütme dahil).
+    let outputTokens: Int
+}
+
 struct ProviderRequest: Equatable, Sendable {
     let sessionID: UUID
     let configuration: SessionConfiguration
@@ -58,6 +81,9 @@ struct ProviderRequest: Equatable, Sendable {
     let extensionContext: String?
     /// Activities that ran in prior turns of this session, for restoring full context.
     let activityGroups: [AgentTurnActivityGroup]
+    /// Yuvarlanan bağlam özeti (`/compact`): pencere dışına düşen ön ekin
+    /// yoğunlaştırılmışı. Boşken maliyet yoktur; doluyken istek başına eklenir.
+    let contextSummary: String
 
     init(
         sessionID: UUID,
@@ -66,7 +92,8 @@ struct ProviderRequest: Equatable, Sendable {
         speedMode: ResponseSpeedMode,
         mode: AgentMode = .build,
         extensionContext: String? = nil,
-        activityGroups: [AgentTurnActivityGroup] = []
+        activityGroups: [AgentTurnActivityGroup] = [],
+        contextSummary: String = ""
     ) {
         self.sessionID = sessionID
         self.configuration = configuration
@@ -75,6 +102,7 @@ struct ProviderRequest: Equatable, Sendable {
         self.mode = mode
         self.extensionContext = extensionContext
         self.activityGroups = activityGroups
+        self.contextSummary = contextSummary
     }
 }
 
@@ -138,10 +166,22 @@ protocol ProviderRuntime: Sendable {
     /// why that is the default: an empty list would say "this turn has no tasks"
     /// and wipe a checklist the provider simply does not report.
     func sessionTodos(sessionID: UUID) async -> [AgentTodo]?
+
+    /// Yan soru (`/btw`): oturum bağlamıyla tek-atımlık, araçsız yanıt.
+    ///
+    /// Turn makinesine girmez, transkripte yazmaz, çalışan turu kesmez.
+    /// Her runtime kendi izolasyonuyla implemente eder (OpenCode: geçici uzak
+    /// oturum; durumsuzlar: tek completion). Desteklemeyenler varsayılanı
+    /// kullanır (`.unsupported`).
+    func answerSideQuestion(_ query: SideQuestionQuery) async throws -> ProviderStream
 }
 
 extension ProviderRuntime {
     func releaseSession(_ sessionID: UUID) async {}
 
     func sessionTodos(sessionID: UUID) async -> [AgentTodo]? { nil }
+
+    func answerSideQuestion(_ query: SideQuestionQuery) async throws -> ProviderStream {
+        throw ProviderRuntimeError.unsupported
+    }
 }

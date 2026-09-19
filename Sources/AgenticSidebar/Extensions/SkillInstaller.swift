@@ -57,7 +57,7 @@ struct SkillInstaller: Sendable {
         source: ExtensionSource
     ) throws -> SkillRecord {
         guard let skillFile = fetched.skillFile,
-              let markdown = String(data: skillFile.content, encoding: .utf8)
+            let markdown = String(data: skillFile.content, encoding: .utf8)
         else {
             throw ExtensionFetchError.notFound
         }

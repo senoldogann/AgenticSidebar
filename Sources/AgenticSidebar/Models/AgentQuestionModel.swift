@@ -6,18 +6,6 @@ struct AgentQuestionOption: Identifiable, Equatable, Sendable, Codable {
     let label: String
     let description: String?
     let isRecommended: Bool
-
-    init(
-        id: String,
-        label: String,
-        description: String?,
-        isRecommended: Bool
-    ) {
-        self.id = id
-        self.label = label
-        self.description = description
-        self.isRecommended = isRecommended
-    }
 }
 
 /// The recorded response provided by the user to an interactive question.
@@ -25,16 +13,6 @@ struct AgentQuestionAnswer: Equatable, Sendable, Codable {
     let selectedOptionIDs: [String]
     let customText: String?
     let formattedResponse: String
-
-    init(
-        selectedOptionIDs: [String],
-        customText: String?,
-        formattedResponse: String
-    ) {
-        self.selectedOptionIDs = selectedOptionIDs
-        self.customText = customText
-        self.formattedResponse = formattedResponse
-    }
 }
 
 /// The lifecycle state of an interactive agent question.
@@ -55,26 +33,6 @@ struct AgentQuestion: Identifiable, Equatable, Sendable, Codable {
     let createdAt: Date
     var status: AgentQuestionStatus
 
-    init(
-        id: UUID,
-        toolCallID: String?,
-        prompt: String,
-        options: [AgentQuestionOption],
-        allowCustomAnswer: Bool,
-        isMultiSelect: Bool,
-        createdAt: Date,
-        status: AgentQuestionStatus
-    ) {
-        self.id = id
-        self.toolCallID = toolCallID
-        self.prompt = prompt
-        self.options = options
-        self.allowCustomAnswer = allowCustomAnswer
-        self.isMultiSelect = isMultiSelect
-        self.createdAt = createdAt
-        self.status = status
-    }
-
     /// Formats an answer given selected options and optional custom text.
     static func formatAnswer(
         options: [AgentQuestionOption],
@@ -88,7 +46,8 @@ struct AgentQuestion: Identifiable, Equatable, Sendable, Codable {
                 chosenLabels = ["Hepsi (Tümünü uygula)"]
             } else {
                 let textSample = nonAll.joined()
-                let isTurkish = textSample.range(of: #"[üğşıçöĞÜŞİÇÖ]"#, options: .regularExpression) != nil
+                let isTurkish =
+                    textSample.range(of: #"[üğşıçöĞÜŞİÇÖ]"#, options: .regularExpression) != nil
                     || textSample.localizedCaseInsensitiveContains("soru")
                     || textSample.localizedCaseInsensitiveContains("hepsi")
                     || textSample.localizedCaseInsensitiveContains("uygula")
@@ -96,7 +55,8 @@ struct AgentQuestion: Identifiable, Equatable, Sendable, Codable {
                 chosenLabels = [prefix + nonAll.joined(separator: ", ")]
             }
         } else {
-            chosenLabels = options
+            chosenLabels =
+                options
                 .filter { selectedIDs.contains($0.id) }
                 .map(\.label)
         }
@@ -106,7 +66,7 @@ struct AgentQuestion: Identifiable, Equatable, Sendable, Codable {
 
         let summaryParts: [String] = [
             chosenLabels.isEmpty ? nil : chosenLabels.joined(separator: ", "),
-            effectiveCustom
+            effectiveCustom,
         ].compactMap { $0 }
 
         let response = summaryParts.isEmpty ? "No selection" : summaryParts.joined(separator: " - ")

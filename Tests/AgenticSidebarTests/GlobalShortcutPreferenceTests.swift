@@ -1,6 +1,7 @@
 import Carbon.HIToolbox
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor

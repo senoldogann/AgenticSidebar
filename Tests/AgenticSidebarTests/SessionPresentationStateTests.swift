@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class SessionPresentationStateTests: XCTestCase {
@@ -30,7 +31,7 @@ final class SessionPresentationStateTests: XCTestCase {
             (.cancelling, .cancelling),
             (.completed, .completed),
             (.cancelled, .cancelled),
-            (.failed, .failed)
+            (.failed, .failed),
         ]
 
         for (status, expectedPhase) in mappings {

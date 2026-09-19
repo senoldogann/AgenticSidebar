@@ -48,7 +48,7 @@ enum SkillManifestError: Error, Equatable, Sendable {
             "`description` is longer than \(SkillManifest.maximumDescriptionLength) characters."
         case .invalidName:
             "`name` must be lowercase letters, digits and single hyphens."
-        case let .directoryMismatch(directory, name):
+        case .directoryMismatch(let directory, let name):
             "`name` is “\(name)” but the folder is “\(directory)”; OpenCode requires them to match."
         case .emptyBody:
             "The skill has no instructions after the frontmatter."
@@ -68,7 +68,7 @@ enum SkillManifestParser {
         let lines = normalized.components(separatedBy: "\n")
 
         guard let first = lines.first?.trimmingCharacters(in: .whitespaces),
-              first == "---" || first == "--- "
+            first == "---" || first == "--- "
         else {
             throw SkillManifestError.missingFrontmatter
         }
@@ -90,13 +90,13 @@ enum SkillManifestParser {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let name = fields["name"]?.trimmingCharacters(in: .whitespaces),
-              !name.isEmpty
+            !name.isEmpty
         else {
             throw SkillManifestError.missingName
         }
 
         guard let description = fields["description"]?.trimmingCharacters(in: .whitespaces),
-              !description.isEmpty
+            !description.isEmpty
         else {
             throw SkillManifestError.missingDescription
         }

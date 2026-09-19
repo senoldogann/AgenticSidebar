@@ -18,7 +18,7 @@ enum ProviderSelectionPolicy {
     static let preferredModelTokens = [
         "deepseek v4",
         "deepseek v4.1 flash",
-        "deepseek"
+        "deepseek",
     ]
 
     /// Verilen yeteneklerden varsayılan yapılandırmayı seçer. Modeli olan hiçbir

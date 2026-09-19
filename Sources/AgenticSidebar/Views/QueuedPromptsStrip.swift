@@ -17,6 +17,8 @@ struct QueuedPromptsStrip: View {
     let onMove: (UUID, Int) -> Bool
     let onRemove: (UUID) -> Void
     let onClear: () -> Void
+    /// Stops the running turn and sends this message right away.
+    let onSendNow: (UUID) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -28,12 +30,15 @@ struct QueuedPromptsStrip: View {
                     prompt: prompt,
                     onEditInComposer: { onEditInComposer(prompt.id) },
                     onRemove: { onRemove(prompt.id) },
+                    onSendNow: { onSendNow(prompt.id) },
                     onMove: { draggedID in onMove(draggedID, index) }
                 )
             }
         }
         .padding(.horizontal, 4)
     }
+
+    @Environment(\.paneWidth) private var paneWidth
 
     private var header: some View {
         HStack(spacing: 6) {
@@ -44,11 +49,15 @@ struct QueuedPromptsStrip: View {
             Text("Queued (\(prompts.count))")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.secondary)
-
-            Text("sent in order when this turn finishes")
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
                 .lineLimit(1)
+
+            if !PaneResponsive.isCompact(width: paneWidth) {
+                Text("sent in order when this turn finishes")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
 
             Spacer(minLength: 8)
 
@@ -71,6 +80,7 @@ private struct QueuedPromptRow: View {
     let prompt: QueuedPrompt
     let onEditInComposer: () -> Void
     let onRemove: () -> Void
+    let onSendNow: () -> Void
     let onMove: (UUID) -> Bool
 
     @State private var isHovering = false
@@ -129,11 +139,16 @@ private struct QueuedPromptRow: View {
 
     private var summary: some View {
         HStack(spacing: 6) {
+            // Satırın esnek elemanı yalnız metindir: kalan genişliği o alır,
+            // sığmayanı kuyruktan kırpar. `Spacer` ile rekabet ederse ideali
+            // tam metin olan `Text` sabit düğmeleri panel dışına iterdi.
             Text(prompt.text)
                 .font(.system(size: 11.5))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .help(prompt.text)
 
             if !prompt.attachmentPaths.isEmpty {
                 Image(systemName: "paperclip")
@@ -141,7 +156,20 @@ private struct QueuedPromptRow: View {
                     .foregroundStyle(.secondary)
             }
 
-            Spacer(minLength: 6)
+            // Kuyruktaki her mesaj gönderildiği andaki modla çalışır (review
+            // seçiliyken giren review, build seçiliyken giren build olur):
+            // satırdaki rozet o seçimin kaybolmadığının görünür kanıtıdır.
+            HStack(spacing: 3) {
+                AgentModeGlyph(mode: prompt.mode, size: 9)
+                Text(prompt.mode.displayName)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.primary.opacity(0.06), in: Capsule())
+            .help("Sent with \(prompt.mode.displayName) mode — runs as a \(prompt.mode.displayName.lowercased()) turn")
+            .accessibilityLabel("Queued in \(prompt.mode.displayName) mode")
 
             Button(action: onEditInComposer) {
                 Image(systemName: "pencil")
@@ -153,6 +181,17 @@ private struct QueuedPromptRow: View {
             .buttonStyle(.plain)
             .interactiveHoverCircle()
             .help("Move this message back to the composer to edit it there")
+
+            Button(action: onSendNow) {
+                Image(systemName: "paperplane.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .padding(3)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .interactiveHoverCircle()
+            .help("Stop the running turn and send this message right away")
 
             Button(action: onRemove) {
                 Image(systemName: "xmark")

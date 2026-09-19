@@ -88,7 +88,7 @@ struct OpenAIProviderRuntime: ProviderRuntime {
                 for try await line in lineStream.lines {
                     try Task.checkCancellation()
 
-                    if let event = try OpenAIStreamDecoder.decode(line: line) {
+                    for event in try OpenAIStreamDecoder.decode(line: line) {
                         try await channel.send(event)
 
                         if event == .completed {
@@ -117,6 +117,29 @@ struct OpenAIProviderRuntime: ProviderRuntime {
                 await channel.finish(throwing: CancellationError())
             }
         )
+    }
+
+    /// Yan soru (`/btw`): durumsuz sağlayıcıda geçmiş + sorudan kurulu
+    /// araçsız tek completion. Kapatılacak oturum yoktur; soru/cevap
+    /// transkripte yazılmaz, turn makinesine girilmez.
+    func answerSideQuestion(_ query: SideQuestionQuery) async throws -> ProviderStream {
+        guard query.configuration.providerID == id else {
+            throw ProviderRuntimeError.unexpectedResponse
+        }
+
+        let questionMessage = ChatMessage(role: .user, text: query.question)
+        let synthetic = ProviderRequest(
+            sessionID: UUID(),
+            configuration: query.configuration,
+            messages: query.historyMessages
+                + query.followups.flatMap { $0.messages() }
+                + [questionMessage],
+            speedMode: query.speedMode,
+            mode: query.mode,
+            activityGroups: query.activityGroups,
+            contextSummary: query.contextSummary
+        )
+        return try await startStream(for: synthetic)
     }
 
     /// Error responses carry a short JSON body describing the cause. Reading a
@@ -182,7 +205,7 @@ struct OpenAIProviderRuntime: ProviderRuntime {
             "maximum context",
             "context window",
             "too many tokens",
-            "reduce the length"
+            "reduce the length",
         ]
 
         return markers.contains { lowercased.contains($0) }
@@ -204,12 +227,12 @@ struct OpenAIProviderRuntime: ProviderRuntime {
     }
 }
 
-private extension OpenAIProviderRuntime {
-    struct ModelList: Decodable {
+extension OpenAIProviderRuntime {
+    fileprivate struct ModelList: Decodable {
         let data: [Model]
     }
 
-    struct Model: Decodable {
+    fileprivate struct Model: Decodable {
         let id: String
     }
 }

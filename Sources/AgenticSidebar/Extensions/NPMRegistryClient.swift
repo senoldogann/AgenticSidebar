@@ -47,7 +47,7 @@ struct NPMRegistryClient: Sendable {
 
         components.queryItems = [
             URLQueryItem(name: "text", value: text),
-            URLQueryItem(name: "size", value: String(Self.pageSize))
+            URLQueryItem(name: "size", value: String(Self.pageSize)),
         ]
 
         guard let url = components.url else {

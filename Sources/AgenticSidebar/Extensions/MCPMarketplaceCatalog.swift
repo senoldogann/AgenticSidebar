@@ -228,6 +228,6 @@ enum MCPMarketplaceCatalog {
             environmentKeys: [],
             url: nil,
             documentationURL: "https://pypi.org/project/mcp-server-time/"
-        )
+        ),
     ]
 }

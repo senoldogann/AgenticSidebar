@@ -1,5 +1,6 @@
 import Darwin
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The port is probed and released before the child binds it, so the app has to

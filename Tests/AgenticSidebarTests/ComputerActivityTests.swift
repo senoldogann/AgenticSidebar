@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+
 @testable import AgenticSidebar
 
 /// Bilgisayar adımı verisi: tür eşleme, başlık detayı, onay detayı ve HUD.
@@ -15,13 +16,10 @@ final class ComputerActivityTests: XCTestCase {
             "chatgpt-system_computer_click",
             "chatgpt-system_computer_run",
             "chatgpt-system_computer_observe",
-            "click",
-            "drag",
-            "scroll",
-            "press_key",
-            "type_text",
-            "screenshot",
-            "focus_app",
+            "chatgpt-system_computer_press_key",
+            "chatgpt-system_computer_type_text",
+            "chatgpt-system_computer_screenshot",
+            "chatgpt-system_computer_focus_app",
         ]
         for tool in tools {
             let kind = ProviderActivityDescriptor.sanitizedTool(
@@ -29,6 +27,22 @@ final class ComputerActivityTests: XCTestCase {
                 toolName: tool
             ).kind
             XCTAssertEqual(kind, .computer, "araç: \(tool)")
+        }
+    }
+
+    func testBareNamesAreNotComputerTools() {
+        // Öneksiz adlar başka provider'lara ait olabilir (`run`, `observe`);
+        // önek şartsız eşleşme onları yanlış türe düşürürdü.
+        for tool in ["click", "drag", "scroll", "press_key", "type_text", "screenshot", "focus_app", "run", "observe"] {
+            XCTAssertFalse(ComputerActivityTitle.isComputerTool(tool), "araç: \(tool)")
+            XCTAssertNotEqual(
+                ProviderActivityDescriptor.sanitizedTool(
+                    id: ProviderActivityID("x"),
+                    toolName: tool
+                ).kind,
+                .computer,
+                "araç: \(tool)"
+            )
         }
     }
 

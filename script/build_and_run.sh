@@ -32,7 +32,7 @@ if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
 fi
 
 cd "$ROOT_DIR"
-swift build --product "$APP_NAME"
+swift build --product "$APP_NAME" -Xswiftc -warnings-as-errors
 BUILD_BINARY="$(swift build --product "$APP_NAME" --show-bin-path)/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"

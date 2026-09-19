@@ -31,6 +31,13 @@ protocol OpenCodeServerManaging: Sendable {
     ) async throws -> OpenCodeServerConnection
     func currentConnection() async -> OpenCodeServerConnection?
     func stop() async
+    func workingDirectory() async -> URL?
+}
+
+extension OpenCodeServerManaging {
+    func workingDirectory() async -> URL? {
+        nil
+    }
 }
 
 /// Where an `opencode` binary was found, and whether running it is safe.
@@ -54,7 +61,7 @@ protocol OpenCodeExecutableLocating: Sendable {
 extension OpenCodeExecutableLocating {
     /// The path, when one was found that may be run.
     func locate() -> URL? {
-        if case let .found(url) = resolution() {
+        if case .found(let url) = resolution() {
             return url
         }
         return nil

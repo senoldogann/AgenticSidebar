@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class StreamingTextAccumulatorTests: XCTestCase {
@@ -58,11 +59,11 @@ final class StreamingTextIntervalTests: XCTestCase {
     func testFastModeUsesFasterStreamingIntervals() {
         XCTAssertEqual(
             AgentSession.streamingTextInterval(forMessageLength: 0, speedMode: .fast),
-            .milliseconds(16)
+            .milliseconds(40)
         )
         XCTAssertEqual(
             AgentSession.streamingTextInterval(forMessageLength: 29_999, speedMode: .fast),
-            .milliseconds(16)
+            .milliseconds(40)
         )
         XCTAssertEqual(
             AgentSession.streamingTextInterval(forMessageLength: 30_000, speedMode: .fast),

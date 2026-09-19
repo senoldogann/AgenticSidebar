@@ -29,10 +29,12 @@ extension SettingsView {
 
                 computerUseReadinessBanner
 
-                Text("The managed OpenCode server registers `chatgpt-system` as a local MCP server. computer_* tools observe the screen (accessibility tree + screenshots) and post pointer/keyboard input. Every action asks for your approval first; authority is an Admin lease with a one-hour maximum that the agent must renew.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                Text(
+                    "The managed OpenCode server registers `chatgpt-system` as a local MCP server. computer_* tools observe the screen (accessibility tree + screenshots) and post pointer/keyboard input. Every action asks for your approval first; authority is an Admin lease with a one-hour maximum that the agent must renew."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
                 computerUseApprovalsBlock
                 computerUseFolderRow
@@ -161,12 +163,14 @@ extension SettingsView {
         )
     }
 
-    private var readinessPresentation: (
-        title: String,
-        detail: String,
-        symbol: String,
-        tint: Color
-    ) {
+    private var readinessPresentation:
+        (
+            title: String,
+            detail: String,
+            symbol: String,
+            tint: Color
+        )
+    {
         guard let readiness = computerUseStatus.readiness else {
             return (
                 "Checking…",
@@ -245,10 +249,12 @@ extension SettingsView {
                     .foregroundStyle(.secondary)
             }
 
-            Text("Computer use keeps its own limits at every level: only computer_* and session_authority_* tools are exposed, and the authority lease is always yours to approve unless you chose Full access.")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                "Computer use keeps its own limits at every level: only computer_* and session_authority_* tools are exposed, and the authority lease is always yours to approve unless you chose Full access."
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -263,13 +269,13 @@ extension SettingsView {
                 .frame(width: 56, alignment: .leading)
 
             TextField("~/Desktop/chatgpt-system", text: $settings.chatgptSystemRootPath)
-            .textFieldStyle(.roundedBorder)
-            .font(.system(size: 11.5, design: .monospaced))
-            .onSubmit {
-                Task {
-                    await refreshComputerUseReadiness()
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11.5, design: .monospaced))
+                .onSubmit {
+                    Task {
+                        await refreshComputerUseReadiness()
+                    }
                 }
-            }
 
             secondaryActionButton(title: "Choose…", icon: "folder") {
                 chooseComputerUseFolder()
@@ -325,10 +331,12 @@ extension SettingsView {
                             // Screen Recording switch is real, on, and never
                             // consulted, because macOS asks the process that
                             // launched it.
-                            Text("Screen Recording is enforced on the process that launches the helper, so macOS asks this app — not the helper — for it. A switched-on **ChatGPTSystemComputerRuntime** row in that list has no effect on its own.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            Text(
+                                "Screen Recording is enforced on the process that launches the helper, so macOS asks this app — not the helper — for it. A switched-on **ChatGPTSystemComputerRuntime** row in that list has no effect on its own."
+                            )
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         }
 
                         HStack(spacing: 8) {
@@ -353,10 +361,12 @@ extension SettingsView {
                             .foregroundStyle(.orange)
                             .padding(.top, 1)
 
-                        Text("The helper could not be asked what macOS has granted it. Install it with the step below; the check runs again by itself afterwards.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                        Text(
+                            "The helper could not be asked what macOS has granted it. Install it with the step below; the check runs again by itself afterwards."
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -605,14 +615,25 @@ extension SettingsView {
             icon: "exclamationmark.shield.fill"
         ) {
             VStack(alignment: .leading, spacing: 6) {
-                computerUseSafetyBullet("Only computer_* and session_authority_* tools are exposed; filesystem, git, terminal and browser tools of the MCP server are denied by policy.")
-                computerUseSafetyBullet("Full-host JavaScript (computer_run_js) stays disabled; the server is started with --personal-admin and --enable-computer-use only.")
+                computerUseSafetyBullet(
+                    "Only computer_* and session_authority_* tools are exposed; filesystem, git, terminal and browser tools of the MCP server are denied by policy."
+                )
+                computerUseSafetyBullet(
+                    "Full-host JavaScript (computer_run_js) stays disabled; the server is started with --personal-admin and --enable-computer-use only."
+                )
                 computerUseSafetyBullet(approvalSafetyText)
-                computerUseSafetyBullet("The permission check spawns the signed helper for one health question and nothing else; it performs no action and reads no screen content.")
-                computerUseSafetyBullet("Screen Recording is the one grant macOS enforces on this app rather than on the helper, because tccd attributes it to the process that launched the helper. Nothing is captured by the check itself.")
-                computerUseSafetyBullet("The setup buttons run `npm run build` and `npm run setup:computer:macos` in the folder above, through `env`, never a shell — no other command can be run from here.")
+                computerUseSafetyBullet(
+                    "The permission check spawns the signed helper for one health question and nothing else; it performs no action and reads no screen content."
+                )
+                computerUseSafetyBullet(
+                    "Screen Recording is the one grant macOS enforces on this app rather than on the helper, because tccd attributes it to the process that launched the helper. Nothing is captured by the check itself."
+                )
+                computerUseSafetyBullet(
+                    "The setup buttons run `npm run build` and `npm run setup:computer:macos` in the folder above, through `env`, never a shell — no other command can be run from here."
+                )
                 computerUseSafetyBullet("chatgpt-system writes its own redacted audit log at ~/.chatgpt-system/audit.jsonl.")
-                computerUseSafetyBullet("The setup files live in AgenticSidebar's Application Support folder; your opencode.json is never modified.")
+                computerUseSafetyBullet(
+                    "The setup files live in AgenticSidebar's Application Support folder; your opencode.json is never modified.")
             }
         }
     }
@@ -625,7 +646,7 @@ extension SettingsView {
         case .approveSafe:
             "Screen observation runs unattended; anything that moves the pointer, types, presses a key, runs a program or mints the Admin authority lease waits for you."
         case .fullAccess:
-            "Full access is on: computer actions and the authority lease run unattended without any approval. Switch the level in AI & Models to bring the prompts back."
+            "Full access is on: shell, edits and fetches run unattended, but computer actions and the authority lease still wait for you."
         }
     }
 

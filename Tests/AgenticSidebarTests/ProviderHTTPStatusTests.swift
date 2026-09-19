@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ProviderHTTPStatusTests: XCTestCase {
@@ -10,7 +11,7 @@ final class ProviderHTTPStatusTests: XCTestCase {
             (429, .rateLimited),
             (500, .unavailable),
             (503, .unavailable),
-            (400, .unexpectedResponse)
+            (400, .unexpectedResponse),
         ]
 
         for (statusCode, expected) in expectations {
@@ -29,7 +30,7 @@ final class ProviderHTTPStatusTests: XCTestCase {
             (401, .authenticationFailure),
             (429, .rateLimited),
             (503, .unavailable),
-            (404, .unexpectedResponse)
+            (404, .unexpectedResponse),
         ]
 
         for (statusCode, expected) in expectations {

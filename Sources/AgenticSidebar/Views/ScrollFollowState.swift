@@ -70,7 +70,9 @@ final class ScrollFollowState {
 
     /// Suppresses spurious offset drops during turn startup / settling so programmatic
     /// layout estimations do not falsely disable auto-follow or trigger blank screens.
-    private var suppressOffsetDropUntil: Date = .distantPast
+    /// Monotonik saat: duvar saati değişimi (NTP, uyku) pencereyi uzatıp
+    /// kısaltmamalı.
+    private var suppressOffsetDropUntil: ContinuousClock.Instant?
 
     /// Kaydırma ölçümü.
     ///
@@ -79,7 +81,7 @@ final class ScrollFollowState {
     /// kapatabilir. Yanıt büyürken okunan konum "yukarı kaydırıldı" diye
     /// yorumlanamaz — büyüme konumu düşürmez.
     func record(snapshot: ChatScrollSnapshot) {
-        let isSuppressed = Date() < suppressOffsetDropUntil
+        let isSuppressed = suppressOffsetDropUntil.map { ContinuousClock.now < $0 } ?? false
         let movedUp = lastOffsetY.map { snapshot.offsetY < $0 - Self.upwardStep } ?? false
         lastOffsetY = snapshot.offsetY
 
@@ -148,7 +150,19 @@ final class ScrollFollowState {
         lastAutoScrollTime = .distantPast
         lastOffsetY = nil
         isUserPosition = false
-        suppressOffsetDropUntil = Date().addingTimeInterval(0.6)
+        suppressOffsetDropUntil = Self.deadline(seconds: 0.6)
+    }
+
+    /// Programatik yerleşim sarsıntısı: inspector açılıp kapanırken genişlik
+    /// animasyonu konumda sahte düşüşler üretir. Burası `resumeFollow` gibi
+    /// kullanıcı durumunu silmez — yalnız düşüş yorumunu susturur — o yüzden
+    /// tarihte okuyan kullanıcı dipte sayılmaz, dipteki kullanıcı da yukarıda.
+    func suppressTransientDrop(for seconds: TimeInterval = 0.8) {
+        let next = Self.deadline(seconds: seconds)
+        if let current = suppressOffsetDropUntil, current > next {
+            return
+        }
+        suppressOffsetDropUntil = next
     }
 
     func reset() {
@@ -158,7 +172,14 @@ final class ScrollFollowState {
         lastAutoScrollTime = .distantPast
         lastOffsetY = nil
         isUserPosition = false
-        suppressOffsetDropUntil = .distantPast
+        // Yeni sohbetin ilk yerleşim adımları konumda sahte düşüşler üretir;
+        // bastırılmazsa takip modu haksız yere kapanır ve dibe inilmez.
+        suppressOffsetDropUntil = Self.deadline(seconds: 0.4)
+    }
+
+    /// Monotonik saate göre bastırma bitişi.
+    private static func deadline(seconds: TimeInterval) -> ContinuousClock.Instant {
+        ContinuousClock.now.advanced(by: .milliseconds(Int((seconds * 1_000).rounded())))
     }
 
     /// Akan yanıt görünümü dibe çekmeli mi?
@@ -182,6 +203,14 @@ final class ScrollFollowState {
 
         lastAutoScrollTime = now
         return true
+    }
+
+    /// Programatik yerleşim değişimlerinde (collapse, inspector) karar anındaki
+    /// canlı durum: kullanıcı jesti yok, konum kullanıcıda değil ve son ölçüm
+    /// dipte. `@State` kopyası değil bu sınıfın kendisi okunur — `Equatable`
+    /// alt görünümlerden gelen kapanımlar bayat değer taşıyamaz.
+    var isFollowing: Bool {
+        !isUserScrolling && !isUserPosition && !awayFromBottom
     }
 
     /// Bekleyen kararları verir ve temizler; aynı ölçüm iki kez yayınlanmaz.

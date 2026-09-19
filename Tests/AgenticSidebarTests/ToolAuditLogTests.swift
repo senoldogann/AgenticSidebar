@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ToolAuditLogTests: XCTestCase {
@@ -27,16 +28,18 @@ final class ToolAuditLogTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let log = ToolAuditLog(fileURL: directory.appendingPathComponent("audit.jsonl"))
 
-        await log.recordExecution(ToolAuditLog.ExecutionRecord(
-            timestamp: Date(timeIntervalSince1970: 1_700_000_000),
-            sessionID: "ses_remote", activityID: "part-1", toolKind: .edit,
-            title: "Edited source.swift", detail: "source.swift", event: .started
-        ))
-        await log.recordExecution(ToolAuditLog.ExecutionRecord(
-            timestamp: Date(timeIntervalSince1970: 1_700_000_001),
-            sessionID: "ses_remote", activityID: "part-1", toolKind: .edit,
-            title: "Edited source.swift", detail: "source.swift", event: .completed
-        ))
+        await log.recordExecution(
+            ToolAuditLog.ExecutionRecord(
+                timestamp: Date(timeIntervalSince1970: 1_700_000_000),
+                sessionID: "ses_remote", activityID: "part-1", toolKind: .edit,
+                title: "Edited source.swift", detail: "source.swift", event: .started
+            ))
+        await log.recordExecution(
+            ToolAuditLog.ExecutionRecord(
+                timestamp: Date(timeIntervalSince1970: 1_700_000_001),
+                sessionID: "ses_remote", activityID: "part-1", toolKind: .edit,
+                title: "Edited source.swift", detail: "source.swift", event: .completed
+            ))
 
         let executions = await log.recentExecutions(limit: 10)
         XCTAssertEqual(executions.map(\.event), [.started, .completed])
@@ -98,7 +101,8 @@ final class ToolAuditLogTests: XCTestCase {
             "The previous file is kept aside, not overwritten"
         )
 
-        let size = (try FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?
+        let size =
+            (try FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?
             .intValue ?? 0
         XCTAssertLessThan(size, 1_000)
 

@@ -2,6 +2,12 @@ import Foundation
 
 /// Pure functional parser for extracting interactive questions from tool arguments or text.
 enum AgentQuestionParser {
+    /// Hızlı yanıt listesi deseni: her çağrıda yeniden derlenmez.
+    private static let quickReplyRegex: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"^(?:(?:\d+[\.\)]|\-)\s+)(.+)$"#,
+        options: []
+    )
+
     /// Attempts to parse an interactive question from tool input properties.
     static func parseFromToolInput(
         toolCallID: String?,
@@ -9,16 +15,19 @@ enum AgentQuestionParser {
     ) -> AgentQuestion? {
         let promptCandidates = ["question", "prompt", "title", "message"]
         guard let prompt = promptCandidates.compactMap({ input[$0] as? String }).first,
-              !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
             return nil
         }
 
         let options = parseOptions(from: input["options"])
-        let allowCustom = (input["allowCustomAnswer"] as? Bool)
+        let allowCustom =
+            (input["allowCustomAnswer"] as? Bool)
             ?? (input["allow_custom"] as? Bool)
             ?? (input["allowFreeform"] as? Bool)
             ?? true
-        let isMulti = (input["isMultiSelect"] as? Bool)
+        let isMulti =
+            (input["isMultiSelect"] as? Bool)
             ?? (input["is_multi_select"] as? Bool)
             ?? (input["multiple"] as? Bool)
             ?? false
@@ -52,12 +61,14 @@ enum AgentQuestionParser {
 
         if let dictArray = raw as? [[String: Any]] {
             return dictArray.enumerated().map { index, dict in
-                let label = (dict["label"] as? String)
+                let label =
+                    (dict["label"] as? String)
                     ?? (dict["title"] as? String)
                     ?? (dict["text"] as? String)
                     ?? "Option \(index + 1)"
                 let desc = dict["description"] as? String
-                let isRec = (dict["isRecommended"] as? Bool)
+                let isRec =
+                    (dict["isRecommended"] as? Bool)
                     ?? (dict["recommended"] as? Bool)
                     ?? isRecommendedTag(label)
                 let id = (dict["id"] as? String) ?? "opt_\(index + 1)"
@@ -87,37 +98,65 @@ enum AgentQuestionParser {
     }
 
     /// Parses numbered or labeled options from markdown text when an assistant asks a question.
+    ///
+    /// Only a list that ends the message counts: an informational answer that
+    /// happens to contain a bullet list mid-text (identities, steps, files)
+    /// must not pop up a blocking question card. Lines inside fenced code
+    /// blocks are never options.
     static func parseQuickReplyOptions(from text: String) -> [AgentQuestionOption] {
         let lines = text.components(separatedBy: "\n")
         var collected: [AgentQuestionOption] = []
+        var lastOptionLineIndex: Int?
 
-        let pattern = #"^(?:(?:\d+[\.\)]|\-)\s+)(.+)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+        guard let regex = Self.quickReplyRegex else {
             return []
         }
 
-        for line in lines {
+        var insideFence = false
+        for (index, line) in lines.enumerated() {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                insideFence.toggle()
+                continue
+            }
+            guard !insideFence, !trimmed.isEmpty else { continue }
             let range = NSRange(location: 0, length: trimmed.utf16.count)
             if let match = regex.firstMatch(in: trimmed, options: [], range: range),
-               let matchRange = Range(match.range(at: 1), in: trimmed) {
+                let matchRange = Range(match.range(at: 1), in: trimmed)
+            {
                 let candidate = String(trimmed[matchRange]).trimmingCharacters(in: .whitespacesAndNewlines)
                 if candidate.count >= 2 && candidate.count <= 60 {
-                    let index = collected.count + 1
+                    let optionIndex = collected.count + 1
                     let isRec = isRecommendedTag(candidate)
                     collected.append(
                         AgentQuestionOption(
-                            id: "quick_\(index)",
+                            id: "quick_\(optionIndex)",
                             label: candidate,
                             description: nil,
                             isRecommended: isRec
                         )
                     )
+                    lastOptionLineIndex = index
                 }
             }
         }
 
-        return (collected.count >= 2 && collected.count <= 6) ? collected : []
+        guard collected.count >= 2, collected.count <= 6,
+            let lastIndex = lastOptionLineIndex
+        else {
+            return []
+        }
+
+        // Seçeneklerden sonra gelen gerçek içerik (paragraf, kod bloğu), listenin
+        // bilgi amaçlı olduğunu gösterir; hızlı yanıt yalnız mesaj listeyle
+        // bitiyorsa sunulur.
+        let hasTrailingContent = lines[(lastIndex + 1)...].contains {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !hasTrailingContent else {
+            return []
+        }
+
+        return collected
     }
 }

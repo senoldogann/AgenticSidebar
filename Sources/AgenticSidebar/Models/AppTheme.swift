@@ -283,7 +283,7 @@ enum AppThemes {
             assistantBubbleLight: Color(red: 0.98, green: 0.97, blue: 0.93),
             borderSubtleDark: Color(red: 0.85, green: 0.47, blue: 0.34).opacity(0.18),
             borderSubtleLight: Color(red: 0.85, green: 0.47, blue: 0.34).opacity(0.20)
-        )
+        ),
     ]
 
     /// Single source of truth for resolving a stored theme identifier, including

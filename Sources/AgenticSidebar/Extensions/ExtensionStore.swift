@@ -179,6 +179,16 @@ final class ExtensionStore {
             )
             return false
         }
+        // Kabuk meta karakterleri komut tanımında yasaktır: sunucu doğrudan
+        // çalıştırılır, kabuk üzerinden değil.
+        if definition.transport == .local {
+            let forbidden: Set<Character> = [";", "&", "|", ">", "<", "`", "$", "(", ")", "{", "}", "\\", "\n", "\r"]
+            let joined = definition.command.joined(separator: " ")
+            if joined.contains(where: { forbidden.contains($0) }) {
+                status = .failure("Komut kabuk işleci içeremez; tek çalıştırılabilir ve argümanları yazın.")
+                return false
+            }
+        }
 
         guard !registry.mcpServers.contains(where: { $0.name == trimmed && !$0.isInherited })
         else {
@@ -334,7 +344,8 @@ final class ExtensionStore {
 
         do {
             pluginCatalog = try await npm.search(query)
-            status = pluginCatalog.isEmpty
+            status =
+                pluginCatalog.isEmpty
                 ? .info("npm has nothing matching “\(query)”")
                 : .info("\(pluginCatalog.count) plugins found.")
         } catch let error as ExtensionFetchError {
@@ -376,7 +387,8 @@ final class ExtensionStore {
 
         do {
             searchResults = try await skillsSh.search(query)
-            status = searchResults.isEmpty
+            status =
+                searchResults.isEmpty
                 ? .info("skills.sh has nothing matching “\(query)”.")
                 : .info("\(searchResults.count) skills found.")
         } catch let error as ExtensionFetchError {
@@ -544,7 +556,7 @@ enum ExtensionStatus: Equatable, Sendable {
 
     var message: String {
         switch self {
-        case let .info(message), let .failure(message):
+        case .info(let message), .failure(let message):
             message
         }
     }

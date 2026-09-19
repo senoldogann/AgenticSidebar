@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class SessionListQueryTests: XCTestCase {
@@ -19,13 +20,15 @@ final class SessionListQueryTests: XCTestCase {
         lastMessageAt: Date? = nil,
         completedAt: Date? = nil,
         customTitle: String? = nil,
-        isPinned: Bool = false
+        isPinned: Bool = false,
+        isBusy: Bool = false,
+        status: AgentSessionStatus = .idle
     ) -> SessionSummary {
         SessionSummary(
             id: UUID(),
             title: title,
-            isBusy: false,
-            status: .idle,
+            isBusy: isBusy,
+            status: status,
             completedAt: completedAt,
             lastMessageAt: lastMessageAt,
             createdAt: createdAt,
@@ -164,5 +167,23 @@ final class SessionListQueryTests: XCTestCase {
     func testEmptyListReturnsEmpty() {
         let result = filterSortSessions([], query: "x", sort: .alphabetical, dateFilter: .today, now: now, calendar: calendar)
         XCTAssertTrue(result.isEmpty)
+    }
+
+    func testDoneBadgeShowsOnlyForCompletedIdleSessions() {
+        let done = makeSummary(title: "done", createdAt: now, status: .completed)
+        XCTAssertTrue(done.showsDoneBadge)
+
+        let idle = makeSummary(title: "idle", createdAt: now, status: .idle)
+        XCTAssertFalse(idle.showsDoneBadge)
+
+        let failed = makeSummary(title: "failed", createdAt: now, status: .failed)
+        XCTAssertFalse(failed.showsDoneBadge)
+
+        let cancelled = makeSummary(title: "cancelled", createdAt: now, status: .cancelled)
+        XCTAssertFalse(cancelled.showsDoneBadge)
+
+        // Koşan turda rozet değil ilerleme göstergesi durur.
+        let busyCompleted = makeSummary(title: "busy", createdAt: now, isBusy: true, status: .completed)
+        XCTAssertFalse(busyCompleted.showsDoneBadge)
     }
 }

@@ -23,6 +23,10 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     var sessionList: [SessionSummary] { get }
     var todos: [AgentTodo] { get }
 
+    /// Yan yana görünümde ikincil bölme aktif olmayan bir oturumu gösterir:
+    /// kimliğe göre doğrudan oturumu verir, bulunamazsa `nil` döner.
+    func session(for id: UUID) -> AgentSession?
+
     @discardableResult
     func createSession() -> UUID
     func selectSession(_ id: UUID)
@@ -33,6 +37,7 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     func renameSession(_ id: UUID, to newTitle: String)
     func setSessionPinned(_ id: UUID, pinned: Bool)
     func toggleSessionPin(_ id: UUID)
+    func updateVisibleSessions(_ visibleIDs: Set<UUID>)
     func selectProvider(_ providerID: ProviderID) throws
     func selectModel(_ modelID: ProviderModelID) throws
     func selectVariant(_ variantID: ProviderVariantID?) throws
@@ -58,6 +63,7 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     func answerActiveQuestion(_ answer: AgentQuestionAnswer)
     func dismissActiveQuestion()
     func removeQueuedPrompt(_ id: UUID)
+    func sendQueuedPromptImmediately(_ id: UUID)
     @discardableResult
     func updateQueuedPrompt(_ id: UUID, text: String) -> Bool
     @discardableResult
@@ -67,6 +73,14 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     func cancel() async
     func flushPendingSave() async
     func saveNow() async
+
+    /// Yan soru (`/btw`) anlık görüntüsü: soru anındaki runtime,
+    /// yapılandırma ve geçmiş. Turn makinesine dokunulmaz.
+    func sideQuestionContext(for id: UUID) -> SideQuestionContext?
+}
+
+extension AgentSessionServiceProtocol {
+    func sideQuestionContext(for id: UUID) -> SideQuestionContext? { nil }
 }
 
 extension AgentSessionService: AgentSessionServiceProtocol {}

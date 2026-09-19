@@ -45,10 +45,11 @@ struct ChatMessage: Identifiable, Equatable, Codable, Sendable {
         role = try container.decode(Role.self, forKey: .role)
         text = try container.decode(String.self, forKey: .text)
         attachmentPaths = try container.decode([String].self, forKey: .attachmentPaths)
-        extensionTags = try container.decodeIfPresent(
-            [ExtensionTag].self,
-            forKey: .extensionTags
-        ) ?? []
+        extensionTags =
+            try container.decodeIfPresent(
+                [ExtensionTag].self,
+                forKey: .extensionTags
+            ) ?? []
         createdAt = try container.decode(Date.self, forKey: .createdAt)
     }
 
@@ -76,5 +77,35 @@ struct ChatMessage: Identifiable, Equatable, Codable, Sendable {
         self.attachmentPaths = attachmentPaths
         self.extensionTags = extensionTags
         self.createdAt = Date()
+    }
+
+    /// Aynı içeriği yeni bir kimlikle kopyalar. Dal (fork) oturumlar kaynakla
+    /// aynı mesaj kimliklerini taşırsa bölme-bağımsız depolar (daraltma durumu,
+    /// imleç yoklamaları) iki sohbeti birbirine karıştırır.
+    func withID(_ newID: UUID) -> ChatMessage {
+        ChatMessage(
+            id: newID,
+            role: role,
+            text: text,
+            attachmentPaths: attachmentPaths,
+            extensionTags: extensionTags,
+            createdAt: createdAt
+        )
+    }
+
+    init(
+        id: UUID,
+        role: Role,
+        text: String,
+        attachmentPaths: [String],
+        extensionTags: [ExtensionTag],
+        createdAt: Date
+    ) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.attachmentPaths = attachmentPaths
+        self.extensionTags = extensionTags
+        self.createdAt = createdAt
     }
 }

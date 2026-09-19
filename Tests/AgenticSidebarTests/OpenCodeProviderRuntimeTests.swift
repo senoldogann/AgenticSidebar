@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class OpenCodeProviderRuntimeTests: XCTestCase {
@@ -12,7 +13,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             cancelPendingPermissions: nil
         )
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await runtime.capabilities()
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .unavailable)
@@ -78,7 +79,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
                         modelID: "claude/opus"
                     ),
                     variant: "high",
-                    text: "First"
+                    text: "<user_turn>\nFirst\n</user_turn>"
                 ),
                 .eventStream,
                 .prompt(
@@ -88,8 +89,8 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
                         modelID: "claude/opus"
                     ),
                     variant: "high",
-                    text: "Second"
-                )
+                    text: "<user_turn>\nSecond\n</user_turn>"
+                ),
             ]
         )
     }
@@ -97,7 +98,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
     func testPlanAndBuildTurnsSelectDistinctBackendAgents() async throws {
         let client = RuntimeMockOpenCodeClient(eventStreams: [
             completedLineStream(sessionID: "ses_remote"),
-            completedLineStream(sessionID: "ses_remote")
+            completedLineStream(sessionID: "ses_remote"),
         ])
         let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
         let sessionID = UUID()
@@ -107,6 +108,41 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         _ = try await collect(build.events)
         let agents = await client.agents()
         XCTAssertEqual(agents, [ManagedOpenCodeConfiguration.planAgentName, "build"])
+    }
+
+    func testExamTurnsUseTheReadOnlyBackendAgent() async throws {
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            completedLineStream(sessionID: "ses_remote")
+        ])
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let sessionID = UUID()
+        let exam = try await runtime.startStream(for: makeRequest(sessionID: sessionID, text: "Solve", mode: .exam))
+        _ = try await collect(exam.events)
+        let agents = await client.agents()
+        XCTAssertEqual(
+            agents,
+            [ManagedOpenCodeConfiguration.planAgentName],
+            "Exam input (clipboard/OCR) is untrusted, so it must never run with build powers"
+        )
+    }
+
+    func testReviewTurnsUseTheReadOnlyBackendAgent() async throws {
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            completedLineStream(sessionID: "ses_remote"),
+            completedLineStream(sessionID: "ses_remote"),
+        ])
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let sessionID = UUID()
+        let review = try await runtime.startStream(for: makeRequest(sessionID: sessionID, text: "Review", mode: .review))
+        _ = try await collect(review.events)
+        let build = try await runtime.startStream(for: makeRequest(sessionID: sessionID, text: "Build", mode: .build))
+        _ = try await collect(build.events)
+        let agents = await client.agents()
+        XCTAssertEqual(
+            agents,
+            [ManagedOpenCodeConfiguration.planAgentName, "build"],
+            "A review turn must stay read-only even though it runs after queueing"
+        )
     }
 
     func testRuntimeNormalizesTextToolAndCompletionEvents() async throws {
@@ -157,7 +193,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
                     outcome: .completed,
                     output: "ok"
                 ),
-                .completed
+                .completed,
             ]
         )
     }
@@ -277,7 +313,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         )
         let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await runtime.startStream(
                 for: makeRequest(sessionID: UUID(), text: "Fail")
             )
@@ -332,7 +368,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             #"data: {"type":"question.asked","properties":{"id":"que_answer","sessionID":"ses_remote","questions":[{"question":"Which database?","header":"Database","options":[{"label":"SQLite","description":"Local"}],"multiple":false,"custom":true}]}}"#
         )
         let first = try await events.next()
-        guard case let .questionAsked(firstQuestion) = first else {
+        guard case .questionAsked(let firstQuestion) = first else {
             XCTFail("The original backend request must reach the UI, not a synthetic tool title")
             await stream.cancel()
             return
@@ -345,7 +381,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             #"data: {"type":"question.asked","properties":{"id":"que_reject","sessionID":"ses_remote","questions":[{"question":"Proceed?","header":"Confirm","options":[],"custom":true}]}}"#
         )
         let second = try await events.next()
-        guard case let .questionAsked(secondQuestion) = second else {
+        guard case .questionAsked(let secondQuestion) = second else {
             XCTFail("The second question must reach the same active turn")
             await stream.cancel()
             return
@@ -466,7 +502,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         let client = RuntimeMockOpenCodeClient(
             eventStreams: [
                 completedLineStream(sessionID: "ses_remote"),
-                completedLineStream(sessionID: "ses_remote")
+                completedLineStream(sessionID: "ses_remote"),
             ]
         )
         let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
@@ -521,7 +557,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             messages: [
                 ChatMessage(role: .user, text: "Old question"),
                 ChatMessage(role: .assistant, text: "Old answer"),
-                ChatMessage(role: .user, text: "New question")
+                ChatMessage(role: .user, text: "New question"),
             ],
             speedMode: .normal,
             mode: .build
@@ -531,7 +567,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         _ = try await collect(stream.events)
 
         let texts = await client.calls().compactMap { call -> String? in
-            if case let .prompt(_, _, _, text) = call { return text }
+            if case .prompt(_, _, _, let text) = call { return text }
             return nil
         }
         XCTAssertEqual(texts.count, 1)
@@ -549,7 +585,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         let client = RuntimeMockOpenCodeClient(
             eventStreams: [
                 completedLineStream(sessionID: "ses_remote"),
-                completedLineStream(sessionID: "ses_remote")
+                completedLineStream(sessionID: "ses_remote"),
             ]
         )
         let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
@@ -572,7 +608,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
             messages: [
                 ChatMessage(role: .user, text: "First"),
                 ChatMessage(role: .assistant, text: "First answer"),
-                ChatMessage(role: .user, text: "Second")
+                ChatMessage(role: .user, text: "Second"),
             ],
             speedMode: .normal,
             mode: .build
@@ -581,7 +617,7 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         _ = try await collect(second.events)
 
         let texts = await client.calls().compactMap { call -> String? in
-            if case let .prompt(_, _, _, text) = call { return text }
+            if case .prompt(_, _, _, let text) = call { return text }
             return nil
         }
         XCTAssertEqual(texts.count, 2)
@@ -692,7 +728,7 @@ private struct StubRuntimeOpenCodeServerManager: OpenCodeServerManaging {
 /// Text summary of a prompt so call assertions can keep comparing strings.
 private func openCodePromptText(from parts: [OpenCodePromptPart]) -> String {
     parts.compactMap { part -> String? in
-        if case let .text(text) = part { return text }
+        if case .text(let text) = part { return text }
         return nil
     }.joined(separator: "\n")
 }
@@ -766,7 +802,7 @@ private actor RuntimeMockOpenCodeClient: OpenCodeClientProtocol {
         parts: [OpenCodePromptPart]
     ) async throws {
         let text = parts.compactMap { part -> String? in
-            if case let .text(str) = part { return str }
+            if case .text(let str) = part { return str }
             return nil
         }.joined(separator: "\n")
         recordedCalls.append(
@@ -828,7 +864,6 @@ private actor RuntimeMockOpenCodeClient: OpenCodeClientProtocol {
 
     func disconnectMCPServer(name: String) async throws {}
 
-
     func eventStream() async throws -> OpenCodeLineStream {
         recordedCalls.append(.eventStream)
         guard !streams.isEmpty else {
@@ -863,7 +898,7 @@ private actor RuntimePermissionCancellationProbe {
     func conversationIDs() -> [UUID] { cancelledConversationIDs }
 }
 
-private func XCTAssertThrowsErrorAsync<T>(
+private func assertThrowsErrorAsync<T>(
     _ expression: @autoclosure () async throws -> T,
     _ errorHandler: (Error) -> Void,
     file: StaticString = #filePath,

@@ -14,6 +14,10 @@ final class AgentSession {
     @ObservationIgnored
     private let runtimes: [any ProviderRuntime]
 
+    /// Eşleşmezlik kuralı: `activeTask`/`activeStream` doluysa `activeTurnID`
+    /// de doludur ve üçü aynı tura aittir; üçü birlikte kurulur, birlikte
+    /// düşürülür (`startTurn`, `cancel`, `consume` sonu, `recoverOrphanedTurn`).
+    /// `cancel` bu sayede elindeki tutamacın koşan tura ait olduğunu bilir.
     @ObservationIgnored
     private var activeTask: Task<Void, Never>?
 
@@ -39,10 +43,20 @@ final class AgentSession {
     private var activeTurnSpeedMode: ResponseSpeedMode = .normal
 
     @ObservationIgnored
+    private var activeTurnMode: AgentMode = .build
+
+    @ObservationIgnored
     private var activeAssistantMessageID: UUID?
 
     @ObservationIgnored
     private var currentTurnAnchorMessageID: UUID?
+
+    /// Bu turda akış hedefine hiç asistan metni düştü mü.
+    ///
+    /// Sessiz bir tamamlanmayı ayırt etmek için: model hiç yanıt üretmezse
+    /// transkripte hiçbir şey eklenmez ve kullanıcı "ajan başlamadı" der.
+    @ObservationIgnored
+    private var turnProducedAssistantText = false
 
     /// Invalidates older asynchronous todo reads, including reads from previous turns.
     @ObservationIgnored
@@ -54,29 +68,62 @@ final class AgentSession {
     @ObservationIgnored
     private var streamingTextFlushTask: Task<Void, Never>?
 
+    /// Henüz düşünme kartına yazılmamış thinking deltası. Asistan metni gibi
+    /// her SSE satırında `state`'e dokunmak gözlem fırtınası çıkarır, o yüzden
+    /// aynı debounce deseniyle birikir ve boşaltılır.
+    @ObservationIgnored
+    private var pendingThinkingText = ""
+
+    @ObservationIgnored
+    private var thinkingFlushTask: Task<Void, Never>?
+
     @ObservationIgnored
     private var pendingActivityUpdates: [ProviderActivityID: (descriptor: ProviderActivityDescriptor, turnID: UUID)] = [:]
 
     @ObservationIgnored
     private var activityUpdateFlushTask: Task<Void, Never>?
 
+    @ObservationIgnored
+    private var noticeAutoDismissTask: Task<Void, Never>?
+
     /// Called after every transcript/status change so the owner can debounce a
     /// persistence write. Streaming flushes fire often, hence the debounce.
     @ObservationIgnored
     var onPersistentChange: (@MainActor () -> Void)?
     var onImmediatePersistentChange: (@MainActor () -> Void)?
-    var onTurnFinished: (@MainActor (_ sessionID: UUID, _ sessionTitle: String, _ status: AgentSessionStatus, _ lastMessageSnippet: String?) -> Void)?
+    /// Notifies the session service when summary-relevant fields change (title, status, pin, message count),
+    /// strictly avoiding updates on intermediate streaming text chunks to prevent sidebar re-render storms.
+    @ObservationIgnored
+    var onSummaryChange: (@MainActor () -> Void)?
+    var onTurnFinished:
+        (@MainActor (_ sessionID: UUID, _ sessionTitle: String, _ status: AgentSessionStatus, _ lastMessageSnippet: String?) -> Void)?
+    /// Tur sınırları: izin seviyesi tur başında anlık görüntülenir, tur
+    /// bitene kadar koşan tur eski kuralla devam eder. Başlangıç ve bitiş
+    /// aynı `turnID` ile eşleşir; üstüne binen turda eski turun geç bitişi
+    /// yeni turun kaydını düşürmez (merkez `turnID` korur).
+    var onTurnStarted: (@MainActor (_ sessionID: UUID, _ turnID: UUID) -> Void)?
+    var onTurnEnded: (@MainActor (_ sessionID: UUID, _ turnID: UUID) -> Void)?
 
     @ObservationIgnored
     private let budget: TranscriptBudget
 
-    /// Determines the streaming UI flush interval. In Fast mode, flushes occur at 16ms
-    /// (60fps) for an instantaneous typewriter streaming experience.
-    static func streamingTextInterval(forMessageLength length: Int, speedMode: ResponseSpeedMode) -> Duration {
-        switch speedMode {
+    /// Determines the streaming UI flush interval. Fast mode floors at 40ms:
+    /// 60fps (16ms) full-transcript `@Observable` invalidation starved the
+    /// main thread during display-cycle layout (22:46 SIGABRT family); 25fps
+    /// keeps the typewriter feel without the storm.
+    /// Background sessions flush at 750ms to save CPU without losing responsiveness on switch.
+    static func streamingTextInterval(
+        forMessageLength length: Int,
+        speedMode: ResponseSpeedMode,
+        isVisibleInUI: Bool
+    ) -> Duration {
+        guard isVisibleInUI else {
+            return .milliseconds(750)
+        }
+        return switch speedMode {
         case .fast:
             switch length {
-            case ..<30_000: .milliseconds(16)
+            case ..<30_000: .milliseconds(40)
             case ..<80_000: .milliseconds(40)
             default: .milliseconds(80)
             }
@@ -89,6 +136,17 @@ final class AgentSession {
         }
     }
 
+    static func streamingTextInterval(
+        forMessageLength length: Int,
+        speedMode: ResponseSpeedMode
+    ) -> Duration {
+        streamingTextInterval(
+            forMessageLength: length,
+            speedMode: speedMode,
+            isVisibleInUI: true
+        )
+    }
+
     /// Bellekte tutulan aktivite sayısı, arşivdekiyle aynı sınıra budanır.
     /// Budanmazsa uzun bir sohbette bütün tur geçmişi RAM'de birikir.
     private static let maximumInMemoryActivities = SessionArchiveStore.maximumActivitiesPerSession
@@ -99,12 +157,20 @@ final class AgentSession {
     /// bir çıktı görür — ama bir dosyanın tamamının süresiz durmasını engeller.
     private static let maximumInMemoryOutputLength = 64_000
 
+    /// Tur başına düşünme kartında tutulan en fazla karakter. Araç çıktısından
+    /// (64k) küçüktür: düşünme gösterim metnidir. Taşan sessizce düşer, turu
+    /// ve arşivi bozmaz (`output` alanı arşiv sınırına da tabidir).
+    private static let maximumThinkingCharacters = 8_000
+
     /// Kuyrukta bekleyebilecek en fazla mesaj.
     ///
     /// Sınırsız bir kuyruk, uzun süre yanıtlanmayan bir turun arkasında hem
     /// belleği hem de kullanıcının ne göndereceği üzerindeki kontrolünü
     /// kaybettiriyordu.
     static let maximumQueuedPrompts = 20
+
+    /// Bellekte tutulan en fazla mesaj: arşiv tam kalır, RAM büyümez.
+    private static let maximumInMemoryMessages = 1000
 
     private(set) var providers: [ProviderCapabilities] = []
 
@@ -115,9 +181,147 @@ final class AgentSession {
     /// written to the conversation ahead of the turn that will answer it.
     private(set) var queuedPrompts: [QueuedPrompt] = []
 
+    /// Whether this session is currently rendered in an active UI pane.
+    /// Background sessions throttle their flush timer to 750ms, drastically reducing MainActor pressure.
+    @ObservationIgnored
+    var isVisibleInUI: Bool = true {
+        didSet {
+            if isVisibleInUI && !oldValue {
+                if let activeTurnID {
+                    flushPendingAssistantText(turnID: activeTurnID)
+                }
+            }
+        }
+    }
+
+    /// Fast O(1) guard preventing wasteful O(N) array traversals across all historical turns on every token delta.
+    @ObservationIgnored
+    private var hasRunningThinkingActivity: Bool = false
+
+    /// Discretely tracked properties avoiding broad observation storms when `state` mutates on streaming tokens.
+    private(set) var status: AgentSessionStatus = .idle
+    private(set) var configuration: SessionConfiguration?
+    private(set) var todos: [AgentTodo] = []
+    private(set) var activeQuestion: AgentQuestion?
+    /// Yuvarlanan bağlam özeti (`/compact`): pencere dışına düşen ön ekin
+    /// yoğunlaştırılmışı. Ekrandaki transkripti değiştirmez; istek başına
+    /// eklenir. Arşivde yaşar, yeniden başlatmada geri gelir.
+    private(set) var contextSummary = ""
+    /// Özetin kapsadığı en yeni mesaj: bu kimlik ve öncesini tekrar
+    /// özetleme; aynı kaybı her turda yeniden işlemek hem tur hem fatura yakar.
+    private var summarizedThroughMessageID: UUID?
+    /// Nag kilidi: kırpma bildirimi yalnız kayıp sayısı ARTTIĞINDA kurulur.
+    /// Aynı kayıp her turda yeniden sunulmaz.
+    private var lastTrimNoticeDroppedCount = 0
+    /// Sağlayıcının bildirdiği son tur sayımı (`.turnUsage`): OpenAI
+    /// `response.usage`, OpenCode asistan `tokens`. Sunucu oturumu dönünce
+    /// (özet rotasyonu) ya da model değişince bayatlar, sıfırlanır.
+    private(set) var lastTurnUsage: TurnTokenUsage?
+    /// Oturum ömrünce işlenen toplam jeton (halka açılır penceresindeki
+    /// "Total processed" satırı). Tur bildirimleri geldikçe birikir; model
+    /// değişiminde sıfırlanmaz (ömür boyu sayaçtır), yalnız bellekte yaşar.
+    private(set) var totalInputTokens = 0
+    private(set) var totalOutputTokens = 0
+
+    /// Giren + çıkan toplamı: açılır pencerenin alt satırı.
+    var totalProcessedTokens: Int {
+        totalInputTokens + totalOutputTokens
+    }
+    /// Bestecideki bağlam halkasının girdisi: yalnız sağlayıcı verisi.
+    /// Pay son turun bildirilen girdisi, payda seçili modelin penceresi;
+    /// ikisinden biri yoksa halka bilinmeyen gösterir, tahmin uydurulmaz.
+    var contextUsage: SessionContextUsage {
+        SessionContextUsage(
+            usedTokens: lastTurnUsage?.inputTokens,
+            limitTokens: selectedModelCapability?.contextLimit,
+            lastInputTokens: lastTurnUsage?.inputTokens,
+            lastOutputTokens: lastTurnUsage?.outputTokens
+        )
+    }
+    /// Seçili modelin yetenek kaydı (pencere boyu buradan okunur).
+    private var selectedModelCapability: ProviderModelCapability? {
+        guard
+            let configuration,
+            let provider = providers.first(where: { $0.id == configuration.providerID })
+        else {
+            return nil
+        }
+        return provider.model(id: configuration.modelID)
+    }
+    /// Sürmekte olan özet turu: tek uçuşludur, iptal edilebilir.
+    @ObservationIgnored
+    private var compactionTask: Task<Void, Never>?
+    var isCompacting: Bool { compactionTask != nil }
+
+    /// Compact düğmesinin engeli (`nil` = basılabilir). `requestCompaction`
+    /// içindeki koruma sırasının okunur izdüşümüdür; düğme ile eylem aynı
+    /// kararı verir, ikisi ayrışamaz.
+    var compactionBlocker: CompactionFailureReason? {
+        if isBusy {
+            return .busy
+        }
+        if isCompacting {
+            return .compacting
+        }
+        guard
+            let configuration,
+            runtime(for: configuration.providerID) != nil
+        else {
+            return .unavailable
+        }
+        guard
+            ContextCompactor.plan(
+                messages: state.messages,
+                budget: budget,
+                summarizedThroughMessageID: summarizedThroughMessageID
+            ) != nil
+        else {
+            return .nothingToCompact
+        }
+        return nil
+    }
+
+    @ObservationIgnored
+    private var lastCompletedAt: Date?
+    @ObservationIgnored
+    private var lastObservedMessageCount: Int = 0
+
     /// The session state, directly tracked through the Observation framework.
     var state: AgentSessionState {
         didSet {
+            var summaryChanged = false
+            if state.status != status {
+                status = state.status
+                summaryChanged = true
+            }
+            if state.configuration != configuration {
+                configuration = state.configuration
+            }
+            if state.todos != todos {
+                todos = state.todos
+            }
+            if state.activeQuestion != activeQuestion {
+                activeQuestion = state.activeQuestion
+            }
+            if state.completedAt != lastCompletedAt {
+                lastCompletedAt = state.completedAt
+                summaryChanged = true
+            }
+            if state.messages.count != lastObservedMessageCount {
+                lastObservedMessageCount = state.messages.count
+                summaryChanged = true
+            }
+            if state.notice != oldValue.notice {
+                if state.notice != nil {
+                    scheduleNoticeAutoDismiss(after: .seconds(6))
+                } else {
+                    noticeAutoDismissTask?.cancel()
+                    noticeAutoDismissTask = nil
+                }
+            }
+            if summaryChanged {
+                noteSummaryChange()
+            }
             onPersistentChange?()
         }
     }
@@ -126,6 +330,7 @@ final class AgentSession {
     /// `state` dışında tutulduğu için değişimde kalıcılık elle tetiklenir.
     var customTitle: String? {
         didSet {
+            noteSummaryChange()
             onPersistentChange?()
         }
     }
@@ -133,6 +338,7 @@ final class AgentSession {
     /// Sabitli oturumlar listede üstte durur, arşiv budamada en son düşer.
     var isPinned: Bool {
         didSet {
+            noteSummaryChange()
             onPersistentChange?()
         }
     }
@@ -151,6 +357,12 @@ final class AgentSession {
         self.budget = budget
         self.customTitle = customTitle
         self.isPinned = isPinned
+        self.status = state.status
+        self.configuration = state.configuration
+        self.todos = state.todos
+        self.activeQuestion = state.activeQuestion
+        self.lastCompletedAt = state.completedAt
+        self.lastObservedMessageCount = state.messages.count
     }
 
     init(
@@ -164,15 +376,24 @@ final class AgentSession {
         self.budget = budget
         self.customTitle = snapshot.customTitle
         self.isPinned = snapshot.isPinned
+        self.contextSummary = snapshot.contextSummary
+        self.summarizedThroughMessageID = snapshot.summarizedThroughMessageID
         // Kuyruk, kesintiden sağ çıkar: kapanışta tur ortasında bekleyen mesaj,
         // açılışta yine bekliyor olur — kullanıcı gönderdiği işi geri yazar.
         self.queuedPrompts = Array(snapshot.queuedPrompts.prefix(Self.maximumQueuedPrompts))
-        self.state = AgentSessionState(
+        let restoredState = AgentSessionState(
             id: snapshot.id,
             configuration: snapshot.configuration,
             messages: snapshot.messages,
             status: .idle
         )
+        self.state = restoredState
+        self.status = .idle
+        self.configuration = snapshot.configuration
+        self.todos = restoredState.todos
+        self.activeQuestion = restoredState.activeQuestion
+        self.lastCompletedAt = restoredState.completedAt
+        self.lastObservedMessageCount = restoredState.messages.count
         // The timeline is restored collapsed and closed: a turn that was still
         // running when the app quit never finished, and its thinking row would
         // otherwise count up from a stale start date forever.
@@ -192,7 +413,9 @@ final class AgentSession {
             activityGroups: state.activityGroups,
             customTitle: customTitle,
             isPinned: isPinned,
-            queuedPrompts: queuedPrompts
+            queuedPrompts: queuedPrompts,
+            contextSummary: contextSummary,
+            summarizedThroughMessageID: summarizedThroughMessageID
         )
     }
 
@@ -202,7 +425,8 @@ final class AgentSession {
             return "New session"
         }
 
-        let firstLine = firstUserMessage.text
+        let firstLine =
+            firstUserMessage.text
             .split(separator: "\n", omittingEmptySubsequences: true)
             .first
             .map(String.init) ?? firstUserMessage.text
@@ -233,24 +457,38 @@ final class AgentSession {
     func rename(to newTitle: String) {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            customTitle = nil
+            if customTitle != nil {
+                customTitle = nil
+                noteSummaryChange()
+            }
             return
         }
-        customTitle = String(trimmed.prefix(120))
+        let updated = String(trimmed.prefix(120))
+        if customTitle != updated {
+            customTitle = updated
+            noteSummaryChange()
+        }
     }
 
     /// Sabitleme durumunu ayarlar.
     func setPinned(_ pinned: Bool) {
+        guard isPinned != pinned else { return }
         isPinned = pinned
+        noteSummaryChange()
     }
 
     /// Sabitleme durumunu tersine çevirir.
     func togglePin() {
         isPinned.toggle()
+        noteSummaryChange()
+    }
+
+    private func noteSummaryChange() {
+        onSummaryChange?()
     }
 
     var isBusy: Bool {
-        switch state.status {
+        switch status {
         case .streaming, .runningTool, .waiting, .cancelling:
             true
         case .idle, .completed, .cancelled, .failed:
@@ -259,7 +497,7 @@ final class AgentSession {
     }
 
     var canSubmit: Bool {
-        guard let configuration = state.configuration else {
+        guard let configuration else {
             return false
         }
 
@@ -278,7 +516,7 @@ final class AgentSession {
 
         guard
             isBusy,
-            let configuration = state.configuration,
+            let configuration,
             runtime(for: configuration.providerID) != nil
         else {
             return false
@@ -289,7 +527,7 @@ final class AgentSession {
 
     var availableModels: [ProviderModelCapability] {
         guard
-            let configuration = state.configuration,
+            let configuration,
             let provider = providers.first(where: { $0.id == configuration.providerID })
         else {
             return []
@@ -300,7 +538,7 @@ final class AgentSession {
 
     var availableVariants: [ProviderVariant] {
         guard
-            let configuration = state.configuration,
+            let configuration,
             let provider = providers.first(where: { $0.id == configuration.providerID }),
             let model = provider.model(id: configuration.modelID)
         else {
@@ -328,14 +566,24 @@ final class AgentSession {
 
     func clearConfiguration() {
         state.configuration = nil
+        // The checklist belongs to a provider that can report one; without a
+        // configuration no refresh can arrive to replace it, so a stale list
+        // would sit on screen until the next turn clears it at start.
+        invalidateTodoReads()
+        state.todos = []
         state.status = .idle
         state.error = nil
+        // Pencere yokken eski sayım paydaya vurulmaz.
+        lastTurnUsage = nil
     }
 
     func failCapabilityDiscovery(with error: AgentSessionError) {
         state.configuration = nil
+        invalidateTodoReads()
+        state.todos = []
         state.status = .failed
         state.error = error
+        lastTurnUsage = nil
     }
 
     func selectProvider(_ providerID: ProviderID) throws {
@@ -355,14 +603,18 @@ final class AgentSession {
             modelID: model.id,
             variantID: nil
         )
+        // Another provider's checklist must not survive the switch: a provider
+        // with no such notion answers `nil` and leaves the last list in place.
+        invalidateTodoReads()
+        state.todos = []
         state.error = nil
+        // Pencere de değişmiş olabilir: eski sayım yeni paydaya vurulmaz.
+        lastTurnUsage = nil
     }
 
     func selectModel(_ modelID: ProviderModelID) throws {
-        guard !isBusy else {
-            return
-        }
-
+        // Tur ortasında değişim güvenlidir: koşan tur yapılandırmayı tur
+        // başında kopyalamıştır, bu yazım yalnız sonraki turu belirler.
         guard
             var configuration = state.configuration,
             let provider = providers.first(where: { $0.id == configuration.providerID }),
@@ -380,13 +632,12 @@ final class AgentSession {
         }
         state.configuration = configuration
         state.error = nil
+        // Pencere değişti: eski turun sayımı yeni paydaya vurulmaz.
+        lastTurnUsage = nil
     }
 
     func selectVariant(_ variantID: ProviderVariantID?) throws {
-        guard !isBusy else {
-            return
-        }
-
+        // Gerekçe `selectModel` ile aynı: yazım sonraki turu belirler.
         guard
             var configuration = state.configuration,
             let provider = providers.first(where: { $0.id == configuration.providerID }),
@@ -501,6 +752,25 @@ final class AgentSession {
         startNextQueuedTurn()
     }
 
+    /// Kuyruktaki bir mesajı öne alıp hemen çalıştırır: tur dönüyorsa o tur
+    /// durdurulur, boşta ise mesaj sıradaki iş olarak başlar. İptalin sonundaki
+    /// `startNextQueuedTurn` en öndekini aldığı için öne almak yeterlidir.
+    func sendQueuedPromptImmediately(_ id: UUID) {
+        guard let index = queuedPrompts.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let prompt = queuedPrompts.remove(at: index)
+        queuedPrompts.insert(prompt, at: 0)
+        noteQueueChange()
+        if isBusy {
+            Task { @MainActor [weak self] in
+                await self?.cancel()
+            }
+        } else {
+            startNextQueuedTurn()
+        }
+    }
+
     func removeQueuedPrompt(_ id: UUID) {
         let count = queuedPrompts.count
         queuedPrompts.removeAll { $0.id == id }
@@ -592,7 +862,7 @@ final class AgentSession {
 
         // If the session is currently idle, send the formatted response as the next turn prompt.
         if !isBusy {
-            let mode = state.configuration?.providerID == nil ? AgentMode.build : AgentMode.build
+            let mode = activeTurnMode
             send(
                 answer.formattedResponse,
                 attachmentPaths: [],
@@ -616,6 +886,195 @@ final class AgentSession {
         question.status = .dismissed
         state.questionHistory.append(question)
         state.activeQuestion = nil
+    }
+
+    /// Manually dismisses the current notice banner.
+    func dismissNotice() {
+        noticeAutoDismissTask?.cancel()
+        noticeAutoDismissTask = nil
+        if state.notice != nil {
+            state.notice = nil
+        }
+    }
+
+    /// Presents a non-fatal notice and schedules its automatic dismissal.
+    func presentNotice(_ notice: AgentSessionNotice, autoDismissAfter duration: Duration) {
+        state.notice = notice
+        scheduleNoticeAutoDismiss(after: duration)
+    }
+
+    /// Schedules automatic dismissal of the notice banner after the specified duration.
+    private func scheduleNoticeAutoDismiss(after duration: Duration) {
+        noticeAutoDismissTask?.cancel()
+        noticeAutoDismissTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return
+            }
+            self?.dismissNotice()
+        }
+    }
+
+    // MARK: - Bağlam sıkıştırma
+
+    /// Elle `/compact`: düşen ön eki özetler, sunucu tarafını döndürür.
+    /// Transkripte yazmaz; özet sonraki isteklerin başına eklenir.
+    func requestCompaction() {
+        guard !isBusy, !isCompacting else {
+            presentNotice(.compactionFailed(reason: .busy), autoDismissAfter: .seconds(6))
+            return
+        }
+        guard
+            let configuration,
+            let runtime = runtime(for: configuration.providerID)
+        else {
+            presentNotice(.compactionFailed(reason: .unavailable), autoDismissAfter: .seconds(6))
+            return
+        }
+        guard
+            let plan = ContextCompactor.plan(
+                messages: state.messages,
+                budget: budget,
+                summarizedThroughMessageID: summarizedThroughMessageID
+            )
+        else {
+            presentNotice(.compactionFailed(reason: .nothingToCompact), autoDismissAfter: .seconds(6))
+            return
+        }
+        runCompaction(plan: plan, runtime: runtime, configuration: configuration, manual: true)
+    }
+
+    /// Sürmekte olan özet turunu durdurur (uzak taraf da kapatılır).
+    func cancelCompaction() {
+        compactionTask?.cancel()
+        compactionTask = nil
+    }
+
+    /// Tur sonu otomatik sıkıştırma: aynı korumalar artı kuyruk boşluğu.
+    /// Başarısızlık sessizdir — kapsama değişmediği için bir sonraki
+    /// yerleşmede yeniden denenir, nag üretilmez.
+    private func maybeAutoCompact() {
+        guard
+            !isBusy, queuedPrompts.isEmpty, !isCompacting,
+            let configuration,
+            let runtime = runtime(for: configuration.providerID),
+            let plan = ContextCompactor.plan(
+                messages: state.messages,
+                budget: budget,
+                summarizedThroughMessageID: summarizedThroughMessageID
+            )
+        else {
+            return
+        }
+        runCompaction(plan: plan, runtime: runtime, configuration: configuration, manual: false)
+    }
+
+    /// Özet turu: geçici sağlayıcı sorgusu, transkripte ve turn makinesine
+    /// dokunmaz (`/btw` ile aynı izolasyon). Başarıda özet uygulanır ve
+    /// sunucu tarafı döndürülür; sonraki tur özeti taşıyarak taze açılır.
+    private func runCompaction(
+        plan: ContextCompactor.Plan,
+        runtime: any ProviderRuntime,
+        configuration: SessionConfiguration,
+        manual: Bool
+    ) {
+        let coveredThroughID = plan.staleMessages.last?.id
+        let prompt = ContextCompactor.summarizationPrompt(
+            priorSummary: contextSummary,
+            staleMessages: plan.staleMessages
+        )
+        let query = SideQuestionQuery(
+            configuration: configuration,
+            historyMessages: [],
+            activityGroups: [],
+            followups: [],
+            question: prompt,
+            speedMode: .normal,
+            mode: .build,
+            contextSummary: ""
+        )
+        compactionTask = Task { @MainActor [weak self] in
+            defer { self?.compactionTask = nil }
+            do {
+                let stream = try await runtime.answerSideQuestion(query)
+                var summary = ""
+                var overshot = false
+                for try await event in stream.events {
+                    try Task.checkCancellation()
+                    if case .assistantTextDelta(let text) = event {
+                        summary += text
+                        if summary.count > ContextCompactor.maximumSummaryCharacters + 1_000 {
+                            overshot = true
+                            break
+                        }
+                    }
+                }
+                if overshot {
+                    // Akış erken bırakıldı: geçici uzak oturumun temizliği
+                    // iptale bağlıdır, yoksa sunucuda ölü oturum kalır.
+                    await stream.cancel()
+                }
+                let bounded = ContextCompactor.boundSummary(summary)
+                guard !bounded.isEmpty else {
+                    throw CancellationError()
+                }
+                self?.applyCompaction(summary: bounded, throughMessageID: coveredThroughID)
+            } catch is CancellationError {
+                // İptal veya boş özet: kapsama değişmedi, otomatik tur
+                // bir sonrakinde yeniden dener; elle istenmişse de sessizlik
+                // yerine kısa bir not düşer.
+                if manual {
+                    self?.presentNotice(
+                        .compactionFailed(reason: .summarizerError),
+                        autoDismissAfter: .seconds(6)
+                    )
+                }
+            } catch {
+                AppLog.agentSession.error(
+                    "Context compaction failed: \(String(describing: error), privacy: .public)"
+                )
+                if manual {
+                    self?.presentNotice(
+                        .compactionFailed(reason: .summarizerError),
+                        autoDismissAfter: .seconds(6)
+                    )
+                }
+            }
+        }
+    }
+
+    /// Özeti işler ve sunucu tarafını döndürür: sonraki tur, özet +
+    /// pencereyle taze bir uzak oturumda açılır. Meşgulse rotasyon atlanır
+    /// (canlı turun oturumunu silmektense özet bir sonraki boşlukta döner);
+    /// özet yine de saklanır, bir sonraki taze oturumda taşınır.
+    private func applyCompaction(summary: String, throughMessageID: UUID?) {
+        contextSummary = summary
+        summarizedThroughMessageID = throughMessageID
+        onImmediatePersistentChange?()
+        guard !isBusy, queuedPrompts.isEmpty else {
+            return
+        }
+        guard
+            let configuration,
+            let runtime = runtime(for: configuration.providerID)
+        else {
+            return
+        }
+        // Sunucu tarafı dönüyor: eski sayım bayatlar, sonraki turun
+        // bildirimi gelene kadar halka yerel tahmini gösterir.
+        lastTurnUsage = nil
+        presentNotice(.contextCompacted, autoDismissAfter: .seconds(6))
+        // Yarış notu: `await` sırasında yeni bir tur başlayabilir; o turun ilk
+        // gönderimi bilinmeyen-oturum hatasına düşerse çalışma zamanı onu
+        // özet taşıyan preambulle otomatik yeniden kurar.
+        let sessionID = id
+        Task { @MainActor [weak self] in
+            guard let self, !self.isBusy, self.queuedPrompts.isEmpty else {
+                return
+            }
+            await runtime.releaseSession(sessionID)
+        }
     }
 
     /// The question tool supplies a server request ID, not a suggested next prompt.
@@ -643,9 +1102,9 @@ final class AgentSession {
 
     private func answerBackendQuestion(_ answer: AgentQuestionAnswer) {
         guard !state.isQuestionSubmitting,
-              var batch = pendingBackendQuestion,
-              let current = state.activeQuestion,
-              activeTurnID == batch.turnID
+            var batch = pendingBackendQuestion,
+            let current = state.activeQuestion,
+            activeTurnID == batch.turnID
         else { return }
 
         if batch.answers.count < batch.request.questions.count {
@@ -654,8 +1113,11 @@ final class AgentSession {
             let selected = Set(answer.selectedOptionIDs)
             let isAllSelected = selected.contains("__all__") || selected.contains("opt_all")
             guard isAllSelected || selected.isSubset(of: validIDs),
-                  item.isMultiSelect || selected.count <= 1
-            else { return }
+                item.isMultiSelect || selected.count <= 1
+            else {
+                state.questionSubmissionFailed = true
+                return
+            }
 
             var values: [String]
             if isAllSelected {
@@ -669,11 +1131,15 @@ final class AgentSession {
                 values = item.options.filter { selected.contains($0.id) }.map(\.label)
             }
             if item.allowCustomAnswer,
-               let custom = answer.customText?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !custom.isEmpty {
+                let custom = answer.customText?.trimmingCharacters(in: .whitespacesAndNewlines),
+                !custom.isEmpty
+            {
                 values.append(custom)
             }
-            guard !values.isEmpty else { return }
+            guard !values.isEmpty else {
+                state.questionSubmissionFailed = true
+                return
+            }
 
             var answered = current
             answered.status = .answered(answer)
@@ -693,9 +1159,9 @@ final class AgentSession {
 
     private func submitBackendAnswers() {
         guard let batch = pendingBackendQuestion,
-              batch.answers.count == batch.request.questions.count,
-              let stream = activeStream,
-              !state.isQuestionSubmitting
+            batch.answers.count == batch.request.questions.count,
+            let stream = activeStream,
+            !state.isQuestionSubmitting
         else { return }
 
         state.isQuestionSubmitting = true
@@ -704,8 +1170,8 @@ final class AgentSession {
             do {
                 try await stream.replyQuestion(requestID: batch.request.requestID, answers: batch.answers)
                 guard let self,
-                      self.activeTurnID == batch.turnID,
-                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                    self.activeTurnID == batch.turnID,
+                    self.pendingBackendQuestion?.request.requestID == batch.request.requestID
                 else { return }
                 self.state.questionHistory.append(contentsOf: batch.resolvedQuestions)
                 self.pendingBackendQuestion = nil
@@ -716,8 +1182,8 @@ final class AgentSession {
                 self.presentNextBackendQuestion(turnID: batch.turnID)
             } catch {
                 guard let self,
-                      self.activeTurnID == batch.turnID,
-                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                    self.activeTurnID == batch.turnID,
+                    self.pendingBackendQuestion?.request.requestID == batch.request.requestID
                 else { return }
                 // A failed request is not an accepted answer. Keep earlier
                 // answers for a multi-question batch, but allow editing the
@@ -736,8 +1202,8 @@ final class AgentSession {
 
     private func rejectBackendQuestion() {
         guard let batch = pendingBackendQuestion,
-              let stream = activeStream,
-              !state.isQuestionSubmitting
+            let stream = activeStream,
+            !state.isQuestionSubmitting
         else { return }
         state.isQuestionSubmitting = true
         state.questionSubmissionFailed = false
@@ -745,8 +1211,8 @@ final class AgentSession {
             do {
                 try await stream.rejectQuestion(requestID: batch.request.requestID)
                 guard let self,
-                      self.activeTurnID == batch.turnID,
-                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                    self.activeTurnID == batch.turnID,
+                    self.pendingBackendQuestion?.request.requestID == batch.request.requestID
                 else { return }
                 if var active = self.state.activeQuestion {
                     active.status = .dismissed
@@ -760,8 +1226,8 @@ final class AgentSession {
                 self.presentNextBackendQuestion(turnID: batch.turnID)
             } catch {
                 guard let self,
-                      self.activeTurnID == batch.turnID,
-                      self.pendingBackendQuestion?.request.requestID == batch.request.requestID
+                    self.activeTurnID == batch.turnID,
+                    self.pendingBackendQuestion?.request.requestID == batch.request.requestID
                 else { return }
                 self.state.isQuestionSubmitting = false
                 self.state.questionSubmissionFailed = true
@@ -839,27 +1305,42 @@ final class AgentSession {
         discardPendingAssistantText()
         activeAssistantMessageID = nil
         currentTurnAnchorMessageID = userMessage.id
+        turnProducedAssistantText = false
 
+        // Düşünme satırı tembeldir: ilk `thinkingDelta` gelene kadar grup boş
+        // durur. Reasoning paylaşmayan modellerde `output` hiç dolmadığı için
+        // her turda boş bir "Thought" satırı çiziliyordu.
         let turnID = UUID()
         state.activityGroups.append(
             AgentTurnActivityGroup(
                 id: turnID,
                 anchorMessageID: userMessage.id,
-                activities: [
-                    AgentActivity(
-                        id: thinkingActivityID(turnID: turnID),
-                        kind: .thinking,
-                        phase: .running
-                    )
-                ],
+                activities: [],
                 turnID: turnID
             )
         )
+        hasRunningThinkingActivity = false
 
         let selection = budget.select(from: state.messages)
-        state.notice = selection.droppedMessageCount > 0
-            ? .transcriptTrimmed(droppedMessageCount: selection.droppedMessageCount)
-            : nil
+        if selection.droppedMessageCount != lastTrimNoticeDroppedCount {
+            // Kayıp DEĞİŞTİ: büyüdü ya da küçüldü, bandı güncel tut.
+            lastTrimNoticeDroppedCount = selection.droppedMessageCount
+            if selection.droppedMessageCount > 0 {
+                presentNotice(
+                    .transcriptTrimmed(droppedMessageCount: selection.droppedMessageCount),
+                    autoDismissAfter: .seconds(6)
+                )
+            } else {
+                // Yalnız kırpma bildirimi geri çekilir: `dismissNotice()` koşulsuz
+                // çağrıldığında, saniyeler önce gösterilmiş ilgisiz bir uyarıyı
+                // (başarısız `/compact` gibi) yeni bir mesaj göndermek siliyordu.
+                if state.notice?.isTranscriptTrim == true {
+                    dismissNotice()
+                }
+            }
+        }
+        // Aynı kayıp sürüyorsa banner yeniden kurulmaz: her turda beliren
+        // nag, bildirimin kendisinden usandırıyordu.
 
         let request = ProviderRequest(
             sessionID: id,
@@ -868,10 +1349,13 @@ final class AgentSession {
             speedMode: queuedPrompt.speedMode,
             mode: queuedPrompt.mode,
             extensionContext: queuedPrompt.extensionTags.turnInstruction,
-            activityGroups: state.activityGroups
+            activityGroups: state.activityGroups,
+            contextSummary: contextSummary
         )
         activeTurnID = turnID
         activeTurnSpeedMode = queuedPrompt.speedMode
+        activeTurnMode = queuedPrompt.mode
+        onTurnStarted?(id, turnID)
 
         let task = Task { @MainActor [weak self] in
             guard let self else {
@@ -889,11 +1373,14 @@ final class AgentSession {
     }
 
     func cancel() async {
-        guard let task = activeTask else {
+        // Both handles have to name a live turn: a finished turn's task handle
+        // can linger behind (see consume), and cancelling through it would
+        // settle whatever turn happens to run now — including clearing a newer
+        // turn's state while its stream keeps running orphaned.
+        guard let task = activeTask, let cancelledTurnID = activeTurnID else {
             return
         }
 
-        let cancelledTurnID = activeTurnID
         state.status = .cancelling
         state.error = nil
         task.cancel()
@@ -906,6 +1393,9 @@ final class AgentSession {
 
         // A queued prompt may already have taken the session over while the
         // cancelled turn was unwinding; that turn's state must survive here.
+        // The comparison is against a non-optional turn: a settle with no
+        // active turn used to pass vacuously (`nil == nil`) and clear the
+        // state of whatever turn had just started.
         guard activeTurnID == cancelledTurnID else {
             return
         }
@@ -918,6 +1408,47 @@ final class AgentSession {
         activeTask = nil
         activeStream = nil
         activeTurnID = nil
+        onTurnEnded?(id, cancelledTurnID)
+        onImmediatePersistentChange?()
+        startNextQueuedTurn()
+    }
+
+    /// Settles a turn whose owner is gone without handing the session over.
+    ///
+    /// Every `guard activeTurnID == turnID` exit in `consume` means one of two
+    /// things: a newer turn owns the session — then nothing here may touch it —
+    /// or no turn does while the session still reports busy. The second case is
+    /// a leaked turn, and without this recovery its stop control stays on
+    /// screen forever: the transcript says the agent is done (its last text is
+    /// already there) while the session never leaves the busy state.
+    ///
+    /// A `.cancelling` orphan was asked to stop, so it settles as `.cancelled`;
+    /// any other busy orphan died silently and settles as an interruption.
+    /// `onTurnEnded` still fires through `consume`'s `defer`, so the approval
+    /// centre releases the turn exactly once.
+    private func recoverOrphanedTurnIfNeeded(turnID: UUID) {
+        guard activeTurnID == nil, isBusy else {
+            return
+        }
+
+        AppLog.agentSession.error(
+            "A turn ended without handing the session over; settling it instead of staying busy"
+        )
+        if state.status == .cancelling {
+            finishRunningActivities(turnID: turnID, phase: .cancelled)
+            state.status = .cancelled
+        } else {
+            finishRunningActivities(turnID: turnID, phase: .failed)
+            state.status = .failed
+            state.error = .streamInterrupted
+        }
+        state.completedAt = Date()
+        clearBackendQuestions(turnID: turnID)
+        activeTask = nil
+        activeStream = nil
+        activeTurnID = nil
+        activeAssistantMessageID = nil
+        discardPendingAssistantText()
         onImmediatePersistentChange?()
         startNextQueuedTurn()
     }
@@ -927,6 +1458,9 @@ final class AgentSession {
         request: ProviderRequest,
         turnID: UUID
     ) async {
+        defer {
+            onTurnEnded?(id, turnID)
+        }
         do {
             // A turn the user cancelled before it reached the provider must not
             // open a backend stream just to tear it down again: it would start a
@@ -945,6 +1479,7 @@ final class AgentSession {
 
             guard activeTurnID == turnID else {
                 await stream.cancel()
+                recoverOrphanedTurnIfNeeded(turnID: turnID)
                 return
             }
 
@@ -955,21 +1490,38 @@ final class AgentSession {
                 try Task.checkCancellation()
 
                 guard activeTurnID == turnID else {
+                    await stream.cancel()
+                    recoverOrphanedTurnIfNeeded(turnID: turnID)
                     return
                 }
 
                 switch event {
-                case let .questionAsked(question):
+                case .questionAsked(let question):
                     flushPendingAssistantText(turnID: turnID)
+                    flushPendingThinkingText(turnID: turnID)
                     finishThinkingActivity(turnID: turnID)
                     receiveBackendQuestion(question, turnID: turnID)
 
-                case let .assistantTextDelta(delta):
+                case .assistantTextDelta(let delta):
+                    flushPendingThinkingText(turnID: turnID)
                     finishThinkingActivity(turnID: turnID)
                     enqueueAssistantText(delta, turnID: turnID)
 
-                case let .activityStarted(activity):
+                case .thinkingDelta(let text):
+                    appendThinkingText(text, turnID: turnID)
+
+                case .turnUsage(let usage):
+                    // Bu dal tur kimliği korumasının içindedir: sayı koşan
+                    // turun adımına aittir, halka bir sonraki çizimde
+                    // sağlayıcının gerçeğine oturur. Ömür boyu sayaç da
+                    // burada birikir (tur başına tek bildirim varsayılır).
+                    lastTurnUsage = usage
+                    totalInputTokens += usage.inputTokens
+                    totalOutputTokens += usage.outputTokens
+
+                case .activityStarted(let activity):
                     flushPendingAssistantText(turnID: turnID)
+                    flushPendingThinkingText(turnID: turnID)
                     finishThinkingActivity(turnID: turnID)
                     if activeAssistantMessageID != nil {
                         currentTurnAnchorMessageID = activeAssistantMessageID
@@ -977,19 +1529,19 @@ final class AgentSession {
                     }
                     startActivity(activity, turnID: turnID)
 
-                    // A task-list tool is the moment the agent's plan changes, so
-                    // the checklist is re-read as it happens: the point of showing
-                    // it is to see the work move, not to read it afterwards.
-                    if activity.kind == .todo {
-                        refreshTodos()
-                    } else if activity.kind == .question,
-                              request.configuration.providerID != ProviderID("opencode") {
+                    // Görev listesi yazı bitince okunur, başlarken değil: başlangıçta
+                    // backend henüz eski listeyi tutar, o yüzden önceki turun
+                    // bitmiş kartı yeni turun ortasında görünürdü. Yeniden okuma
+                    // `activityFinished` dalında yapılır.
+                    if activity.kind == .question,
+                        request.configuration.providerID != ProviderID("opencode")
+                    {
                         // OpenCode questions use question.asked, never a title-derived imitation.
                         let parsedQuestion = AgentQuestionParser.parseFromToolInput(
                             toolCallID: activity.id.rawValue,
                             input: [
                                 "prompt": activity.title ?? "Question from assistant",
-                                "detail": activity.detail as Any
+                                "detail": activity.detail as Any,
                             ]
                         )
                         if let parsedQuestion {
@@ -997,12 +1549,14 @@ final class AgentSession {
                         }
                     }
 
-                case let .activityUpdated(activity):
+                case .activityUpdated(let activity):
                     enqueueActivityUpdate(activity, turnID: turnID)
 
-                case let .activityFinished(activityID, outcome, output, diff):
+                case .activityFinished(let activityID, let outcome, let output, let diff):
                     flushPendingActivityUpdates(turnID: turnID)
                     flushPendingAssistantText(turnID: turnID)
+                    flushPendingThinkingText(turnID: turnID)
+                    let finishedKind = activityKind(for: activityID)
                     finishActivity(
                         activityID,
                         outcome: outcome,
@@ -1011,6 +1565,12 @@ final class AgentSession {
                         turnID: turnID
                     )
                     restoreStatusAfterActivity(turnID: turnID)
+                    // Görev listesi aracı bittiğinde backend yazıyı işlemiş olur:
+                    // liste ancak burada okunursa kart yeni turun listesini
+                    // gösterir, önceki turun bayat kartını değil.
+                    if finishedKind == .todo {
+                        refreshTodos()
+                    }
 
                 case .waiting:
                     flushPendingAssistantText(turnID: turnID)
@@ -1019,6 +1579,7 @@ final class AgentSession {
                 case .completed:
                     flushPendingActivityUpdates(turnID: turnID)
                     flushPendingAssistantText(turnID: turnID)
+                    flushPendingThinkingText(turnID: turnID)
                     finishRunningActivities(
                         turnID: turnID,
                         phase: .completed
@@ -1037,13 +1598,26 @@ final class AgentSession {
             }
 
             guard activeTurnID == turnID else {
+                recoverOrphanedTurnIfNeeded(turnID: turnID)
                 return
             }
 
             flushPendingAssistantText(turnID: turnID)
 
             if didComplete {
-                state.status = .completed
+                // Sağlayıcı "bitti" dedi ama ne metin ne araç üretti: bunu sessiz
+                // bir başarı olarak göstermek, kullanıcının ekranda yeni hiçbir
+                // şey göremeyip "ajan başlamadı" demesi demekti.
+                //
+                // Bildirim yuvası değil `error` kullanılır: tek bir bildirim
+                // yuvası var ve buraya yazmak kırpma raporu gibi başka bir
+                // bildirimi ezerdi (bkz. `startTurn`'daki aynı sınıf hata).
+                if shouldReportEmptyTurn(turnID: turnID) {
+                    state.status = .failed
+                    state.error = .unexpectedBackendResponse
+                } else {
+                    state.status = .completed
+                }
                 state.completedAt = Date()
             } else {
                 finishRunningActivities(turnID: turnID, phase: .failed)
@@ -1053,6 +1627,7 @@ final class AgentSession {
             }
         } catch is CancellationError {
             guard activeTurnID == turnID else {
+                recoverOrphanedTurnIfNeeded(turnID: turnID)
                 return
             }
 
@@ -1062,6 +1637,7 @@ final class AgentSession {
             state.completedAt = Date()
         } catch let error as ProviderRuntimeError {
             guard activeTurnID == turnID else {
+                recoverOrphanedTurnIfNeeded(turnID: turnID)
                 return
             }
 
@@ -1075,6 +1651,7 @@ final class AgentSession {
             )
         } catch {
             guard activeTurnID == turnID else {
+                recoverOrphanedTurnIfNeeded(turnID: turnID)
                 return
             }
 
@@ -1101,7 +1678,31 @@ final class AgentSession {
             let lastSnippet = state.messages.last(where: { $0.role == .assistant })?.text
             onTurnFinished?(id, title, state.status, lastSnippet)
             startNextQueuedTurn()
+            // Kuyruk boşaldıysa ve pencere taştıysa özet turu: sunucu tarafı
+            // büyümeden budanır, düşen ön ek özetten yaşamaya devam eder.
+            maybeAutoCompact()
         }
+    }
+
+    /// Tur "tamamlandı" dedi ama ne metin ne araç üretti mi.
+    ///
+    /// Yalnız gerçekten boş turlar: araç çalıştırmış bir tur (ör. yalnız dosya
+    /// okuyup metin üretmeyen bir tur) normaldir ve başarısız sayılmaz.
+    ///
+    /// Ölçülen olay: OpenCode'un oturum günlüğünde, kullanıcı mesajı oluşturulup
+    /// yalnız `agent=title` akışı koştuğunda (model turu hiç başlamadığında)
+    /// gelen tek olay `session.idle`'dır; uygulama bunu "tamamlandı" sayıp
+    /// ekranda hiçbir şey göstermiyordu.
+    private func shouldReportEmptyTurn(turnID: UUID) -> Bool {
+        guard !turnProducedAssistantText else {
+            return false
+        }
+        let hasRealActivity =
+            state.activityGroups
+            .filter { $0.id == turnID || $0.turnID == turnID }
+            .flatMap(\.activities)
+            .contains { $0.kind != .thinking }
+        return !hasRealActivity
     }
 
     /// Tamamlanan turun sonunda hızlı-yanıt seçenekleri varsa soru olarak sunar.
@@ -1141,7 +1742,7 @@ final class AgentSession {
     /// leaves the last one in place, because "no answer" is not "no tasks".
     func refreshTodos() {
         guard let configuration = state.configuration,
-              let runtime = runtime(for: configuration.providerID)
+            let runtime = runtime(for: configuration.providerID)
         else {
             return
         }
@@ -1189,7 +1790,8 @@ final class AgentSession {
 
         let interval = Self.streamingTextInterval(
             forMessageLength: activeAssistantTextLength,
-            speedMode: activeTurnSpeedMode
+            speedMode: activeTurnSpeedMode,
+            isVisibleInUI: isVisibleInUI
         )
 
         streamingTextFlushTask = Task { @MainActor [weak self] in
@@ -1237,9 +1839,9 @@ final class AgentSession {
         guard let text = drainResult.text else {
             return
         }
+        turnProducedAssistantText = true
 
-        if
-            let activeAssistantMessageID,
+        if let activeAssistantMessageID,
             let index = messageIndex(id: activeAssistantMessageID)
         {
             state.messages[index].text += text
@@ -1253,19 +1855,125 @@ final class AgentSession {
     }
 
     private func discardPendingAssistantText() {
+        hasRunningThinkingActivity = false
         streamingTextFlushTask?.cancel()
         streamingTextFlushTask = nil
         streamingTextAccumulator = .empty
         activityUpdateFlushTask?.cancel()
         activityUpdateFlushTask = nil
         pendingActivityUpdates.removeAll(keepingCapacity: false)
+        discardPendingThinkingText()
+    }
+
+    /// Thinking deltasını biriktirir; kart 250 ms debounce ile yazılır.
+    ///
+    /// Her SSE satırında `state`'e dokunmak `@Observable` fırtınası çıkarır;
+    /// düşünme kartı typewriter değil, periyodik tazelenen bir karttır.
+    private func appendThinkingText(
+        _ delta: String,
+        turnID: UUID
+    ) {
+        guard activeTurnID == turnID, !delta.isEmpty else {
+            return
+        }
+
+        pendingThinkingText += delta
+
+        guard thinkingFlushTask == nil else {
+            return
+        }
+
+        thinkingFlushTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled else {
+                return
+            }
+
+            self?.flushPendingThinkingText(turnID: turnID)
+        }
+    }
+
+    private func flushPendingThinkingText(turnID: UUID) {
+        guard activeTurnID == turnID else {
+            return
+        }
+
+        thinkingFlushTask?.cancel()
+        thinkingFlushTask = nil
+
+        guard !pendingThinkingText.isEmpty else {
+            return
+        }
+        let text = pendingThinkingText
+        pendingThinkingText = ""
+        appendThinkingContent(text, turnID: turnID)
+    }
+
+    /// Biriken düşünmeyi turdaki `.thinking` aktivitesinin `output`'una ekler.
+    ///
+    /// `output` seçimi bilinçlidir: arşiv sınırı (`boundedForArchive`) yalnız
+    /// `output`/`diff`'i kırpar, `detail`'i değil — düşünme arşivi şişirmez.
+    /// Geçmişe taşınmaz (`OpenCodeHistoryPreamble` thinking'i atlar) ve
+    /// boş-tur sayılmaz (`shouldReportEmptyTurn` thinking'i yok sayar).
+    private func appendThinkingContent(_ text: String, turnID: UUID) {
+        guard let groupIndex = activityGroupIndex(turnID: turnID) else {
+            return
+        }
+        // İlk thinking deltası satırı kurar; düşünme her zaman grubun başında
+        // durur, böylece araç satırları kronolojik olarak arkasına düşer.
+        let activityIndex: Int
+        if let existingIndex = state.activityGroups[groupIndex].activities.firstIndex(
+            where: { $0.kind == .thinking }
+        ) {
+            activityIndex = existingIndex
+        } else {
+            state.activityGroups[groupIndex].activities.insert(
+                AgentActivity(
+                    id: thinkingActivityID(turnID: turnID),
+                    kind: .thinking,
+                    phase: .running
+                ),
+                at: 0
+            )
+            activityIndex = 0
+            hasRunningThinkingActivity = true
+        }
+
+        var activity = state.activityGroups[groupIndex].activities[activityIndex]
+        let existing = activity.output ?? ""
+        // Kapak dolduysa sessizce düşer: düşünme turu bozmaz.
+        guard existing.utf8.count < Self.maximumThinkingCharacters else {
+            return
+        }
+        let room = Self.maximumThinkingCharacters - existing.utf8.count
+        let fitting = text.utf8.count <= room ? text : String(text.prefix(room)) + "\n… (thought truncated)"
+        activity.output = existing + fitting
+        // Araç sonrası ikinci reasoning bloğu: kart kapanmıştı, yeniden açılır
+        // ve bir sonraki metin/araç olayında yine kapanır.
+        if activity.phase != .running {
+            activity.phase = .running
+            activity.completedAt = nil
+            hasRunningThinkingActivity = true
+        }
+        state.activityGroups[groupIndex].activities[activityIndex] = activity
+        noteActivityChange()
+    }
+
+    private func discardPendingThinkingText() {
+        thinkingFlushTask?.cancel()
+        thinkingFlushTask = nil
+        pendingThinkingText = ""
     }
 
     /// Aktif turun grubu listenin sonundadır; her aktivite olayında bütün
     /// geçmişi taramak yerine önce oraya bakılır.
     private func activityGroupIndex(turnID: UUID) -> Int? {
-        if
-            let last = state.activityGroups.indices.last,
+        if let last = state.activityGroups.indices.last,
             state.activityGroups[last].id == turnID
         {
             return last
@@ -1277,8 +1985,7 @@ final class AgentSession {
     /// Akış hedefi olan asistan mesajı transkriptin sonundadır; 40 ms'de bir
     /// bütün transkripti taramaya gerek yok.
     private func messageIndex(id: UUID) -> Int? {
-        if
-            let last = state.messages.indices.last,
+        if let last = state.messages.indices.last,
             state.messages[last].id == id
         {
             return last
@@ -1321,6 +2028,11 @@ final class AgentSession {
 
     /// Biten turdan sonra bellekteki zaman çizelgesini sınırların içine çeker.
     private func pruneActivityHistory() {
+        // Önce mesaj penceresi: en yeni 1000 mesaj tutulur, ön ek özetten yaşar.
+        if state.messages.count > Self.maximumInMemoryMessages {
+            let excess = state.messages.count - Self.maximumInMemoryMessages
+            state.messages.removeFirst(excess)
+        }
         // Yalnızca grup sayısı budanır: araç sonuçları zaten yakalandıkları anda
         // sınırlandı, burada yeniden kırpmak işareti her turda tazeleyip
         // sayısını yanlışlardı.
@@ -1341,13 +2053,24 @@ final class AgentSession {
     }
 
     private func finishThinkingActivity(turnID: UUID) {
-        for groupIndex in state.activityGroups.indices {
-            if let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
-                where: { $0.kind == .thinking && $0.phase == .running }
-            ) {
-                state.activityGroups[groupIndex].activities[activityIndex].phase = .completed
-                state.activityGroups[groupIndex].activities[activityIndex].completedAt = Date()
+        guard hasRunningThinkingActivity else {
+            return
+        }
+        hasRunningThinkingActivity = false
+        // Tur başına tek bir çalışan "thinking" satırı vardır ve o, aktif turun
+        // — yani sondaki — grubundadır. Eskiden bütün geçmiş taranıyor ve
+        // bulunduktan sonra da döngü kırılmıyordu.
+        for groupIndex in state.activityGroups.indices.reversed() {
+            guard
+                let activityIndex = state.activityGroups[groupIndex].activities.firstIndex(
+                    where: { $0.kind == .thinking && $0.phase == .running }
+                )
+            else {
+                continue
             }
+            state.activityGroups[groupIndex].activities[activityIndex].phase = .completed
+            state.activityGroups[groupIndex].activities[activityIndex].completedAt = Date()
+            return
         }
     }
 
@@ -1381,7 +2104,8 @@ final class AgentSession {
         let anchorID = currentTurnAnchorMessageID ?? state.messages.last?.id ?? UUID()
         let targetGroupIndex: Int
         if let lastGroupIndex = state.activityGroups.indices.last,
-           state.activityGroups[lastGroupIndex].anchorMessageID == anchorID {
+            state.activityGroups[lastGroupIndex].anchorMessageID == anchorID
+        {
             targetGroupIndex = lastGroupIndex
         } else {
             let newGroup = AgentTurnActivityGroup(
@@ -1391,7 +2115,10 @@ final class AgentSession {
                 turnID: activeTurnID
             )
             state.activityGroups.append(newGroup)
-            targetGroupIndex = state.activityGroups.indices.last!
+            guard let target = state.activityGroups.indices.last else {
+                return
+            }
+            targetGroupIndex = target
         }
 
         state.activityGroups[targetGroupIndex].activities.append(
@@ -1499,6 +2226,17 @@ final class AgentSession {
         return true
     }
 
+    /// Bitmiş bir etkinliğin türü, bitiş sonrası ne yapılacağına karar vermek
+    /// için gruplardan bulunur (örn. görev listesi yalnız `todo` bitince okunur).
+    private func activityKind(for activityID: ProviderActivityID) -> ProviderActivityKind? {
+        for group in state.activityGroups.reversed() {
+            if let activity = group.activities.first(where: { $0.id == activityID }) {
+                return activity.kind
+            }
+        }
+        return nil
+    }
+
     private func finishActivity(
         _ activityID: ProviderActivityID,
         outcome: ProviderActivityOutcome,
@@ -1518,12 +2256,13 @@ final class AgentSession {
         }
 
         var activity = state.activityGroups[groupIndex].activities[activityIndex]
-        activity.phase = switch outcome {
-        case .completed:
-            .completed
-        case .failed:
-            .failed
-        }
+        activity.phase =
+            switch outcome {
+            case .completed:
+                .completed
+            case .failed:
+                .failed
+            }
 
         // A tool's result only exists on its terminal update, so this is where
         // the output panel and the change preview get their content.
@@ -1571,6 +2310,10 @@ final class AgentSession {
     ) {
         let finishedAt = Date()
         for groupIndex in state.activityGroups.indices {
+            let group = state.activityGroups[groupIndex]
+            guard group.id == turnID || group.turnID == turnID else {
+                continue
+            }
             for activityIndex in state.activityGroups[groupIndex].activities.indices {
                 if state.activityGroups[groupIndex].activities[activityIndex].phase == .running {
                     state.activityGroups[groupIndex].activities[activityIndex].phase = phase
@@ -1582,8 +2325,7 @@ final class AgentSession {
     }
 
     private func normalizeConfigurationState() {
-        if
-            var configuration = state.configuration,
+        if var configuration = state.configuration,
             let provider = providers.first(where: { $0.id == configuration.providerID }),
             provider.model(id: configuration.modelID) != nil
         {
@@ -1599,7 +2341,20 @@ final class AgentSession {
 
         // Hangi sağlayıcı ve modelin varsayılan olacağı bir ürün tercihidir;
         // oturum çekirdeği yalnızca sonucu uygular.
+        let previousProviderID = state.configuration?.providerID
+        let previousModelID = state.configuration?.modelID
         state.configuration = ProviderSelectionPolicy.defaultConfiguration(from: providers)
+        if state.configuration?.providerID != previousProviderID {
+            invalidateTodoReads()
+            state.todos = []
+        }
+        if state.configuration?.modelID != previousModelID {
+            lastTurnUsage = nil
+        }
+    }
+
+    private func invalidateTodoReads() {
+        todoRefreshGeneration &+= 1
     }
 
     private func runtime(for providerID: ProviderID) -> (any ProviderRuntime)? {
@@ -1625,6 +2380,8 @@ final class AgentSession {
         case .transport:
             .transportFailure
         case .unexpectedResponse:
+            .unexpectedBackendResponse
+        case .unsupported:
             .unexpectedBackendResponse
         }
     }

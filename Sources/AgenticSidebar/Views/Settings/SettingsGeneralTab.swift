@@ -63,6 +63,22 @@ extension SettingsView {
                         .padding(.vertical, 2)
 
                     Toggle(
+                        "Include message preview",
+                        isOn: $settings.sessionNotificationPreviewEnabled
+                    )
+                    .tint(currentTheme.accentGradient.first ?? .accentColor)
+                    .help("Show a short transcript excerpt in the completion banner")
+
+                    Text(
+                        "The preview (up to 160 characters) is shown in the system banner and Notification Center, including on the lock screen. Turn it off for sensitive sessions."
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    Divider()
+                        .padding(.vertical, 2)
+
+                    Toggle(
                         "Play sound on completion",
                         isOn: $settings.sessionNotificationSoundEnabled
                     )
@@ -135,37 +151,6 @@ extension SettingsView {
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
 
                 Text(capturePrivacyCapabilities.limitation)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-        }
-
-        settingsCard(
-            title: "Interactive Questions",
-            subtitle: "Behavior for interactive questions, quick-reply options, and choices.",
-            icon: "questionmark.bubble.fill"
-        ) {
-            VStack(alignment: .leading, spacing: 10) {
-                Toggle(
-                    "Offer 'All / Hepsi' choice in question options",
-                    isOn: $settings.autoOfferAllOption
-                )
-                .tint(currentTheme.accentGradient.first ?? .accentColor)
-
-                Text("Automatically adds a 'Hepsi (Tümünü uygula)' option when the agent presents multiple choices.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-
-                Divider()
-                    .padding(.vertical, 2)
-
-                Toggle(
-                    "Auto-select (Recommended) / (Önerilen) option",
-                    isOn: $settings.autoSelectRecommendedOption
-                )
-                .tint(currentTheme.accentGradient.first ?? .accentColor)
-
-                Text("Pre-selects the recommended option by default when a question is presented.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

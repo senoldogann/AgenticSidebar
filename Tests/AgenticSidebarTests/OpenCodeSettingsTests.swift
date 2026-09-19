@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -34,11 +35,11 @@ final class OpenCodeSettingsTests: XCTestCase {
             authMethods: [
                 "poe": [
                     OpenCodeAuthMethod(type: .oauth, label: "Login with Poe", prompts: nil),
-                    OpenCodeAuthMethod(type: .api, label: "Manually enter API Key", prompts: nil)
+                    OpenCodeAuthMethod(type: .api, label: "Manually enter API Key", prompts: nil),
                 ],
                 "github-copilot": [
                     OpenCodeAuthMethod(type: .oauth, label: "GitHub OAuth", prompts: nil)
-                ]
+                ],
             ]
         )
         let settings = OpenCodeSettings(

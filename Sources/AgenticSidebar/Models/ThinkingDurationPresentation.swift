@@ -14,6 +14,17 @@ enum ThinkingDurationPresentation {
     ///   okunur. Tur bilgisi yoksa `nil` geçilir.
     /// - `hasRunningChildren`: düşünme bitti ama turun araçları hâlâ çalışıyor.
     /// - `now`: ölçümün yapıldığı an.
+    /// Kartın çizmeye değer içeriği var mı: reasoning paylaşmayan modellerde
+    /// `output` hiç dolmaz. Karar bilinçli olarak "gizle"dir — boş bir
+    /// "Thought" kutusu veya süre rozeti gürültüden ibarettir, placeholder
+    /// metin eklenmez.
+    static func hasVisibleContent(output: String?) -> Bool {
+        guard let output else {
+            return false
+        }
+        return !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     static func text(
         startedAt: Date,
         completedAt: Date?,
@@ -33,7 +44,11 @@ enum ThinkingDurationPresentation {
     /// Geçen saniye. Saat geri alınmış olsa bile negatif bir süre gösterilmez ve
     /// bir saniyenin altı "0s" değil "1s" okunur.
     private static func seconds(from startedAt: Date, to endedAt: Date) -> Int {
-        max(1, Int(endedAt.timeIntervalSince(startedAt)))
+        let interval = endedAt.timeIntervalSince(startedAt)
+        guard interval.isFinite else {
+            return 1
+        }
+        return max(1, Int(interval))
     }
 
     /// Kısa süreler saniye, dakikayı aşanlar "4m 12s", saati aşanlar "1h 2m"

@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class OpenCodeStreamNormalizerTests: XCTestCase {
@@ -7,42 +8,210 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_1","field":"text","delta":"Hel"}}"#
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_1","field":"text","delta":"Hel"}}"#
             ),
             []
         )
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_1","sessionID":"ses_target","messageID":"msg_1","type":"text","text":"Hel"},"time":1}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_1","sessionID":"ses_target","messageID":"msg_1","type":"text","text":"Hel"},"time":1}}"#
             ),
             [.assistantTextDelta("Hel")]
         )
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_1","field":"text","delta":"lo"}}"#
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_1","field":"text","delta":"lo"}}"#
             ),
             [.assistantTextDelta("lo")]
         )
     }
 
+    /// Kullanıcının kendi mesajı asistan metni olarak yayılmaz.
+    ///
+    /// OpenCode kullanıcının mesajını da parça olarak yayar ve o parçanın metni
+    /// gönderilen çerçeveli prompt'un aynısıdır; rol ayrımı olmadan sohbete
+    /// `<user_turn>…</user_turn>` bir asistan yanıtı gibi düşüyordu.
+    func testUserMessagePartsAreNeverEmittedAsAssistantText() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.updated","properties":{"info":{"id":"msg_user","sessionID":"ses_target","role":"user"}}}"#
+            ),
+            []
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_user","sessionID":"ses_target","messageID":"msg_user","type":"text","text":"<user_turn>Fix the bug</user_turn>"},"time":1}}"#
+            ),
+            []
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_user","partID":"prt_user","field":"text","delta":"leak"}}"#
+            ),
+            []
+        )
+    }
+
+    /// Rol öğrenildikten sonra asistan parçaları akmaya devam eder.
+    func testAssistantPartsStillStreamAfterRoleTracking() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        for line in [
+            #"data: {"type":"message.updated","properties":{"info":{"id":"msg_user","sessionID":"ses_target","role":"user"}}}"#,
+            #"data: {"type":"message.updated","properties":{"info":{"id":"msg_asst","sessionID":"ses_target","role":"assistant"}}}"#,
+        ] {
+            XCTAssertEqual(try normalizer.consume(line: line), [])
+        }
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_a","sessionID":"ses_target","messageID":"msg_asst","type":"text","text":"Hel"},"time":1}}"#
+            ),
+            [.assistantTextDelta("Hel")]
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_asst","partID":"prt_a","field":"text","delta":"lo"}}"#
+            ),
+            [.assistantTextDelta("lo")]
+        )
+    }
+
+    /// Başka bir oturumun kullanıcı mesajı bu turun parçalarını susturmaz.
+    func testUserMessageRoleFromAForeignSessionIsIgnored() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.updated","properties":{"info":{"id":"msg_other","sessionID":"ses_other","role":"user"}}}"#
+            ),
+            []
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_x","sessionID":"ses_target","messageID":"msg_other","type":"text","text":"Hel"},"time":1}}"#
+            ),
+            [.assistantTextDelta("Hel")]
+        )
+    }
+
+    /// Biten asistan mesajının jeton sayımı tur kullanımı olarak yayılır:
+    /// sunucu tarafı oturumun o adımdaki girdi sayımı, bağlam boyutunun
+    /// gerçek karşılığıdır.
+    func testAssistantMessageTokensAreEmittedAsTurnUsage() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.updated","properties":{"info":{"id":"msg_asst","sessionID":"ses_target","role":"assistant","tokens":{"input":48210,"output":1204,"reasoning":300,"cache":{"read":40000,"write":0}},"cost":0.012}}}"#
+            ),
+            [.turnUsage(TurnTokenUsage(inputTokens: 48210, outputTokens: 1204))]
+        )
+    }
+
+    func testAssistantMessageWithoutTokensEmitsNothing() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.updated","properties":{"info":{"id":"msg_asst","sessionID":"ses_target","role":"assistant"}}}"#
+            ),
+            []
+        )
+    }
+
+    func testForeignAssistantTokensAreIgnored() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.updated","properties":{"info":{"id":"msg_asst","sessionID":"ses_other","role":"assistant","tokens":{"input":48210,"output":1204}}}}"#
+            ),
+            []
+        )
+    }
+
+    /// Reasoning asistan metni olarak yayılmaz — ayrı thinking kanalına akar.
+    ///
+    /// Düşünme içeriği cevaba karışmamalı ama çöpe de gitmemeli: turdaki
+    /// düşünme kartını doldurur, transkripte yazılmaz.
     func testReasoningDeltaIsNeverExposedAsAssistantText() throws {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_reason","field":"text","delta":"private reasoning"}}"#
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_reason","field":"text","delta":"private reasoning"}}"#
             ),
             []
         )
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_reason","sessionID":"ses_target","messageID":"msg_1","type":"reasoning","text":"private reasoning","time":{"start":1}},"time":1}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_reason","sessionID":"ses_target","messageID":"msg_1","type":"reasoning","text":"private reasoning","time":{"start":1}},"time":1}}"#
+            ),
+            [.thinkingDelta("private reasoning")]
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_reason","field":"text","delta":" more"}}"#
+            ),
+            [.thinkingDelta(" more")]
+        )
+    }
+
+    /// Akışsız gelen bütün reasoning parçası tek seferlik thinking'e taşınır;
+    /// tekrarı sessizce düşer.
+    func testReasoningFullTextWithoutDeltasEmitsThinkingOnce() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        let line =
+            #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_reason","sessionID":"ses_target","messageID":"msg_1","type":"reasoning","text":"full thought","time":{"start":1}},"time":1}}"#
+        XCTAssertEqual(
+            try normalizer.consume(line: line),
+            [.thinkingDelta("full thought")]
+        )
+        XCTAssertEqual(try normalizer.consume(line: line), [])
+    }
+
+    /// Akmış reasoning deltası bütün-metin güncellemesiyle ikilenmez.
+    func testReasoningStreamedDeltasAreNotDuplicatedByFullText() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_reason","sessionID":"ses_target","messageID":"msg_1","type":"reasoning","text":"","time":1}}}"#
             ),
             []
         )
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_reason","field":"text","delta":" more"}}"#
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_reason","field":"text","delta":"Hel"}}"#
+            ),
+            [.thinkingDelta("Hel")]
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_reason","sessionID":"ses_target","messageID":"msg_1","type":"reasoning","text":"Hello","time":2}}}"#
             ),
             []
         )
@@ -53,7 +222,8 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
             ),
             [
                 .activityStarted(
@@ -66,7 +236,8 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
         )
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{},"output":"ok","title":"done","metadata":{},"time":{"start":1,"end":2}}},"time":2}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{},"output":"ok","title":"done","metadata":{},"time":{"start":1,"end":2}}},"time":2}}"#
             ),
             [
                 .activityFinished(
@@ -82,12 +253,14 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         _ = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
         )
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"error","input":{},"error":"backend detail","time":{"start":1,"end":2}}},"time":2}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"edit","state":{"status":"error","input":{},"error":"backend detail","time":{"start":1,"end":2}}},"time":2}}"#
             ),
             [
                 .activityFinished(
@@ -127,7 +300,8 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         XCTAssertThrowsError(
             try normalizer.consume(
-                line: #"data: {"type":"session.error","properties":{"sessionID":"ses_target","error":{"name":"UnknownError","data":{"message":"sensitive backend detail"}}}}"#
+                line:
+                    #"data: {"type":"session.error","properties":{"sessionID":"ses_target","error":{"name":"UnknownError","data":{"message":"sensitive backend detail"}}}}"#
             )
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .unexpectedResponse)
@@ -139,7 +313,8 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         XCTAssertThrowsError(
             try normalizer.consume(
-                line: #"data: {"type":"session.error","properties":{"sessionID":"ses_target","error":{"name":"ContextOverflowError","data":{"message":"Input exceeds the context window"}}}}"#
+                line:
+                    #"data: {"type":"session.error","properties":{"sessionID":"ses_target","error":{"name":"ContextOverflowError","data":{"message":"Input exceeds the context window"}}}}"#
             )
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .contextLimitExceeded)
@@ -184,13 +359,15 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         // A global /event subscription also sees unrelated conversations.
         let otherSession = try normalizer.consume(
-            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_other","id":"per_other","permission":"chatgpt-system_computer_click"}}"#
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_other","id":"per_other","permission":"chatgpt-system_computer_click"}}"#
         )
         XCTAssertEqual(otherSession, [])
         XCTAssertNil(box.value, "Foreign session requests have no verified owner")
 
         let events = try normalizer.consume(
-            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_12345","permission":"chatgpt-system_computer_click","patterns":["*"],"always":["chatgpt-system_computer_click*"],"metadata":{"description":"Click the Run button"}}}"#
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_12345","permission":"chatgpt-system_computer_click","patterns":["*"],"always":["chatgpt-system_computer_click*"],"metadata":{"description":"Click the Run button"}}}"#
         )
         XCTAssertEqual(events, [])
         XCTAssertEqual(
@@ -222,17 +399,20 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
         )
 
         _ = try normalizer.consume(
-            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_own","permission":"bash","patterns":["ls"],"always":[]}}"#
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_own","permission":"bash","patterns":["ls"],"always":[]}}"#
         )
 
         XCTAssertEqual(box.value?.isDelegatedSession, false)
 
         // The parent task's backend metadata is the evidence of ownership.
         _ = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","type":"tool","tool":"task","state":{"status":"running","input":{},"metadata":{"sessionId":"ses_child"}}}}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","type":"tool","tool":"task","state":{"status":"running","input":{},"metadata":{"sessionId":"ses_child"}}}}}"#
         )
         _ = try normalizer.consume(
-            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_child","id":"per_child","permission":"external_directory","patterns":["/tmp/*"],"always":[]}}"#
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_child","id":"per_child","permission":"external_directory","patterns":["/tmp/*"],"always":[]}}"#
         )
 
         XCTAssertEqual(box.value?.isDelegatedSession, true)
@@ -251,18 +431,21 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
 
         // /event is global. Never attribute a foreign conversation's request.
         _ = try normalizer.consume(
-            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_foreign","id":"per_foreign","permission":"bash","patterns":["rm -rf *"]}}"#
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_foreign","id":"per_foreign","permission":"bash","patterns":["rm -rf *"]}}"#
         )
         XCTAssertTrue(box.requests.isEmpty)
 
         // A delegated child can ask before the task publishes its identity.
         _ = try normalizer.consume(
-            line: #"data: {"type":"permission.asked","properties":{"sessionID":"ses_child","id":"per_child","permission":"bash","patterns":["swift test"]}}"#
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_child","id":"per_child","permission":"bash","patterns":["swift test"]}}"#
         )
         XCTAssertTrue(box.requests.isEmpty)
 
         _ = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","type":"tool","tool":"task","state":{"status":"running","input":{"subagent_type":"explore"},"metadata":{"sessionId":"ses_child"}}}}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","type":"tool","tool":"task","state":{"status":"running","input":{"subagent_type":"explore"},"metadata":{"sessionId":"ses_child"}}}}}"#
         )
         XCTAssertEqual(box.requests.map(\.id), ["per_child"])
         XCTAssertEqual(box.requests.first?.remoteSessionID, "ses_child")
@@ -296,7 +479,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","prompt":"Find how login works","subagent_type":"explore"},"time":{"start":1}}},"time":1}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","prompt":"Find how login works","subagent_type":"explore"},"time":{"start":1}}},"time":1}}"#
             ),
             [
                 .activityStarted(
@@ -316,13 +500,15 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         _ = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"time":{"start":1}}},"time":1}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"time":{"start":1}}},"time":1}}"#
         )
 
         // Çocuk oturumun araç olayı: eşleme henüz bilinmediği için tamponda bekler.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_read","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c","tool":"read","state":{"status":"completed","input":{"filePath":"Sources/Session.swift"},"time":{"start":1,"end":2}}},"time":2}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_read","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c","tool":"read","state":{"status":"completed","input":{"filePath":"Sources/Session.swift"},"time":{"start":1,"end":2}}},"time":2}}"#
             ),
             []
         )
@@ -330,7 +516,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         // Çocuk kimliğini açıklayan güncelleme tamponu boşaltır ve adımı yayınlar.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"metadata":{"sessionId":"ses_child"},"time":{"start":1}}},"time":3}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"metadata":{"sessionId":"ses_child"},"time":{"start":1}}},"time":3}}"#
             ),
             [
                 .activityUpdated(
@@ -349,7 +536,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         // soyulmuş hâlde tek başına taşınır.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"completed","input":{"description":"Research auth flow","subagent_type":"explore"},"output":"<task_result>Login uses OAuth.</task_result>","title":"Research auth flow","metadata":{"sessionId":"ses_child"},"time":{"start":1,"end":4}}},"time":4}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"completed","input":{"description":"Research auth flow","subagent_type":"explore"},"output":"<task_result>Login uses OAuth.</task_result>","title":"Research auth flow","metadata":{"sessionId":"ses_child"},"time":{"start":1,"end":4}}},"time":4}}"#
             ),
             [
                 .activityUpdated(
@@ -365,7 +553,7 @@ final class SubagentStreamNormalizerTests: XCTestCase {
                     ProviderActivityID("prt_task"),
                     outcome: .completed,
                     output: "Login uses OAuth."
-                )
+                ),
             ]
         )
     }
@@ -374,15 +562,17 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         _ = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"time":{"start":1}}},"time":1}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"time":{"start":1}}},"time":1}}"#
         )
 
         let events = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"completed","input":{"description":"Research auth flow","subagent_type":"explore"},"output":"<task id=\"ses_child\" state=\"completed\">\n\n<task_result>\n\nRapor:\n- madde\n\n</task_result>\n</task>","title":"Research auth flow","metadata":{"sessionId":"ses_child"},"time":{"start":1,"end":4}}},"time":4}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"completed","input":{"description":"Research auth flow","subagent_type":"explore"},"output":"<task id=\"ses_child\" state=\"completed\">\n\n<task_result>\n\nRapor:\n- madde\n\n</task_result>\n</task>","title":"Research auth flow","metadata":{"sessionId":"ses_child"},"time":{"start":1,"end":4}}},"time":4}}"#
         )
 
         let finished = events.compactMap { event -> String? in
-            if case let .activityFinished(_, _, output, _) = event {
+            if case .activityFinished(_, _, let output, _) = event {
                 return output
             }
             return nil
@@ -396,7 +586,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
 
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_mcp","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"mcp__github__get_user","state":{"status":"running","input":{"username":"octocat"},"time":{"start":1}}},"time":1}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_mcp","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"mcp__github__get_user","state":{"status":"running","input":{"username":"octocat"},"time":{"start":1}}},"time":1}}"#
             ),
             [
                 .activityStarted(
@@ -424,7 +615,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         let events = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_sub","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_sub","tool":"subagent_explore","state":{"status":"running","time":{"start":1}}},"time":1}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_sub","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_sub","tool":"subagent_explore","state":{"status":"running","time":{"start":1}}},"time":1}}"#
         )
 
         XCTAssertEqual(
@@ -447,13 +639,15 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         _ = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"metadata":{"sessionId":"ses_child"},"time":{"start":1}}},"time":1}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_task","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"task","state":{"status":"running","input":{"description":"Research auth flow","subagent_type":"explore"},"metadata":{"sessionId":"ses_child"},"time":{"start":1}}},"time":1}}"#
         )
 
         // Çocuk araç başlıyor: adım "…" ile görünür.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_bash","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c","tool":"bash","state":{"status":"running","input":{"command":"swift build"},"time":{"start":1}}},"time":2}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_bash","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c","tool":"bash","state":{"status":"running","input":{"command":"swift build"},"time":{"start":1}}},"time":2}}"#
             ),
             [
                 .activityUpdated(
@@ -471,7 +665,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         // Araç bitince aynı satır "✓" olur.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_bash","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c","tool":"bash","state":{"status":"completed","input":{"command":"swift build"},"output":"ok","time":{"start":1,"end":2}}},"time":3}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_bash","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c","tool":"bash","state":{"status":"completed","input":{"command":"swift build"},"output":"ok","time":{"start":1,"end":2}}},"time":3}}"#
             ),
             [
                 .activityUpdated(
@@ -489,7 +684,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         // İkinci araç listeye eklenir.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_read","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c2","tool":"read","state":{"status":"running","input":{"filePath":"Sources/App.swift"},"time":{"start":3}}},"time":4}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_child","part":{"id":"prt_child_read","sessionID":"ses_child","messageID":"msg_c","type":"tool","callID":"call_c2","tool":"read","state":{"status":"running","input":{"filePath":"Sources/App.swift"},"time":{"start":3}}},"time":4}}"#
             ),
             [
                 .activityUpdated(
@@ -507,7 +703,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         // Eşlemesi olmayan bir oturumun olayı karta hiçbir şey yazmaz.
         XCTAssertEqual(
             try normalizer.consume(
-                line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_other","part":{"id":"prt_other","sessionID":"ses_other","messageID":"msg_o","type":"tool","callID":"call_o","tool":"bash","state":{"status":"completed","input":{"command":"echo other"},"time":{"start":1,"end":2}}},"time":5}}"#
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_other","part":{"id":"prt_other","sessionID":"ses_other","messageID":"msg_o","type":"tool","callID":"call_o","tool":"bash","state":{"status":"completed","input":{"command":"echo other"},"time":{"start":1,"end":2}}},"time":5}}"#
             ),
             []
         )
@@ -517,7 +714,8 @@ final class SubagentStreamNormalizerTests: XCTestCase {
         var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
 
         let events = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_fast","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_fast","tool":"bash","state":{"status":"completed","input":{"command":"ls -la"},"output":"file.txt","time":{"start":1,"end":2}}},"time":2}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_fast","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_fast","tool":"bash","state":{"status":"completed","input":{"command":"ls -la"},"output":"file.txt","time":{"start":1,"end":2}}},"time":2}}"#
         )
 
         XCTAssertEqual(
@@ -536,14 +734,167 @@ final class SubagentStreamNormalizerTests: XCTestCase {
                     ProviderActivityID("prt_fast"),
                     outcome: .completed,
                     output: "file.txt"
-                )
+                ),
             ]
         )
 
         // Duplicate completion event for the same part ID is ignored
         let duplicateEvents = try normalizer.consume(
-            line: #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_fast","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_fast","tool":"bash","state":{"status":"completed","input":{"command":"ls -la"},"output":"file.txt","time":{"start":1,"end":2}}},"time":2}}"#
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_fast","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_fast","tool":"bash","state":{"status":"completed","input":{"command":"ls -la"},"output":"file.txt","time":{"start":1,"end":2}}},"time":2}}"#
         )
         XCTAssertEqual(duplicateEvents, [])
+    }
+}
+
+/// Runtime lifecycle (T3): an unrelated turn must survive foreign backend
+/// noise, complete text parts must surface, and turn-bounded buffers stay
+/// bounded no matter how many part IDs a turn invents.
+final class OpenCodeStreamNormalizerLifecycleTests: XCTestCase {
+    func testSessionErrorWithoutSessionIDIsIgnored() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line: #"data: {"type":"session.error","properties":{"error":{"name":"UnknownError","data":{"message":"boom"}}}}"#
+            ),
+            [],
+            "A session.error that names no session cannot be attributed to this turn"
+        )
+    }
+
+    func testSessionErrorForAnotherSessionIsIgnored() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"session.error","properties":{"sessionID":"ses_other","error":{"name":"UnknownError","data":{"message":"boom"}}}}"#
+            ),
+            []
+        )
+    }
+
+    func testTextPartUpdateWithoutBufferedDeltaEmitsInlineText() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_1","sessionID":"ses_target","messageID":"msg_1","type":"text","text":"Direct"},"time":1}}"#
+            ),
+            [.assistantTextDelta("Direct")]
+        )
+    }
+
+    func testStreamedDeltasAreNotDuplicatedByLaterFullTextUpdate() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        // Creation update learns the part type; its text is still empty.
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_1","sessionID":"ses_target","messageID":"msg_1","type":"text","text":""},"time":1}}"#
+            ),
+            []
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_1","field":"text","delta":"Hel"}}"#
+            ),
+            [.assistantTextDelta("Hel")]
+        )
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.delta","properties":{"sessionID":"ses_target","messageID":"msg_1","partID":"prt_1","field":"text","delta":"lo"}}"#
+            ),
+            [.assistantTextDelta("lo")]
+        )
+        // A later update carrying the full text must not re-emit what streamed.
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_1","sessionID":"ses_target","messageID":"msg_1","type":"text","text":"Hello"},"time":2}}"#
+            ),
+            []
+        )
+    }
+
+    func testBufferedTextDeltasAreCappedAndEvictOldest() throws {
+
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        for index in 0..<130 {
+            let events = try normalizer.consume(
+                line:
+                    "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"ses_target\",\"messageID\":\"msg_1\",\"partID\":\"prt_\(index)\",\"field\":\"text\",\"delta\":\"t\(index)\"}}"
+            )
+            XCTAssertEqual(events, [])
+        }
+
+        let events = try normalizer.consume(
+            line: #"data: {"type":"session.idle","properties":{"sessionID":"ses_target"}}"#
+        )
+        let texts = events.compactMap { event -> String? in
+            if case .assistantTextDelta(let text) = event { return text }
+            return nil
+        }
+
+        XCTAssertEqual(events.last, .completed)
+        XCTAssertEqual(texts.count, 128, "Turn-bounded text buffers must not grow without bound")
+        XCTAssertEqual(texts.first, "t2", "Eviction drops the oldest buffered parts first")
+        XCTAssertEqual(texts.last, "t129")
+    }
+
+    func testFinishedToolPartIDsEvictOldest() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        for index in 0..<260 {
+            let events = try normalizer.consume(line: Self.toolCompletionLine(index: index))
+            XCTAssertEqual(events.count, 2, "A direct completion emits started and finished")
+        }
+
+        // The oldest IDs fell out of the capped set: their late duplicate is
+        // processed again instead of being dropped.
+        let reemitted = try normalizer.consume(line: Self.toolCompletionLine(index: 0))
+        XCTAssertEqual(reemitted.count, 2)
+        // A recent ID is still remembered: its duplicate stays silent.
+        XCTAssertEqual(
+            try normalizer.consume(line: Self.toolCompletionLine(index: 259)),
+            []
+        )
+    }
+
+    private static func toolCompletionLine(index: Int) -> String {
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_target\",\"part\":{\"id\":\"prt_\(index)\",\"sessionID\":\"ses_target\",\"messageID\":\"msg_1\",\"type\":\"tool\",\"callID\":\"call_\(index)\",\"tool\":\"read\",\"state\":{\"status\":\"completed\",\"input\":{},\"output\":\"ok\",\"time\":{\"start\":1,\"end\":2}}},\"time\":2}}"
+    }
+
+    func testEmittedTextPartIDsEvictOldest() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        for index in 0..<260 {
+            XCTAssertEqual(
+                try normalizer.consume(line: Self.completeTextLine(index: index)),
+                [.assistantTextDelta("t\(index)")]
+            )
+        }
+
+        // The oldest IDs fell out of the capped set: the same complete part
+        // emits again instead of staying silent.
+        XCTAssertEqual(
+            try normalizer.consume(line: Self.completeTextLine(index: 0)),
+            [.assistantTextDelta("t0")]
+        )
+        // A recent ID is still remembered: its repeat stays silent.
+        XCTAssertEqual(
+            try normalizer.consume(line: Self.completeTextLine(index: 259)),
+            []
+        )
+    }
+
+    private static func completeTextLine(index: Int) -> String {
+        "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_target\",\"part\":{\"id\":\"prt_\(index)\",\"sessionID\":\"ses_target\",\"messageID\":\"msg_1\",\"type\":\"text\",\"text\":\"t\(index)\"},\"time\":2}}"
     }
 }

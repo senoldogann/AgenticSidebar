@@ -18,6 +18,10 @@ struct SessionSnapshot: Codable, Equatable, Sendable {
     /// Tur çalışırken gelen mesajlar: kapanışta kaybolmamaları için arşivlenir,
     /// açılışta kuyruk aynen geri gelir.
     var queuedPrompts: [QueuedPrompt] = []
+    /// Yuvarlanan bağlam özeti (`/compact`) ve kapsadığı en yeni mesaj.
+    /// Eski arşivlerde yoktur; yoklukları "henüz özetlenmedi" demektir.
+    var contextSummary: String = ""
+    var summarizedThroughMessageID: UUID? = nil
 }
 
 extension SessionSnapshot {
@@ -39,7 +43,9 @@ extension SessionSnapshot {
             ) ?? [],
             customTitle: try container.decodeIfPresent(String.self, forKey: .customTitle),
             isPinned: try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false,
-            queuedPrompts: try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
+            queuedPrompts: try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? [],
+            contextSummary: try container.decodeIfPresent(String.self, forKey: .contextSummary) ?? "",
+            summarizedThroughMessageID: try container.decodeIfPresent(UUID.self, forKey: .summarizedThroughMessageID)
         )
     }
 
@@ -51,7 +57,8 @@ extension SessionSnapshot {
         maximumOutputLength: Int
     ) -> SessionSnapshot {
         var bounded = self
-        bounded.activityGroups = activityGroups
+        bounded.activityGroups =
+            activityGroups
             .bounded(
                 toActivityCount: maximumActivities,
                 anchoredTo: Set(messages.map(\.id))
@@ -172,6 +179,14 @@ struct SessionArchiveStore: Sendable {
     /// Kodlama ve disk yazımı burada, ana iş parçacığının dışında yapılır.
     private let writer: SessionArchiveWriter
 
+    /// Dosya boyutu: FileManager NSNumber döner, doğrudan Int cast'i düşebilir.
+    static func fileSize(from value: Any?) -> Int? {
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        return value as? Int
+    }
+
     private var fileManager: FileManager {
         .default
     }
@@ -210,7 +225,7 @@ struct SessionArchiveStore: Sendable {
 
         guard
             let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path),
-            let size = attributes[.size] as? Int
+            let size = Self.fileSize(from: attributes[.size])
         else {
             AppLog.agentSession.error(
                 "Session archive attributes are unreadable; keeping it aside and starting empty"
@@ -238,7 +253,7 @@ struct SessionArchiveStore: Sendable {
         }
 
         do {
-            let archive = try Self.decoder.decode(SessionArchive.self, from: data)
+            let archive = try Self.makeDecoder().decode(SessionArchive.self, from: data)
             guard archive.version <= SessionArchive.currentVersion else {
                 AppLog.agentSession.error(
                     "Session archive was written by a newer version; keeping it aside and starting empty"
@@ -272,7 +287,8 @@ struct SessionArchiveStore: Sendable {
     )
 
     private func moveAside() {
-        let damagedURL = fileURL
+        let damagedURL =
+            fileURL
             .deletingPathExtension()
             .appendingPathExtension("corrupt.json")
 
@@ -280,11 +296,18 @@ struct SessionArchiveStore: Sendable {
         try? fileManager.moveItem(at: fileURL, to: damagedURL)
     }
 
-    private static let decoder: JSONDecoder = {
+    private static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
-    }()
+    }
+
+    /// Arka planda yükleme: büyük arşivde açılışı kilitlememek için.
+    func loadAsync() async -> SessionArchive? {
+        await Task.detached(priority: .utility) { [fileURL] in
+            SessionArchiveStore(fileURL: fileURL).load()
+        }.value
+    }
 }
 
 /// Arşivin diske yazılırken uyacağı sınırlar.
@@ -348,7 +371,12 @@ actor SessionArchiveWriter {
             // corrupt. One extra pass over bytes that were just encoded buys a
             // logged failure instead of a lost transcript; the whole write already
             // runs off the main actor, behind the coalescing debounce.
-            guard (try? Self.decoder.decode(SessionArchive.self, from: fitted.data)) != nil else {
+            let verifyDecoder: JSONDecoder = {
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return decoder
+            }()
+            guard (try? verifyDecoder.decode(SessionArchive.self, from: fitted.data)) != nil else {
                 AppLog.agentSession.error(
                     "Refusing to replace the session archive: the encoded payload does not decode; the previous archive was kept"
                 )
@@ -409,11 +437,5 @@ actor SessionArchiveWriter {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
         return encoder
-    }()
-
-    private static let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return decoder
     }()
 }

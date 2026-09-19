@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ComputerUseFilesTests: XCTestCase {
@@ -13,7 +14,7 @@ final class ComputerUseFilesTests: XCTestCase {
                 "chatgpt-system_computer_*",
                 "chatgpt-system_session_authority_*",
                 "chatgpt-system_computer_health",
-                "chatgpt-system_computer_run_js"
+                "chatgpt-system_computer_run_js",
             ]
         )
         XCTAssertEqual(
@@ -83,7 +84,8 @@ final class ComputerUseFilesTests: XCTestCase {
         XCTAssertEqual(configurationURL.lastPathComponent, ComputerUseFiles.configurationFileName)
         XCTAssertTrue(FileManager.default.fileExists(atPath: configurationURL.path))
 
-        let instructionsURL = directory
+        let instructionsURL =
+            directory
             .appendingPathComponent(ComputerUseFiles.instructionsFileName)
         let instructions = try String(contentsOf: instructionsURL, encoding: .utf8)
         XCTAssertTrue(instructions.contains("session_authority_start"))

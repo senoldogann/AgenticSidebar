@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ThinkingDurationPresentationTests: XCTestCase {
@@ -88,6 +89,13 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             ),
             "Thought for 9s"
         )
+    }
+
+    func testVisibleContentRequiresNonBlankOutput() {
+        XCTAssertFalse(ThinkingDurationPresentation.hasVisibleContent(output: nil))
+        XCTAssertFalse(ThinkingDurationPresentation.hasVisibleContent(output: ""))
+        XCTAssertFalse(ThinkingDurationPresentation.hasVisibleContent(output: "   \n  "))
+        XCTAssertTrue(ThinkingDurationPresentation.hasVisibleContent(output: "Plan A"))
     }
 
     func testAFinishedTurnReportsTotalWorkBeyondThinking() {

@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class AppIdentityTests: XCTestCase {

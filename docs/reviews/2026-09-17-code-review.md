@@ -1,5 +1,12 @@
 # Code Review — AgenticSidebar (Freebuff Desktop)
 
+> **Tarihsel belge (point-in-time).** Bu inceleme 2026-09-16/17 anını ve
+> `feat/chat-ux-streaming-activities-enter` dalını kaydeder; aşağıdaki tablodaki
+> sayılar o anki ağacın anlık görüntüsüdür, bugünkü hâli değildir (kaynak dosya
+> ve test sayıları bu yana arttı; CI artık `swift-format` için bir kapı).
+> İzin, süreç yaşam döngüsü ve kalıcılık kararları için hâlâ başvuru kaynağıdır.
+> Güncel durum için `README.md` ve aşağıdaki *Commands* bölümüne bakın.
+
 Reviewer role: senior code review / security audit. Every finding below is a trackable checkbox with a
 stable Task ID. Code snippets are patch-style and ready to apply.
 

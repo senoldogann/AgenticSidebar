@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The backend spawns a process per MCP server, and the app is routinely killed
@@ -78,7 +79,7 @@ final class OpenCodeProcessTreeTests: XCTestCase {
     func testTheFingerprintNoLongerDependsOnThePureFlag() {
         for arguments in [
             ["serve", "--hostname", "127.0.0.1", "--port", "59021"],
-            ["serve", "--hostname", "127.0.0.1", "--port", "59021", "--pure"]
+            ["serve", "--hostname", "127.0.0.1", "--port", "59021", "--pure"],
         ] {
             XCTAssertTrue(
                 OpenCodeProcessTree.isManagedServer(
@@ -339,7 +340,8 @@ final class OpenCodeServerLedgerTests: XCTestCase {
             includeUnownedScan: false,
             factsProvider: { _ in
                 let invocation = OpenCodeProcessTree.invocation(of: pid)
-                let environment = (invocation?.environment.isEmpty ?? true)
+                let environment =
+                    (invocation?.environment.isEmpty ?? true)
                     ? ["OPENCODE_CONFIG": ManagedOpenCodeConfiguration.fileURL(in: directory).path]
                     : invocation?.environment
                 return [

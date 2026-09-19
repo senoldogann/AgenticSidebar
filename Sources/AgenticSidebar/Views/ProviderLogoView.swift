@@ -17,11 +17,13 @@ enum ProviderLogo: Equatable, Sendable {
         let lowered = identifier.lowercased()
 
         if lowered.contains("openai") || lowered.contains("gpt")
-            || lowered.contains("codex") || lowered.contains("o1") || lowered.contains("o3") {
+            || lowered.contains("codex") || lowered.contains("o1") || lowered.contains("o3")
+        {
             return .openAI
         }
         if lowered.contains("anthropic") || lowered.contains("claude") || lowered.contains("sonnet")
-            || lowered.contains("opus") || lowered.contains("haiku") {
+            || lowered.contains("opus") || lowered.contains("haiku")
+        {
             return .anthropic
         }
         if lowered.contains("google") || lowered.contains("gemini") || lowered.contains("gemma") {
@@ -34,7 +36,8 @@ enum ProviderLogo: Equatable, Sendable {
             return .xAI
         }
 
-        let initial = identifier
+        let initial =
+            identifier
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .first
             .map { String($0.prefix(2)).uppercased() } ?? "?"
@@ -49,7 +52,7 @@ enum ProviderLogo: Equatable, Sendable {
         case .google: "Google"
         case .openCode: "OpenCode"
         case .xAI: "xAI"
-        case let .generic(initial): initial
+        case .generic(let initial): initial
         }
     }
 }
@@ -87,7 +90,7 @@ struct ProviderLogoView: View {
             }
         }
         .overlay {
-            if case let .generic(initial) = logo {
+            if case .generic(let initial) = logo {
                 Text(initial)
                     .font(.system(size: size * 0.52, weight: .bold, design: .rounded))
                     .foregroundStyle(tint ?? .secondary)

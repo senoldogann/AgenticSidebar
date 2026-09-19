@@ -21,8 +21,7 @@ enum RelativeTimestamp {
 
     static func bucket(_ date: Date) -> Date {
         Date(
-            timeIntervalSinceReferenceDate:
-                (date.timeIntervalSinceReferenceDate / bucketInterval).rounded(.down)
+            timeIntervalSinceReferenceDate: (date.timeIntervalSinceReferenceDate / bucketInterval).rounded(.down)
                 * bucketInterval
         )
     }

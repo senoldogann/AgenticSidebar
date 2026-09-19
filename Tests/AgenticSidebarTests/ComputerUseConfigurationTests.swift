@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ComputerUseConfigurationTests: XCTestCase {
@@ -96,13 +97,15 @@ final class ComputerUseConfigurationTests: XCTestCase {
             .disabled
         )
 
-        guard case .invalid(let message) = ComputerUseConfiguration.decision(
-            enabled: true,
-            rootPath: root.path,
-            workingDirectoryURL: root,
-            environment: ["PATH": "/nonexistent"],
-            fileManager: .default
-        ) else {
+        guard
+            case .invalid(let message) = ComputerUseConfiguration.decision(
+                enabled: true,
+                rootPath: root.path,
+                workingDirectoryURL: root,
+                environment: ["PATH": "/nonexistent"],
+                fileManager: .default
+            )
+        else {
             return XCTFail("Expected an invalid decision")
         }
         XCTAssertTrue(message.contains("dist/cli.js"))
@@ -138,7 +141,7 @@ final class ComputerUseConfigurationTests: XCTestCase {
                 "stdio",
                 "--root", root.path,
                 "--personal-admin",
-                "--enable-computer-use"
+                "--enable-computer-use",
             ]
         )
         XCTAssertFalse(serverConfig.command.contains("--enable-full-host-js"))

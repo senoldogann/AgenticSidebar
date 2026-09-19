@@ -249,10 +249,10 @@ extension Array where Element == AgentTurnActivityGroup {
     }
 }
 
-private extension String {
+extension String {
     /// Keeps the head of a long tool result and says so, rather than dropping
     /// the tail silently.
-    func boundedForArchive(maxLength: Int) -> String {
+    fileprivate func boundedForArchive(maxLength: Int) -> String {
         guard count > maxLength else {
             return self
         }

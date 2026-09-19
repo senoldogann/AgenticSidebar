@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -7,7 +8,7 @@ final class AgentSessionServiceTests: XCTestCase {
         let service = AgentSessionService(
             runtimes: [
                 makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast"),
-                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep")
+                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep"),
             ]
         )
 
@@ -23,7 +24,7 @@ final class AgentSessionServiceTests: XCTestCase {
         let service = AgentSessionService(
             runtimes: [
                 makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast"),
-                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep")
+                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep"),
             ]
         )
         await service.refreshCapabilities()
@@ -142,7 +143,9 @@ final class AgentSessionServiceTests: XCTestCase {
         let userMessage = try XCTUnwrap(service.state.messages.first)
         let group = try XCTUnwrap(service.state.activityGroups.first)
         XCTAssertEqual(group.anchorMessageID, userMessage.id)
-        XCTAssertEqual(group.activities.map(\.kind), [.thinking, .read])
+        // Düşünme tembeldir: thinking deltası gelmeyen turda boş `.thinking`
+        // satırı kurulmaz.
+        XCTAssertEqual(group.activities.map(\.kind), [.read])
         XCTAssertTrue(group.activities.allSatisfy { $0.phase == .completed })
     }
 
@@ -263,7 +266,7 @@ final class AgentSessionServiceTests: XCTestCase {
             (.authenticationFailure, .authenticationFailure),
             (.unavailable, .providerUnavailable),
             (.transport, .transportFailure),
-            (.unexpectedResponse, .unexpectedBackendResponse)
+            (.unexpectedResponse, .unexpectedBackendResponse),
         ]
 
         for (runtimeError, expectedError) in mappings {
@@ -292,6 +295,165 @@ final class AgentSessionServiceTests: XCTestCase {
         }
     }
 
+    /// İki kez üst üste durdurma tek sonuç verir ve sonraki turu bozmaz.
+    ///
+    /// Durdurma düğmesine çift tıklamak (ya da iptal ile kuyruk boşaltımının
+    /// yarışması) eskiden bitmiş turun tutamacıyla koşan turun durumunu
+    /// ezebiliyordu: sonraki tur sahipsiz akışla baş başa kalıyor, durdurma
+    /// simgesi ekranda takılı kalıyordu.
+    func testDoubleCancelSettlesOnceAndLeavesTheNextTurnAlone() async throws {
+        final class StreamPairs: @unchecked Sendable {
+            private let lock = NSLock()
+            private var calls = 0
+            let first = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+            let second = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+
+            func next() -> AsyncThrowingStream<ProviderEvent, Error> {
+                lock.withLock {
+                    calls += 1
+                    return calls == 1 ? first.stream : second.stream
+                }
+            }
+
+            func cancelFirst() {
+                first.continuation.finish(throwing: CancellationError())
+            }
+        }
+        let pairs = StreamPairs()
+        let runtime = TestProviderRuntime(
+            id: ProviderID("alpha"),
+            displayName: "Alpha",
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("alpha-1"),
+                    displayName: "Alpha 1",
+                    variants: []
+                )
+            ],
+            streamFactory: { _ in
+                // İlk turun akışı iptalde sonlanır, ikincisi testin elindedir.
+                ProviderStream(
+                    events: pairs.next(),
+                    cancellation: { pairs.cancelFirst() }
+                )
+            }
+        )
+        let service = AgentSessionService(runtimes: [runtime])
+        await service.refreshCapabilities()
+
+        let task = try XCTUnwrap(service.submit("Hi"))
+        XCTAssertTrue(service.isBusy)
+
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await service.cancel() }
+            group.addTask { await service.cancel() }
+        }
+        await task.value
+
+        XCTAssertEqual(service.state.status, .cancelled)
+        XCTAssertFalse(service.isBusy)
+        XCTAssertNil(service.activeTurnID)
+
+        // Sonraki tur tertemiz başlar ve biter: sahipsiz akış kalmamıştır.
+        let followUp = try XCTUnwrap(service.submit("Again"))
+        pairs.second.continuation.yield(.assistantTextDelta("Back"))
+        pairs.second.continuation.yield(.completed)
+        pairs.second.continuation.finish()
+        await followUp.value
+
+        XCTAssertEqual(service.state.status, .completed)
+        XCTAssertFalse(service.isBusy)
+        XCTAssertEqual(service.state.messages.last?.text, "Back")
+    }
+
+    func testCancelWithoutARunningTurnIsANoOp() async {
+        let service = AgentSessionService(runtimes: [
+            makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")
+        ])
+        await service.refreshCapabilities()
+
+        await service.cancel()
+
+        XCTAssertEqual(service.state.status, .idle)
+        XCTAssertNil(service.activeTurnID)
+        XCTAssertFalse(service.isBusy)
+    }
+
+    /// Başka sağlayıcıya geçince önceki listenin kartı ekranda kalmamalı.
+    ///
+    /// Listesi olmayan sağlayıcı `nil` döner ve son listeyi yerinde bırakır;
+    /// o yüzden yapılandırma değişiminde liste düşürülür — yoksa OpenAI
+    /// turunda OpenCode'un bayat kontrol listesi görünürdü.
+    func testSwitchingProviderDropsThePreviousChecklist() throws {
+        let alpha = makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")
+        let beta = makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep")
+        let session = AgentSession(runtimes: [alpha, beta])
+        session.applyCapabilities(
+            [alpha.capabilitySet, beta.capabilitySet],
+            normalizeConfiguration: true
+        )
+        try session.selectProvider(ProviderID("alpha"))
+
+        session.state.todos = [
+            AgentTodo(id: "t1", content: "Write it", status: .inProgress)
+        ]
+        try session.selectProvider(ProviderID("beta"))
+
+        XCTAssertTrue(
+            session.state.todos.isEmpty,
+            "Another provider's checklist must not survive the switch"
+        )
+    }
+
+    func testStaleTodoReadDoesNotSurviveProviderSwitch() async throws {
+        let alpha = DelayedTodosRuntime(
+            id: ProviderID("alpha"),
+            modelID: ProviderModelID("alpha-1"),
+            todos: [AgentTodo(id: "t1", content: "Write it", status: .inProgress)],
+            delayMilliseconds: 200
+        )
+        let beta = makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep")
+        let session = AgentSession(runtimes: [alpha, beta])
+        session.applyCapabilities(
+            [alpha.capabilitySet, beta.capabilitySet],
+            normalizeConfiguration: true
+        )
+        try session.selectProvider(ProviderID("alpha"))
+        session.refreshTodos()
+        try session.selectProvider(ProviderID("beta"))
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertTrue(
+            session.state.todos.isEmpty,
+            "A slow todo answer for the previous provider must not land after the switch"
+        )
+    }
+
+    func testCapabilityRefreshFallingBackToAnotherProviderDropsTheChecklist() throws {
+        let alpha = makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")
+        let beta = makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep")
+        let session = AgentSession(runtimes: [alpha, beta])
+        session.applyCapabilities(
+            [alpha.capabilitySet, beta.capabilitySet],
+            normalizeConfiguration: true
+        )
+        try session.selectProvider(ProviderID("alpha"))
+        session.state.todos = [
+            AgentTodo(id: "t1", content: "Write it", status: .inProgress)
+        ]
+
+        // Aynı sağlayıcı kümesi listeyi korumalı…
+        session.applyCapabilities(
+            [alpha.capabilitySet, beta.capabilitySet],
+            normalizeConfiguration: true
+        )
+        XCTAssertEqual(session.state.todos.count, 1)
+
+        // …ama alpha ortadan kalkıp yapılandırma beta'ya düşünce liste düşer.
+        session.applyCapabilities([beta.capabilitySet], normalizeConfiguration: true)
+        XCTAssertEqual(session.state.configuration?.providerID, ProviderID("beta"))
+        XCTAssertTrue(session.state.todos.isEmpty)
+    }
+
     private func makeRuntime(
         id: String,
         modelID: String,
@@ -313,6 +475,37 @@ final class AgentSessionServiceTests: XCTestCase {
                 )
             ]
         )
+    }
+}
+
+private struct DelayedTodosRuntime: ProviderRuntime {
+    let id: ProviderID
+    let capabilitySet: ProviderCapabilities
+    let todos: [AgentTodo]
+    let delayMilliseconds: UInt64
+
+    init(id: ProviderID, modelID: ProviderModelID, todos: [AgentTodo], delayMilliseconds: UInt64) {
+        self.id = id
+        self.capabilitySet = ProviderCapabilities(
+            id: id,
+            displayName: id.rawValue.capitalized,
+            models: [ProviderModelCapability(id: modelID, displayName: modelID.rawValue, variants: [])]
+        )
+        self.todos = todos
+        self.delayMilliseconds = delayMilliseconds
+    }
+
+    func capabilities() async throws -> ProviderCapabilities {
+        capabilitySet
+    }
+
+    func startStream(for request: ProviderRequest) async throws -> ProviderStream {
+        throw ProviderRuntimeError.unsupported
+    }
+
+    func sessionTodos(sessionID: UUID) async -> [AgentTodo]? {
+        try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+        return todos
     }
 }
 

@@ -1,16 +1,17 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class AgentTodoDecodingTests: XCTestCase {
     func testTheBackendsOwnListDecodes() throws {
         let json = """
-        [
-          {"id": "1", "content": "Read the parser", "status": "completed", "priority": "high"},
-          {"id": "2", "content": "Add the card", "status": "in_progress", "priority": "medium"},
-          {"id": "3", "content": "Run the tests", "status": "pending"}
-        ]
-        """
+            [
+              {"id": "1", "content": "Read the parser", "status": "completed", "priority": "high"},
+              {"id": "2", "content": "Add the card", "status": "in_progress", "priority": "medium"},
+              {"id": "3", "content": "Run the tests", "status": "pending"}
+            ]
+            """
 
         let todos = try JSONDecoder().decode([AgentTodo].self, from: Data(json.utf8))
 
@@ -25,11 +26,11 @@ final class AgentTodoDecodingTests: XCTestCase {
     /// than one that shows an unknown task as still pending.
     func testAnUnknownStatusOrMissingIdKeepsTheTask() throws {
         let json = """
-        [
-          {"content": "No id here", "status": "waiting-for-review"},
-          {"id": "9", "content": "Known status", "status": "cancelled"}
-        ]
-        """
+            [
+              {"content": "No id here", "status": "waiting-for-review"},
+              {"id": "9", "content": "Known status", "status": "cancelled"}
+            ]
+            """
 
         let todos = try JSONDecoder().decode([AgentTodo].self, from: Data(json.utf8))
 
@@ -43,8 +44,8 @@ final class AgentTodoDecodingTests: XCTestCase {
 
     func testATaskWithoutTextIsNotATask() {
         let json = """
-        [{"id": "1", "status": "pending"}]
-        """
+            [{"id": "1", "status": "pending"}]
+            """
 
         XCTAssertThrowsError(
             try JSONDecoder().decode([AgentTodo].self, from: Data(json.utf8))
@@ -65,7 +66,7 @@ final class AgentTodoPresentationTests: XCTestCase {
             todo("a", .completed),
             todo("b", .cancelled),
             todo("c", .inProgress),
-            todo("d", .pending)
+            todo("d", .pending),
         ]
 
         XCTAssertEqual(

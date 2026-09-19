@@ -12,13 +12,13 @@ final class ContextSnapCoordinator {
     private let snapService: ContextSnapService
     private let draftCenter: ComposerDraftCenter
     private let settings: SettingsStore
-    private let activeSessionID: @Sendable () -> UUID
+    private let activeSessionID: @MainActor @Sendable () -> UUID
 
     init(
         snapService: ContextSnapService,
         draftCenter: ComposerDraftCenter,
         settings: SettingsStore,
-        activeSessionID: @escaping @Sendable () -> UUID
+        activeSessionID: @escaping @MainActor @Sendable () -> UUID
     ) {
         self.snapService = snapService
         self.draftCenter = draftCenter
@@ -36,6 +36,7 @@ final class ContextSnapCoordinator {
         }
         draftCenter.requestRestore(
             text: snap.markdown(),
+            attachmentPaths: [],
             sessionID: activeSessionID()
         )
     }

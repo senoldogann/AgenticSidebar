@@ -3,6 +3,7 @@ import SwiftUI
 /// Inline summary card shown in the transcript when a turn modified or created files.
 struct FileChangesSummaryCard: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.paneWidth) private var paneWidth
 
     let summary: TurnFileChangesSummary
     @Binding var isExpanded: Bool
@@ -105,8 +106,10 @@ struct FileChangesSummaryCard: View {
                     Image(systemName: "doc.badge.plus")
                         .font(.system(size: 10.5, weight: .medium))
 
-                    Text("Review")
-                        .font(.system(size: 11, weight: .medium))
+                    if !PaneResponsive.isCompact(width: paneWidth) {
+                        Text("Review")
+                            .font(.system(size: 11, weight: .medium))
+                    }
                 }
                 .foregroundStyle(.primary)
                 .padding(.horizontal, 9)
@@ -140,12 +143,15 @@ struct FileChangesSummaryCard: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
-
-                Text(file.directoryPath)
-                    .font(.system(size: 10.5, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
                     .truncationMode(.middle)
+
+                if !PaneResponsive.isCompact(width: paneWidth) {
+                    Text(file.directoryPath)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 Spacer(minLength: 6)
 

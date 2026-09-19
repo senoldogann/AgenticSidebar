@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class BackendRestartResilienceTests: XCTestCase {
@@ -57,7 +58,8 @@ final class BackendRestartResilienceTests: XCTestCase {
         XCTAssertEqual(requests.count, 2)
         let launchedPorts = requests.map { request -> String in
             guard let portIndex = request.arguments.firstIndex(of: "--port"),
-                  request.arguments.indices.contains(portIndex + 1) else {
+                request.arguments.indices.contains(portIndex + 1)
+            else {
                 return "missing"
             }
             return request.arguments[portIndex + 1]
@@ -127,10 +129,159 @@ final class BackendRestartResilienceTests: XCTestCase {
 
         let createdSessions = await client.createdSessions()
         let prompts = await client.prompts()
+        let deletedSessions = await client.deletedSessions()
 
-        XCTAssertEqual(createdSessions, ["ses_1", "ses_2"])
+        // The fake names sessions by count, so the replacement reuses `ses_1`:
+        // what matters is that the rejected orphan was deleted, not kept.
+        XCTAssertEqual(createdSessions.count, 1)
+        XCTAssertEqual(deletedSessions, ["ses_1"])
         XCTAssertEqual(prompts.count, 2)
         XCTAssertEqual(prompts.first, prompts.last)
+    }
+
+    func testFailedFirstPromptDropsMappingSoNextTurnStartsFresh() async throws {
+        let serverManager = MutableConnectionServerManager(
+            connection: makeConnection(port: 51403)
+        )
+        let client = RestartRecordingOpenCodeClient(
+            promptErrors: [ProviderRuntimeError.transport]
+        )
+        let runtime = OpenCodeProviderRuntime(
+            serverManager: serverManager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+        let sessionID = UUID()
+
+        do {
+            _ = try await runtime.startStream(for: makeRequest(sessionID: sessionID))
+            XCTFail("A failed first prompt must surface, not hang")
+        } catch {
+            XCTAssertEqual(error as? ProviderRuntimeError, .transport)
+        }
+
+        let retryRequest = ProviderRequest(
+            sessionID: sessionID,
+            configuration: SessionConfiguration(
+                providerID: ProviderID("opencode"),
+                modelID: ProviderModelID("anthropic/claude/opus"),
+                variantID: nil
+            ),
+            messages: [
+                ChatMessage(role: .user, text: "Old question"),
+                ChatMessage(role: .assistant, text: "Old answer"),
+                ChatMessage(role: .user, text: "New question"),
+            ],
+            speedMode: .normal
+        )
+        let retry = try await runtime.startStream(for: retryRequest)
+        await retry.cancel()
+
+        let sessionsAfterRetry = await client.createdSessions()
+        let deletionsAfterRetry = await client.deletedSessions()
+        let retryPrompts = await client.prompts()
+        // Same naming caveat as above: the recreated session reuses `ses_1`.
+        XCTAssertEqual(sessionsAfterRetry.count, 1)
+        XCTAssertEqual(deletionsAfterRetry, ["ses_1"])
+        XCTAssertEqual(retryPrompts.count, 2)
+        XCTAssertTrue(
+            retryPrompts.last?.contains("Conversation history restored") ?? false,
+            "The turn after a failed first prompt must carry the preamble again"
+        )
+    }
+
+    func testRetryFailureAlsoDropsMappingSoNextTurnStartsFresh() async throws {
+        let serverManager = MutableConnectionServerManager(
+            connection: makeConnection(port: 51404)
+        )
+        let client = RestartRecordingOpenCodeClient(
+            promptErrors: [ProviderRuntimeError.unexpectedResponse, ProviderRuntimeError.transport]
+        )
+        let runtime = OpenCodeProviderRuntime(
+            serverManager: serverManager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+        let sessionID = UUID()
+
+        do {
+            _ = try await runtime.startStream(for: makeRequest(sessionID: sessionID))
+            XCTFail("A twice-failed prompt must surface, not hang")
+        } catch {
+            XCTAssertEqual(error as? ProviderRuntimeError, .transport)
+        }
+
+        let deletions = await client.deletedSessions()
+        XCTAssertEqual(
+            deletions.count,
+            2,
+            "Both the rejected orphan and the failed retry must be deleted"
+        )
+
+        let retryRequest = ProviderRequest(
+            sessionID: sessionID,
+            configuration: SessionConfiguration(
+                providerID: ProviderID("opencode"),
+                modelID: ProviderModelID("anthropic/claude/opus"),
+                variantID: nil
+            ),
+            messages: [
+                ChatMessage(role: .user, text: "Old question"),
+                ChatMessage(role: .assistant, text: "Old answer"),
+                ChatMessage(role: .user, text: "New question"),
+            ],
+            speedMode: .normal
+        )
+        let retry = try await runtime.startStream(for: retryRequest)
+        await retry.cancel()
+
+        let secondRetryPrompts = await client.prompts()
+        XCTAssertEqual(secondRetryPrompts.count, 3)
+        XCTAssertTrue(
+            secondRetryPrompts.last?.contains("Conversation history restored") ?? false,
+            "The turn after a failed retry must carry the preamble again"
+        )
+    }
+
+    func testPermissionDedupEvictsOldest() async throws {
+        // 130 distinct requests overflow the 128-entry turn dedup; repeating
+        // the evicted oldest must be answered again, not mistaken for a dupe.
+        // `ses_1` is the fake's first created session (see its createSession).
+        var lines: [String] = []
+        for index in 0..<130 {
+            lines.append(
+                "data: {\"type\":\"permission.asked\",\"properties\":{\"sessionID\":\"ses_1\",\"id\":\"per_\(index)\",\"permission\":\"bash\",\"patterns\":[\"ls\"],\"always\":[]}}"
+            )
+        }
+        lines.append(
+            "data: {\"type\":\"permission.asked\",\"properties\":{\"sessionID\":\"ses_1\",\"id\":\"per_0\",\"permission\":\"bash\",\"patterns\":[\"ls\"],\"always\":[]}}"
+        )
+        lines.append("data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_1\"}}")
+
+        let serverManager = MutableConnectionServerManager(
+            connection: makeConnection(port: 51405)
+        )
+        let client = RestartRecordingOpenCodeClient(streamLines: lines)
+        let runtime = OpenCodeProviderRuntime(
+            serverManager: serverManager,
+            clientFactory: { _ in client },
+            permissionHandler: { _ in .once },
+            cancelPendingPermissions: nil
+        )
+
+        let stream = try await runtime.startStream(for: makeRequest(sessionID: UUID()))
+        for try await _ in stream.events {}
+
+        let deadline = ContinuousClock.now + .seconds(10)
+        var replies: [String] = []
+        while ContinuousClock.now < deadline {
+            replies = await client.replies()
+            if replies.count >= 131 { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(replies.count, 131)
     }
 
     func testClientWithoutAgentSelectionRefusesReadOnlyPlan() async {
@@ -335,10 +486,14 @@ private actor MutableConnectionServerManager: OpenCodeServerManaging {
 private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
     private var sessions: [String] = []
     private var recordedPrompts: [String] = []
+    private var recordedDeletions: [String] = []
+    private var recordedReplies: [String] = []
     private var promptErrors: [Error]
+    private let streamLines: [String]
 
-    init(promptErrors: [Error] = []) {
+    init(promptErrors: [Error] = [], streamLines: [String] = []) {
         self.promptErrors = promptErrors
+        self.streamLines = streamLines
     }
 
     func capabilities() async throws -> ProviderCapabilities {
@@ -360,6 +515,7 @@ private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
     }
 
     func deleteSession(sessionID: String) async throws {
+        recordedDeletions.append(sessionID)
         sessions.removeAll { $0 == sessionID }
     }
 
@@ -370,7 +526,7 @@ private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
         parts: [OpenCodePromptPart]
     ) async throws {
         let text = parts.compactMap { part -> String? in
-            if case let .text(str) = part { return str }
+            if case .text(let str) = part { return str }
             return nil
         }.joined(separator: "\n")
         recordedPrompts.append(text)
@@ -382,7 +538,9 @@ private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
 
     func abort(sessionID: String) async throws {}
 
-    func replyPermission(requestID: String, reply: String) async throws {}
+    func replyPermission(requestID: String, reply: String) async throws {
+        recordedReplies.append(requestID)
+    }
 
     func sessionTodos(sessionID: String) async throws -> [AgentTodo] {
         []
@@ -403,12 +561,23 @@ private actor RestartRecordingOpenCodeClient: OpenCodeClientProtocol {
 
     func eventStream() async throws -> OpenCodeLineStream {
         let pair = AsyncThrowingStream<String, Error>.makeStream()
+        for line in streamLines {
+            pair.continuation.yield(line)
+        }
         pair.continuation.finish()
         return OpenCodeLineStream(statusCode: 200, lines: pair.stream)
     }
 
     func createdSessions() -> [String] {
         sessions
+    }
+
+    func deletedSessions() -> [String] {
+        recordedDeletions
+    }
+
+    func replies() -> [String] {
+        recordedReplies
     }
 
     func prompts() -> [String] {

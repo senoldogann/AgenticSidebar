@@ -1,21 +1,52 @@
+import AppKit
 import PDFKit
 import SwiftUI
 
 struct ConversationDetailView: View {
     let sessionService: any AgentSessionServiceProtocol
     let permissionApprovalCenter: PermissionApprovalCenter
+    let collapseStore: TimelineCollapseStore
+    let focusedSessionID: UUID?
+    let paneID: String?
+    let showsNavigationTitle: Bool
+
+    init(
+        sessionService: any AgentSessionServiceProtocol,
+        permissionApprovalCenter: PermissionApprovalCenter,
+        collapseStore: TimelineCollapseStore,
+        focusedSessionID: UUID?,
+        paneID: String?,
+        showsNavigationTitle: Bool
+    ) {
+        self.sessionService = sessionService
+        self.permissionApprovalCenter = permissionApprovalCenter
+        self.collapseStore = collapseStore
+        self.focusedSessionID = focusedSessionID
+        self.paneID = paneID
+        self.showsNavigationTitle = showsNavigationTitle
+    }
+
+    private var focusedSession: AgentSession {
+        if let focusedSessionID, let session = sessionService.session(for: focusedSessionID) {
+            return session
+        }
+        return sessionService.activeSession
+    }
 
     @Environment(SettingsStore.self) private var settingsStore
     /// What "write again" on an earlier message is for: the draft it edits lives
     /// in the composer, one view away.
     @Environment(ComposerDraftCenter.self) private var draftCenter: ComposerDraftCenter?
+    @Environment(SessionComposerPrefs.self) private var composerPrefs: SessionComposerPrefs?
     @Environment(\.colorScheme) private var systemColorScheme
+    @Environment(\.paneWidth) private var paneWidth
 
     /// Sağ panelde açık olan sekmeler ve seçili olan sekme kimliği.
     @State private var inspectorTabs: [InspectorTab] = []
     @State private var selectedInspectorTabID: String? = nil
     @State private var inspectorWidth: CGFloat = 620
     @State private var isInspectorExpanded: Bool = false
+    @State private var terminalCenter = TerminalServiceCenter()
     /// Yalnız bu iki karar gövdeyi etkiler. Kaydırma ölçümleri bunlara doğrudan
     /// yazılmaz: ölçümü yapan geri çağrı bir ekran döngüsünün içinde çalışır ve
     /// oradan `@State` yazmak aynı döngüde yeni bir yerleşim turu ister.
@@ -26,6 +57,23 @@ struct ConversationDetailView: View {
     @State private var messageCountScrollTask: Task<Void, Never>?
     @State private var activePromptID: UUID? = nil
     @State private var offsetTracker = PromptOffsetTracker()
+    /// Inspector yerleşim animasyonu bitince dibe sabitleyen görev: art arda
+    /// açılıp kapanmalarda yalnız sonuncusu yaşar, yoksa bayat görev elle
+    /// yukarı kaydırmış kullanıcıyı dibe çekerdi.
+    @State private var inspectorPinTask: Task<Void, Never>?
+    /// Collapse değişiminde konumu sabitleyen görev: art arda açılıp
+    /// kapanmalarda yalnız sonuncusu yaşar (inspector görevindekiyle aynı
+    /// gerekçe).
+    @State private var collapsePinTask: Task<Void, Never>?
+    /// Bölme genişliği animasyonla değişirken satır konumlarını ölçmek SwiftUI
+    /// geometri eylemini aynı karede ileri geri besler. Ölçüm, genişlik kısa
+    /// süre sabit kaldıktan sonra yeniden açılır.
+    @State private var isPaneResizing = false
+    @State private var paneResizeSettleTask: Task<Void, Never>?
+    /// Sağ panel durumu oturum başına saklanır: bölme kimliği (`pane-…`)
+    /// sohbet değişiminde aynı kaldığı için `@State` sekmeler yok olmazdı ve
+    /// bir sohbette açılan rapor diğer sohbete geçince de görünürdü.
+    @State private var inspectorStateBySession: [UUID: InspectorPaneState] = [:]
     /// Ölçümler burada toplanır ve döngü dışında yayınlanır (bkz. `body.task`).
     @State private var followState = ScrollFollowState()
 
@@ -33,6 +81,14 @@ struct ConversationDetailView: View {
     /// during streaming the body runs many times a second, and the rail titles
     /// and activity anchors do not change while an answer grows.
     @State private var indexCache = TranscriptIndexCache()
+    /// Yan soru (`/btw`) servisi: bölme başına yaşar, bellek oturum kimliğine
+    /// göre tutulur. Pane-scope seçimi `focusedSession.id` üzerinden yapılır,
+    /// o yüzden bölmeler birbirinin sorusunu görmez.
+    @State private var sideQuestionService = SideQuestionService()
+    /// Hedef (`/goal`) orkestratörü: bölme başına yaşar, diskteki tek koşu
+    /// kuralıyla ikinci bölme çalışırken başlatmayı reddeder.
+    @State private var goalOrchestrator = GoalOrchestrator()
+    @Environment(ComposerDraftMemory.self) private var draftMemory: ComposerDraftMemory?
 
     private let contentMaxWidth: CGFloat = 820
 
@@ -45,117 +101,165 @@ struct ConversationDetailView: View {
         ZStack(alignment: .bottom) {
             HStack(spacing: 0) {
                 VStack(spacing: 0) {
-                    if sessionService.state.messages.isEmpty {
+                    if focusedSession.state.messages.isEmpty {
                         emptyStateView(preset: preset)
                     } else {
                         transcriptScrollView(preset: preset, isDark: isDark)
                     }
 
-                if let error = sessionService.state.error,
-                   !sessionService.state.messages.isEmpty {
-                    sessionBanner(
-                        symbol: error.symbolName,
-                        message: error.message,
-                        tint: .orange
+                    if let error = focusedSession.state.error,
+                        !focusedSession.state.messages.isEmpty
+                    {
+                        sessionBanner(
+                            symbol: error.symbolName,
+                            message: error.message,
+                            tint: .orange,
+                            onDismiss: nil
+                        )
+                    }
+
+                    if let notice = focusedSession.state.notice,
+                        !focusedSession.state.messages.isEmpty
+                    {
+                        sessionBanner(
+                            symbol: notice.symbolName,
+                            message: notice.message,
+                            tint: .secondary,
+                            onDismiss: {
+                                focusedSession.dismissNotice()
+                            }
+                        )
+                    }
+
+                    if let question = focusedSession.state.activeQuestion {
+                        AgentQuestionCard(
+                            question: question,
+                            preset: preset,
+                            isDark: isDark,
+                            isSubmitting: focusedSession.state.isQuestionSubmitting,
+                            submissionFailed: focusedSession.state.questionSubmissionFailed,
+                            onAnswer: { answer in
+                                focusedSession.answerActiveQuestion(answer)
+                            },
+                            onDismiss: {
+                                focusedSession.dismissActiveQuestion()
+                            }
+                        )
+                        .id(question.id)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    } else if let request = permissionApprovalCenter.pending.first(where: {
+                        $0.appSessionID == focusedSession.id
+                    }) ?? (focusedSessionID == nil ? permissionApprovalCenter.pending.first(where: { $0.appSessionID == nil }) : nil) {
+                        let sessionPendingCount = permissionApprovalCenter.pending.filter {
+                            $0.appSessionID == focusedSession.id || (focusedSessionID == nil && $0.appSessionID == nil)
+                        }.count
+                        permissionApprovalBar(
+                            request,
+                            pendingCount: sessionPendingCount,
+                            preset: preset,
+                            isDark: isDark
+                        )
+                    }
+
+                    SideQuestionPanelView(
+                        service: sideQuestionService,
+                        onInsertToComposer: { insertSideAnswerToComposer($0) },
+                        onClose: { sideQuestionService.dismiss() }
+                    )
+                    GoalPanelView(orchestrator: goalOrchestrator)
+
+                    ComposerView(
+                        sessionService: sessionService,
+                        permissionApprovalCenter: permissionApprovalCenter,
+                        focusedSessionID: focusedSessionID,
+                        onInspectFile: { url in
+                            openFileInInspector(url: url)
+                        },
+                        onSideQuestion: { question, speedMode, mode in
+                            askSideQuestion(question, speedMode: speedMode, mode: mode)
+                        },
+                        onStartGoal: { objective, speedMode, mode in
+                            startGoalObjective(objective, speedMode: speedMode, mode: mode)
+                        },
+                        onCompactSession: {
+                            focusedSession.requestCompaction()
+                        },
+                        fileManager: .default
                     )
                 }
+                .frame(
+                    minWidth: isInspectorExpanded ? 0 : 360,
+                    maxWidth: isInspectorExpanded ? 0 : .infinity,
+                    maxHeight: .infinity
+                )
+                .opacity(isInspectorExpanded ? 0 : 1)
 
-                if let notice = sessionService.state.notice,
-                   !sessionService.state.messages.isEmpty {
-                    sessionBanner(
-                        symbol: notice.symbolName,
-                        message: notice.message,
-                        tint: .secondary
-                    )
-                }
+                if !inspectorTabs.isEmpty,
+                    let selectedID = selectedInspectorTabID,
+                    let activeTab = inspectorTabs.first(where: { $0.id == selectedID }) ?? inspectorTabs.last
+                {
+                    if !isInspectorExpanded {
+                        inspectorResizeSplitter
+                    }
 
-                if let question = sessionService.state.activeQuestion {
-                    AgentQuestionCard(
-                        question: question,
+                    InspectorTabsContainerView(
+                        tabs: inspectorTabs,
+                        selectedTabID: activeTab.id,
                         preset: preset,
                         isDark: isDark,
-                        isSubmitting: sessionService.state.isQuestionSubmitting,
-                        submissionFailed: sessionService.state.questionSubmissionFailed,
-                        onAnswer: { answer in
-                            sessionService.answerActiveQuestion(answer)
+                        isExpanded: isInspectorExpanded,
+                        terminalCenter: terminalCenter,
+                        onSelectTab: { tabID in
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                selectedInspectorTabID = tabID
+                            }
                         },
-                        onDismiss: {
-                            sessionService.dismissActiveQuestion()
+                        onCloseTab: { tabID in
+                            closeInspectorTab(tabID)
+                        },
+                        onToggleExpand: {
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                isInspectorExpanded.toggle()
+                            }
+                        },
+                        onCloseAll: {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                                for tab in inspectorTabs {
+                                    if case .terminal(let id, _) = tab.kind {
+                                        terminalCenter.close(id: id)
+                                    }
+                                }
+                                inspectorTabs = []
+                                selectedInspectorTabID = nil
+                                isInspectorExpanded = false
+                            }
                         }
                     )
-                    .id(question.id)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                } else if let request = permissionApprovalCenter.pending.first(where: {
-                    $0.appSessionID == sessionService.activeSessionID
-                }) ?? permissionApprovalCenter.pending.first {
-                    permissionApprovalBar(
-                        request,
-                        pendingCount: permissionApprovalCenter.pending.count,
-                        preset: preset,
-                        isDark: isDark
+                    .frame(
+                        minWidth: isInspectorExpanded ? 400 : 380,
+                        idealWidth: isInspectorExpanded ? nil : inspectorWidth,
+                        maxWidth: isInspectorExpanded ? .infinity : inspectorWidth
                     )
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-
-                ComposerView(
-                    sessionService: sessionService,
-                    permissionApprovalCenter: permissionApprovalCenter,
-                    onInspectFile: { url in
-                        openFileInInspector(url: url)
-                    }
-                )
-            }
-            .frame(
-                minWidth: isInspectorExpanded ? 0 : 360,
-                maxWidth: isInspectorExpanded ? 0 : .infinity,
-                maxHeight: .infinity
-            )
-            .opacity(isInspectorExpanded ? 0 : 1)
-
-            if !inspectorTabs.isEmpty,
-               let selectedID = selectedInspectorTabID,
-               let activeTab = inspectorTabs.first(where: { $0.id == selectedID }) ?? inspectorTabs.last {
-                if !isInspectorExpanded {
-                    inspectorResizeSplitter
-                }
-
-                InspectorTabsContainerView(
-                    tabs: inspectorTabs,
-                    selectedTabID: activeTab.id,
-                    preset: preset,
-                    isDark: isDark,
-                    isExpanded: isInspectorExpanded,
-                    onSelectTab: { tabID in
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            selectedInspectorTabID = tabID
-                        }
-                    },
-                    onCloseTab: { tabID in
-                        closeInspectorTab(tabID)
-                    },
-                    onToggleExpand: {
-                        withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                            isInspectorExpanded.toggle()
-                        }
-                    },
-                    onCloseAll: {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
-                            inspectorTabs = []
-                            selectedInspectorTabID = nil
-                            isInspectorExpanded = false
-                        }
-                    }
-                )
-                .frame(
-                    minWidth: isInspectorExpanded ? 400 : 380,
-                    idealWidth: isInspectorExpanded ? nil : inspectorWidth,
-                    maxWidth: isInspectorExpanded ? .infinity : inspectorWidth
-                )
-                .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-    }
         .background(isDark ? preset.backgroundDark : preset.backgroundLight)
-        .navigationTitle(sessionService.activeSessionTitle)
+        .navigationTitle(showsNavigationTitle ? focusedSession.title : "")
+        .onReceive(NotificationCenter.default.publisher(for: .openPaneTerminal)) { notification in
+            guard let targetPane = notification.object as? String else { return }
+            let myPane = paneID ?? "primary"
+            guard targetPane == myPane else { return }
+            let dir = ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+            openTerminalInInspector(workingDirectory: dir)
+        }
+        .onAppear {
+            // Yarım kalan hedef varsa panel devam etmeyi önerir (otomatik
+            // başlamaz). Koşu yoksa veya bu bölmede zaten aktifse sessizdir.
+            if let storeURL = GoalStore.liveFileURL() {
+                goalOrchestrator.noticeStoredRun(storeURL: storeURL, bridge: goalBridge())
+            }
+        }
         .task {
             // Kaydırma ölçümlerini ekran döngüsünün dışında yayınlar. Ölçümü
             // yapan geri çağrının içinde yayınlamak, aynı döngüde yerleşimi
@@ -165,6 +269,27 @@ struct ConversationDetailView: View {
                 try? await Task.sleep(for: ScrollFollowState.publishInterval)
                 publishFollowMeasurements()
             }
+        }
+        .onChange(of: focusedSession.id) { oldID, newID in
+            // Bayat kaydırma sabitleme: collapse/inspector görevleri eski
+            // bölmenin `proxy` ve `messageID` değerlerini tutar; oturum
+            // değişince uyanıp yanlış transkripte `scrollTo` yapmamalı.
+            collapsePinTask?.cancel()
+            collapsePinTask = nil
+            inspectorPinTask?.cancel()
+            inspectorPinTask = nil
+            switchInspectorState(from: oldID, to: newID)
+        }
+        .onChange(of: paneWidth) { _, _ in
+            handlePaneWidthChange()
+        }
+        .onDisappear {
+            collapsePinTask?.cancel()
+            collapsePinTask = nil
+            inspectorPinTask?.cancel()
+            inspectorPinTask = nil
+            paneResizeSettleTask?.cancel()
+            paneResizeSettleTask = nil
         }
     }
 
@@ -180,12 +305,22 @@ struct ConversationDetailView: View {
     /// A plan is actionable only while it is the newest thing in the transcript,
     /// the session is idle, and the composer still says Plan. Anything else means
     /// the user has moved on.
-    private func isPlanAwaitingApproval(for message: ChatMessage) -> Bool {
+    private func isPlanAwaitingApproval(
+        for message: ChatMessage,
+        lastMessageID: UUID?,
+        isBusy: Bool
+    ) -> Bool {
+        let currentMode =
+            composerPrefs?.effectiveAgentMode(
+                for: focusedSession.id,
+                default: settingsStore.agentMode
+            ) ?? settingsStore.agentMode
+
         guard
             message.role == .assistant,
-            settingsStore.agentMode == .plan || settingsStore.agentMode == .review,
-            !sessionService.isBusy,
-            message.id == sessionService.state.messages.last?.id
+            currentMode == .plan || currentMode == .review,
+            !isBusy,
+            message.id == lastMessageID
         else {
             return false
         }
@@ -196,12 +331,22 @@ struct ConversationDetailView: View {
     /// Approving is what leaves Plan mode: the mode flips first, then the
     /// assistant is told to build, so nothing is ever built before consent.
     private func approvePlan() {
-        settingsStore.agentMode = .build
+        if let composerPrefs {
+            composerPrefs.setAgentMode(.build, for: focusedSession.id)
+        } else {
+            settingsStore.agentMode = .build
+        }
 
-        let acceptance = sessionService.send(
+        let speedMode =
+            composerPrefs?.effectiveSpeedMode(
+                for: focusedSession.id,
+                default: settingsStore.responseSpeedMode
+            ) ?? settingsStore.responseSpeedMode
+
+        let acceptance = focusedSession.send(
             Self.planApprovalPrompt,
             attachmentPaths: [],
-            speedMode: settingsStore.responseSpeedMode,
+            speedMode: speedMode,
             mode: .build,
             tags: []
         )
@@ -220,7 +365,7 @@ struct ConversationDetailView: View {
         draftCenter?.requestRestore(
             text: message.text,
             attachmentPaths: message.attachmentPaths,
-            sessionID: sessionService.activeSessionID
+            sessionID: focusedSession.id
         )
     }
 
@@ -235,12 +380,16 @@ struct ConversationDetailView: View {
     private func transcriptRow(
         for message: ChatMessage,
         preset: AppThemePreset,
-        isDark: Bool
+        isDark: Bool,
+        index: TranscriptIndex,
+        isBusy: Bool,
+        hasPendingApprovalForActiveSession: Bool,
+        onCollapse: ((UUID) -> Void)? = nil
     ) -> some View {
         let isVisibleUser = message.role == .user
         let isVisibleAssistant = message.role == .assistant && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasTurnHeader = message.role == .user && shouldShowTurnHeader(for: message)
-        let activityGroup = activityGroup(after: message.id)
+        let hasTurnHeader = message.role == .user && shouldShowTurnHeader(for: message, index: index, isBusy: isBusy)
+        let activityGroup = index.activityGroup(after: message.id)
 
         VStack(alignment: .leading, spacing: 4) {
             if isVisibleUser || isVisibleAssistant {
@@ -249,12 +398,16 @@ struct ConversationDetailView: View {
                     preset: preset,
                     isDark: isDark,
                     contrast: settingsStore.contrast,
-                    isPlanAwaitingApproval: isPlanAwaitingApproval(for: message),
-                    canResend: !sessionService.isBusy,
+                    isPlanAwaitingApproval: isPlanAwaitingApproval(
+                        for: message,
+                        lastMessageID: index.lastMessageID,
+                        isBusy: isBusy
+                    ),
+                    canResend: !isBusy,
                     isActiveAssistant: message.role == .assistant
-                        && sessionService.isBusy
-                        && message.id == sessionService.state.messages.last?.id,
-                    isLastAssistantOfTurn: isLastAssistantMessageOfTurn(message),
+                        && isBusy
+                        && message.id == index.lastMessageID,
+                    isLastAssistantOfTurn: index.lastAssistantMessageIDs.contains(message.id),
                     onApprovePlan: approvePlan,
                     onRestore: { writeAgain(message) },
                     onInspectFile: { url in
@@ -265,7 +418,7 @@ struct ConversationDetailView: View {
                     PromptOffsetProbe(
                         messageID: message.id,
                         isUserMessage: message.role == .user,
-                        isEnabled: promptItems.count > 1,
+                        isEnabled: promptItems.count > 1 && !isPaneResizing,
                         space: Self.transcriptSpace,
                         onOffset: { messageID, offset in
                             reportPromptOffset(offset, for: messageID)
@@ -275,80 +428,76 @@ struct ConversationDetailView: View {
             }
 
             if hasTurnHeader {
-                turnHeaderView(for: message, isDark: isDark)
+                turnHeaderView(
+                    for: message,
+                    isDark: isDark,
+                    lastUserMessageID: index.lastUserMessageID,
+                    isBusy: isBusy
+                )
             }
 
             if let activityGroup {
+                let isTurnAct = isTurnActive(
+                    for: activityGroup,
+                    isBusy: isBusy,
+                    activeTurnMessageIDs: index.activeTurnMessageIDs
+                )
                 AgentActivityTimelineView(
                     group: activityGroup,
-                    isTurnActive: isTurnActive(for: activityGroup),
-                    isSessionBusy: sessionService.isBusy,
-                    hasPendingApproval: hasPendingApproval(for: activityGroup),
+                    isTurnActive: isTurnAct,
+                    isSessionBusy: isBusy,
+                    hasPendingApproval: hasPendingApprovalForActiveSession && isTurnAct,
+                    sessionID: focusedSession.id,
+                    collapseStore: collapseStore,
                     onOpenReport: { activity in
                         openSubagentReportInInspector(activity: activity)
                     },
                     onOpenReview: { summary, file in
                         openReviewInInspector(summary: summary, initialFile: file)
+                    },
+                    onCollapseChange: {
+                        onCollapse?(message.id)
                     }
                 )
+                .equatable()
             }
         }
         .id(message.id)
     }
 
-    private func isLastAssistantMessageOfTurn(_ message: ChatMessage) -> Bool {
-        guard message.role == .assistant else { return false }
-        let allMessages = sessionService.state.messages
-        guard let index = allMessages.firstIndex(where: { $0.id == message.id }) else {
-            return false
-        }
-        for i in (index + 1)..<allMessages.count {
-            let next = allMessages[i]
-            if next.role == .user {
-                return true
-            }
-            if next.role == .assistant {
-                return false
-            }
-        }
-        return true
-    }
-
-    private func shouldShowTurnHeader(for userMessage: ChatMessage) -> Bool {
+    private func shouldShowTurnHeader(
+        for userMessage: ChatMessage,
+        index: TranscriptIndex,
+        isBusy: Bool
+    ) -> Bool {
         guard userMessage.role == .user else { return false }
-        if sessionService.isBusy && userMessage.id == sessionService.state.messages.last(where: { $0.role == .user })?.id {
+        if isBusy && userMessage.id == index.lastUserMessageID {
             return true
         }
-        let allMessages = sessionService.state.messages
-        guard let index = allMessages.firstIndex(where: { $0.id == userMessage.id }) else {
-            return false
-        }
-        if index + 1 < allMessages.count && allMessages[index + 1].role == .assistant {
-            return true
-        }
-        if activityGroup(after: userMessage.id) != nil {
-            return true
-        }
-        return false
+        return index.turnHeaderUserMessageIDs.contains(userMessage.id)
     }
 
     @ViewBuilder
-    private func turnHeaderView(for userMessage: ChatMessage, isDark: Bool) -> some View {
-        let isCurrentBusyTurn = sessionService.isBusy &&
-            userMessage.id == sessionService.state.messages.last(where: { $0.role == .user })?.id
+    private func turnHeaderView(
+        for userMessage: ChatMessage,
+        isDark: Bool,
+        lastUserMessageID: UUID?,
+        isBusy: Bool
+    ) -> some View {
+        let isCurrentBusyTurn = isBusy && userMessage.id == lastUserMessageID
 
         VStack(alignment: .leading, spacing: 4) {
             if isCurrentBusyTurn {
                 TimelineView(.periodic(from: .now, by: 1.0)) { context in
-                    let start = sessionService.state.startedAt ?? Date()
+                    let start = focusedSession.state.startedAt ?? Date()
                     let duration = formatTurnDuration(startedAt: start, endedAt: context.date)
                     Text("Working for \(duration)")
                         .font(.system(size: 13, weight: .regular))
                         .foregroundStyle(.secondary)
                 }
             } else {
-                let start = sessionService.state.startedAt ?? userMessage.createdAt
-                let end = sessionService.state.completedAt ?? Date()
+                let start = focusedSession.state.startedAt ?? userMessage.createdAt
+                let end = focusedSession.state.completedAt ?? Date()
                 let duration = formatTurnDuration(startedAt: start, endedAt: end)
                 Text("Working for \(duration)")
                     .font(.system(size: 13, weight: .regular))
@@ -396,7 +545,156 @@ struct ConversationDetailView: View {
 
     // MARK: - Inspector Tabs
 
+    /// Yan soru (`/btw`): besteci kancası panele taşınır. Bağlam bu bölmenin
+    /// oturumundan kurulur; transkripte ve turn makinesine dokunulmaz.
+    private func askSideQuestion(_ question: String, speedMode: ResponseSpeedMode, mode: AgentMode) {
+        guard let context = sessionService.sideQuestionContext(for: focusedSession.id) else {
+            sideQuestionService.fail(
+                sessionID: focusedSession.id,
+                question: question,
+                message: "This conversation has no provider context yet."
+            )
+            return
+        }
+        sideQuestionService.ask(
+            context: context,
+            sessionID: focusedSession.id,
+            question: question,
+            speedMode: speedMode,
+            mode: mode
+        )
+    }
+
+    /// Yan cevabı besteci taslağına ekler (metin korunur, altına eklenir).
+    private func insertSideAnswerToComposer(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let draftMemory else {
+            return
+        }
+        let key = focusedSessionID ?? sessionService.activeSessionID
+        var drafts = draftMemory.drafts
+        var draft = drafts[key, default: .empty]
+        draft.text = draft.text.isEmpty ? trimmed : draft.text + "\n\n" + trimmed
+        drafts[key] = draft
+        draftMemory.drafts = drafts
+    }
+
+    /// Hedef (`/goal`): besteci kancası orkestratöre taşınır. Doğrulama
+    /// dizini ajanın çalışma dizinidir; diskteki tek-koşu kuralı ikinci
+    /// bölmenin aynı anda başlatmasını engeller. Başarıyı döner: besteci
+    /// taslağı yalnız kabulde temizler, rette metin alanda kalır.
+    @discardableResult
+    private func startGoalObjective(_ objective: String, speedMode: ResponseSpeedMode, mode: AgentMode) -> Bool {
+        let directory = resolvedGoalDirectory()
+        let started = goalOrchestrator.start(
+            objective: objective,
+            sessionID: focusedSession.id,
+            speedMode: speedMode,
+            mode: mode,
+            workingDirectory: directory,
+            bridge: goalBridge(),
+            storeURL: GoalStore.liveFileURL()
+        )
+        if started {
+            GoalStore.savePreferredPackageDirectory(directory.path)
+        }
+        return started
+    }
+
+    /// Hedef doğrulamanın koşacağı dizin: önce bu bölmenin bilinen dizini
+    /// (koşan/biten koşudan), sonra kayıtlı tercih (geçerliyse), sonra
+    /// oturumdaki dosya sinyallerinden türetilen paket dizini (ekler,
+    /// aktivite yoları). Yönetilen dizinde `Package.swift` yoktur; körü
+    /// körüne orayı vermek her `/goal`u retle düşürüyordu. Hiçbir sinyal
+    /// paket vermezse yönetilen dizin döner ve orkestratör reddeder.
+    private func resolvedGoalDirectory() -> URL {
+        let known = [goalOrchestrator.workingDirectoryPath, GoalStore.preferredPackageDirectory() ?? ""]
+        if let found = GoalRunners.resolvePackageDirectory(
+            knownPaths: known,
+            seedPaths: Self.goalDirectorySeeds(
+                messages: focusedSession.state.messages,
+                groups: focusedSession.state.activityGroups
+            )
+        ) {
+            return found
+        }
+        return ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+    }
+
+    /// Oturumdaki dosya sinyalleri (en yeniden en eskiye, üst sınırlı):
+    /// ileti ekleri ve aktivite detay yolları. Paket araması bunları tohum
+    /// sayar; kullanıcıya klasör sormadan dizin bulunur.
+    static func goalDirectorySeeds(
+        messages: [ChatMessage],
+        groups: [AgentTurnActivityGroup],
+        maximumSeeds: Int = 50
+    ) -> [String] {
+        var seeds: [String] = []
+        seeds.reserveCapacity(maximumSeeds)
+        for message in messages.reversed() {
+            for path in message.attachmentPaths.reversed() {
+                seeds.append(path)
+                if seeds.count >= maximumSeeds {
+                    return seeds
+                }
+            }
+        }
+        for group in groups.reversed() {
+            for activity in group.activities.reversed() {
+                if let detail = activity.detail {
+                    seeds.append(detail)
+                    if seeds.count >= maximumSeeds {
+                        return seeds
+                    }
+                }
+            }
+        }
+        return seeds
+    }
+
+    private func goalBridge() -> GoalOrchestrator.Bridge {
+        GoalOrchestrator.Bridge(
+            isBusy: { [sessionService] id in
+                sessionService.session(for: id)?.isBusy ?? false
+            },
+            activityCount: { [sessionService] id in
+                sessionService.session(for: id)?.state.activityGroups.flatMap(\.activities).count ?? 0
+            },
+            submit: { [sessionService] id, text, turnMode, turnSpeed in
+                sessionService.session(for: id)?.send(
+                    text,
+                    attachmentPaths: [],
+                    speedMode: turnSpeed,
+                    mode: turnMode,
+                    tags: []
+                ) ?? .rejected
+            },
+            turnError: { [sessionService] id in
+                sessionService.session(for: id)?.state.error
+            }
+        )
+    }
+
     private func openFileInInspector(url: URL) {
+        // Sembolik bağ kaçışı: yönetilen dizin içinde görünüp dışarıyı
+        // gösteren bağ (ya da dışarıdaki dosya) sessizce önizlenmez;
+        // bağlantı tıklamalarındaki desenle aynı bilinçli onay istenir.
+        let canonical = url.resolvingSymlinksInPath().standardizedFileURL
+        let base = ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+            .resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalPath = canonical.path
+        let isInside = canonicalPath == base || canonicalPath.hasPrefix(base + "/")
+        let hopsThroughSymlink = canonicalPath != url.standardizedFileURL.path
+        if hopsThroughSymlink, !isInside {
+            let alert = NSAlert()
+            alert.messageText = "Bu dosya dışarıyı gösteriyor. Önizlensin mi?"
+            alert.informativeText = canonicalPath
+            alert.addButton(withTitle: "Önizle")
+            alert.addButton(withTitle: "Vazgeç")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                return
+            }
+        }
         let tab = InspectorTab.forFile(url: url)
         withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
             if !inspectorTabs.contains(where: { $0.id == tab.id }) {
@@ -428,12 +726,30 @@ struct ConversationDetailView: View {
         }
     }
 
+    private func openTerminalInInspector(workingDirectory: URL) {
+        let paneKey = paneID ?? "primary"
+        let tab = InspectorTab.forTerminal(
+            paneID: paneKey,
+            workingDirectory: workingDirectory.path
+        )
+        _ = terminalCenter.service(for: tab.id, workingDirectory: workingDirectory)
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+            if !inspectorTabs.contains(where: { $0.id == tab.id }) {
+                inspectorTabs.append(tab)
+            }
+            selectedInspectorTabID = tab.id
+        }
+    }
+
     private func closeInspectorTab(_ tabID: String) {
         withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
             guard let idx = inspectorTabs.firstIndex(where: { $0.id == tabID }) else {
                 return
             }
-            inspectorTabs.remove(at: idx)
+            let removed = inspectorTabs.remove(at: idx)
+            if case .terminal(let id, _) = removed.kind {
+                terminalCenter.close(id: id)
+            }
             if selectedInspectorTabID == tabID {
                 if inspectorTabs.indices.contains(idx) {
                     selectedInspectorTabID = inspectorTabs[idx].id
@@ -479,7 +795,8 @@ struct ConversationDetailView: View {
     private func sessionBanner(
         symbol: String,
         message: String,
-        tint: Color
+        tint: Color,
+        onDismiss: (() -> Void)?
     ) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: symbol)
@@ -490,6 +807,20 @@ struct ConversationDetailView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             Spacer(minLength: 0)
+
+            if let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(tint.opacity(0.8))
+                        .padding(4)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .help("Dismiss notice")
+                .accessibilityLabel("Dismiss notice")
+            }
         }
         .foregroundStyle(tint)
         .padding(.horizontal, 12)
@@ -520,15 +851,18 @@ struct ConversationDetailView: View {
         let owningTitle = request.appSessionID.flatMap { id in
             sessionService.sessions.first { $0.id == id }?.title
         }
-        let conversation = request.appSessionID == sessionService.activeSessionID
-            ? "Current conversation · \(owningTitle ?? sessionService.activeSessionTitle)"
+        let isCurrentSession = request.appSessionID == focusedSession.id
+        let conversation =
+            isCurrentSession
+            ? "Current conversation · \(owningTitle ?? focusedSession.title)"
             : request.appSessionID == nil
                 ? "Backend session · \(request.remoteSessionID)"
                 : "Background conversation · \(owningTitle ?? request.remoteSessionID)"
         // A delegated session asks on the agent's behalf, and its question is the
         // one a user is most likely to misread as the whole turn's. Saying who is
         // asking is what keeps "may I read outside this folder?" answerable.
-        let origin = request.isDelegatedSession
+        let origin =
+            request.isDelegatedSession
             ? "Delegated subagent · \(conversation)"
             : conversation
 
@@ -709,52 +1043,30 @@ struct ConversationDetailView: View {
         .pointingHandCursor()
     }
 
-    private func isGroupRunning(_ group: AgentTurnActivityGroup) -> Bool {
-        group.activities.contains { $0.phase == .running }
-    }
-
-    private func isTurnActive(for group: AgentTurnActivityGroup) -> Bool {
-        guard sessionService.isBusy else {
+    private func isTurnActive(
+        for group: AgentTurnActivityGroup,
+        isBusy: Bool,
+        activeTurnMessageIDs: Set<UUID>
+    ) -> Bool {
+        guard isBusy else {
             return false
         }
 
-        if let activeTurnID = sessionService.activeTurnID {
-            if let groupTurnID = group.turnID {
-                return groupTurnID == activeTurnID
-            }
-            if activeTurnID == group.id {
-                return true
-            }
-        }
-
-        let messages = sessionService.state.messages
-        if let activeUserIndex = messages.lastIndex(where: { $0.role == .user }) {
-            let activeTurnMessageIDs = Set(messages[activeUserIndex...].map(\.id))
-            if activeTurnMessageIDs.contains(group.anchorMessageID) {
-                return true
-            }
-        }
-
-        return sessionService.state.activityGroups.last?.id == group.id
-    }
-
-    /// Bu grubun kartında "onay bekliyor" rozeti görünsün mü?
-    ///
-    /// Rozet sohbet-bazlıdır, grup-bazlı değil: bekleyen istek bu aktif sohbete
-    /// aitse ve grup aktif turunsa gösterilir. Başka sohbetin isteği bu sohbetin
-    /// bitmiş gruplarına asla yansımaz.
-    private func hasPendingApproval(for group: AgentTurnActivityGroup) -> Bool {
-        let hasPendingForActiveSession = permissionApprovalCenter.pending.contains { request in
-            request.appSessionID == sessionService.activeSessionID
-        }
-        guard hasPendingForActiveSession else {
+        guard let activeTurnID = focusedSession.activeTurnID else {
             return false
         }
-        return isTurnActive(for: group)
-    }
+        if let groupTurnID = group.turnID {
+            return groupTurnID == activeTurnID
+        }
+        if activeTurnID == group.id {
+            return true
+        }
 
-    private func activityGroup(after messageID: UUID) -> AgentTurnActivityGroup? {
-        transcriptIndex.activityGroup(after: messageID)
+        if activeTurnMessageIDs.contains(group.anchorMessageID) {
+            return true
+        }
+
+        return false
     }
 
     // MARK: - Prompt navigation
@@ -763,10 +1075,10 @@ struct ConversationDetailView: View {
     /// conversation's questions, not the answers.
     private var transcriptIndex: TranscriptIndex {
         indexCache.index(
-            messages: sessionService.state.messages,
-            activityGroups: sessionService.state.activityGroups,
+            messages: focusedSession.state.messages,
+            activityGroups: focusedSession.state.activityGroups,
             maximumPromptCount: PromptRailMetrics.maximumBarCount,
-            activityRevision: sessionService.state.activityRevision
+            activityRevision: focusedSession.state.activityRevision
         )
     }
 
@@ -910,14 +1222,27 @@ struct ConversationDetailView: View {
 
     @ViewBuilder
     private func transcriptScrollView(preset: AppThemePreset, isDark: Bool) -> some View {
+        let index = transcriptIndex
+        let isBusy = focusedSession.isBusy
+        let sessionID = focusedSession.id
+        let hasPendingForActiveSession = permissionApprovalCenter.pending.contains { request in
+            request.appSessionID == sessionID
+        }
+
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 6) {
-                    ForEach(sessionService.state.messages) { message in
+                    ForEach(focusedSession.state.messages) { message in
                         transcriptRow(
                             for: message,
                             preset: preset,
-                            isDark: isDark
+                            isDark: isDark,
+                            index: index,
+                            isBusy: isBusy,
+                            hasPendingApprovalForActiveSession: hasPendingForActiveSession,
+                            onCollapse: { messageID in
+                                handleTimelineCollapse(messageID: messageID, proxy: proxy)
+                            }
                         )
                     }
 
@@ -932,7 +1257,7 @@ struct ConversationDetailView: View {
                 .frame(maxWidth: contentMaxWidth)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
-            .id(sessionService.activeSessionID)
+            .id(focusedSession.id)
             .coordinateSpace(.named(Self.transcriptSpace))
             .defaultScrollAnchor(.bottom)
             .onScrollGeometryChange(for: ChatScrollSnapshot.self) { geometry in
@@ -951,37 +1276,43 @@ struct ConversationDetailView: View {
             .onScrollPhaseChange { _, phase in
                 followState.setScrolling(phase != .idle && phase != .animating)
             }
-            .onChange(of: sessionService.state.messages.count) { _, _ in
-                let lastMessage = sessionService.state.messages.last
+            .onChange(of: focusedSession.state.messages.count) { _, _ in
+                let lastMessage = focusedSession.state.messages.last
                 if lastMessage?.role == .user {
                     isUserScrolledUp = false
                     followState.resumeFollow()
                 }
 
-                guard sessionService.state.messages.last != nil else {
+                guard focusedSession.state.messages.last != nil else {
                     return
                 }
 
                 messageCountScrollTask?.cancel()
                 messageCountScrollTask = Task { @MainActor in
                     try? await Task.sleep(for: .milliseconds(40))
-                    guard !Task.isCancelled else {
+                    guard !Task.isCancelled, followState.shouldAutoFollow(now: Date()) else {
                         return
                     }
                     proxy.scrollTo("bottom_anchor", anchor: .bottom)
                 }
             }
-            .onChange(of: sessionService.state.messages.last?.text) { _, _ in
+            .onChange(of: focusedSession.state.messages.last?.text) { _, _ in
                 handleStreamingTextChange(proxy: proxy)
             }
-            .onChange(of: sessionService.state.activityGroups.last?.activities.count) { _, _ in
+            .onChange(of: focusedSession.state.activityGroups.last?.activities.count) { _, _ in
                 handleActivityCountChange(proxy: proxy)
             }
-            .onChange(of: sessionService.isBusy) { oldValue, newValue in
+            .onChange(of: focusedSession.isBusy) { oldValue, newValue in
                 handleBusyChange(oldValue: oldValue, newValue: newValue, proxy: proxy)
             }
-            .onChange(of: sessionService.activeSessionID) { _, _ in
+            .onChange(of: focusedSession.id) { _, _ in
                 handleActiveSessionChange(proxy: proxy)
+            }
+            .onChange(of: inspectorTabs.isEmpty) { _, _ in
+                handleInspectorLayoutChange(proxy: proxy)
+            }
+            .onChange(of: isInspectorExpanded) { _, _ in
+                handleInspectorLayoutChange(proxy: proxy)
             }
             .overlay(alignment: .leading) {
                 promptNavigatorOverlay(proxy: proxy)
@@ -993,22 +1324,22 @@ struct ConversationDetailView: View {
                         preset: preset,
                         isDark: isDark
                     )
+                    .animation(.easeInOut(duration: 0.2), value: isUserScrolledUp)
                 }
             }
-            .animation(.easeInOut(duration: 0.2), value: isUserScrolledUp)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func handleStreamingTextChange(proxy: ScrollViewProxy) {
-        guard sessionService.isBusy, followState.shouldAutoFollow(now: Date()) else {
+        guard focusedSession.isBusy, followState.shouldAutoFollow(now: Date()) else {
             return
         }
         proxy.scrollTo("bottom_anchor", anchor: .bottom)
     }
 
     private func handleActivityCountChange(proxy: ScrollViewProxy) {
-        guard sessionService.isBusy, followState.shouldAutoFollow(now: Date()) else {
+        guard focusedSession.isBusy, followState.shouldAutoFollow(now: Date()) else {
             return
         }
         proxy.scrollTo("bottom_anchor", anchor: .bottom)
@@ -1027,6 +1358,101 @@ struct ConversationDetailView: View {
         activePromptID = nil
         Task { @MainActor in
             proxy.scrollTo("bottom_anchor", anchor: .bottom)
+        }
+    }
+
+    /// Oturum değişiminde sağ panel el değiştirir: çıkanın sekmeleri
+    /// sözlüğe kaldırılır, gelenin kayıtlı sekmeleri geri yüklenir (yoksa boş
+    /// panel). Bölme aynı kaldığı için `@State` kendiliğinden yapmazdı.
+    private func switchInspectorState(from oldID: UUID, to newID: UUID) {
+        let current = InspectorPaneState(
+            tabs: inspectorTabs,
+            selectedID: selectedInspectorTabID,
+            expanded: isInspectorExpanded
+        )
+        let liveIDs = Set(sessionService.sessions.map(\.id))
+        let result = InspectorPaneState.switched(
+            inspectorStateBySession,
+            from: oldID,
+            to: newID,
+            current: current,
+            liveIDs: liveIDs
+        )
+        inspectorStateBySession = result.states
+        inspectorTabs = result.restored.tabs
+        selectedInspectorTabID = result.restored.selectedID
+        isInspectorExpanded = result.restored.expanded
+    }
+
+    /// Inspector açılıp kapanınca (ya da genişleyince) genişlik animasyonu
+    /// biterken transkripti dibe sabitler — ama yalnız dipte okuyan kullanıcı
+    /// için. Tarihte okuyan kullanıcıya dokunulmaz.
+    ///
+    /// Neden gerekli: animasyon ortasında daralan satırlar yeniden sarılır,
+    /// içerik boyu büyür, sabit kaydırma konumu görsel olarak yukarı kayar.
+    /// O sırada ölçülen sahte düşüşler kullanıcı jesti sanılıp takip modu
+    /// ölürdü (`suppressTransientDrop` onu engeller); yerleşim bitince dip
+    /// yeniden tutturulur.
+    private func handleInspectorLayoutChange(proxy: ScrollViewProxy) {
+        followState.suppressTransientDrop()
+        guard !isUserScrolledUp, !followState.isUserScrolling else {
+            return
+        }
+        inspectorPinTask?.cancel()
+        inspectorPinTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, followState.shouldAutoFollow(now: Date()) else {
+                return
+            }
+            proxy.scrollTo("bottom_anchor", anchor: .bottom)
+        }
+    }
+
+    /// Sidebar, inspector ya da bölme ayırıcısı genişliği art arda değiştirir.
+    /// Bu sırada prompt konum ölçerlerini kapatmak, aynı karede yinelenen
+    /// geometri değerlerinin SwiftUI yerleşim döngüsüne dönüşmesini önler.
+    private func handlePaneWidthChange() {
+        isPaneResizing = true
+        paneResizeSettleTask?.cancel()
+        paneResizeSettleTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(180))
+            } catch is CancellationError {
+                return
+            } catch {
+                assertionFailure("Bölme yeniden boyutlandırma beklemesi başarısız: \(error)")
+                return
+            }
+            guard !Task.isCancelled else { return }
+            isPaneResizing = false
+        }
+    }
+
+    /// Collapse açılıp kapanınca transkript boyu yüzlerce pt değişir.
+    /// `.defaultScrollAnchor(.bottom)` dibe göre koruduğu için viewport kayar
+    /// ve düşüş kullanıcı jesti sanılıp takip modu ölürdü — kullanıcı kendini
+    /// eski yazıların arasında bulur, dibe elle dönerdi. Burası düşüş yorumunu
+    /// susturur (`suppressTransientDrop`), dipte okuyanı animasyon bitiminde
+    /// dibe geri sabitler. Tarihte okuyana dokunulmaz: dokunduğu başlık zaten
+    /// görünürdür, `scrollTo` yalnız görünmez kaldıysa en küçük hareketle
+    /// geri getirir.
+    ///
+    /// Karar `followState.isFollowing` ile verilir: `@State` kopyası değil,
+    /// ölçümün canlı durumudur. Art arda tıklamalarda yalnız son görev yaşar.
+    private func handleTimelineCollapse(messageID: UUID, proxy: ScrollViewProxy) {
+        let wasFollowing = followState.isFollowing
+        followState.suppressTransientDrop(for: 0.9)
+        collapsePinTask?.cancel()
+        collapsePinTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(320))
+            guard !Task.isCancelled else { return }
+            if wasFollowing {
+                guard followState.shouldAutoFollow(now: Date()) else { return }
+                proxy.scrollTo("bottom_anchor", anchor: .bottom)
+            } else {
+                guard !followState.isUserScrolling else { return }
+                proxy.scrollTo(messageID)
+            }
         }
     }
 
@@ -1072,10 +1498,11 @@ private struct PromptOffsetProbe: ViewModifier {
                 for: CGFloat.self,
                 of: { proxy in
                     (proxy.frame(in: .named(space)).minY / 8).rounded() * 8
+                },
+                action: { offset in
+                    onOffset(messageID, offset)
                 }
-            ) { offset in
-                onOffset(messageID, offset)
-            }
+            )
         } else {
             content
         }

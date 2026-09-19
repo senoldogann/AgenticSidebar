@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class InspectorTabModelTests: XCTestCase {
@@ -12,7 +13,7 @@ final class InspectorTabModelTests: XCTestCase {
         XCTAssertEqual(tab.iconColorName, "orange")
         XCTAssertEqual(tab.id, "file:/workspace/Sources/App.swift")
 
-        if case let .file(url) = tab.kind {
+        if case .file(let url) = tab.kind {
             XCTAssertEqual(url.lastPathComponent, "App.swift")
         } else {
             XCTFail("Expected file tab kind")
@@ -36,7 +37,7 @@ final class InspectorTabModelTests: XCTestCase {
         XCTAssertEqual(tab.iconName, "arrow.triangle.branch")
         XCTAssertEqual(tab.id, "report:task-123")
 
-        if case let .subagentReport(actID, title, report) = tab.kind {
+        if case .subagentReport(let actID, let title, let report) = tab.kind {
             XCTAssertEqual(actID.rawValue, "task-123")
             XCTAssertEqual(title, "Code Review Subagent")
             XCTAssertEqual(report, "All clear")
@@ -62,7 +63,7 @@ final class InspectorTabModelTests: XCTestCase {
         XCTAssertEqual(tab.iconName, "doc.badge.plus")
         XCTAssertEqual(tab.id, "review:\(turnID.uuidString)")
 
-        if case let .changesReview(tid, sum, initFile) = tab.kind {
+        if case .changesReview(let tid, let sum, let initFile) = tab.kind {
             XCTAssertEqual(tid, turnID)
             XCTAssertEqual(sum.fileCount, 1)
             XCTAssertEqual(initFile?.fileName, "File.swift")
@@ -114,5 +115,92 @@ final class InspectorTabModelTests: XCTestCase {
         XCTAssertEqual(InspectorTab.displayLabel(for: file2, among: allTabs), "Sekme 2")
         XCTAssertEqual(InspectorTab.displayLabel(for: agent1, among: allTabs), "Agent 1")
         XCTAssertEqual(InspectorTab.displayLabel(for: agent2, among: allTabs), "Agent 2")
+    }
+
+    // MARK: - Oturum başına panel durumu
+
+    /// Sohbet değişiminde çıkanın sekmeleri saklanır, gelen boş panel alır:
+    /// bir sohbette açılan rapor diğer sohbete sızmaz.
+    func testInspectorStateSwitchSavesOutgoingAndRestoresEmpty() {
+        let first = UUID()
+        let second = UUID()
+        let tab = InspectorTab.forFile(url: URL(fileURLWithPath: "/workspace/App.swift"))
+        let current = InspectorPaneState(tabs: [tab], selectedID: tab.id, expanded: true)
+
+        let result = InspectorPaneState.switched(
+            [:],
+            from: first,
+            to: second,
+            current: current,
+            liveIDs: [first, second]
+        )
+
+        XCTAssertEqual(result.states[first]?.tabs, [tab])
+        XCTAssertEqual(result.states[first]?.selectedID, tab.id)
+        XCTAssertEqual(result.states[first]?.expanded, true)
+        XCTAssertEqual(result.restored, InspectorPaneState())
+    }
+
+    /// Geri dönünce kayıtlı sekmeler aynen geri gelir (seçim ve genişletme dahil).
+    func testInspectorStateSwitchRoundTrip() {
+        let first = UUID()
+        let second = UUID()
+        let tab = InspectorTab.forFile(url: URL(fileURLWithPath: "/workspace/App.swift"))
+        let saved = InspectorPaneState(tabs: [tab], selectedID: tab.id, expanded: true)
+
+        let away = InspectorPaneState.switched(
+            [first: saved],
+            from: second,
+            to: first,
+            current: InspectorPaneState(),
+            liveIDs: [first, second]
+        )
+        XCTAssertEqual(away.restored, saved)
+
+        let back = InspectorPaneState.switched(
+            away.states,
+            from: first,
+            to: second,
+            current: away.restored,
+            liveIDs: [first, second]
+        )
+        XCTAssertEqual(back.restored, InspectorPaneState())
+        XCTAssertEqual(back.states[first], saved)
+    }
+
+    /// Silinmiş sohbetlerin kayıtları tutulmaz.
+    func testInspectorStateSwitchDropsDeadSessions() {
+        let live = UUID()
+        let dead = UUID()
+        let tab = InspectorTab.forFile(url: URL(fileURLWithPath: "/workspace/App.swift"))
+
+        let result = InspectorPaneState.switched(
+            [dead: InspectorPaneState(tabs: [tab], selectedID: tab.id, expanded: false)],
+            from: dead,
+            to: live,
+            current: InspectorPaneState(),
+            liveIDs: [live]
+        )
+
+        XCTAssertNil(result.states[dead])
+        XCTAssertEqual(result.restored, InspectorPaneState())
+    }
+
+    /// Aynı oturumda değişim yok: sözlük ve mevcut durum aynen döner.
+    func testInspectorStateSwitchSameSessionIsNoOp() {
+        let only = UUID()
+        let tab = InspectorTab.forFile(url: URL(fileURLWithPath: "/workspace/App.swift"))
+        let current = InspectorPaneState(tabs: [tab], selectedID: tab.id, expanded: false)
+
+        let result = InspectorPaneState.switched(
+            [:],
+            from: only,
+            to: only,
+            current: current,
+            liveIDs: [only]
+        )
+
+        XCTAssertTrue(result.states.isEmpty)
+        XCTAssertEqual(result.restored, current)
     }
 }

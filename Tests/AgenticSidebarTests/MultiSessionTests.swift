@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -373,6 +374,31 @@ final class MultiSessionTests: XCTestCase {
         XCTAssertEqual(service.activeSessionID, thirdID)
     }
 
+    /// Aktiften daha YENİ bir sohbet de silindiğinde kayma olmamalı: seçim
+    /// silinen aktifin hemen ardındaki kalan olur, eski indeksin denk geldiği
+    /// (daha yaşlı) komşu değil.
+    func testDeletingActiveAlongsideANewerSessionSelectsTheNextSurvivor() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
+        await service.refreshCapabilities()
+
+        // createSession başa ekler: en yeni ilk sırada.
+        let oldestID = service.activeSessionID
+        let secondID = service.createSession()
+        let thirdID = service.createSession()
+        let newestID = service.createSession()
+        XCTAssertEqual(service.sessions.map(\.id), [newestID, thirdID, secondID, oldestID])
+
+        service.selectSession(thirdID)
+        service.deleteSessions([thirdID, newestID])
+
+        XCTAssertEqual(service.sessions.map(\.id), [secondID, oldestID])
+        XCTAssertEqual(
+            service.activeSessionID,
+            secondID,
+            "silinen aktifin hemen ardındaki kalan seçilmeli"
+        )
+    }
+
     func testDeleteSessionsWithAllSessionsLeavesOneEmptyReplacement() async throws {
         let service = AgentSessionService(runtimes: [makeAlphaRuntime()])
         await service.refreshCapabilities()
@@ -503,4 +529,3 @@ private actor StreamGate {
 private final class FlagBox: @unchecked Sendable {
     var value = false
 }
-

@@ -69,7 +69,7 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
             "filePath",
             "url",
             "query",
-            "name"
+            "name",
         ]
 
         var parts: [String] = []
@@ -84,7 +84,7 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
         }
 
         if let toolName, ComputerActivityTitle.isComputerTool(toolName),
-           Self.hasComputerSignal(metadata)
+            Self.hasComputerSignal(metadata)
         {
             let (title, _) = ComputerActivityTitle.titleAndDetail(tool: toolName, input: metadata)
             if let title, !title.isEmpty {
@@ -129,7 +129,8 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
 
     /// Araç adını kullanıcıya gösterilecek başlığa çevirir.
     static func title(for toolName: String) -> String {
-        let suffix = toolName.hasPrefix(ComputerUseConfiguration.toolPrefix)
+        let suffix =
+            toolName.hasPrefix(ComputerUseConfiguration.toolPrefix)
             ? String(toolName.dropFirst(ComputerUseConfiguration.toolPrefix.count))
             : toolName
 

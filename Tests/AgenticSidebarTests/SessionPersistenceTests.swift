@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -212,7 +213,7 @@ final class SessionPersistenceTests: XCTestCase {
                             completedAt: Date()
                         )
                     ]
-                )
+                ),
             ]
         )
 
@@ -299,26 +300,26 @@ final class SessionPersistenceTests: XCTestCase {
 
         let sessionID = UUID()
         let legacyJSON = """
-        {
-          "version": 1,
-          "activeSessionID": "\(sessionID.uuidString)",
-          "sessions": [
             {
-              "id": "\(sessionID.uuidString)",
-              "createdAt": "2023-11-14T22:13:20Z",
-              "messages": [
+              "version": 1,
+              "activeSessionID": "\(sessionID.uuidString)",
+              "sessions": [
                 {
-                  "id": "\(UUID().uuidString)",
-                  "role": "user",
-                  "text": "hello",
-                  "attachmentPaths": [],
-                  "createdAt": "2023-11-14T22:13:20Z"
+                  "id": "\(sessionID.uuidString)",
+                  "createdAt": "2023-11-14T22:13:20Z",
+                  "messages": [
+                    {
+                      "id": "\(UUID().uuidString)",
+                      "role": "user",
+                      "text": "hello",
+                      "attachmentPaths": [],
+                      "createdAt": "2023-11-14T22:13:20Z"
+                    }
+                  ]
                 }
               ]
             }
-          ]
-        }
-        """
+            """
 
         try FileManager.default.createDirectory(
             at: store.fileURL.deletingLastPathComponent(),
@@ -364,7 +365,7 @@ final class SessionPersistenceTests: XCTestCase {
                     text: "hi",
                     attachmentPaths: [],
                     createdAt: Date(timeIntervalSince1970: 1_700_000_200)
-                )
+                ),
             ]
         )
         let archive = SessionArchive(
@@ -513,7 +514,7 @@ final class SessionPersistenceTests: XCTestCase {
                 id: UUID(),
                 anchorMessageID: session.messages[19].id,
                 activities: []
-            )
+            ),
         ]
 
         let archive = SessionArchive(
@@ -646,26 +647,26 @@ final class SessionPersistenceTests: XCTestCase {
 
         let sessionID = UUID()
         let legacyJSON = """
-        {
-          "version": 2,
-          "activeSessionID": "\(sessionID.uuidString)",
-          "sessions": [
             {
-              "id": "\(sessionID.uuidString)",
-              "createdAt": "2023-11-14T22:13:20Z",
-              "messages": [
+              "version": 2,
+              "activeSessionID": "\(sessionID.uuidString)",
+              "sessions": [
                 {
-                  "id": "\(UUID().uuidString)",
-                  "role": "user",
-                  "text": "hello",
-                  "attachmentPaths": [],
-                  "createdAt": "2023-11-14T22:13:20Z"
+                  "id": "\(sessionID.uuidString)",
+                  "createdAt": "2023-11-14T22:13:20Z",
+                  "messages": [
+                    {
+                      "id": "\(UUID().uuidString)",
+                      "role": "user",
+                      "text": "hello",
+                      "attachmentPaths": [],
+                      "createdAt": "2023-11-14T22:13:20Z"
+                    }
+                  ]
                 }
               ]
             }
-          ]
-        }
-        """
+            """
 
         try FileManager.default.createDirectory(
             at: store.fileURL.deletingLastPathComponent(),

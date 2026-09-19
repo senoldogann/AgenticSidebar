@@ -124,7 +124,7 @@ actor BoundedChannel<Element: Sendable> {
             return element
         }
 
-        if case let .finished(error) = outcome {
+        if case .finished(let error) = outcome {
             if let error {
                 throw error
             }
@@ -135,7 +135,7 @@ actor BoundedChannel<Element: Sendable> {
             switch outcome {
             case .open:
                 receiveWaiter = continuation
-            case let .finished(error):
+            case .finished(let error):
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
@@ -170,7 +170,7 @@ actor BoundedChannel<Element: Sendable> {
         }
 
         receiveWaiter = nil
-        if case let .finished(error) = outcome, let error {
+        if case .finished(let error) = outcome, let error {
             waiter.resume(throwing: error)
         } else {
             waiter.resume(returning: nil)

@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 /// Dosya denetçisinin metin önizlemesi.
@@ -24,7 +25,7 @@ final class FileInspectorTextPreviewTests: XCTestCase {
     func testHugeFileIsReadOnlyUpToTheBoundedPrefix() throws {
         let url = directory.appendingPathComponent("huge.log")
         let line = "0123456789 the quick brown fox jumps over the lazy dog\n"
-        let repetitions = 60_000 // ~3 MB, sınırın üstünde
+        let repetitions = 60_000  // ~3 MB, sınırın üstünde
         let content = String(repeating: line, count: repetitions)
         try content.write(to: url, atomically: true, encoding: .utf8)
 

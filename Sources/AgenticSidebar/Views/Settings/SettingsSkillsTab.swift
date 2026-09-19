@@ -46,11 +46,9 @@ struct SettingsSkillsView: View {
         SkillsMarketplaceCatalog.curatedSkills.filter { skill in
             let matchesCategory = selectedCategory == "All" || skill.category == selectedCategory
             let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let matchesSearch = query.isEmpty ||
-                skill.name.lowercased().contains(query) ||
-                skill.displayName.lowercased().contains(query) ||
-                skill.description.lowercased().contains(query) ||
-                skill.category.lowercased().contains(query)
+            let matchesSearch =
+                query.isEmpty || skill.name.lowercased().contains(query) || skill.displayName.lowercased().contains(query)
+                || skill.description.lowercased().contains(query) || skill.category.lowercased().contains(query)
             return matchesCategory && matchesSearch
         }
     }
@@ -220,6 +218,7 @@ struct SettingsSkillsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Clear search")
                     }
                 }
                 .padding(.horizontal, 10)
@@ -742,12 +741,15 @@ struct SettingsSkillsView: View {
                 Spacer()
 
                 // Active / Inactive Toggle
-                Toggle("", isOn: Binding(
-                    get: { isEnabled },
-                    set: { newValue in
-                        extensionStore.setSkillEnabled(skill.name, newValue)
-                    }
-                ))
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { isEnabled },
+                        set: { newValue in
+                            extensionStore.setSkillEnabled(skill.name, newValue)
+                        }
+                    )
+                )
                 .toggleStyle(.switch)
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
                 .labelsHidden()
@@ -854,12 +856,16 @@ struct SettingsSkillsView: View {
             .foregroundStyle(isDisabled ? Color.secondary : Color.white)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(isDisabled ? (isDarkMode ? Color.white.opacity(0.1) : Color.black.opacity(0.08)) : (currentTheme.accentGradient.first ?? Color.accentColor))
+                    .fill(
+                        isDisabled
+                            ? (isDarkMode ? Color.white.opacity(0.1) : Color.black.opacity(0.08))
+                            : (currentTheme.accentGradient.first ?? Color.accentColor))
             )
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
         .disabled(isDisabled)
+        .help(title)
     }
 }
 

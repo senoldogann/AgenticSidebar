@@ -107,44 +107,18 @@ enum PastedTextAttachment {
         guard let data = text.data(using: .utf8) else {
             throw PastedTextAttachmentError.unencodableText
         }
-        try data.write(to: url, options: .atomic)
-        try? fileManager.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: url.path
-        )
+        try AttachmentStorage.writeAtomically(data, to: url, fileManager: fileManager)
 
         prune(directory: baseFolder, fileManager: fileManager)
         return url
     }
 
     private static func prune(directory: URL, fileManager: FileManager) {
-        guard
-            let entries = try? fileManager.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: [.contentModificationDateKey],
-                options: [.skipsHiddenFiles]
-            )
-        else {
-            return
-        }
-
-        let sorted = entries.sorted {
-            modificationDate(of: $0, fileManager: fileManager)
-                < modificationDate(of: $1, fileManager: fileManager)
-        }
-
-        guard sorted.count > maximumStoredFiles else {
-            return
-        }
-
-        for stale in sorted.prefix(sorted.count - maximumStoredFiles) {
-            try? fileManager.removeItem(at: stale)
-        }
+        AttachmentStorage.prune(directory: directory, keeping: maximumStoredFiles, fileManager: fileManager)
     }
 
     private static func modificationDate(of url: URL, fileManager: FileManager) -> Date {
-        (try? fileManager.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
-            ?? .distantPast
+        AttachmentStorage.modificationDate(of: url, fileManager: fileManager)
     }
 }
 

@@ -1,21 +1,22 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The extension layer: validating a skill before it is written, keeping the
 /// context gate honest, and the two triggers the composer offers.
 final class ExtensionManifestTests: XCTestCase {
     private let validManifest = """
-    ---
-    name: code-review
-    description: Reviews a diff for correctness, not style.
-    license: MIT
-    metadata:
-      author: someone
-    ---
+        ---
+        name: code-review
+        description: Reviews a diff for correctness, not style.
+        license: MIT
+        metadata:
+          author: someone
+        ---
 
-    Read the diff, then report only real defects.
-    """
+        Read the diff, then report only real defects.
+        """
 
     func testAValidManifestParsesIntoNameDescriptionAndBody() throws {
         let manifest = try SkillManifestParser.parse(validManifest)
@@ -35,11 +36,11 @@ final class ExtensionManifestTests: XCTestCase {
 
     func testAManifestWithoutABodyIsRejected() {
         let empty = """
-        ---
-        name: code-review
-        description: Something
-        ---
-        """
+            ---
+            name: code-review
+            description: Something
+            ---
+            """
 
         XCTAssertThrowsError(try SkillManifestParser.parse(empty)) { error in
             XCTAssertEqual(error as? SkillManifestError, .emptyBody)
@@ -80,13 +81,13 @@ final class ExtensionManifestTests: XCTestCase {
     func testAnOverlongNameIsRejected() throws {
         let name = String(repeating: "a", count: SkillManifest.maximumNameLength + 1)
         let manifest = """
-        ---
-        name: \(name)
-        description: Something
-        ---
+            ---
+            name: \(name)
+            description: Something
+            ---
 
-        Body
-        """
+            Body
+            """
 
         XCTAssertThrowsError(try SkillManifestParser.parse(manifest)) { error in
             XCTAssertEqual(error as? SkillManifestError, .nameTooLong)
@@ -100,7 +101,7 @@ final class ExtensionContextGateTests: XCTestCase {
             mcpServers: [
                 makeMCP(name: "github", isEnabled: true),
                 makeMCP(name: "notion", isEnabled: false),
-                makeMCP(name: "user-own", isEnabled: false, isInherited: true)
+                makeMCP(name: "user-own", isEnabled: false, isInherited: true),
             ]
         )
 
@@ -132,7 +133,7 @@ final class ExtensionContextGateTests: XCTestCase {
         let registry = ExtensionRegistry(
             skills: [
                 makeSkill(name: "code-review", isEnabled: true),
-                makeSkill(name: "noisy", isEnabled: false)
+                makeSkill(name: "noisy", isEnabled: false),
             ]
         )
 
@@ -171,7 +172,7 @@ final class ExtensionContextGateTests: XCTestCase {
         let registry = ExtensionRegistry(
             skills: [
                 makeSkill(name: "deep-review", isEnabled: true),
-                makeSkill(name: "review", isEnabled: true)
+                makeSkill(name: "review", isEnabled: true),
             ]
         )
 
@@ -225,7 +226,7 @@ final class ManagedConfigurationTests: XCTestCase {
                     source: .manual,
                     isInherited: true,
                     installedAt: Date()
-                )
+                ),
             ],
             plugins: [
                 PluginRecord(
@@ -325,7 +326,7 @@ final class ManagedConfigurationTests: XCTestCase {
                     source: .manual,
                     isInherited: false,
                     installedAt: Date()
-                )
+                ),
             ]
         )
 
@@ -442,7 +443,8 @@ final class ManagedConfigurationTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            rendered.components(separatedBy: "\"skill\"").count - 1,
+            String(rendered.prefix(upTo: rendered.range(of: "\"agent\"")!.lowerBound))
+                .components(separatedBy: "\"skill\"").count - 1,
             1,
             "A JSON object cannot carry the same key twice; the parser keeps the last one"
         )
@@ -554,7 +556,7 @@ final class GitHubReferenceTests: XCTestCase {
         let tree = [
             "docs/code-review/SKILL.md",
             "skills/code-review/SKILL.md",
-            "README.md"
+            "README.md",
         ]
 
         XCTAssertEqual(
@@ -566,7 +568,7 @@ final class GitHubReferenceTests: XCTestCase {
     func testAnExplicitSubpathWinsOverTheNameSearch() {
         let tree = [
             "skills/code-review/SKILL.md",
-            "plugins/other/code-review/SKILL.md"
+            "plugins/other/code-review/SKILL.md",
         ]
 
         XCTAssertEqual(
@@ -671,7 +673,7 @@ final class SkillInstallerTests: XCTestCase {
                 FetchedSkillFile(
                     relativePath: "scripts/run.sh",
                     content: Data("echo hi".utf8)
-                )
+                ),
             ]
         )
 
@@ -695,7 +697,7 @@ final class SkillInstallerTests: XCTestCase {
 
         let installer = SkillInstaller(
             rootDirectoryURL: directory,
-            transport: StubExtensionTransport(responses: [:]) 
+            transport: StubExtensionTransport(responses: [:])
         )
 
         let versionOne = FetchedSkill(
@@ -703,7 +705,7 @@ final class SkillInstallerTests: XCTestCase {
             repository: "anthropics/skills",
             files: [
                 FetchedSkillFile(relativePath: "SKILL.md", content: Data(manifestData.utf8)),
-                FetchedSkillFile(relativePath: "scripts/run.sh", content: Data("echo v1".utf8))
+                FetchedSkillFile(relativePath: "scripts/run.sh", content: Data("echo v1".utf8)),
             ]
         )
         try installer.install(fetched: versionOne, source: .manual)
@@ -716,7 +718,7 @@ final class SkillInstallerTests: XCTestCase {
             repository: "anthropics/skills",
             files: [
                 FetchedSkillFile(relativePath: "SKILL.md", content: Data(manifestData.utf8)),
-                FetchedSkillFile(relativePath: "reference.md", content: Data("v2".utf8))
+                FetchedSkillFile(relativePath: "reference.md", content: Data("v2".utf8)),
             ]
         )
         try installer.install(fetched: versionTwo, source: .manual)
@@ -738,7 +740,7 @@ final class SkillInstallerTests: XCTestCase {
             repository: "anthropics/skills",
             files: [
                 FetchedSkillFile(relativePath: "SKILL.md", content: Data(manifestData.utf8)),
-                FetchedSkillFile(relativePath: "../../../escape.md", content: Data("bad".utf8))
+                FetchedSkillFile(relativePath: "../../../escape.md", content: Data("bad".utf8)),
             ]
         )
 
@@ -776,20 +778,20 @@ final class SkillInstallerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let tree = """
-        {"tree":[
-          {"path":"skills/code-review/SKILL.md","type":"blob"},
-          {"path":"skills/code-review/reference.md","type":"blob"}
-        ]}
-        """
+            {"tree":[
+              {"path":"skills/code-review/SKILL.md","type":"blob"},
+              {"path":"skills/code-review/reference.md","type":"blob"}
+            ]}
+            """
 
         let manifest = """
-        ---
-        name: code-review
-        description: Reviews a diff.
-        ---
+            ---
+            name: code-review
+            description: Reviews a diff.
+            ---
 
-        Body
-        """
+            Body
+            """
 
         let transport = StubExtensionTransport(
             responses: [
@@ -798,7 +800,7 @@ final class SkillInstallerTests: XCTestCase {
                 "https://raw.githubusercontent.com/anthropics/skills/HEAD/skills/code-review/SKILL.md":
                     Data(manifest.utf8),
                 "https://raw.githubusercontent.com/anthropics/skills/HEAD/skills/code-review/reference.md":
-                    Data("reference".utf8)
+                    Data("reference".utf8),
             ]
         )
 
@@ -852,10 +854,10 @@ final class SkillInstallerTests: XCTestCase {
 final class SkillsShClientTests: XCTestCase {
     func testTheDirectoryPayloadIsDecoded() throws {
         let payload = """
-        {"skills":[
-          {"id":"mattpocock/skills/code-review","skillId":"code-review","name":"code-review","installs":1234,"source":"mattpocock/skills"}
-        ]}
-        """
+            {"skills":[
+              {"id":"mattpocock/skills/code-review","skillId":"code-review","name":"code-review","installs":1234,"source":"mattpocock/skills"}
+            ]}
+            """
 
         let entries = try SkillsShClient.decode(Data(payload.utf8))
 
@@ -877,10 +879,10 @@ final class PluginCatalogTests: XCTestCase {
         // `\\n` inside the JSON is an escape the decoder resolves, not a literal
         // newline: the payload has to be valid JSON before it can be tested.
         let payload = """
-        {"objects":[
-          {"package":{"name":"opencode-plugin-foo","description":"A  plugin\\nfor foo","version":"1.2.3","links":{"npm":"https://npmjs.com/x","homepage":"https://example.com"}}}
-        ]}
-        """
+            {"objects":[
+              {"package":{"name":"opencode-plugin-foo","description":"A  plugin\\nfor foo","version":"1.2.3","links":{"npm":"https://npmjs.com/x","homepage":"https://example.com"}}}
+            ]}
+            """
 
         let entries = try NPMRegistryClient.decode(Data(payload.utf8))
 
@@ -979,7 +981,7 @@ final class ExtensionTagInstructionTests: XCTestCase {
         let instruction = try XCTUnwrap(
             [
                 ExtensionTag(kind: .mcp, name: "github"),
-                ExtensionTag(kind: .skill, name: "code-review")
+                ExtensionTag(kind: .skill, name: "code-review"),
             ].turnInstruction
         )
 

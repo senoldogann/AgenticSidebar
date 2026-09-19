@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ReasoningEffortPresentationTests: XCTestCase {
@@ -74,7 +75,7 @@ final class ProviderLogoTests: XCTestCase {
             .google,
             .openCode,
             .xAI,
-            .generic("MI")
+            .generic("MI"),
         ] {
             XCTAssertFalse(logo.accessibilityName.isEmpty)
         }

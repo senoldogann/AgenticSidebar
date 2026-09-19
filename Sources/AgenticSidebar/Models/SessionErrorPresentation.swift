@@ -64,8 +64,16 @@ extension AgentSessionError {
 extension AgentSessionNotice {
     var message: String {
         switch self {
-        case let .transcriptTrimmed(droppedMessageCount):
+        case .transcriptTrimmed(let droppedMessageCount):
             "Earlier \(droppedMessageCount) message\(droppedMessageCount == 1 ? "" : "s") left out to fit the model context window."
+        case .forkUnavailable:
+            "Couldn't branch from that message; it may have been removed."
+        case .dictationUnavailable:
+            "Microphone or speech recognition isn't allowed. Enable it in System Settings → Privacy & Security."
+        case .contextCompacted:
+            "Earlier context was compacted into a summary; the on-screen transcript is unchanged."
+        case .compactionFailed(let reason):
+            reason.message
         }
     }
 
@@ -73,6 +81,31 @@ extension AgentSessionNotice {
         switch self {
         case .transcriptTrimmed:
             "scissors"
+        case .forkUnavailable:
+            "arrow.triangle.branch"
+        case .dictationUnavailable:
+            "mic.slash"
+        case .contextCompacted:
+            "archivebox"
+        case .compactionFailed:
+            "exclamationmark.triangle"
+        }
+    }
+}
+
+extension CompactionFailureReason {
+    var message: String {
+        switch self {
+        case .busy:
+            "A turn is running; compact after it finishes."
+        case .compacting:
+            "Compacting is already running."
+        case .unavailable:
+            "No provider is configured; compaction needs a model."
+        case .nothingToCompact:
+            "The conversation fits the window; nothing to compact."
+        case .summarizerError:
+            "The summary turn failed; compaction will retry automatically."
         }
     }
 }

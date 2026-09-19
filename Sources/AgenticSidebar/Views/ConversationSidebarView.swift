@@ -2,6 +2,8 @@ import SwiftUI
 
 struct ConversationSidebarView: View {
     let sessionService: any AgentSessionServiceProtocol
+    /// Yan yana görünüm: satır buradan sürüklenir ya da menüden sabitlenir.
+    let splitStore: SplitLayoutStore
 
     @Environment(SettingsStore.self) private var settingsStore
     @Environment(SettingsWindowController.self) private var settingsWindowController: SettingsWindowController?
@@ -63,11 +65,10 @@ struct ConversationSidebarView: View {
         return CategorizedSessions(all: all, pinned: pinned, regular: regular)
     }
 
-    private var filteredSessions: [SessionSummary] {
-        categorizedSessions.all
-    }
-
     var body: some View {
+        // Tek geçiş: `categorizedSessions` her okunuşta süzer+sıralar, o
+        // yüzden gövde bir kez okuyup sayaç ve araç çubuklarını aynı sonuçla
+        // besler (önceden gövde başına üç geçiş yapılıyordu).
         let sessions = categorizedSessions
         let pinned = sessions.pinned
         let regular = sessions.regular
@@ -111,10 +112,13 @@ struct ConversationSidebarView: View {
                 .help("Start a new session (⌘N)")
                 .accessibilityLabel("New session")
 
-                searchAndFilterControls
+                searchAndFilterControls(
+                    shownCount: sessions.all.count,
+                    totalCount: sessionService.sessionList.count
+                )
 
                 if isEditingSelection {
-                    selectionToolbar
+                    selectionToolbar(filtered: sessions.all)
                 }
 
                 if !pinned.isEmpty {
@@ -258,7 +262,7 @@ struct ConversationSidebarView: View {
     /// filtre göstergeli bir menü var, aktif filtreler altında silinebilir çip
     /// olarak durur.
     @ViewBuilder
-    private var searchAndFilterControls: some View {
+    private func searchAndFilterControls(shownCount: Int, totalCount: Int) -> some View {
         VStack(spacing: 6) {
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass")
@@ -295,11 +299,11 @@ struct ConversationSidebarView: View {
             )
 
             HStack(spacing: 6) {
-                Text(sessionCountText)
+                Text(sessionCountText(shownCount: shownCount, totalCount: totalCount))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .accessibilityLabel("\(filteredSessions.count) of \(sessionService.sessionList.count) sessions shown")
+                    .accessibilityLabel("\(shownCount) of \(totalCount) sessions shown")
 
                 Spacer(minLength: 0)
 
@@ -409,14 +413,12 @@ struct ConversationSidebarView: View {
     }
 
     /// Liste başlığı altındaki küçük sayaç metni.
-    private var sessionCountText: String {
-        let total = sessionService.sessionList.count
-        let shown = filteredSessions.count
+    private func sessionCountText(shownCount: Int, totalCount: Int) -> String {
         let trimmedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedQuery.isEmpty || hasActiveFilters {
-            return "\(shown) of \(total)"
+            return "\(shownCount) of \(totalCount)"
         }
-        return total == 1 ? "1 session" : "\(total) sessions"
+        return totalCount == 1 ? "1 session" : "\(totalCount) sessions"
     }
 
     /// Arama, sıralama ve tarih filtresini birlikte temizler.
@@ -470,13 +472,13 @@ struct ConversationSidebarView: View {
 
     /// Toplu seçim kipinde tümünü seç / bırak kısayolu.
     @ViewBuilder
-    private var selectionToolbar: some View {
+    private func selectionToolbar(filtered: [SessionSummary]) -> some View {
         HStack {
-            Button(selection.count == filteredSessions.count ? "Deselect all" : "Select all") {
-                if selection.count == filteredSessions.count {
+            Button(selection.count == filtered.count ? "Deselect all" : "Select all") {
+                if selection.count == filtered.count {
                     selection.removeAll()
                 } else {
-                    selection = Set(filteredSessions.map(\.id))
+                    selection = Set(filtered.map(\.id))
                 }
             }
             .font(.caption)
@@ -701,6 +703,23 @@ struct ConversationSidebarView: View {
                         .controlSize(.small)
                         .scaleEffect(0.6)
                         .frame(minWidth: 12, minHeight: 12)
+                } else if session.showsDoneBadge {
+                    // Tamamlanan tur: okunmadı parlaklığında mavi nokta + Done.
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(.blue)
+                            .frame(width: 8, height: 8)
+                            .shadow(color: .blue.opacity(0.7), radius: 2.5)
+                            .accessibilityHidden(true)
+                        Text("Done")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.blue)
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.blue)
+                    }
+                    .help("Turn completed")
+                    .accessibilityLabel("Done, turn completed")
                 }
             }
             .padding(.vertical, 6)
@@ -715,10 +734,26 @@ struct ConversationSidebarView: View {
             )
             .contentShape(Rectangle())
             .interactiveHoverPill(cornerRadius: 8)
+            .draggable(session.id.uuidString)
+            .help("Drag onto the open conversation to work side by side")
         }
         .buttonStyle(.plain)
         .accessibilityLabel(accessibilityLabel(for: session, isActive: isActive, isSelected: isSelected))
         .contextMenu {
+            Button {
+                if let slot = splitStore.togglePin(session.id) {
+                    splitStore.focus(slot)
+                }
+            } label: {
+                Label(
+                    splitStore.slot(containing: session.id) != nil
+                        ? "Remove from pane"
+                        : "Open in a pane",
+                    systemImage: "rectangle.split.2x1"
+                )
+            }
+            .disabled(session.id == sessionService.activeSessionID)
+            Divider()
             Button {
                 sessionToRename = session
                 renameDraft = session.customTitle ?? session.displayTitle
@@ -760,6 +795,9 @@ struct ConversationSidebarView: View {
         }
         if isActive {
             parts.append("active")
+        }
+        if session.showsDoneBadge {
+            parts.append("done")
         }
         if isEditingSelection {
             parts.append(isSelected ? "selected" : "not selected")

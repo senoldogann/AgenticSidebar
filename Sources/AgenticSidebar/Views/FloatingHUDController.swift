@@ -24,28 +24,81 @@ struct HUDActivityItem: Identifiable, Equatable, Sendable {
 /// (`sharingType = .none`): aksi halde agent'ın kendi gördüğü ekran
 /// görüntüsünde belirip geri besleme döngüsüne neden olurdu.
 ///
-/// Canlı veri bağlantısı ertelendi (`AgentSession` şu anda başka bir
-/// çalışmanın kirli alanında): `update(with:)` hazır dikiştir; oturum
-/// tarafında "current computer step" yayımlandığında bağlanır.
+/// Canlı bağlantı `FloatingHUDHostView` üzerinden kurulur: `AgenticSidebarApp`
+/// oturum etkinliklerini geçirir, `HUDActivityMapper` son üç bilgisayar
+/// adımına indirger.
 @MainActor
 final class FloatingHUDController {
-    /// HUD'da tutulan en fazla satır.
-    nonisolated static let maximumItems = 3
-
     private var panel: NSPanel?
     private var hostingView: NSHostingView<HUDContentView>?
 
+    /// Son uygulanan içerik + çerçeve + zaman: streaming sırasında her
+    /// aktivite değişiminde senkron `setFrame`/`layoutIfNeeded` dayatması
+    /// display-cycle ile çakışıyordu. Değişmeyen içerik no-op, hızlı
+    /// değişimler 4Hz'e kısılır, pencere işlemi yalnız gerçekten değiştiyse
+    /// yapılır.
+    ///
+    /// Satır üst sınırı `HUDActivityMapper.maximumItems` tek kaynağındadır.
+    private var lastAppliedItems: [HUDActivityItem] = []
+    private var lastAppliedFrame: NSRect?
+    private var lastAppliedAt = Date.distantPast
+    private var pendingItems: [HUDActivityItem]?
+    private var throttleTask: Task<Void, Never>?
+    private static let minimumUpdateInterval: Duration = .milliseconds(250)
+
     /// Son durumla pencereyi tazeler; liste boşsa gizler.
     func update(with items: [HUDActivityItem]) {
-        let visible = Array(items.suffix(Self.maximumItems))
+        let visible = Array(items.suffix(HUDActivityMapper.maximumItems))
         guard !visible.isEmpty else {
+            throttleTask?.cancel()
+            throttleTask = nil
+            pendingItems = nil
             hide()
+            lastAppliedItems = []
+            lastAppliedFrame = nil
             return
         }
+        guard visible != lastAppliedItems || visible != pendingItems else {
+            return
+        }
+        if Date().timeIntervalSince(lastAppliedAt) < 0.25 {
+            pendingItems = visible
+            guard throttleTask == nil else {
+                return
+            }
+            throttleTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: Self.minimumUpdateInterval)
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+                self.throttleTask = nil
+                if let pending = self.pendingItems {
+                    self.pendingItems = nil
+                    self.apply(items: pending)
+                }
+            }
+            return
+        }
+        pendingItems = nil
+        apply(items: visible)
+    }
+
+    /// İçeriği ve (değiştiyse) çerçeveyi uygular; görünürlük yalnız gerektiğinde.
+    private func apply(items: [HUDActivityItem]) {
+        lastAppliedAt = Date()
+        lastAppliedItems = items
         let panel = ensuredPanel()
-        hostingView?.rootView = HUDContentView(items: visible)
-        panel.layoutIfNeeded()
-        panel.orderFrontRegardless()
+        hostingView?.rootView = HUDContentView(items: items)
+        if let frame = HUDContentView.preferredFrame(itemCount: items.count),
+            frame != lastAppliedFrame
+        {
+            lastAppliedFrame = frame
+            panel.setFrame(frame, display: false)
+            panel.layoutIfNeeded()
+        }
+        if !panel.isVisible {
+            panel.orderFrontRegardless()
+        }
     }
 
     func hide() {
@@ -99,11 +152,63 @@ final class FloatingHUDController {
         panel.contentView = effect
         hostingView = hosting
 
-        if let frame = HUDContentView.preferredFrame {
-            panel.setFrame(frame, display: false)
-        }
         self.panel = panel
         return panel
+    }
+}
+
+/// Bilgisayar adımlarını HUD satırlarına indirger.
+///
+/// Saf eşleme: yalnızca çalışan `.computer` adımları alınır, son üçü
+/// gösterilir. Tamamlanan adım timeline'da kalır, HUD'da kalmaz; çalışan adım
+/// yoksa liste boş döner ve panel gizlenir.
+enum HUDActivityMapper {
+    /// HUD'da tutulan en fazla satır. Denetleyici kesmesi ve çerçeve hesabı
+    /// dahil tüm üst sınır okumalarının tek kaynağı budur.
+    nonisolated static let maximumItems = 3
+
+    static func items(from activities: [AgentActivity]) -> [HUDActivityItem] {
+        let running = activities.filter { $0.kind == .computer && $0.phase == .running }
+        return Array(running.suffix(maximumItems)).map { activity in
+            HUDActivityItem(
+                id: activity.id.rawValue,
+                title: activity.title ?? "Computer",
+                detail: activity.detail,
+                isRunning: true
+            )
+        }
+    }
+}
+
+/// Canlı HUD ana bilgisayarı: görünmezdir, yalnızca denetleyiciyi besler.
+///
+/// `AgentSession` dosyasına dokunmadan oturum durumundan beslenir: çağıran
+/// `sessionService.state.activityGroups.flatMap(\.activities)` geçirir.
+/// Boşken panel gizlenir, doluyken `orderFrontRegardless` ile odak çalmadan
+/// gösterilir.
+struct FloatingHUDHostView: View {
+    let activities: [AgentActivity]
+
+    @State private var controller = FloatingHUDController()
+
+    private var items: [HUDActivityItem] {
+        HUDActivityMapper.items(from: activities)
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onAppear {
+                controller.update(with: items)
+            }
+            .onChange(of: activities) { _, _ in
+                controller.update(with: items)
+            }
+            .onDisappear {
+                controller.hide()
+            }
     }
 }
 
@@ -111,13 +216,20 @@ final class FloatingHUDController {
 struct HUDContentView: View {
     let items: [HUDActivityItem]
 
+    /// Satır sayısına göre içerik boyutu. Sabit 96pt üç satırda son satırı
+    /// kesiyordu; panel ve içerik aynı kaynaktan beslenir.
+    nonisolated static func frameSize(itemCount: Int) -> NSSize {
+        let rows = max(1, min(itemCount, HUDActivityMapper.maximumItems))
+        return NSSize(width: 300, height: CGFloat(40 + rows * 20))
+    }
+
     /// Ekranın sağ üst köşesi (menü çubuğunun altı).
-    nonisolated static var preferredFrame: NSRect? {
+    nonisolated static func preferredFrame(itemCount: Int) -> NSRect? {
         guard let screen = NSScreen.main else {
             return nil
         }
         let frame = screen.visibleFrame
-        let size = NSSize(width: 300, height: 96)
+        let size = frameSize(itemCount: itemCount)
         return NSRect(
             x: frame.maxX - size.width - 16,
             y: frame.maxY - size.height - 12,
@@ -157,6 +269,10 @@ struct HUDContentView: View {
             Spacer(minLength: 0)
         }
         .padding(10)
-        .frame(width: 300, height: 96, alignment: .topLeading)
+        .frame(
+            width: Self.frameSize(itemCount: items.count).width,
+            height: Self.frameSize(itemCount: items.count).height,
+            alignment: .topLeading
+        )
     }
 }

@@ -7,9 +7,40 @@ struct ComposerView: View {
     /// Answers this session's "Always allow" decisions and holds the prompts that
     /// are waiting, which the level control has to show and re-answer.
     let permissionApprovalCenter: PermissionApprovalCenter
-    var onInspectFile: ((URL) -> Void)? = nil
-    /// Ek yolu filtreleri için enjekte edilen dosya sistemi; üretimde `.default`.
-    var fileManager: FileManager = .default
+    /// The session this composer writes to; when nil, it tracks the active session.
+    /// In multi-pane (dual or quad) split layouts, secondary, tertiary, and quaternary
+    /// panes pass their pinned session UUID to isolate drafts, queues, and message dispatch.
+    let focusedSessionID: UUID?
+    let onInspectFile: ((URL) -> Void)?
+    /// Hook for side questions (`/btw`).
+    let onSideQuestion: ((String, ResponseSpeedMode, AgentMode) -> Void)?
+    /// Hook for goals (`/goal`). Başarıyı döner: `true` ise taslak
+    /// temizlenir, `false` ise metin alanda kalır (ret panelde görünür).
+    let onStartGoal: ((String, ResponseSpeedMode, AgentMode) -> Bool)?
+    /// Hook for manual context compaction (`/compact`).
+    let onCompactSession: (() -> Void)?
+    /// File manager injected for path filtering.
+    let fileManager: FileManager
+
+    init(
+        sessionService: any AgentSessionServiceProtocol,
+        permissionApprovalCenter: PermissionApprovalCenter,
+        focusedSessionID: UUID?,
+        onInspectFile: ((URL) -> Void)?,
+        onSideQuestion: ((String, ResponseSpeedMode, AgentMode) -> Void)?,
+        onStartGoal: ((String, ResponseSpeedMode, AgentMode) -> Bool)?,
+        onCompactSession: (() -> Void)? = nil,
+        fileManager: FileManager
+    ) {
+        self.sessionService = sessionService
+        self.permissionApprovalCenter = permissionApprovalCenter
+        self.focusedSessionID = focusedSessionID
+        self.onInspectFile = onInspectFile
+        self.onSideQuestion = onSideQuestion
+        self.onStartGoal = onStartGoal
+        self.onCompactSession = onCompactSession
+        self.fileManager = fileManager
+    }
 
     @Environment(SettingsStore.self) private var settingsStore
     @Environment(ExtensionStore.self) private var extensionStore
@@ -19,49 +50,119 @@ struct ComposerView: View {
     /// while the app runs, the store only carries it over a quit.
     @Environment(ComposerDraftStore.self) private var draftStore: ComposerDraftStore?
     @Environment(\.colorScheme) private var systemColorScheme
+    /// Kök ızgaradan gelen bölme genişliği; dar uyum kararları buradan okunur.
+    @Environment(\.paneWidth) private var paneWidth
 
     /// Taslaklar oturuma göre saklanır.
     ///
     /// Tek bir taslak alanı sohbetler arasında sızıyordu: A'da yazılan metin B'ye
     /// geçildiğinde B'nin alanında duruyor ve B'ye gönderiliyordu. Ekler ve
     /// etiketler için de aynısı geçerliydi.
-    @State private var draftsBySession: [UUID: ComposerDraft] = [:]
+    ///
+    /// Sözlük paylaşılan `ComposerDraftMemory` deposunda yaşar: tekli↔yan yana
+    /// geçişte görünüm yok olsa da taslak korunur. Depo ortama verilmemişse
+    /// (önizleme/test) yerel alan kullanılır.
+    @Environment(ComposerDraftMemory.self) private var draftMemory: ComposerDraftMemory?
+    /// Ajan modu ve hız modu oturum başınadır: bir sohbette Plan'a geçmek
+    /// diğer sohbeti etkilemez. Depo yoksa (önizleme/test) genel değer kullanılır.
+    @Environment(SessionComposerPrefs.self) private var composerPrefs: SessionComposerPrefs?
+    @State private var localDrafts: [UUID: ComposerDraft] = [:]
+
+    private var draftsBySession: [UUID: ComposerDraft] {
+        get { draftMemory?.drafts ?? localDrafts }
+        nonmutating set {
+            if let draftMemory {
+                draftMemory.drafts = newValue
+            } else {
+                localDrafts = newValue
+            }
+        }
+    }
+    /// Bölmenin bağlı olduğu oturum: sabit kimlik çözülemezse (silinmişse)
+    /// aktif oturuma düşer.
+    private var focusedSession: AgentSession {
+        if let focusedSessionID,
+            let match = sessionService.session(for: focusedSessionID)
+        {
+            return match
+        }
+        return sessionService.activeSession
+    }
     @State private var isTargetedForDrop = false
     /// Escape ya da panelin kapatma düğmesiyle reddedilen token. Aynı token
     /// yazılmaya devam ettiği sürece öneri paneli geri açılmaz; taslaktan
     /// trigger tümüyle çıkınca silinir.
     @State private var dismissedSuggestionToken: String?
+    /// Tıklanan fotoğrafın büyük önizleme popup hedefi.
+    @State private var previewingImage: PreviewableImageAttachment?
+    /// Sesle yazma durumu; kayıt `SpeechDictationService` tarafındadır, burada
+    /// yalnızca düğme görünümü ve taslağa akan metin yaşar.
+    @State private var dictationService = SpeechDictationService()
+    @State private var isDictating: Bool = false
+    /// Model menüsündeki arama sorgusu; menü kapanınca temizlenir
+    /// (`ComposerDropdown` kapatırken sıfırlar), yoksa eski sorgu bir
+    /// sonraki açılışta listeyi süzülü bırakırdı.
+    @State private var modelMenuSearchText = ""
 
-    /// Yazılmakta olan mesajın tamamı: metin, ekler ve etiketler.
-    private struct ComposerDraft: Equatable {
-        var text: String
-        var attachedURLs: [URL]
-        /// Extensions the user tagged for the next turn. They are chips rather
-        /// than characters in the draft so the text the agent receives stays the
-        /// text the user wrote.
-        var selectedTags: [ExtensionTag]
-
-        static let empty = ComposerDraft(text: "", attachedURLs: [], selectedTags: [])
+    /// Taslağın anahtarı: bölme kimliği çözülemezse bile o kimlikte kalır,
+    /// böylece silinmiş bir oturumun bölmesi aktif sohbetin taslağını ezmez.
+    private var draftSessionID: UUID {
+        focusedSessionID ?? sessionService.activeSessionID
     }
 
     private var draft: String {
-        get { draftsBySession[sessionService.activeSessionID]?.text ?? "" }
+        get { draftsBySession[draftSessionID]?.text ?? "" }
         nonmutating set {
-            draftsBySession[sessionService.activeSessionID, default: .empty].text = newValue
+            draftsBySession[draftSessionID, default: .empty].text = newValue
         }
     }
 
     private var attachedURLs: [URL] {
-        get { draftsBySession[sessionService.activeSessionID]?.attachedURLs ?? [] }
+        get { draftsBySession[draftSessionID]?.attachedURLs ?? [] }
         nonmutating set {
-            draftsBySession[sessionService.activeSessionID, default: .empty].attachedURLs = newValue
+            draftsBySession[draftSessionID, default: .empty].attachedURLs = newValue
         }
     }
 
+    /// Fotoğraf ekleri kare sırada, diğer dosyalar hap sırada durur.
+    private var attachedImageURLs: [URL] {
+        attachedURLs.filter { AttachmentKind.isImage(url: $0) }
+    }
+
+    private var attachedFileURLs: [URL] {
+        attachedURLs.filter { !AttachmentKind.isImage(url: $0) }
+    }
+
     private var selectedTags: [ExtensionTag] {
-        get { draftsBySession[sessionService.activeSessionID]?.selectedTags ?? [] }
+        get { draftsBySession[draftSessionID]?.selectedTags ?? [] }
         nonmutating set {
-            draftsBySession[sessionService.activeSessionID, default: .empty].selectedTags = newValue
+            draftsBySession[draftSessionID, default: .empty].selectedTags = newValue
+        }
+    }
+
+    /// Bu sohbetin etkin ajan modu: geçersiz kılma yoksa genel değer.
+    private var agentMode: AgentMode {
+        get {
+            composerPrefs?.effectiveAgentMode(
+                for: focusedSession.id,
+                default: settingsStore.agentMode
+            ) ?? settingsStore.agentMode
+        }
+        nonmutating set {
+            composerPrefs?.setAgentMode(newValue, for: focusedSession.id)
+        }
+    }
+
+    /// Bu sohbetin etkin hız modu: geçersiz kılma yoksa genel değer.
+    private var speedMode: ResponseSpeedMode {
+        get {
+            composerPrefs?.effectiveSpeedMode(
+                for: focusedSession.id,
+                default: settingsStore.responseSpeedMode
+            ) ?? settingsStore.responseSpeedMode
+        }
+        nonmutating set {
+            composerPrefs?.setSpeedMode(newValue, for: focusedSession.id)
         }
     }
 
@@ -86,6 +187,19 @@ struct ComposerView: View {
         settingsStore.currentThemePreset
     }
 
+    /// Dar bölmede denetimler simgeye iner; satır sayısı değişmez, hap kayar.
+    private var isCompactPane: Bool {
+        PaneResponsive.isCompact(width: paneWidth)
+    }
+
+    private var composerOuterPadding: CGFloat {
+        PaneResponsive.outerPadding(forWidth: paneWidth)
+    }
+
+    private var composerBoxPadding: CGFloat {
+        PaneResponsive.innerPadding(forWidth: paneWidth)
+    }
+
     var body: some View {
         // The panels that belong to the composer *area* but not to the composer
         // box: the queued messages and the `/`/`@` suggestions. Both are siblings
@@ -94,7 +208,7 @@ struct ComposerView: View {
         // underneath them. They also have their own surface, border and shadow, so
         // each reads as a panel of its own rather than a part of the field.
         VStack(spacing: 8) {
-            if !sessionService.queuedPrompts.isEmpty {
+            if !focusedSession.queuedPrompts.isEmpty {
                 floatingPanel {
                     queuedPromptsStrip
                         .padding(.vertical, 6)
@@ -108,11 +222,11 @@ struct ComposerView: View {
             // kaybolur, oysa bu panel o anki oturumun listesini çalışırken
             // açılır-kapanır gösterir.
             if AgentTodoPlacement.shouldShow(
-                todos: sessionService.todos,
-                isTurnRunning: sessionService.isBusy
+                todos: focusedSession.todos,
+                isTurnRunning: focusedSession.isBusy
             ) {
                 AgentTodoChecklistView(
-                    todos: sessionService.todos,
+                    todos: focusedSession.todos,
                     preset: currentTheme,
                     isDark: isDarkMode
                 )
@@ -129,10 +243,17 @@ struct ComposerView: View {
             composerBox
         }
         .animation(.easeOut(duration: 0.14), value: visibleTrigger)
-        .animation(.easeOut(duration: 0.14), value: sessionService.queuedPrompts.isEmpty)
-        .animation(.easeOut(duration: 0.14), value: sessionService.todos.count)
+        .animation(.easeOut(duration: 0.14), value: focusedSession.queuedPrompts.isEmpty)
+        .animation(.easeOut(duration: 0.14), value: focusedSession.todos.count)
+        .popover(item: $previewingImage) { preview in
+            ImagePreviewPopoverContent(
+                url: preview.url,
+                onRemove: preview.allowsRemove ? { removeAttachment(preview.url) } : nil,
+                onClose: { previewingImage = nil }
+            )
+        }
         .frame(maxWidth: 820)
-        .padding(.horizontal, 20)
+        .padding(.horizontal, composerOuterPadding)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .center)
     }
@@ -167,55 +288,15 @@ struct ComposerView: View {
                 selectedTagsRow
             }
 
-            if !attachedURLs.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(attachedURLs, id: \.self) { url in
-                            attachmentPreviewPill(for: url)
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                    .padding(.bottom, 2)
-                }
-            }
+            attachedImagesRow
 
-            ZStack(alignment: .topLeading) {
-                ComposerTextEditor(
-                    text: draftBinding,
-                    submissionAvailability: submissionAvailability,
-                    onSubmit: sendDraft,
-                    onCancelSuggestions: dismissVisibleSuggestions,
-                    onSpillLargePaste: spillLargePasteToAttachment
-                )
+            attachedFilesRow
 
-                if draft.isEmpty {
-                    Text(placeholderText)
-                        .font(.system(size: 13.5))
-                        .foregroundStyle(
-                            isDarkMode
-                                ? Color.white.opacity(0.35)
-                                : Color.black.opacity(0.40)
-                        )
-                        .padding(.top, 2)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-            }
-            .frame(minHeight: 26, maxHeight: 96)
-            .padding(.horizontal, 2)
+            composerEditorArea
 
-            HStack(alignment: .center, spacing: 6) {
-                composerControlPill
-
-                Spacer(minLength: 8)
-
-                attachmentButton
-
-                submitButton
-            }
-            .padding(.top, 2)
+            composerControlRow
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, composerBoxPadding)
         .padding(.vertical, 8)
         .background(
             currentTheme.composerBackground(isDark: isDarkMode)
@@ -232,42 +313,13 @@ struct ComposerView: View {
                 )
         )
         .overlay {
-            if isTargetedForDrop {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(currentTheme.composerBackground(isDark: isDarkMode).opacity(0.95))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .strokeBorder(
-                                LinearGradient(
-                                    colors: currentTheme.accentGradient,
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                style: StrokeStyle(lineWidth: 2, dash: [6, 4])
-                            )
-                    )
-                    .overlay(
-                        VStack(spacing: 6) {
-                            Image(systemName: "arrow.down.doc.fill")
-                                .font(.system(size: 24, weight: .semibold))
-                                .foregroundStyle(
-                                    LinearGradient(
-                                        colors: currentTheme.accentGradient,
-                                        startPoint: .topLeading,
-                                        endPoint: .bottomTrailing
-                                    )
-                                )
-
-                            Text("Drop image or file here")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.primary)
-                        }
-                    )
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
+            dropTargetOverlay
         }
-        .onDrop(of: [.fileURL], isTargeted: $isTargetedForDrop) { providers in
+        // Dosya URL'si yanında ham görüntü de kabul edilir: macOS ekran
+        // görüntüsü önizleme küçük resmi sürüklendiğinde pano dosya URL'si
+        // vermez, yalnızca görüntü verisi verir; yalnız `.fileURL` dinlenirse
+        // bırakma sessizce reddedilir.
+        .onDrop(of: [.fileURL, .image], isTargeted: $isTargetedForDrop) { providers in
             handleDrop(providers: providers)
         }
         .onChange(of: extensionStore.registry) { _, _ in
@@ -275,13 +327,16 @@ struct ComposerView: View {
             let available = Set(extensionStore.tagSuggestions.map(\.id))
             selectedTags.removeAll { !available.contains($0.id) }
         }
-        .onChange(of: sessionService.activeSessionID) { _, _ in
+        .onChange(of: focusedSession.id) { _, _ in
             discardDraftsOfRemovedSessions()
             restoreStoredDraftIfEmpty()
             applyPendingRestore()
         }
         .onChange(of: sessionService.sessionList.map(\.id)) { _, ids in
-            draftStore?.discardSessions(notIn: Set(ids))
+            let liveIDs = Set(ids)
+            draftStore?.discardSessions(notIn: liveIDs)
+            composerPrefs?.discardSessions(notIn: liveIDs)
+            discardDraftsOfRemovedSessions()
         }
         .onChange(of: draft) { _, _ in
             // Trigger taslaktan tümüyle çıkınca kapanış kaydı da düşer: aynı
@@ -303,6 +358,137 @@ struct ComposerView: View {
         }
     }
 
+    /// Fotoğraflar yan yana kareler olarak durur, diğer dosyalar hap olarak;
+    /// kareye tıklayınca büyük önizleme popup açılır.
+    @ViewBuilder
+    private var attachedImagesRow: some View {
+        if !attachedImageURLs.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(attachedImageURLs, id: \.self) { url in
+                        ImageSquareThumbnail(url: url, onRemove: { removeAttachment(url) }) {
+                            previewingImage = PreviewableImageAttachment(url: url, allowsRemove: true)
+                        }
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.bottom, 2)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var attachedFilesRow: some View {
+        if !attachedFileURLs.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(attachedFileURLs, id: \.self) { url in
+                        attachmentPreviewPill(for: url)
+                    }
+                }
+                .padding(.horizontal, 2)
+                .padding(.bottom, 2)
+            }
+        }
+    }
+
+    /// Metin alanı ve yer tutucu.
+    ///
+    /// Oturum kimliğine bağlı kimlik: `NSViewRepresentable` koordinatörü
+    /// oluşturulduğu andaki bağlamayı tutar. Yan yana görünümde takasta (ya da
+    /// kenar çubuğunda sohbet değişiminde) aynı konumdaki alan başka oturumu
+    /// gösterirdi ama yazı koordinatördeki bayat bağlamayla önceki oturumun
+    /// taslağına giderdi — yazılan diğer bölmede belirirdi. Kimlik değişince
+    /// alan ve koordinatör yeniden kurulur, yazı doğru taslağa düşer.
+    private var composerEditorArea: some View {
+        ZStack(alignment: .topLeading) {
+            ComposerTextEditor(
+                text: draftBinding,
+                submissionAvailability: submissionAvailability,
+                onSubmit: sendDraft,
+                onCancelSuggestions: dismissVisibleSuggestions,
+                onSpillLargePaste: spillLargePasteToAttachment
+            )
+            .id(focusedSession.id)
+
+            if draft.isEmpty {
+                Text(placeholderText)
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(
+                        isDarkMode
+                            ? Color.white.opacity(0.35)
+                            : Color.black.opacity(0.40)
+                    )
+                    .padding(.top, 2)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(minHeight: 26, maxHeight: 96)
+        .padding(.horizontal, 2)
+    }
+
+    /// Denetim satırı her genişlikte tek satırdır: hap sığmadığında yatay
+    /// kayar, işlem düğmeleri (ses/ek/gönder) sabit durur. Dar bölmede hap
+    /// zaten simgeye iner (`isCompactPane`), o yüzden kaydırma yalnız en dar
+    /// ızgaralarda devreye girer; besteci yüksekliği bölme sayısıyla büyümez.
+    private var composerControlRow: some View {
+        HStack(alignment: .center, spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                composerControlPill
+            }
+
+            ComposerDictationButton(
+                isRecording: isDictating,
+                onToggle: { toggleDictation() }
+            )
+
+            attachmentButton
+
+            submitButton
+        }
+        .padding(.top, 2)
+    }
+
+    /// Sürükleme geri bildirimi: hedefin üstünü örten kesikli çerçeve.
+    @ViewBuilder
+    private var dropTargetOverlay: some View {
+        if isTargetedForDrop {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(currentTheme.composerBackground(isDark: isDarkMode).opacity(0.95))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: currentTheme.accentGradient,
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            style: StrokeStyle(lineWidth: 2, dash: [6, 4])
+                        )
+                )
+                .overlay(
+                    VStack(spacing: 6) {
+                        Image(systemName: "arrow.down.doc.fill")
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: currentTheme.accentGradient,
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+
+                        Text("Drop image or file here")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.primary)
+                    }
+                )
+                .allowsHitTesting(false)
+                .transition(.opacity)
+        }
+    }
+
     /// Puts a message the user asked to write again back into the field.
     ///
     /// The text is appended rather than swapped in, and the request is only
@@ -312,13 +498,11 @@ struct ComposerView: View {
     private func applyPendingRestore() {
         guard
             let draftCenter,
-            let request = draftCenter.pending,
-            request.sessionID == sessionService.activeSessionID
+            let request = draftCenter.consumePending(for: focusedSession.id)
         else {
             return
         }
 
-        _ = draftCenter.consumePending()
         draft = ComposerDraftPlacement.merged(existing: draft, restored: request.text)
 
         // An attachment whose file is gone would be sent as a path the agent
@@ -336,7 +520,7 @@ struct ComposerView: View {
     /// write, so a keystroke costs a comparison, not I/O.
     private func pushDraftToStore() {
         draftStore?.update(
-            sessionID: sessionService.activeSessionID,
+            sessionID: focusedSession.id,
             text: draft,
             attachmentPaths: attachedURLs.map(\.path)
         )
@@ -349,7 +533,7 @@ struct ComposerView: View {
         guard
             draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             attachedURLs.isEmpty,
-            let stored = draftStore?.storedDraft(for: sessionService.activeSessionID)
+            let stored = draftStore?.storedDraft(for: focusedSession.id)
         else {
             return
         }
@@ -383,14 +567,60 @@ struct ComposerView: View {
                     }
                 }
                 handled = true
+            } else if let imageType = Self.preferredImageTypeIdentifier(for: provider) {
+                let suggestedName = provider.suggestedName
+                _ = provider.loadDataRepresentation(forTypeIdentifier: imageType) { data, _ in
+                    guard let data, !data.isEmpty else { return }
+                    Task { @MainActor in
+                        do {
+                            let url = try DroppedImageAttachment.save(
+                                data,
+                                suggestedName: suggestedName,
+                                typeIdentifier: imageType
+                            )
+                            if !attachedURLs.contains(url) {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    attachedURLs.append(url)
+                                }
+                            }
+                        } catch {
+                            AppLog.agentSession.error(
+                                "A dropped image could not be stored as an attachment"
+                            )
+                        }
+                    }
+                }
+                handled = true
             }
         }
         return handled
     }
 
+    /// Sağlayıcının sunduğu görüntü türlerinden kayıpsız olana öncelik verir;
+    /// dosya URL'si ayrıca ele alınır, buraya yalnız URL'siz bırakmalar düşer.
+    private static func preferredImageTypeIdentifier(for provider: NSItemProvider) -> String? {
+        let offered = provider.registeredTypeIdentifiers
+        let preference = [
+            UTType.png.identifier,
+            UTType.tiff.identifier,
+            UTType.jpeg.identifier,
+            UTType.gif.identifier,
+            UTType.heic.identifier,
+            UTType.webP.identifier,
+            UTType.bmp.identifier,
+        ]
+        if let exact = preference.first(where: { offered.contains($0) }) {
+            return exact
+        }
+        return offered.first {
+            guard let type = UTType($0) else { return false }
+            return type.conforms(to: .image)
+        }
+    }
+
     private var isSelectedModelThinking: Bool {
         guard let selectedModelID else { return false }
-        return sessionService.availableModels.first(where: { $0.id == selectedModelID })?.supportsThinking == true
+        return focusedSession.availableModels.first(where: { $0.id == selectedModelID })?.supportsThinking == true
     }
 
     // MARK: - Unified composer control pill
@@ -404,8 +634,13 @@ struct ComposerView: View {
     /// is the one setting a user changes *while* watching the agent work.
     private var composerControlPill: some View {
         HStack(spacing: 0) {
+            // Bağlam halkası: sonraki turun pencere doluluğu, turda gerçek
+            // zamanlı büyür, tur sonunda sağlayıcı sayımına oturur.
+            contextRingSection
+
             // Model section
-            if !sessionService.availableModels.isEmpty {
+            if !focusedSession.availableModels.isEmpty {
+                pillDivider
                 modelMenuSection
             }
 
@@ -434,7 +669,7 @@ struct ComposerView: View {
     /// reads as part of the decision when it is not.
     private var approvalLevelSection: some View {
         let policy = settingsStore.toolApprovalPolicy
-        let pendingCount = permissionApprovalCenter.pending.count
+        let pendingCount = permissionApprovalCenter.pendingRequests(for: focusedSession.id).count
 
         return HStack(spacing: 2) {
             ComposerDropdown(
@@ -446,9 +681,11 @@ struct ComposerView: View {
                     Image(systemName: policy.symbolName)
                         .font(.system(size: 10.5, weight: .semibold))
 
-                    Text(policy.compactName)
-                        .font(.system(size: 12, weight: .medium))
-                        .lineLimit(1)
+                    if !isCompactPane {
+                        Text(policy.compactName)
+                            .font(.system(size: 12, weight: .medium))
+                            .lineLimit(1)
+                    }
 
                     if pendingCount > 0 {
                         Text("\(pendingCount)")
@@ -459,9 +696,11 @@ struct ComposerView: View {
                             .background(Color.orange, in: Capsule())
                     }
 
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 7, weight: .bold))
-                        .foregroundStyle(.tertiary)
+                    if !isCompactPane {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
                 .foregroundStyle(policy.isUnrestricted ? Color.orange : .secondary)
                 .padding(.horizontal, 9)
@@ -494,15 +733,17 @@ struct ComposerView: View {
         }
 
         settingsStore.toolApprovalPolicy = policy
-        // The prompts on screen were asked under the previous level; leaving them
-        // to time out would refuse work the user just approved.
-        permissionApprovalCenter.reinterpretPendingRequests()
+        // Koşan turun bekleyenleri eski kuralla durur (merkez tur ortası
+        // değişimi uygulamaz); tur çalışmıyorken bekleyen istek varsa yeni
+        // kuralla yeniden yorumlanır. Yalnız bu bölmenin sohbeti kapsanır,
+        // diğer bölmenin kuyusuna dokunulmaz.
+        permissionApprovalCenter.reinterpretPendingRequests(appSessionID: focusedSession.id)
     }
 
     /// Build or Plan for the *next* turn, so it stays switchable while a turn is
     /// running — the same reason the speed mode is not disabled either.
     private var agentModeMenuSection: some View {
-        let mode = settingsStore.agentMode
+        let mode = agentMode
 
         return ComposerDropdown(
             isEnabled: true,
@@ -518,13 +759,17 @@ struct ComposerView: View {
                         : .secondary
                 )
 
-                Text(mode.displayName)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
+                if !isCompactPane {
+                    Text(mode.displayName)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
 
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(.tertiary)
+                if !isCompactPane {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
@@ -536,7 +781,7 @@ struct ComposerView: View {
                     isSelected: candidate == mode,
                     helpText: candidate.helpText
                 ) {
-                    settingsStore.agentMode = candidate
+                    agentMode = candidate
                 } icon: {
                     AgentModeGlyph(
                         mode: candidate,
@@ -555,18 +800,21 @@ struct ComposerView: View {
     /// prompt has not been answered yet, so it is not part of the conversation.
     private var queuedPromptsStrip: some View {
         QueuedPromptsStrip(
-            prompts: sessionService.queuedPrompts,
+            prompts: focusedSession.queuedPrompts,
             onEditInComposer: { id in
                 editQueuedPromptInComposer(id)
             },
             onMove: { id, index in
-                sessionService.moveQueuedPrompt(id, to: index)
+                focusedSession.moveQueuedPrompt(id, to: index)
             },
             onRemove: { id in
-                sessionService.removeQueuedPrompt(id)
+                focusedSession.removeQueuedPrompt(id)
             },
             onClear: {
-                sessionService.clearQueuedPrompts()
+                focusedSession.clearQueuedPrompts()
+            },
+            onSendNow: { id in
+                focusedSession.sendQueuedPromptImmediately(id)
             }
         )
     }
@@ -575,26 +823,35 @@ struct ComposerView: View {
     /// eklerini "Write again" ile aynı yoldan composer girdisine taşır, kullanıcı
     /// düzenlemeyi tam boy alanda yapar ve normal gönderir.
     private func editQueuedPromptInComposer(_ id: UUID) {
-        guard let prompt = sessionService.queuedPrompts.first(where: { $0.id == id }) else {
+        guard let prompt = focusedSession.queuedPrompts.first(where: { $0.id == id }) else {
             return
         }
 
-        sessionService.removeQueuedPrompt(id)
+        focusedSession.removeQueuedPrompt(id)
         draftCenter?.requestRestore(
             text: prompt.text,
             attachmentPaths: prompt.attachmentPaths,
-            sessionID: sessionService.activeSessionID
+            sessionID: focusedSession.id
         )
     }
 
     private var placeholderText: String {
-        if sessionService.state.activeQuestion != nil {
+        if isCompactPane {
+            if focusedSession.activeQuestion != nil {
+                return "Reply here…"
+            }
+            if focusedSession.isBusy {
+                return "Add a follow-up…"
+            }
+            return "Message… @ tools, / skills"
+        }
+        if focusedSession.activeQuestion != nil {
             return "Agent is waiting for your choice above — or write a reply here"
         }
-        if sessionService.isBusy {
+        if focusedSession.isBusy {
             return "Add a follow-up — it is queued and sent when this turn finishes"
         }
-        switch settingsStore.agentMode {
+        switch agentMode {
         case .build:
             return "Message or request changes — @ for MCP and plugins, / for skills"
         case .plan:
@@ -613,11 +870,25 @@ struct ComposerView: View {
             .padding(.horizontal, 2)
     }
 
+    private var contextRingSection: some View {
+        ContextRingView(
+            usage: focusedSession.contextUsage,
+            totalProcessedTokens: focusedSession.totalProcessedTokens,
+            compactionBlocker: focusedSession.compactionBlocker,
+            onCompact: { onCompactSession?() }
+        )
+    }
+
+    /// Sonraki turun modeli: tur ortasında değişim koşan turu etkilemez —
+    /// istek tur başında anlık görüntüyü alır — bu yüzden seçici, mod menüsü
+    /// gibi, meşgulken de açık kalır.
     private var modelMenuSection: some View {
         ComposerDropdown(
-            isEnabled: !sessionService.isBusy,
+            isEnabled: true,
             helpText: "Select the model for this conversation",
-            accessibilityText: "Model"
+            accessibilityText: "Model",
+            searchText: $modelMenuSearchText,
+            searchPlaceholder: "Search models"
         ) {
             HStack(spacing: 4) {
                 // The provider's drawn mark belongs here, on a label SwiftUI
@@ -630,12 +901,16 @@ struct ComposerView: View {
                         : .secondary
                 )
 
-                Text(selectedModelName)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                if !isCompactPane {
+                    Text(selectedModelName)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(maxWidth: 160)
+                        .truncationMode(.tail)
+                }
 
-                if isSelectedModelThinking {
+                if isSelectedModelThinking && !isCompactPane {
                     Text("Thinking")
                         .font(.system(size: 9, weight: .semibold))
                         .padding(.horizontal, 4)
@@ -647,21 +922,30 @@ struct ComposerView: View {
                         .foregroundStyle(currentTheme.accentGradient.first ?? .purple)
                 }
 
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(.tertiary)
+                if !isCompactPane {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .interactiveHoverPill(cornerRadius: 6)
         } content: {
-            ForEach(sessionService.availableModels, id: \.id) { model in
+            if filteredModels.isEmpty {
+                Text("No models match your search")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5.5)
+            }
+            ForEach(filteredModels, id: \.id) { model in
                 ComposerDropdownRow(
                     title: model.displayName,
                     isSelected: model.id == selectedModelID,
                     helpText: nil
                 ) {
-                    try? sessionService.selectModel(model.id)
+                    try? focusedSession.selectModel(model.id)
                 } icon: {
                     ProviderLogoView(
                         logo: ProviderLogo.matching(model.id.rawValue),
@@ -682,7 +966,7 @@ struct ComposerView: View {
     /// of unrelated settings. The chip shows both at once: “XHigh · Fast”.
     private var effortMenuSection: some View {
         let variantID = selectedVariantID
-        let isFast = settingsStore.responseSpeedMode == .fast
+        let isFast = speedMode == .fast
 
         return ComposerDropdown(
             isEnabled: true,
@@ -697,14 +981,18 @@ struct ComposerView: View {
                     .font(.system(size: 10, weight: isFast ? .bold : .medium))
                     .foregroundStyle(isFast ? Color.yellow : Color.secondary)
 
-                Text(effortLabel(isFast: isFast))
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                if !isCompactPane {
+                    Text(effortLabel(isFast: isFast))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
 
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(.tertiary)
+                if !isCompactPane {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
@@ -717,20 +1005,20 @@ struct ComposerView: View {
                 isSelected: variantID == nil,
                 helpText: "Whatever the model ships with"
             ) {
-                try? sessionService.selectVariant(nil)
+                try? focusedSession.selectVariant(nil)
             } icon: {
                 Image(systemName: "brain")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
             }
 
-            ForEach(sessionService.availableVariants, id: \.id) { variant in
+            ForEach(focusedSession.availableVariants, id: \.id) { variant in
                 ComposerDropdownRow(
                     title: variant.displayName,
                     isSelected: variant.id == variantID,
                     helpText: nil
                 ) {
-                    try? sessionService.selectVariant(variant.id)
+                    try? focusedSession.selectVariant(variant.id)
                 } icon: {
                     Image(systemName: "brain")
                         .font(.system(size: 10, weight: .medium))
@@ -745,7 +1033,7 @@ struct ComposerView: View {
                 isSelected: isFast,
                 helpText: ResponseSpeedMode.fast.helpText
             ) {
-                settingsStore.responseSpeedMode = .fast
+                speedMode = .fast
             } icon: {
                 Image(systemName: "bolt.fill")
                     .font(.system(size: 10, weight: .medium))
@@ -760,7 +1048,7 @@ struct ComposerView: View {
                 isSelected: !isFast,
                 helpText: ResponseSpeedMode.normal.helpText
             ) {
-                settingsStore.responseSpeedMode = .normal
+                speedMode = .normal
             } icon: {
                 Image(systemName: "bolt.slash")
                     .font(.system(size: 10, weight: .medium))
@@ -789,6 +1077,7 @@ struct ComposerView: View {
         .buttonStyle(.plain)
         .pointingHandCursor()
         .help("Attach files")
+        .accessibilityLabel("Attach files")
     }
 
     @ViewBuilder
@@ -796,7 +1085,7 @@ struct ComposerView: View {
         HStack(spacing: 6) {
             sendOrQueueButton
 
-            if sessionService.isBusy {
+            if focusedSession.isBusy {
                 cancelButton
             }
         }
@@ -821,7 +1110,7 @@ struct ComposerView: View {
                             : LinearGradient(
                                 colors: [
                                     Color.primary.opacity(0.12),
-                                    Color.primary.opacity(0.06)
+                                    Color.primary.opacity(0.06),
                                 ],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
@@ -837,7 +1126,7 @@ struct ComposerView: View {
                             : Color.primary.opacity(0.35)
                     )
 
-                if sessionService.isBusy {
+                if focusedSession.isBusy {
                     // Marks the button as "this will be queued", not "this will be
                     // sent now".
                     Image(systemName: "clock.fill")
@@ -857,14 +1146,14 @@ struct ComposerView: View {
         .disabled(submissionAvailability == .unavailable)
         .help(sendButtonHelp)
         .accessibilityLabel(
-            sessionService.isBusy ? "Queue message" : "Send message"
+            focusedSession.isBusy ? "Queue message" : "Send message"
         )
     }
 
     private var cancelButton: some View {
         Button {
             Task {
-                await sessionService.cancel()
+                await focusedSession.cancel()
             }
         } label: {
             ZStack {
@@ -881,34 +1170,50 @@ struct ComposerView: View {
         .buttonStyle(.plain)
         .pointingHandCursor()
         .help("Cancel the active turn")
+        .accessibilityLabel("Cancel the active turn")
     }
 
     private var selectedModelID: ProviderModelID? {
-        sessionService.state.configuration?.modelID
+        focusedSession.configuration?.modelID
     }
 
     private var selectedModelName: String {
         if let selectedModelID,
-           let model = sessionService.availableModels.first(where: { $0.id == selectedModelID }) {
+            let model = focusedSession.availableModels.first(where: { $0.id == selectedModelID })
+        {
             return model.displayName
         }
-        return sessionService.availableModels.first?.displayName ?? "Select model"
+        return focusedSession.availableModels.first?.displayName ?? "Select model"
     }
 
     private var selectedVariantID: ProviderVariantID? {
-        sessionService.state.configuration?.variantID
+        focusedSession.configuration?.variantID
+    }
+
+    /// Model menüsünün süzülmüş listesi: boş sorguda hepsi, doluyken adı
+    /// sorguyu içerenler (büyük-küçük harf duyarsız). Seçim değişmez, yalnız
+    /// görünüm elenir.
+    private var filteredModels: [ProviderModelCapability] {
+        let query = modelMenuSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            return focusedSession.availableModels
+        }
+        return focusedSession.availableModels.filter {
+            $0.displayName.localizedCaseInsensitiveContains(query)
+        }
     }
 
     private var selectedVariantName: String {
         if let selectedVariantID,
-           let variant = sessionService.availableVariants.first(where: { $0.id == selectedVariantID }) {
+            let variant = focusedSession.availableVariants.first(where: { $0.id == selectedVariantID })
+        {
             return variant.displayName
         }
         return "Default"
     }
 
     private var selectedProviderID: ProviderID? {
-        sessionService.state.configuration?.providerID
+        focusedSession.configuration?.providerID
     }
 
     private var selectedProviderIdentifier: String {
@@ -925,11 +1230,11 @@ struct ComposerView: View {
             return "A provider adapter is required before sending messages"
         }
 
-        guard sessionService.isBusy else {
+        guard focusedSession.isBusy else {
             return "Send message"
         }
 
-        let queued = sessionService.queuedPrompts.count
+        let queued = focusedSession.queuedPrompts.count
         return queued == 0
             ? "Queue this message for the next turn"
             : "Queue this message (\(queued) already waiting)"
@@ -948,10 +1253,15 @@ struct ComposerView: View {
         // A running turn accepts a follow-up into its queue, so only a session
         // that could never run a turn — no provider configured, or a queue that
         // is already full — is disabled.
-        return sessionService.canAcceptPrompt ? .available : .unavailable
+        return focusedSession.canAcceptPrompt ? .available : .unavailable
     }
 
     private func sendDraft() {
+        // Kayıt sürerken gönderilirse mikrofon durur: dikte metni zaten
+        // taslaktadır (o gönderilir), sonrasındaki kısmi sonuçlar boşalan
+        // besteciyi hayalet metinle doldurmamalı. Önce durdurulur ki araya
+        // kısmi sonuç giremesin, sonra taslak okunur.
+        stopDictation()
         let promptText = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectivePrompt: String
         if promptText.isEmpty {
@@ -960,12 +1270,52 @@ struct ComposerView: View {
             effectivePrompt = promptText
         }
 
+        // Yan soru önek yakalama: `/btw` normal kuyruğa girmez, panele gider.
+        // Meşgul oturumdan da sorulabilir; transkript kirlenmez.
+        if let sideQuestion = Self.sideQuestion(from: effectivePrompt),
+            let onSideQuestion
+        {
+            onSideQuestion(sideQuestion, speedMode, agentMode)
+            draft = ""
+            attachedURLs = []
+            selectedTags = []
+            draftStore?.clear(sessionID: focusedSession.id)
+            return
+        }
+
+        // Hedef önek yakalama: `/goal` normal kuyruğa girmez, hedef
+        // paneline gider. Ret panelde görünür, taslak korunur: yazı ne
+        // sohbete ne boşluğa düşer. Kanca yoksa düz metin gibi gönderilir.
+        if let objective = SlashCommand.parseGoal(from: effectivePrompt),
+            let onStartGoal
+        {
+            guard onStartGoal(objective, speedMode, agentMode) else {
+                return
+            }
+            draft = ""
+            attachedURLs = []
+            selectedTags = []
+            draftStore?.clear(sessionID: focusedSession.id)
+            return
+        }
+
+        // Sıkıştırma önek yakalama: `/compact` normal kuyruğa girmez,
+        // oturumun özet turunu başlatır. Kanca yoksa düz metin gider.
+        if SlashCommand.isCompactCommand(effectivePrompt), let onCompactSession {
+            onCompactSession()
+            draft = ""
+            attachedURLs = []
+            selectedTags = []
+            draftStore?.clear(sessionID: focusedSession.id)
+            return
+        }
+
         let attachmentPaths = attachedURLs.map { $0.path }
-        let acceptance = sessionService.send(
+        let acceptance = focusedSession.send(
             effectivePrompt,
             attachmentPaths: attachmentPaths,
-            speedMode: settingsStore.responseSpeedMode,
-            mode: settingsStore.agentMode,
+            speedMode: speedMode,
+            mode: agentMode,
             tags: selectedTags
         )
 
@@ -973,8 +1323,26 @@ struct ComposerView: View {
             draft = ""
             attachedURLs = []
             selectedTags = []
-            draftStore?.clear(sessionID: sessionService.activeSessionID)
+            draftStore?.clear(sessionID: focusedSession.id)
         }
+    }
+
+    /// `/btw soru` önekini ayıklar: `/btw` + boşluk + boş-olmayan soru.
+    /// Saf ve test edilebilir; büyük/küçük harf duyarsızdır.
+    static func sideQuestion(from text: String) -> String? {
+        let prefix = "/btw"
+        guard text.count > prefix.count else {
+            return nil
+        }
+        guard text.lowercased().hasPrefix(prefix) else {
+            return nil
+        }
+        let remainder = text.dropFirst(prefix.count)
+        guard remainder.first?.isWhitespace == true else {
+            return nil
+        }
+        let question = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+        return question.isEmpty ? nil : question
     }
 
     /// Codex/ChatGPT davranışı: eşik üstü bir yapıştırma metin alanını şişirmez,
@@ -1039,20 +1407,30 @@ struct ComposerView: View {
     @ViewBuilder
     private func extensionSuggestions(for trigger: ExtensionTrigger) -> some View {
         let matches = suggestions(for: trigger)
+        // Yerleşik komutlar yalnız `/` panelinde çıkar (`@` paneli
+        // sunucu/eklenti listesidir, komut almaz).
+        let commands =
+            trigger.kinds.contains(.skill)
+            ? SlashCommand.matching(query: trigger.query)
+            : []
 
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Image(systemName: trigger.kinds.first == .skill
-                    ? "slash.circle"
-                    : "at")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(.secondary)
+                Image(
+                    systemName: trigger.kinds.first == .skill
+                        ? "slash.circle"
+                        : "at"
+                )
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.secondary)
 
-                Text(trigger.kinds.first == .skill
-                    ? "Skills — the agent loads one only when it uses it"
-                    : "MCP servers and plugins for this turn")
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(.secondary)
+                Text(
+                    trigger.kinds.first == .skill
+                        ? "Skills — the agent loads one only when it uses it"
+                        : "MCP servers and plugins for this turn"
+                )
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
 
                 Spacer(minLength: 8)
 
@@ -1082,6 +1460,10 @@ struct ComposerView: View {
             }
             .padding(.horizontal, 6)
 
+            if !commands.isEmpty {
+                commandsSection(commands, in: trigger)
+            }
+
             // Bounded: a machine with sixty skills must not turn this panel into a
             // full-height wall over the conversation.
             ScrollView {
@@ -1107,31 +1489,99 @@ struct ComposerView: View {
         Button {
             select(suggestion, in: trigger)
         } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: iconName(for: suggestion.kind))
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(currentTheme.accentGradient.first ?? .secondary)
-                            .frame(width: 14)
+            HStack(spacing: 8) {
+                Image(systemName: iconName(for: suggestion.kind))
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(currentTheme.accentGradient.first ?? .secondary)
+                    .frame(width: 14)
 
-                        Text(suggestion.name)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.primary)
+                Text(suggestion.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.primary)
 
-                        Text(suggestion.detail)
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                Text(suggestion.detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
 
-                        Spacer(minLength: 4)
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .contentShape(Rectangle())
-                    .interactiveHoverPill(cornerRadius: 6)
-                }
-                .buttonStyle(.plain)
-                .pointingHandCursor()
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+            .interactiveHoverPill(cornerRadius: 6)
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .help("Insert this suggestion into the draft")
+    }
+
+    /// Yerleşik komut bölümü: beceri etiketinden önce, kendi başlığıyla.
+    /// Komutlar tura etiket olarak eklenmez; gönderimde kendi akışına gider.
+    @ViewBuilder
+    private func commandsSection(_ commands: [SlashCommand], in trigger: ExtensionTrigger) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Commands — run on send, never as a tag")
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 6)
+
+            ForEach(commands) { command in
+                slashCommandRow(command, in: trigger)
+            }
+        }
+    }
+
+    private func slashCommandRow(_ command: SlashCommand, in trigger: ExtensionTrigger) -> some View {
+        Button {
+            selectSlashCommand(command, in: trigger)
+        } label: {
+            HStack(spacing: 8) {
+                Text("/\(command.name)")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(currentTheme.accentGradient.first ?? .secondary)
+                    .frame(minWidth: 46, alignment: .leading)
+
+                Text(command.detail)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+            .interactiveHoverPill(cornerRadius: 6)
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .help("Insert /\(command.name) into the draft")
+    }
+
+    /// Komut seçimi etikete değil metne yazar: `/btw ` önekinden sonra
+    /// soru, `/goal ` önekinden sonra hedef yazılır; gönderimde ilgili
+    /// akışa yönlenir. Aralık güvenliği `select` ile aynı desendir
+    /// (bayat aralık çökmez, en kötü halde yazı korunur).
+    private func selectSlashCommand(_ command: SlashCommand, in trigger: ExtensionTrigger) {
+        if let current = ExtensionTrigger.detected(in: draft),
+            current.kinds == trigger.kinds,
+            current.tokenRange.lowerBound < draft.endIndex,
+            current.tokenRange.upperBound <= draft.endIndex
+        {
+            draft.removeSubrange(current.tokenRange)
+        }
+
+        while let last = draft.last, last == " " {
+            draft.removeLast()
+        }
+
+        if !draft.isEmpty {
+            draft += " "
+        }
+        draft += command.prefix
     }
 
     /// Choosing a suggestion turns the typed token into a chip: the draft keeps
@@ -1144,9 +1594,9 @@ struct ComposerView: View {
         // and cut only what still matches; otherwise keep the typed text and attach
         // the tag.
         if let current = ExtensionTrigger.detected(in: draft),
-           current.kinds == trigger.kinds,
-           current.tokenRange.lowerBound < draft.endIndex,
-           current.tokenRange.upperBound <= draft.endIndex
+            current.kinds == trigger.kinds,
+            current.tokenRange.lowerBound < draft.endIndex,
+            current.tokenRange.upperBound <= draft.endIndex
         {
             draft.removeSubrange(current.tokenRange)
         }
@@ -1183,6 +1633,7 @@ struct ComposerView: View {
                         }
                         .buttonStyle(.plain)
                         .pointingHandCursor()
+                        .help("Remove tag")
                     }
                     .padding(.leading, 6)
                     .padding(.trailing, 4)
@@ -1221,10 +1672,74 @@ struct ComposerView: View {
         }
     }
 
+    /// Eki kaldırır; önizleme popup açıksa onu da kapatır.
+    private func removeAttachment(_ url: URL) {
+        attachedURLs.removeAll { $0 == url }
+        if previewingImage?.url == url {
+            previewingImage = nil
+        }
+    }
+
+    /// Mikrofon düğmesi: kayıtta kapatıp nihai metni bırakır, duruyorsa izin
+    /// isteyip kısmi sonuçları taslağa akıtır. Metin yalnızca taslakta birikir.
+    ///
+    /// Kayıt sürerken oturum değişirse kısmi sonuçlar yanlış taslağa akmasın
+    /// diye başlayan oturum yakalanır; uyuşmazlıkta kayıt durdurulur.
+    private func stopDictation() {
+        guard isDictating else {
+            return
+        }
+        // Servisin döndürdüğü nihai metin atılır: taslak zaten son kısmi
+        // sonucu taşır ve gönderim onu okur; buradaki iş yalnız kaydı
+        // kapatıp geç gelen geri çağrıları geçersiz kılmaktır.
+        dictationService.stop()
+        isDictating = false
+    }
+
+    private func toggleDictation() {
+        if isDictating {
+            draft = dictationService.stop()
+            isDictating = false
+            return
+        }
+        let base = draft
+        let sessionID = draftSessionID
+        Task { @MainActor in
+            let authorization = await dictationService.requestAuthorization()
+            guard authorization == .authorized else {
+                focusedSession.state.notice = .dictationUnavailable
+                return
+            }
+            do {
+                try dictationService.start(
+                    baseText: base,
+                    onPartial: { partial in
+                        guard
+                            DictationSessionGuard.shouldApplyPartial(
+                                startedSessionID: sessionID,
+                                currentSessionID: self.draftSessionID
+                            )
+                        else {
+                            dictationService.stop()
+                            isDictating = false
+                            return
+                        }
+                        draft = partial
+                    },
+                    onEnded: {
+                        isDictating = false
+                    }
+                )
+                isDictating = true
+            } catch {
+                isDictating = false
+            }
+        }
+    }
+
     private func attachmentPreviewPill(for url: URL) -> some View {
         let ext = url.pathExtension.lowercased()
-        let isImage = ["png", "jpg", "jpeg", "webp", "tiff", "gif", "heic", "bmp"]
-            .contains(ext)
+        let isImage = AttachmentKind.isImage(url: url)
         let isPDF = ext == "pdf"
 
         return HStack(spacing: 6) {
@@ -1267,7 +1782,7 @@ struct ComposerView: View {
             .help("Click to preview file")
 
             Button {
-                attachedURLs.removeAll { $0 == url }
+                removeAttachment(url)
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))

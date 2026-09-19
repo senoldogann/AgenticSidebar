@@ -25,7 +25,7 @@ final class ComposerDraftCenter {
     @discardableResult
     func requestRestore(
         text: String,
-        attachmentPaths: [String] = [],
+        attachmentPaths: [String],
         sessionID: UUID
     ) -> RestoreRequest {
         let request = RestoreRequest(
@@ -38,14 +38,19 @@ final class ComposerDraftCenter {
         return request
     }
 
-    /// Takes the pending request and leaves none behind.
+    /// Atomically claims the pending restore only if it was requested for this session.
     ///
-    /// The composer applies a restore once; a request that stayed pending would
-    /// re-apply on the next redraw and keep appending the same message.
-    func consumePending() -> RestoreRequest? {
-        defer { pending = nil }
+    /// In multi-pane (dual or quad) split layouts, multiple composers observe `draftCenter.pending`.
+    /// Scoping consumption to the matching session ensures other panes neither overwrite
+    /// their own drafts nor prematurely discard the pending restore before the target pane consumes it.
+    func consumePending(for sessionID: UUID) -> RestoreRequest? {
+        guard let pending, pending.sessionID == sessionID else {
+            return nil
+        }
+        defer { self.pending = nil }
         return pending
     }
+
 }
 
 /// Where a restored message lands in a field that may already hold a draft.

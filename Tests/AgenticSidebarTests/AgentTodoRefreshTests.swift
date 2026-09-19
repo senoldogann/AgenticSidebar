@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -75,11 +76,13 @@ private actor ControlledTodoRuntime: ProviderRuntime {
         ProviderCapabilities(
             id: id,
             displayName: "Alpha",
-            models: [ProviderModelCapability(
-                id: ProviderModelID("alpha-1"),
-                displayName: "Alpha 1",
-                variants: []
-            )]
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("alpha-1"),
+                    displayName: "Alpha 1",
+                    variants: []
+                )
+            ]
         )
     }
 

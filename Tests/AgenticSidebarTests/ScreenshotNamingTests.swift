@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The auto-analysis feature reported itself as enabled on every system and only
@@ -19,7 +20,7 @@ final class ScreenshotNamingTests: XCTestCase {
             "스크린샷 2026-09-16 13.15.40.png",
             "截屏 2026-09-16 13.15.40.png",
             "Zrzut ekranu 2026-09-16 o 13.15.40.png",
-            "Képernyőkép 2026-09-16 13.15.40.png"
+            "Képernyőkép 2026-09-16 13.15.40.png",
         ]
 
         for name in names {
@@ -34,7 +35,7 @@ final class ScreenshotNamingTests: XCTestCase {
         for name in [
             "Screenshot 2026-09-16 at 13.15.40.jpg",
             "Screenshot 2026-09-16 at 13.15.40.jpeg",
-            "Screenshot 2026-09-16 at 13.15.40.heic"
+            "Screenshot 2026-09-16 at 13.15.40.heic",
         ] {
             XCTAssertTrue(ScreenshotMonitorService.hasScreenshotName(name), name)
         }
@@ -47,7 +48,7 @@ final class ScreenshotNamingTests: XCTestCase {
             "Screenshot",
             "Screenshot-notes.md",
             "Screenshot 2026.png.bak",
-            "chart.tiff.png"
+            "chart.tiff.png",
         ] {
             XCTAssertFalse(ScreenshotMonitorService.hasScreenshotName(name), name)
         }
@@ -81,7 +82,7 @@ final class ScreenshotNamingTests: XCTestCase {
             "notes.txt",
             "projects",
             "archive.zip",
-            "Screenshot 2026.png.bak"
+            "Screenshot 2026.png.bak",
         ]
 
         let matched = candidates.filter { name in

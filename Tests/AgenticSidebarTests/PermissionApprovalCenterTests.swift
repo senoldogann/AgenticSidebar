@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -131,6 +132,98 @@ final class PermissionApprovalCenterTests: XCTestCase {
         )
         center.resolve(id: "per_missing", reply: .once)
         XCTAssertTrue(center.pending.isEmpty)
+    }
+
+    func testPendingRequestsAreScopedToOneConversation() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+        let first = UUID()
+        let second = UUID()
+        var mine = makeRequest(id: "per_mine", sessionID: "ses_1")
+        mine.appSessionID = first
+        var other = makeRequest(id: "per_other", sessionID: "ses_2")
+        other.appSessionID = second
+        let mineDecision = Task { await center.submit(mine) }
+        let otherDecision = Task { await center.submit(other) }
+        await waitUntil { center.pending.count == 2 }
+
+        XCTAssertEqual(center.pendingRequests(for: first).map(\.id), ["per_mine"])
+        XCTAssertEqual(center.pendingRequests(for: second).map(\.id), ["per_other"])
+        XCTAssertTrue(center.pendingRequests(for: UUID()).isEmpty)
+
+        center.resolve(id: "per_mine", reply: .once)
+        center.resolve(id: "per_other", reply: .once)
+        _ = await mineDecision.value
+        _ = await otherDecision.value
+    }
+
+    func testScopedReinterpretLeavesTheOtherPanesQueueAlone() async {
+        final class AutoReplyFlag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var enabled = false
+            func enable() { lock.withLock { enabled = true } }
+            func reply() -> ProviderPermissionReply? { lock.withLock { enabled ? .once : nil } }
+        }
+        let flag = AutoReplyFlag()
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in flag.reply() },
+            decisionTimeout: .seconds(60)
+        )
+        let first = UUID()
+        let second = UUID()
+        var mine = makeRequest(id: "per_mine", sessionID: "ses_1")
+        mine.appSessionID = first
+        var other = makeRequest(id: "per_other", sessionID: "ses_2")
+        other.appSessionID = second
+        let mineDecision = Task { await center.submit(mine) }
+        let otherDecision = Task { await center.submit(other) }
+        await waitUntil { center.pending.count == 2 }
+
+        flag.enable()
+        center.reinterpretPendingRequests(appSessionID: first)
+
+        let mineReply = await mineDecision.value
+        XCTAssertEqual(mineReply, .once)
+        XCTAssertEqual(center.pending.map(\.id), ["per_other"])
+
+        center.reinterpretPendingRequests()
+        let otherReply = await otherDecision.value
+        XCTAssertEqual(otherReply, .once)
+        XCTAssertTrue(center.pending.isEmpty)
+    }
+
+    func testAGrantDoesNotCoverAnotherConversation() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+        let first = UUID()
+        let second = UUID()
+        var granted = makeRequest(id: "per_granted", sessionID: "ses_1")
+        granted.appSessionID = first
+        let grantedDecision = Task { await center.submit(granted) }
+        await waitUntil { center.pending.count == 1 }
+        center.resolve(id: "per_granted", reply: .always)
+        _ = await grantedDecision.value
+        XCTAssertEqual(center.grants.count, 1)
+
+        // Aynı komut aynı sohbette sessizce geçer…
+        var same = makeRequest(id: "per_same", sessionID: "ses_1")
+        same.appSessionID = first
+        let sameDecision = await center.submit(same)
+        XCTAssertEqual(sameDecision, .once)
+        XCTAssertTrue(center.pending.isEmpty)
+
+        // …ama başka sohbette yeniden sorulur.
+        var foreign = makeRequest(id: "per_foreign", sessionID: "ses_2")
+        foreign.appSessionID = second
+        let foreignDecision = Task { await center.submit(foreign) }
+        await waitUntil { center.pending.count == 1 }
+        center.resolve(id: "per_foreign", reply: .once)
+        let foreignResult = await foreignDecision.value
+        XCTAssertEqual(foreignResult, .once)
     }
 
     func testTitleFallsBackToTheRawToolNameForUnknownTools() {
@@ -304,7 +397,7 @@ final class PermissionApprovalCenterTests: XCTestCase {
         XCTAssertEqual(reply, .reject)
     }
 
-    func testResolvingEveryPendingRequestAtOnce() async {
+    func testRejectingEveryPendingRequestAtOnce() async {
         let center = PermissionApprovalCenter(
             automaticReplyProvider: { _, _ in nil },
             decisionTimeout: .seconds(60)
@@ -315,7 +408,7 @@ final class PermissionApprovalCenterTests: XCTestCase {
         }
         await waitUntil { center.pending.count == 3 }
 
-        center.resolveAll(reply: .reject)
+        center.rejectAll()
 
         for decision in decisions {
             let reply = await decision.value
@@ -364,14 +457,154 @@ final class PermissionApprovalCenterTests: XCTestCase {
             automaticReplyProvider: { _, _ in nil },
             decisionTimeout: .seconds(60), auditLog: audit
         )
-        await audit.recordExecution(ToolAuditLog.ExecutionRecord(
-            timestamp: Date(), sessionID: "ses_1", activityID: "part_1",
-            toolKind: .read, title: "Read file", detail: "source.swift", event: .completed
-        ))
+        await audit.recordExecution(
+            ToolAuditLog.ExecutionRecord(
+                timestamp: Date(), sessionID: "ses_1", activityID: "part_1",
+                toolKind: .read, title: "Read file", detail: "source.swift", event: .completed
+            ))
         let executions = await center.recentExecutions(limit: 10)
         XCTAssertEqual(executions.map(\.activityID), ["part_1"])
         let decisions = await center.recentDecisions(limit: 10)
         XCTAssertTrue(decisions.isEmpty)
+    }
+
+    func testRunningTurnKeepsItsPolicyAfterALevelChange() async {
+        let live = LiveLevel()
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { toolName, patterns in
+                live.reply(toolName: toolName, patterns: patterns)
+            },
+            decisionTimeout: .seconds(60)
+        )
+        let session = UUID()
+        center.beginTurn(appSessionID: session, turnID: UUID(), policy: .ask)
+
+        // Tur ortasında seviye değişir…
+        live.setFullAccess()
+
+        // …ama koşan turun isteği eski kuralla kullanıcıya sorulur, otomatik
+        // onaylanmaz.
+        var request = makeRequest(id: "per_turn", sessionID: "ses_1")
+        request.appSessionID = session
+        let decision = Task { await center.submit(request) }
+        await waitUntil { center.pending.count == 1 }
+
+        center.resolve(id: "per_turn", reply: .once)
+        let turnReply = await decision.value
+        XCTAssertEqual(turnReply, .once)
+    }
+
+    func testEndedTurnFollowsTheNewLevel() async {
+        let live = LiveLevel()
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { toolName, patterns in
+                live.reply(toolName: toolName, patterns: patterns)
+            },
+            decisionTimeout: .seconds(60)
+        )
+        let session = UUID()
+        let turn = UUID()
+        center.beginTurn(appSessionID: session, turnID: turn, policy: .ask)
+
+        live.setFullAccess()
+        center.endTurn(appSessionID: session, turnID: turn)
+
+        // Tur politikası testi bilgisayar aracı kullanamaz: `fullAccess`
+        // bile bilgisayar kullanımını otomatik onaylamaz
+        // (`testFullAccessStillAsksForComputerUse`). Kabuk isteği tur
+        // sınırını korur.
+        var request = makeBashRequest(id: "per_next", sessionID: "ses_1")
+        request.appSessionID = session
+        let reply = await center.submit(request)
+        XCTAssertEqual(reply, .once, "Tur bitince yeni seviye geçerli olmalı")
+        XCTAssertTrue(center.pending.isEmpty)
+    }
+
+    func testStaleEndTurnDoesNotClearTheNewerTurn() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+        let session = UUID()
+        let oldTurn = UUID()
+        center.beginTurn(appSessionID: session, turnID: oldTurn, policy: .fullAccess)
+        let newTurn = UUID()
+        center.beginTurn(appSessionID: session, turnID: newTurn, policy: .ask)
+
+        // Biten turun geç kapanışı yeni turun kaydını düşürmemeli.
+        center.endTurn(appSessionID: session, turnID: oldTurn)
+
+        var request = makeRequest(id: "per_new", sessionID: "ses_1")
+        request.appSessionID = session
+        let decision = Task { await center.submit(request) }
+        await waitUntil { center.pending.count == 1 }
+        center.resolve(id: "per_new", reply: .reject)
+        let newReply = await decision.value
+        XCTAssertEqual(newReply, .reject)
+    }
+
+    func testReinterpretSkipsTheRunningTurn() async {
+        let live = LiveLevel()
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { toolName, patterns in live.reply(toolName: toolName, patterns: patterns) },
+            decisionTimeout: .seconds(60)
+        )
+        let running = UUID()
+        let idle = UUID()
+        // `fullAccess` bilgisayar araçlarını otomatik onaylamaz, o yüzden
+        // bu tur-sınır testi kabuk istekleri kullanır.
+        var runningRequest = makeBashRequest(id: "per_running", sessionID: "ses_1")
+        runningRequest.appSessionID = running
+        var idleRequest = makeBashRequest(id: "per_idle", sessionID: "ses_2")
+        idleRequest.appSessionID = idle
+        let runningDecision = Task { await center.submit(runningRequest) }
+        let idleDecision = Task { await center.submit(idleRequest) }
+        await waitUntil { center.pending.count == 2 }
+
+        center.beginTurn(appSessionID: running, turnID: UUID(), policy: .ask)
+        live.setFullAccess()
+        center.reinterpretPendingRequests()
+
+        // Koşan turun isteği eski kuralla beklemeye devam eder…
+        await Task.yield()
+        XCTAssertEqual(center.pending.map(\.id), ["per_running"])
+
+        // …tur bitince bekleyen kalmaz, yeni kural sonraki turdadır.
+        center.resolve(id: "per_running", reply: .once)
+        let runningReply = await runningDecision.value
+        let idleReply = await idleDecision.value
+        XCTAssertEqual(runningReply, .once)
+        XCTAssertEqual(idleReply, .once)
+        XCTAssertTrue(center.pending.isEmpty)
+    }
+
+    /// `fullAccess` bile bilgisayar isteğini otomatik onaylamaz: merkez
+    /// üzerinden uçtan uca kilit.
+    func testFullAccessStillAsksComputerThroughCenter() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { toolName, patterns in
+                ToolApprovalPolicy.fullAccess.automaticReply(for: toolName, patterns: patterns)
+            },
+            decisionTimeout: .seconds(60)
+        )
+        let decision = Task {
+            await center.submit(makeRequest(id: "per_computer_full", sessionID: "ses_1"))
+        }
+        await waitUntil { center.pending.count == 1 }
+        center.resolve(id: "per_computer_full", reply: .reject)
+        let reply = await decision.value
+        XCTAssertEqual(reply, .reject)
+    }
+
+    /// Tur ortasında değişen seviyeyi `@Sendable` kapatmadan okuyan kutu:
+    /// `var` yakalama, gönderilebilir kapanıştan sonra değişince uyarı verir.
+    private final class LiveLevel: @unchecked Sendable {
+        private let lock = NSLock()
+        private var level: ToolApprovalPolicy = .ask
+        func setFullAccess() { lock.withLock { level = .fullAccess } }
+        func reply(toolName: String, patterns: [String]) -> ProviderPermissionReply? {
+            lock.withLock { level.automaticReply(for: toolName, patterns: patterns) }
+        }
     }
 
     private func makeRequest(id: String, sessionID: String) -> OpenCodePermissionRequest {
@@ -382,6 +615,20 @@ final class PermissionApprovalCenterTests: XCTestCase {
             patterns: ["*"],
             alwaysPatterns: ["chatgpt-system_computer_click*"],
             detail: "description: Click the Run button"
+        )
+    }
+
+    /// Tur-seviye testleri için bilgisayar-dışı istek: `ask` sorar,
+    /// `fullAccess` otomatik onaylar. Bilgisayar araçları her seviyede
+    /// sorduğu için tur sınırı davranışı bunlarla sınanamaz.
+    private func makeBashRequest(id: String, sessionID: String) -> OpenCodePermissionRequest {
+        OpenCodePermissionRequest(
+            id: id,
+            remoteSessionID: sessionID,
+            toolName: "bash",
+            patterns: ["ls"],
+            alwaysPatterns: ["ls*"],
+            detail: "description: List files"
         )
     }
 

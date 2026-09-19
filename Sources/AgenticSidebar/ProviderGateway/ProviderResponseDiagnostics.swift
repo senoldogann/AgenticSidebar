@@ -65,7 +65,8 @@ final class ProviderResponseDiagnostics: @unchecked Sendable {
     /// One line, bounded. JSON is kept as-is apart from collapsed whitespace, so a
     /// provider's own error message survives intact.
     static func snippet(from body: String) -> String {
-        let collapsed = body
+        let collapsed =
+            body
             .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
             .joined(separator: " ")
 

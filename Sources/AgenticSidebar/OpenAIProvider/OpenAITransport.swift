@@ -19,10 +19,6 @@ protocol OpenAITransport: ProviderHTTPTransport {}
 struct URLSessionOpenAITransport: OpenAITransport {
     private let http: URLSessionHTTPTransport
 
-    private init(http: URLSessionHTTPTransport) {
-        self.http = http
-    }
-
     /// Uzun süre sessiz kalabilen akışlar için ayarlanmış bir oturum kurar. Her
     /// çağrı kendi oturumunu açar; bu süreç genelinde paylaşılan bir nesne
     /// değildir, adı da bunu söyler.

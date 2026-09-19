@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ProviderCapabilitiesTests: XCTestCase {
@@ -70,7 +71,7 @@ final class ProviderCapabilitiesTests: XCTestCase {
                     id: ProviderModelID("plain"),
                     displayName: "Plain",
                     variants: []
-                )
+                ),
             ]
         )
     }

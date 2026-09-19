@@ -2,11 +2,8 @@ import SwiftUI
 
 /// Besteci mikrofon düğmesi (Faz 0: tıklayarak aç/kapa).
 ///
-/// `ComposerView` şu anda başka bir çalışmanın kirli alanında olduğu için kablo
-/// oraya çekilmedi; o dosya temizlendiğinde besteci araç çubuğuna
-/// `ComposerDictationButton(isRecording:onToggle:)` eklenmesi yeterlidir.
 /// Düğme yalnızca görünüm durumunu yansıtır: kayıt/bırakma ve metin akışı
-/// `SpeechDictationService` tarafındadır.
+/// `SpeechDictationService` tarafındadır, `ComposerView` besler.
 struct ComposerDictationButton: View {
     let isRecording: Bool
     let onToggle: () -> Void

@@ -159,6 +159,7 @@ struct SettingsPluginsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Clear search")
                     }
                 }
                 .padding(.horizontal, 10)
@@ -574,5 +575,6 @@ struct SettingsPluginsView: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+        .help(title)
     }
 }

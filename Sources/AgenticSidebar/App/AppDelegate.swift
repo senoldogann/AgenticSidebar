@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var terminationTask: Task<Void, Never>?
     private var terminationSignalSources: [DispatchSourceSignal] = []
+    private var hangWatchdogTask: Task<Void, Never>?
 
     private lazy var globalHotKeyController = GlobalHotKeyController { [weak self] in
         self?.mainWindowController.toggle()
@@ -37,12 +38,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private lazy var snapHotKeyController = GlobalHotKeyController(action: { [weak self] in
-        self?.snapCoordinator?.handleSnapHotKey()
-    }, hotKeyID: 2)
+    private lazy var snapHotKeyController = GlobalHotKeyController(
+        action: { [weak self] in
+            self?.snapCoordinator?.handleSnapHotKey()
+        }, hotKeyID: 2)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        CrashReporter.install()
+        hangWatchdogTask = MainThreadHangWatchdog.start()
         applyGlobalShortcut(launchShortcut)
         applySnapShortcut()
         installTerminationSignalHandlers()
@@ -158,6 +162,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let managedShutdown else {
+            hangWatchdogTask?.cancel()
+            hangWatchdogTask = nil
+            CrashReporter.markCleanExit()
             return .terminateNow
         }
 
@@ -173,6 +180,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else {
                     return
                 }
+                self.hangWatchdogTask?.cancel()
+                self.hangWatchdogTask = nil
+                CrashReporter.markCleanExit()
                 self.terminationReply(sender, true)
             }
         }

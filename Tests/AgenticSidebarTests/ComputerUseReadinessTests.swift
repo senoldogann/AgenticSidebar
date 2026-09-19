@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 // MARK: - Fakes
@@ -814,7 +815,8 @@ private struct ComputerUseFixture {
         try FileManager.default.copyItem(at: URL(fileURLWithPath: "/bin/ls"), to: node)
 
         if installHelper {
-            let contents = home
+            let contents =
+                home
                 .appendingPathComponent(".chatgpt-system", isDirectory: true)
                 .appendingPathComponent("ChatGPTSystemComputerRuntime.app", isDirectory: true)
                 .appendingPathComponent("Contents", isDirectory: true)
@@ -824,21 +826,21 @@ private struct ComputerUseFixture {
             )
             try Data("// helper".utf8).write(to: contents.appendingPathComponent("MacOS/chatgpt-system-computer-runtime"))
             let plist = """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>CFBundleIdentifier</key>
-                <string>com.senoldogann.chatgpt-system.computer-runtime</string>
-                <key>CFBundleExecutable</key>
-                <string>chatgpt-system-computer-runtime</string>
-                <key>CFBundlePackageType</key>
-                <string>APPL</string>
-                <key>CFBundleName</key>
-                <string>ChatGPTSystemComputerRuntime</string>
-            </dict>
-            </plist>
-            """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                <plist version="1.0">
+                <dict>
+                    <key>CFBundleIdentifier</key>
+                    <string>com.senoldogann.chatgpt-system.computer-runtime</string>
+                    <key>CFBundleExecutable</key>
+                    <string>chatgpt-system-computer-runtime</string>
+                    <key>CFBundlePackageType</key>
+                    <string>APPL</string>
+                    <key>CFBundleName</key>
+                    <string>ChatGPTSystemComputerRuntime</string>
+                </dict>
+                </plist>
+                """
             try Data(plist.utf8).write(to: contents.appendingPathComponent("Info.plist"))
         }
 

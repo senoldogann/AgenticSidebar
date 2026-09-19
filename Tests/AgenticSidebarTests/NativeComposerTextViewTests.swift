@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -73,6 +74,48 @@ final class NativeComposerTextViewTests: XCTestCase {
         )
 
         XCTAssertEqual(submissionCount, 0)
+    }
+
+    func testModelTextIsNotAppliedWhileCompositionIsActive() {
+        // Arka plandaki sohbet akarken gövde tazelenir; bitmemiş hece
+        // modeldeki eski metinle ezilmemeli, yoksa yazı silinir.
+        XCTAssertFalse(
+            ComposerTextEditor.shouldApplyModelText(
+                hasMarkedText: true,
+                viewString: "merha",
+                modelText: "merh"
+            )
+        )
+    }
+
+    func testModelTextIsSkippedWhileComposingEvenWhenStringsMatch() {
+        XCTAssertFalse(
+            ComposerTextEditor.shouldApplyModelText(
+                hasMarkedText: true,
+                viewString: "merhaba",
+                modelText: "merhaba"
+            )
+        )
+    }
+
+    func testModelTextIsAppliedWhenNothingIsComposing() {
+        XCTAssertTrue(
+            ComposerTextEditor.shouldApplyModelText(
+                hasMarkedText: false,
+                viewString: "merh",
+                modelText: "merhaba"
+            )
+        )
+    }
+
+    func testModelTextIsSkippedWhenViewAlreadyMatches() {
+        XCTAssertFalse(
+            ComposerTextEditor.shouldApplyModelText(
+                hasMarkedText: false,
+                viewString: "merhaba",
+                modelText: "merhaba"
+            )
+        )
     }
 
     private func makeReturnEvent(

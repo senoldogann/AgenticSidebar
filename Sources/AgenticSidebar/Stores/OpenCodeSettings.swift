@@ -104,7 +104,7 @@ final class OpenCodeSettings {
 
     func refreshStatus() async {
         isInstalled = executableLocator.locate() != nil
-        if case let .untrusted(path, reason) = executableLocator.resolution() {
+        if case .untrusted(let path, let reason) = executableLocator.resolution() {
             errorMessage = "The opencode at \(path) was not run because \(reason)."
         }
         await syncServerStatus()
@@ -150,7 +150,7 @@ final class OpenCodeSettings {
             await syncServerStatus()
             errorMessage = "OpenCode executable was not found."
             return false
-        case let .untrusted(path, reason):
+        case .untrusted(let path, let reason):
             // Refusing is the point: this binary is launched with the server
             // password in its environment, so a file another account can rewrite
             // is not something to run quietly.
@@ -266,10 +266,12 @@ final class OpenCodeSettings {
         do {
             let statuses = try await resolvedClient.mcpServerStatuses()
             if let status = statuses[ComputerUseConfiguration.serverName] {
-                computerUseRegistration = status.isConnected
+                computerUseRegistration =
+                    status.isConnected
                     ? .registered
                     : .failed(message: status.error ?? status.status)
-                computerUseErrorMessage = status.isConnected
+                computerUseErrorMessage =
+                    status.isConnected
                     ? nil
                     : (status.error ?? "MCP server status: \(status.status)")
             } else {
@@ -296,7 +298,8 @@ final class OpenCodeSettings {
             )
 
             if let status = statuses[ComputerUseConfiguration.serverName],
-               !status.isConnected {
+                !status.isConnected
+            {
                 let reason = status.error ?? "MCP server status: \(status.status)"
                 computerUseRegistration = .failed(message: reason)
                 computerUseErrorMessage = reason
@@ -357,7 +360,7 @@ final class OpenCodeSettings {
 
         let metadata = activePrompts.reduce(into: [String: String]()) { result, prompt in
             guard let value = metadataDrafts[prompt.key]?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !value.isEmpty
+                !value.isEmpty
             else {
                 return
             }
@@ -409,7 +412,7 @@ final class OpenCodeSettings {
     private func seedSelectPromptDefaults() {
         for prompt in activePrompts where prompt.type == .select {
             guard metadataDrafts[prompt.key] == nil,
-                  let first = prompt.options?.first
+                let first = prompt.options?.first
             else {
                 continue
             }
@@ -446,6 +449,8 @@ final class OpenCodeSettings {
             "OpenCode request was rate limited."
         case .contextLimitExceeded:
             "The request exceeded the model context window limit."
+        case .unsupported:
+            "OpenCode does not support this request."
         }
     }
 }

@@ -95,9 +95,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     nonisolated func windowWillClose(_ notification: Notification) {
-        Task { @MainActor in
-            self.window = nil
-            self.isWindowOpen = false
+        Task { @MainActor [weak self] in
+            self?.window = nil
+            self?.isWindowOpen = false
         }
     }
 }

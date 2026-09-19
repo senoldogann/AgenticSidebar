@@ -114,7 +114,7 @@ struct SkillsCatalog: Sendable {
                     url: home.appendingPathComponent(".claude/skills", isDirectory: true),
                     isManaged: false,
                     label: "~/.claude/skills"
-                )
+                ),
             ]
         )
     }
@@ -133,16 +133,19 @@ struct SkillsCatalog: Sendable {
         for root in roots {
             stamps[root.url.path] = Self.modificationDate(of: root.url) ?? .distantPast
 
-            guard let entries = try? fileManager.contentsOfDirectory(
-                at: root.url,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            ) else {
+            guard
+                let entries = try? fileManager.contentsOfDirectory(
+                    at: root.url,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                )
+            else {
                 continue
             }
 
             for entry in entries {
-                let isDirectory = (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?
+                let isDirectory =
+                    (try? entry.resourceValues(forKeys: [.isDirectoryKey]))?
                     .isDirectory ?? false
                 guard isDirectory else {
                     continue
@@ -180,16 +183,19 @@ struct SkillsCatalog: Sendable {
     }
 
     func scan(root: SkillRoot) -> [DiscoveredSkill] {
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: root.url,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
+        guard
+            let entries = try? fileManager.contentsOfDirectory(
+                at: root.url,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
             return []
         }
 
         return entries.compactMap { directory -> DiscoveredSkill? in
-            let isDirectory = (try? directory.resourceValues(forKeys: [.isDirectoryKey]))?
+            let isDirectory =
+                (try? directory.resourceValues(forKeys: [.isDirectoryKey]))?
                 .isDirectory ?? false
             guard isDirectory else {
                 return nil

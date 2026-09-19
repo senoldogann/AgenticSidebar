@@ -10,32 +10,48 @@ import SwiftUI
 /// imlecini taşır, ikon olarak da kendisine ne verilirse onu gösterir.
 struct ComposerDropdown<Label: View, Content: View>: View {
     @State private var isPresented: Bool = false
+    @FocusState private var isSearchFocused: Bool
 
     let isEnabled: Bool
     let helpText: String
     let accessibilityText: String
-    let label: Label
-    let content: Content
+    /// `nil` iken arama alanı çizilmez; doluyken menünün üstünde sabit durur.
+    /// Süzme işi çağıranındır: sorgu aynı bağlamayla okunup satırlar elenir.
+    let searchText: Binding<String>?
+    let searchPlaceholder: String
+    /// Satırlar `init` anında değil popover açıldığında kurulur.
+    ///
+    /// Önceki hâlde `content()` init içinde çağrılıp hazır görünüm
+    /// saklanıyordu: besteci her yeniden çizildiğinde (tuş vuruşu, akan
+    /// yanıt, kenar çubuğu animasyonunun her karesi) yüzlerce model satırı
+    /// baştan kuruluyordu. Kapanış dersleri bestecinin gövdesinde saklanır,
+    /// açılışta bir kez kurulur.
+    private let label: () -> Label
+    private let content: () -> Content
 
     init(
         isEnabled: Bool,
         helpText: String,
         accessibilityText: String,
-        @ViewBuilder label: () -> Label,
-        @ViewBuilder content: () -> Content
+        searchText: Binding<String>? = nil,
+        searchPlaceholder: String = "Search",
+        @ViewBuilder label: @escaping () -> Label,
+        @ViewBuilder content: @escaping () -> Content
     ) {
         self.isEnabled = isEnabled
         self.helpText = helpText
         self.accessibilityText = accessibilityText
-        self.label = label()
-        self.content = content()
+        self.searchText = searchText
+        self.searchPlaceholder = searchPlaceholder
+        self.label = label
+        self.content = content
     }
 
     var body: some View {
         Button {
             isPresented.toggle()
         } label: {
-            label
+            label()
         }
         .buttonStyle(.plain)
         .disabled(!isEnabled)
@@ -44,14 +60,46 @@ struct ComposerDropdown<Label: View, Content: View>: View {
             // popover kırpıldığı için tekerlekle kaydırılamıyordu. İçerik bir
             // ScrollView içinde ve yüksekliği sınırlı: menü kısa olduğunda
             // görünüm değişmez, uzun olduğunda yukarı-aşağı kaydırılır.
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 2) {
-                    content
+            // Arama alanı kaydırmaz, üstte sabit durur.
+            VStack(alignment: .leading, spacing: 0) {
+                if let searchText {
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        TextField(searchPlaceholder, text: searchText)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12.5))
+                            .focused($isSearchFocused)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        Color.primary.opacity(0.06),
+                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    )
+                    .padding(.horizontal, 6)
+                    .padding(.top, 6)
                 }
-                .padding(6)
-                .frame(minWidth: 216, alignment: .leading)
+                ScrollView(.vertical) {
+                    // Tembel yığın: yüzlerce model satırı açılışta tek turda
+                    // ölçülmüyor, yalnız görünenler kuruluyor.
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        content()
+                    }
+                    .padding(6)
+                    .frame(minWidth: 216, alignment: .leading)
+                }
+                .frame(maxHeight: 380)
             }
-            .frame(maxHeight: 380)
+        }
+        .onChange(of: isPresented) { _, presented in
+            if presented {
+                // Menü açılınca yazmaya hazırdır; arama yoksa odak değişmez.
+                isSearchFocused = searchText != nil
+            } else {
+                searchText?.wrappedValue = ""
+            }
         }
         .accessibilityLabel(accessibilityText)
         .help(helpText)

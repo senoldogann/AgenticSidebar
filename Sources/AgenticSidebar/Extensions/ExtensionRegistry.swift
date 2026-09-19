@@ -115,7 +115,8 @@ struct ExtensionRegistry: Codable, Equatable, Sendable {
             return candidates
         }
 
-        return candidates
+        return
+            candidates
             .filter {
                 $0.name.lowercased().contains(trimmed)
                     || $0.detail.lowercased().contains(trimmed)
@@ -174,7 +175,10 @@ struct ExtensionRegistry: Codable, Equatable, Sendable {
                 mcpServer: MCPServerRecord(
                     name: name,
                     definition: definition,
-                    isEnabled: false,
+                    // Kalıtılmış satır her keşifte yeniden kurulur; açık/kapalı
+                    // seçimi saklı kayıttan gelir, yoksa her `refresh()` düğmeyi
+                    // başa sarardı.
+                    isEnabled: stored.mcpServers.first { $0.name == name }?.isEnabled ?? false,
                     source: .manual,
                     isInherited: true,
                     installedAt: stored.mcpServers.first { $0.name == name }?.installedAt
@@ -215,14 +219,27 @@ struct ExtensionRegistry: Codable, Equatable, Sendable {
         return updated
     }
 
+    /// Aynı adlı kayıt birleşir — ama körü körüne değil.
+    ///
+    /// Aynı kökten gelen taze tanım (kalıtılmışın yeniden keşfi) tanımı
+    /// günceller, kullanıcının açık/kapalı seçimini korur. Kullanıcının kendi
+    /// kurulumu (`isInherited == false`) kalıtılmış gölgeyi her zaman yener:
+    /// tersi, her keşifte API anahtarı dahil tanımı silip marketplace
+    /// "Installed" rozetini yalancı çıkarırdı. Kalıtılmış gölge, kullanıcının
+    /// kaydını asla ezmez.
     mutating func upsert(mcpServer record: MCPServerRecord) {
-        if let index = mcpServers.firstIndex(where: { $0.name == record.name }) {
+        guard let index = mcpServers.firstIndex(where: { $0.name == record.name }) else {
+            mcpServers.append(record)
+            return
+        }
+        let existing = mcpServers[index]
+        if existing.isInherited == record.isInherited {
             // The user's choice survives a rediscovery of the same server.
             var updated = record
-            updated.isEnabled = mcpServers[index].isEnabled
+            updated.isEnabled = existing.isEnabled
             mcpServers[index] = updated
-        } else {
-            mcpServers.append(record)
+        } else if !record.isInherited {
+            mcpServers[index] = record
         }
     }
 
@@ -358,7 +375,8 @@ struct ExtensionRegistryStore: Sendable {
     }
 
     private func moveAside() {
-        let damagedURL = fileURL
+        let damagedURL =
+            fileURL
             .deletingPathExtension()
             .appendingPathExtension("corrupt.json")
 

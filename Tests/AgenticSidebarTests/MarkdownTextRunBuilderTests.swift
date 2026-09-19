@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The run is what makes a whole answer selectable in one drag, so these tests
@@ -13,22 +14,22 @@ final class MarkdownTextRunBuilderTests: XCTestCase {
 
     func testOnlyProseBlocksShareOneTextView() {
         let source = """
-        Prose.
+            Prose.
 
-        ```swift
-        let value = 1
-        ```
+            ```swift
+            let value = 1
+            ```
 
-        | a | b |
-        |---|---|
-        | 1 | 2 |
+            | a | b |
+            |---|---|
+            | 1 | 2 |
 
-        ---
+            ---
 
-        ```plan
-        - step
-        ```
-        """
+            ```plan
+            - step
+            ```
+            """
 
         let blocks = parseMarkdownBlocks(from: source)
 

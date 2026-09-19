@@ -10,7 +10,8 @@ struct CapturePrivacyCapabilities: Equatable, Sendable {
 
     static let current = CapturePrivacyCapabilities(
         externalCaptureExclusionApplied: true,
-        limitation: "This app sets NSWindow.sharingType = .none on its windows, which asks macOS to leave them out of system screenshots and standard screen recordings. Capture paths that do not honor the window sharing setting are not covered."
+        limitation:
+            "This app sets NSWindow.sharingType = .none on its windows, which asks macOS to leave them out of system screenshots and standard screen recordings. Capture paths that do not honor the window sharing setting are not covered."
     )
 }
 
@@ -134,7 +135,7 @@ final class CapturePrivacyController {
         let names: [Notification.Name] = [
             NSWindow.didBecomeKeyNotification,
             NSWindow.didBecomeMainNotification,
-            NSWindow.didChangeOcclusionStateNotification
+            NSWindow.didChangeOcclusionStateNotification,
         ]
 
         for name in names {

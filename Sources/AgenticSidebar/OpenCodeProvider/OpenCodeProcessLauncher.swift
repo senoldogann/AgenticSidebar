@@ -37,12 +37,13 @@ struct SystemOpenCodeExecutableLocator: OpenCodeExecutableLocating {
     func resolution() -> OpenCodeExecutableResolution {
         var candidates = [
             "/opt/homebrew/bin/opencode",
-            "/usr/local/bin/opencode"
+            "/usr/local/bin/opencode",
         ]
 
         if let path = environment["PATH"] {
             candidates.append(
-                contentsOf: path
+                contentsOf:
+                    path
                     .split(separator: ":")
                     .map { String($0) + "/opencode" }
             )
@@ -95,8 +96,8 @@ struct SystemOpenCodeExecutableLocator: OpenCodeExecutableLocating {
         }
 
         if let ownerID = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value,
-           ownerID != 0,
-           ownerID != getuid()
+            ownerID != 0,
+            ownerID != getuid()
         {
             return .untrusted(
                 path: resolved.path,
@@ -276,7 +277,7 @@ struct FoundationOpenCodeProcessLauncher: OpenCodeProcessLaunching {
     static let inheritedEnvironmentKeys = [
         "PATH", "HOME", "USER", "LOGNAME", "SHELL",
         "TMPDIR", "TMP", "LANG", "LC_ALL",
-        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"
+        "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
     ]
 
     static func childEnvironment(overrides: [String: String]) -> [String: String] {
@@ -301,7 +302,7 @@ struct FoundationOpenCodeProcessLauncher: OpenCodeProcessLaunching {
             "/usr/bin",
             "/bin",
             "/usr/sbin",
-            "/sbin"
+            "/sbin",
         ]
         for dir in candidateDirectories {
             if FileManager.default.fileExists(atPath: dir) && !paths.contains(dir) {
@@ -338,10 +339,11 @@ struct FoundationOpenCodeProcessLauncher: OpenCodeProcessLaunching {
         do {
             try process.run()
         } catch {
+            try? logHandle.close()
             throw ProviderRuntimeError.startupFailure
         }
 
-        return FoundationOpenCodeProcessHandle(process: process)
+        return FoundationOpenCodeProcessHandle(process: process, logHandle: logHandle === FileHandle.nullDevice ? nil : logHandle)
     }
 }
 
@@ -381,9 +383,11 @@ extension FileHandle {
 
 private actor FoundationOpenCodeProcessHandle: OpenCodeProcessHandling {
     private let process: Process
+    private var logHandle: FileHandle?
 
-    init(process: Process) {
+    init(process: Process, logHandle: FileHandle? = nil) {
         self.process = process
+        self.logHandle = logHandle
     }
 
     func isRunning() -> Bool {
@@ -441,5 +445,10 @@ private actor FoundationOpenCodeProcessHandle: OpenCodeProcessHandling {
         for descendant in Set(knownDescendants) where OpenCodeProcessTree.isAlive(descendant) {
             kill(descendant, SIGKILL)
         }
+
+        // Ebeveyndeki yazma ucu kapatılmazsa sunucu yeniden başlatma başına
+        // bir fd sızardı; çocuk zaten öldü, log burada kapanır.
+        try? logHandle?.close()
+        logHandle = nil
     }
 }

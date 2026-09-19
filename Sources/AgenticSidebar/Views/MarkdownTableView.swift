@@ -116,6 +116,9 @@ enum MarkdownTables {
                 currentCell.append(character)
             }
         }
+        if isEscaping {
+            currentCell.append("\\")
+        }
 
         cells.append(currentCell.trimmingCharacters(in: .whitespaces))
         return cells

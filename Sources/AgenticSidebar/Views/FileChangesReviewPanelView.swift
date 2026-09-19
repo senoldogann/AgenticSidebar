@@ -98,6 +98,7 @@ struct FileChangesReviewPanelView: View {
                 }
                 .buttonStyle(.plain)
                 .pointingHandCursor()
+                .help("Back to all changed files")
 
                 Divider()
                     .frame(height: 14)
@@ -277,6 +278,7 @@ struct FileChangesReviewPanelView: View {
                     }
                     .buttonStyle(.plain)
                     .pointingHandCursor()
+                    .help("View diff for \(file.fileName)")
                 }
             }
             .padding(.vertical, 8)
@@ -306,6 +308,7 @@ struct FileChangesReviewPanelView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .help("View the full file from disk")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(32)
@@ -450,7 +453,8 @@ struct FileChangesReviewPanelView: View {
         Task {
             let loaded = await Task.detached(priority: .userInitiated) { () -> String? in
                 guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                      let str = String(data: data, encoding: .utf8) else {
+                    let str = String(data: data, encoding: .utf8)
+                else {
                     return nil
                 }
                 return str
@@ -494,9 +498,9 @@ struct FileChangesReviewPanelView: View {
     }
 }
 
-private extension View {
+extension View {
     @ViewBuilder
-    func userSelectable(_ selectable: Bool) -> some View {
+    fileprivate func userSelectable(_ selectable: Bool) -> some View {
         if #available(macOS 14.0, *) {
             // Unselectable line numbers
             self

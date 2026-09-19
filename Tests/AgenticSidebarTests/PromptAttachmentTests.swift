@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -133,15 +134,15 @@ final class PromptAttachmentTests: XCTestCase {
 
     func testChatMessagePresenterCleansRawOCRAndBoilerplateFromScreenshotPrompt() {
         let rawPrompt = """
-        [Screenshot captured: Ekran Resmi 2026-09-16.png]
-        Extracted content from screenshot:
-        \"\"\"
-        Hello world! This is extracted OCR text from the image.
-        12345
-        \"\"\"
+            [Screenshot captured: Ekran Resmi 2026-09-16.png]
+            Extracted content from screenshot:
+            \"\"\"
+            Hello world! This is extracted OCR text from the image.
+            12345
+            \"\"\"
 
-        Please inspect this screenshot carefully: infer intent, if there is a question or problem solve it and provide the direct answer, or describe what is shown.
-        """
+            Please inspect this screenshot carefully: infer intent, if there is a question or problem solve it and provide the direct answer, or describe what is shown.
+            """
 
         let cleaned = ChatMessagePresenter.cleanUserDisplayText(from: rawPrompt, hasAttachments: true)
         XCTAssertEqual(cleaned, "")
@@ -149,14 +150,14 @@ final class PromptAttachmentTests: XCTestCase {
 
     func testChatMessagePresenterPreservesUserQueryWhenPresent() {
         let rawPrompt = """
-        [Screenshot captured: test.png]
-        Extracted content from screenshot:
-        \"\"\"
-        OCR TEXT
-        \"\"\"
+            [Screenshot captured: test.png]
+            Extracted content from screenshot:
+            \"\"\"
+            OCR TEXT
+            \"\"\"
 
-        Can you fix this compile error?
-        """
+            Can you fix this compile error?
+            """
 
         let cleaned = ChatMessagePresenter.cleanUserDisplayText(from: rawPrompt, hasAttachments: true)
         XCTAssertEqual(cleaned, "Can you fix this compile error?")
@@ -174,6 +175,24 @@ final class PromptAttachmentTests: XCTestCase {
         let text = "Hello AI assistant!"
         let cleaned = ChatMessagePresenter.cleanUserDisplayText(from: text, hasAttachments: false)
         XCTAssertEqual(cleaned, text)
+    }
+
+    func testChatMessagePresenterUnwrapsWholeMessageUserTurnFrame() {
+        let framed = "<user_turn>\nDerinlemesine bir review başlat\n</user_turn>"
+        let cleaned = ChatMessagePresenter.cleanUserDisplayText(from: framed, hasAttachments: false)
+        XCTAssertEqual(cleaned, "Derinlemesine bir review başlat")
+    }
+
+    func testChatMessagePresenterPreservesUserTurnMentionInsideText() {
+        let text = "Sohbette <user_turn> etiketleri görünüyor, bunu düzelt"
+        let cleaned = ChatMessagePresenter.cleanUserDisplayText(from: text, hasAttachments: false)
+        XCTAssertEqual(cleaned, text)
+    }
+
+    func testChatMessagePresenterIgnoresEmptyUserTurnFrame() {
+        let framed = "<user_turn>\n</user_turn>"
+        let cleaned = ChatMessagePresenter.cleanUserDisplayText(from: framed, hasAttachments: false)
+        XCTAssertEqual(cleaned, framed)
     }
 
     private func makeRequest(
@@ -270,7 +289,7 @@ private actor AttachmentRecordingOpenCodeClient: OpenCodeClientProtocol {
         parts: [OpenCodePromptPart]
     ) async throws {
         let text = parts.compactMap { part -> String? in
-            if case let .text(str) = part { return str }
+            if case .text(let str) = part { return str }
             return nil
         }.joined(separator: "\n")
         prompts.append(text)

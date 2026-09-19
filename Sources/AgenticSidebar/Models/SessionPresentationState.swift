@@ -32,7 +32,7 @@ struct SessionPresentationState: Equatable, Sendable {
             phase = .idle
         case .streaming:
             phase = .thinking
-        case let .runningTool(toolName):
+        case .runningTool(let toolName):
             phase = .runningTool(toolName)
         case .waiting:
             phase = .waiting
@@ -56,7 +56,7 @@ struct SessionPresentationState: Equatable, Sendable {
             "Idle"
         case .thinking:
             "Thinking"
-        case let .runningTool(toolName):
+        case .runningTool(let toolName):
             "Running \(toolName)"
         case .waiting:
             "Waiting"

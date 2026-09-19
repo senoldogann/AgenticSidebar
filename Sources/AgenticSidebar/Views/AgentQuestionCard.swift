@@ -13,6 +13,7 @@ struct AgentQuestionCard: View {
     let onDismiss: () -> Void
 
     @Environment(SettingsStore.self) private var settingsStore: SettingsStore?
+    @Environment(\.paneWidth) private var paneWidth
 
     @State private var selectedOptionIDs: Set<String> = []
     @State private var customAnswerText: String = ""
@@ -138,6 +139,7 @@ struct AgentQuestionCard: View {
                     }
                     .buttonStyle(.plain)
                     .pointingHandCursor()
+                    .help(isAllSelected ? "Deselect all options" : "Select all options")
                 }
             }
 
@@ -178,6 +180,7 @@ struct AgentQuestionCard: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Clear custom answer")
                     }
                 }
                 .padding(.horizontal, 10)
@@ -216,6 +219,7 @@ struct AgentQuestionCard: View {
                 .buttonStyle(.plain)
                 .disabled(isSubmitting)
                 .pointingHandCursor()
+                .help("Skip this question without answering")
 
                 Spacer(minLength: 0)
 
@@ -249,6 +253,7 @@ struct AgentQuestionCard: View {
                 .buttonStyle(.plain)
                 .disabled(!canSubmit || isSubmitting)
                 .pointingHandCursor()
+                .help("Send the selected answer to the assistant")
             }
         }
         .padding(14)
@@ -267,7 +272,7 @@ struct AgentQuestionCard: View {
             y: 5
         )
         .frame(maxWidth: 820)
-        .padding(.horizontal, 20)
+        .padding(.horizontal, PaneResponsive.outerPadding(forWidth: paneWidth))
         .padding(.bottom, 6)
         .frame(maxWidth: .infinity, alignment: .center)
         .onAppear {
@@ -303,7 +308,7 @@ struct AgentQuestionCard: View {
             "(onerilen)", "(Onerilen)",
             "[Recommended]", "[recommended]",
             "[Önerilen]", "[önerilen]", "[onerilen]",
-            "(Tavsiye Edilen)", "(tavsiye edilen)", "(tavsiye)"
+            "(Tavsiye Edilen)", "(tavsiye edilen)", "(tavsiye)",
         ]
         for tag in tags {
             cleaned = cleaned.replacingOccurrences(of: tag, with: "")
@@ -400,6 +405,7 @@ struct AgentQuestionCard: View {
         .buttonStyle(.plain)
         .disabled(isSubmitting)
         .pointingHandCursor()
+        .help(isSelected ? "Deselect \(cleanLabel(for: option.label))" : "Select \(cleanLabel(for: option.label))")
     }
 
     private func toggleOption(_ id: String) {

@@ -1,4 +1,5 @@
 import Foundation
+
 @testable import AgenticSidebar
 
 struct TestProviderRuntime: ProviderRuntime {

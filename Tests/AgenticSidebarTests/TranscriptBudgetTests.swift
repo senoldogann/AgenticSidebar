@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class TranscriptBudgetTests: XCTestCase {
@@ -8,7 +9,7 @@ final class TranscriptBudgetTests: XCTestCase {
         let messages = [
             ChatMessage(role: .user, text: String(repeating: "a", count: 500)),
             ChatMessage(role: .assistant, text: String(repeating: "b", count: 500)),
-            ChatMessage(role: .user, text: "newest")
+            ChatMessage(role: .user, text: "newest"),
         ]
 
         let selection = budget.select(from: messages)
@@ -23,7 +24,7 @@ final class TranscriptBudgetTests: XCTestCase {
         let messages = [
             ChatMessage(role: .user, text: "old"),
             ChatMessage(role: .assistant, text: String(repeating: "y", count: 5_000)),
-            ChatMessage(role: .user, text: huge)
+            ChatMessage(role: .user, text: huge),
         ]
 
         let selection = budget.select(from: messages)
@@ -41,7 +42,7 @@ final class TranscriptBudgetTests: XCTestCase {
                 attachmentPaths: [String(repeating: "p", count: 900)]
             ),
             ChatMessage(role: .assistant, text: "answer"),
-            ChatMessage(role: .user, text: "follow up")
+            ChatMessage(role: .user, text: "follow up"),
         ]
 
         let selection = budget.select(from: messages)
@@ -55,7 +56,7 @@ final class TranscriptBudgetTests: XCTestCase {
         let messages = [
             ChatMessage(role: .assistant, text: "stray reply"),
             ChatMessage(role: .user, text: "question"),
-            ChatMessage(role: .assistant, text: "answer")
+            ChatMessage(role: .assistant, text: "answer"),
         ]
 
         let selection = budget.select(from: messages)
@@ -68,7 +69,7 @@ final class TranscriptBudgetTests: XCTestCase {
         let budget = TranscriptBudget()
         let messages = [
             ChatMessage(role: .user, text: "hello"),
-            ChatMessage(role: .assistant, text: "hi")
+            ChatMessage(role: .assistant, text: "hi"),
         ]
 
         let selection = budget.select(from: messages)

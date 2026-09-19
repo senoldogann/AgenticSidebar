@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The two things that made a long draft or a long conversation feel slow were
@@ -121,11 +122,16 @@ final class TranscriptIndexTests: XCTestCase {
                 for: [
                     ChatMessage(role: .user, text: "first question"),
                     ChatMessage(role: .assistant, text: "answer"),
-                    ChatMessage(role: .user, text: "second question")
+                    ChatMessage(role: .user, text: "second question"),
                 ],
                 maximumPromptCount: 60
             ),
-            groupsByAnchor: [:]
+            groupsByAnchor: [:],
+            lastAssistantMessageIDs: [],
+            turnHeaderUserMessageIDs: [],
+            lastUserMessageID: nil,
+            lastMessageID: nil,
+            activeTurnMessageIDs: []
         )
 
         XCTAssertEqual(index.promptItems.map(\.title), ["first question", "second question"])
@@ -155,7 +161,12 @@ final class TranscriptIndexTests: XCTestCase {
 
         let index = TranscriptIndex(
             promptItems: [],
-            groupsByAnchor: TranscriptIndex.groupsByAnchor([group])
+            groupsByAnchor: TranscriptIndex.groupsByAnchor([group]),
+            lastAssistantMessageIDs: [],
+            turnHeaderUserMessageIDs: [],
+            lastUserMessageID: nil,
+            lastMessageID: nil,
+            activeTurnMessageIDs: []
         )
 
         XCTAssertEqual(index.activityGroup(after: anchor)?.id, group.id)
@@ -166,7 +177,7 @@ final class TranscriptIndexTests: XCTestCase {
         let cache = TranscriptIndexCache()
         var messages = [
             ChatMessage(role: .user, text: "explain the parser"),
-            ChatMessage(role: .assistant, text: "The")
+            ChatMessage(role: .assistant, text: "The"),
         ]
 
         _ = cache.index(messages: messages, activityGroups: [], maximumPromptCount: 60, activityRevision: 0)

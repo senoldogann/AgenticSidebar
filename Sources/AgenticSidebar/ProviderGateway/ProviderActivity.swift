@@ -123,6 +123,31 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
         )
     }
 
+    /// Whether a tool name delegates to a subagent session (`task` and its
+    /// aliases). One predicate for every call site that attributes child
+    /// sessions — the stream normalizer and the question router — so a
+    /// delegation the timeline files as a subagent is also one whose child
+    /// questions and permissions reach this turn.
+    static func isSubagentTool(_ toolName: String) -> Bool {
+        let normalizedName = toolName.lowercased()
+        let subagentNames: Set<String> = [
+            "task",
+            "subagent",
+            "sub_agent",
+            "browser_subagent",
+            "run_subagent",
+            "call_subagent",
+            "invoke_subagent",
+            "delegate_task",
+            "delegate_agent",
+            "delegate",
+            "agent",
+        ]
+        return subagentNames.contains(normalizedName)
+            || normalizedName.hasSuffix("_subagent")
+            || normalizedName.hasPrefix("subagent_")
+    }
+
     private static func sanitizedKind(for toolName: String) -> ProviderActivityKind {
         let normalizedName = toolName.lowercased()
 
@@ -136,23 +161,7 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
         // Checked first: `task` and other subagent delegation tools. They run
         // their own tools in a child session, so without their own kind they
         // would fall into generic tool or todo lists.
-        let subagentNames: Set<String> = [
-            "task",
-            "subagent",
-            "sub_agent",
-            "browser_subagent",
-            "run_subagent",
-            "call_subagent",
-            "invoke_subagent",
-            "delegate_task",
-            "delegate_agent",
-            "delegate",
-            "agent"
-        ]
-        if subagentNames.contains(normalizedName)
-            || normalizedName.hasSuffix("_subagent")
-            || normalizedName.hasPrefix("subagent_")
-        {
+        if isSubagentTool(toolName) {
             return .subagent
         }
 
@@ -191,7 +200,7 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
             "prompt_user",
             "clarify",
             "user_input",
-            "interactive_question"
+            "interactive_question",
         ]
         if questionNames.contains(normalizedName)
             || normalizedName.hasSuffix("_question")
@@ -305,10 +314,12 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
     ) -> (server: String?, tool: String) {
         let normalized = toolName.lowercased()
         if normalized == "call_mcp_tool" || normalized == "callmcptool" {
-            let server = (input["ServerName"] as? String)
+            let server =
+                (input["ServerName"] as? String)
                 ?? (input["server_name"] as? String)
                 ?? (input["server"] as? String)
-            let tool = (input["ToolName"] as? String)
+            let tool =
+                (input["ToolName"] as? String)
                 ?? (input["tool_name"] as? String)
                 ?? (input["tool"] as? String)
                 ?? toolName
@@ -319,7 +330,8 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
 
     /// `get_user` → "Get user": zaman çizelgesindeki satır başlığı için.
     static func humanizedToolName(_ rawTool: String) -> String {
-        let words = rawTool
+        let words =
+            rawTool
             .split { !$0.isLetter && !$0.isNumber }
             .map(String.init)
             .filter { !$0.isEmpty }
@@ -328,7 +340,8 @@ struct ProviderActivityDescriptor: Equatable, Sendable {
             return rawTool
         }
 
-        return words
+        return
+            words
             .map { $0.prefix(1).uppercased() + $0.dropFirst() }
             .joined(separator: " ")
     }

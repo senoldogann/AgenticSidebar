@@ -67,12 +67,13 @@ struct MarkdownRunTypography: Equatable {
             return system
         }
 
-        let design: NSFontDescriptor.SystemDesign = switch family {
-        case .system: .default
-        case .rounded: .rounded
-        case .serif: .serif
-        case .monospaced: .monospaced
-        }
+        let design: NSFontDescriptor.SystemDesign =
+            switch family {
+            case .system: .default
+            case .rounded: .rounded
+            case .serif: .serif
+            case .monospaced: .monospaced
+            }
 
         guard let descriptor = system.fontDescriptor.withDesign(design) else {
             return system
@@ -112,24 +113,24 @@ enum MarkdownTextRunBuilder {
     ) -> String {
         let content = blocks.map { block in
             switch block {
-            case let .paragraph(_, content): "p:\(content)"
-            case let .heading(_, level, text): "h\(level):\(text)"
-            case let .bulletItem(_, text): "*:\(text)"
-            case let .numberedItem(_, number, text): "\(number).:\(text)"
-            case let .blockquote(_, text): ">\(text)"
-            case let .code(id, _, _): "code:\(id)"
-            case let .divider(id): "divider:\(id)"
-            case let .table(id, _, _, _): "table:\(id)"
-            case let .chart(id, _): "chart:\(id)"
-            case let .plan(id, _): "plan:\(id)"
-            case let .math(id, _): "math:\(id)"
+            case .paragraph(_, let content): "p:\(content)"
+            case .heading(_, let level, let text): "h\(level):\(text)"
+            case .bulletItem(_, let text): "*:\(text)"
+            case .numberedItem(_, let number, let text): "\(number).:\(text)"
+            case .blockquote(_, let text): ">\(text)"
+            case .code(let id, _, _): "code:\(id)"
+            case .divider(let id): "divider:\(id)"
+            case .table(let id, _, _, _): "table:\(id)"
+            case .chart(let id, _): "chart:\(id)"
+            case .plan(let id, _): "plan:\(id)"
+            case .math(let id, _): "math:\(id)"
             }
         }
 
         return [
             typography.fontFamily.rawValue,
             "\(typography.pointSize)",
-            "\(typography.lineSpacing)"
+            "\(typography.lineSpacing)",
         ].joined(separator: "-") + "|" + content.joined(separator: "\n")
     }
 
@@ -185,14 +186,14 @@ enum MarkdownTextRunBuilder {
         isLast: Bool
     ) -> NSAttributedString {
         switch block {
-        case let .paragraph(_, content):
+        case .paragraph(_, let content):
             return inline(
                 content,
                 typography: typography,
                 style: paragraphStyle(typography: typography, isLast: isLast)
             )
 
-        case let .heading(_, level, text):
+        case .heading(_, let level, let text):
             return inline(
                 text,
                 typography: typography,
@@ -204,14 +205,14 @@ enum MarkdownTextRunBuilder {
                 )
             )
 
-        case let .bulletItem(_, text):
+        case .bulletItem(_, let text):
             let style = paragraphStyle(typography: typography, indent: 20, isLast: isLast)
             let bullet = NSMutableAttributedString(
                 string: "•\t",
                 attributes: [
                     .font: typography.applying(bold: true, italic: false, to: typography.baseFont),
                     .foregroundColor: NSColor.secondaryLabelColor,
-                    .paragraphStyle: style
+                    .paragraphStyle: style,
                 ]
             )
             bullet.append(
@@ -219,14 +220,14 @@ enum MarkdownTextRunBuilder {
             )
             return bullet
 
-        case let .numberedItem(_, number, text):
+        case .numberedItem(_, let number, let text):
             let style = paragraphStyle(typography: typography, indent: 20, isLast: isLast)
             let prefix = NSMutableAttributedString(
                 string: "\(number)\t",
                 attributes: [
                     .font: typography.numberFont,
                     .foregroundColor: NSColor.secondaryLabelColor,
-                    .paragraphStyle: style
+                    .paragraphStyle: style,
                 ]
             )
             prefix.append(
@@ -234,7 +235,7 @@ enum MarkdownTextRunBuilder {
             )
             return prefix
 
-        case let .blockquote(_, text):
+        case .blockquote(_, let text):
             return inline(
                 text,
                 typography: typography,
@@ -332,7 +333,7 @@ enum MarkdownTextRunBuilder {
             var attributes: [NSAttributedString.Key: Any] = [
                 .font: runFont,
                 .foregroundColor: runColor,
-                .paragraphStyle: style
+                .paragraphStyle: style,
             ]
 
             if let background {
@@ -408,7 +409,8 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             return
         }
 
-        let startIndex = typographyChanged
+        let startIndex =
+            typographyChanged
             ? 0
             : Self.firstChangedBlockIndex(previous: previousBlocks, next: blocks)
 
@@ -575,8 +577,24 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             guard let url = link as? URL ?? (link as? String).flatMap(URL.init(string:)) else {
                 return false
             }
-
-            NSWorkspace.shared.open(url)
+            // LLM üretimi metindeki bağlantı tek tıkla açılırdı: `file://`,
+            // özel şemalar dahil. Yalnız http/https doğrudan açılır; diğer
+            // şemalar bilinçli onay ister.
+            guard let scheme = url.scheme?.lowercased() else {
+                return false
+            }
+            if scheme == "http" || scheme == "https" {
+                NSWorkspace.shared.open(url)
+                return true
+            }
+            let alert = NSAlert()
+            alert.messageText = "Bağlantı açılsın mı?"
+            alert.informativeText = url.absoluteString
+            alert.addButton(withTitle: "Aç")
+            alert.addButton(withTitle: "Vazgeç")
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(url)
+            }
             return true
         }
     }

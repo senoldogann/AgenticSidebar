@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ComposerSubmissionPolicyTests: XCTestCase {
@@ -22,7 +23,7 @@ final class ComposerSubmissionPolicyTests: XCTestCase {
     func testShiftReturnAlwaysDefersToNativeNewlineBehavior() {
         for availability in [
             ComposerSubmissionAvailability.available,
-            .unavailable
+            .unavailable,
         ] {
             XCTAssertEqual(
                 ComposerSubmissionPolicy.action(

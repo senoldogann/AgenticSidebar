@@ -73,8 +73,9 @@ final class ComposerDraftStore {
             attachmentPaths: attachmentPaths,
             updatedAt: Date()
         )
-        guard drafts[key]?.text != next.text
-            || drafts[key]?.attachmentPaths != next.attachmentPaths
+        guard
+            drafts[key]?.text != next.text
+                || drafts[key]?.attachmentPaths != next.attachmentPaths
         else {
             return
         }
@@ -118,7 +119,7 @@ final class ComposerDraftStore {
             return
         }
 
-        saveTask = Task { [weak self] in
+        saveTask = Task { @MainActor [weak self] in
             while let self, self.hasPendingSave {
                 try? await Task.sleep(for: Self.saveDebounce)
                 guard !Task.isCancelled else {
@@ -141,27 +142,32 @@ final class ComposerDraftStore {
         }
 
         hasPendingSave = false
+        let snapshot = drafts
 
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            encoder.outputFormatting = [.sortedKeys]
-            let data = try encoder.encode(drafts)
-            try FileManager.default.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try data.write(to: fileURL, options: .atomic)
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o600],
-                ofItemAtPath: fileURL.path
-            )
-        } catch {
-            AppLog.agentSession.error(
-                "Composer drafts could not be written: \(error.localizedDescription, privacy: .public)"
-            )
-        }
+        await Task.detached(priority: .utility) { [snapshot, fileURL] in
+            do {
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(snapshot)
+                try FileManager.default.createDirectory(
+                    at: fileURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try data.write(to: fileURL, options: .atomic)
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: fileURL.path
+                )
+            } catch {
+                await MainActor.run {
+                    AppLog.agentSession.error(
+                        "Composer drafts could not be written: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+        }.value
     }
 
     private func reload() {
@@ -190,7 +196,8 @@ final class ComposerDraftStore {
         guard let fileURL else {
             return
         }
-        let damagedURL = fileURL
+        let damagedURL =
+            fileURL
             .deletingPathExtension()
             .appendingPathExtension("corrupt.json")
         try? FileManager.default.removeItem(at: damagedURL)

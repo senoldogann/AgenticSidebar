@@ -104,7 +104,7 @@ struct URLSessionExtensionTransport: ExtensionHTTPTransport {
 enum ExtensionHTTPHeaders {
     static let gitHubAPI: [String: String] = [
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
     ]
 
     static let rawText: [String: String] = [

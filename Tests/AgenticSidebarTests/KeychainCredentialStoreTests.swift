@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The one test that touches the real login keychain.
@@ -15,7 +16,7 @@ final class KeychainCredentialStoreTests: XCTestCase {
             ProcessInfo.processInfo.environment["RUN_KEYCHAIN_TESTS"] == "1",
             "Set RUN_KEYCHAIN_TESTS=1 to exercise the real keychain"
         )
-        
+
         let service = "com.dogan.AgenticSidebar.tests.\(UUID().uuidString)"
 
         let store = KeychainCredentialStore(service: service)

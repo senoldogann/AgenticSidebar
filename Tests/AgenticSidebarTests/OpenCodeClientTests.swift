@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class OpenCodeClientTests: XCTestCase {
@@ -11,7 +12,8 @@ final class OpenCodeClientTests: XCTestCase {
                 return OpenCodeHTTPResponse(
                     statusCode: 200,
                     data: Data(
-                        #"{"all":[{"id":"anthropic","name":"Anthropic","models":{"claude/opus":{"id":"claude/opus","providerID":"anthropic","name":"Claude Opus","variants":{"max":{},"high":{}}}}},{"id":"disconnected","name":"Disconnected","models":{"unused":{"id":"unused","providerID":"disconnected","name":"Unused","variants":{"low":{}}}}}],"connected":["anthropic"],"default":{}}"#.utf8
+                        #"{"all":[{"id":"anthropic","name":"Anthropic","models":{"claude/opus":{"id":"claude/opus","providerID":"anthropic","name":"Claude Opus","variants":{"max":{},"high":{}}}}},{"id":"disconnected","name":"Disconnected","models":{"unused":{"id":"unused","providerID":"disconnected","name":"Unused","variants":{"low":{}}}}}],"connected":["anthropic"],"default":{}}"#
+                            .utf8
                     )
                 )
             }
@@ -36,6 +38,27 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(reference.modelID, "claude/opus")
     }
 
+    func testCapabilitiesExposeModelContextLimitAndTolerateItsAbsence() async throws {
+        let transport = MockOpenCodeTransport(
+            sendHandler: { _ in
+                OpenCodeHTTPResponse(
+                    statusCode: 200,
+                    data: Data(
+                        #"{"all":[{"id":"anthropic","name":"Anthropic","models":{"known":{"id":"known","providerID":"anthropic","name":"Known","limit":{"context":200000,"output":32000}},"unknown":{"id":"unknown","providerID":"anthropic","name":"Unknown"}}}],"connected":["anthropic"],"default":{}}"#
+                            .utf8
+                    )
+                )
+            }
+        )
+        let client = makeClient(transport: transport)
+
+        let capabilities = try await client.capabilities()
+        let byID = Dictionary(uniqueKeysWithValues: capabilities.models.map { ($0.id, $0) })
+
+        XCTAssertEqual(byID[ProviderModelID("anthropic/known")]?.contextLimit, 200_000)
+        XCTAssertNil(byID[ProviderModelID("anthropic/unknown")]?.contextLimit)
+    }
+
     func testAuthMethodsDecodeDynamicPromptsAndSetAPIKeyForwardsMetadata() async throws {
         let generatedKey = UUID().uuidString
         let transport = RecordingOpenCodeTransport { request in
@@ -44,7 +67,8 @@ final class OpenCodeClientTests: XCTestCase {
                 return OpenCodeHTTPResponse(
                     statusCode: 200,
                     data: Data(
-                        #"{"cloudflare-workers-ai":[{"type":"api","label":"API key","prompts":[{"type":"text","key":"accountId","message":"Account ID","placeholder":"account"}]}],"openai":[{"type":"oauth","label":"Browser"}]}"#.utf8
+                        #"{"cloudflare-workers-ai":[{"type":"api","label":"API key","prompts":[{"type":"text","key":"accountId","message":"Account ID","placeholder":"account"}]}],"openai":[{"type":"oauth","label":"Browser"}]}"#
+                            .utf8
                     )
                 )
             case ("PUT", "/auth/cloudflare-workers-ai"):
@@ -115,17 +139,19 @@ final class OpenCodeClientTests: XCTestCase {
                     mime: "image/png",
                     filename: "shot.png",
                     url: "data:image/png;base64,AAAA"
-                )
+                ),
             ]
         )
         try await client.abort(sessionID: sessionID)
 
         let requests = await transport.requests()
-        XCTAssertEqual(requests.map { $0.url?.path }, [
-            "/session",
-            "/session/ses_test/prompt_async",
-            "/session/ses_test/abort"
-        ])
+        XCTAssertEqual(
+            requests.map { $0.url?.path },
+            [
+                "/session",
+                "/session/ses_test/prompt_async",
+                "/session/ses_test/abort",
+            ])
         let promptBody = try XCTUnwrap(requests[1].httpBody)
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: promptBody) as? [String: Any]
@@ -135,15 +161,17 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(model["modelID"], "claude/opus")
         XCTAssertEqual(object["variant"] as? String, "high")
         let parts = try XCTUnwrap(object["parts"] as? [[String: String]])
-        XCTAssertEqual(parts, [
-            ["type": "text", "text": "Hello"],
+        XCTAssertEqual(
+            parts,
             [
-                "type": "file",
-                "mime": "image/png",
-                "filename": "shot.png",
-                "url": "data:image/png;base64,AAAA"
-            ]
-        ])
+                ["type": "text", "text": "Hello"],
+                [
+                    "type": "file",
+                    "mime": "image/png",
+                    "filename": "shot.png",
+                    "url": "data:image/png;base64,AAAA",
+                ],
+            ])
     }
 
     func testEventStreamUsesAuthenticatedSSEEndpointAndPreservesCancellation() async throws {
@@ -182,7 +210,7 @@ final class OpenCodeClientTests: XCTestCase {
         )
         let client = makeClient(transport: transport)
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await client.capabilities()
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .authenticationFailure)
@@ -271,7 +299,7 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(object["agent"] as? String, ManagedOpenCodeConfiguration.planAgentName)
     }
 
-    func testPlanAgentConfigurationDeniesMutationAndDelegation() throws {
+    func testPlanAgentConfigurationDeniesMutationAllowsResearch() throws {
         let json = ManagedOpenCodeConfiguration.rendered(
             instructionPaths: [], permissionRules: [], extensions: .empty
         )
@@ -281,9 +309,53 @@ final class OpenCodeClientTests: XCTestCase {
         let permissions = try XCTUnwrap(plan["permission"] as? [String: String])
         XCTAssertEqual(permissions["*"], "deny")
         XCTAssertEqual(permissions["read"], "allow")
+        XCTAssertEqual(permissions["glob"], "allow")
+        XCTAssertEqual(permissions["grep"], "allow")
+        XCTAssertEqual(permissions["list"], "allow")
+        XCTAssertEqual(permissions["lsp"], "allow")
+        XCTAssertEqual(permissions["question"], "allow")
+        XCTAssertEqual(permissions["websearch"], "allow")
+        XCTAssertEqual(permissions["webfetch"], "allow")
+        XCTAssertEqual(permissions["todowrite"], "allow")
+        XCTAssertEqual(permissions["task"], "allow")
+        XCTAssertEqual(permissions["external_directory"], "allow")
+        XCTAssertEqual(permissions["skill"], "allow")
         XCTAssertEqual(permissions["bash"], nil)
         XCTAssertEqual(permissions["edit"], nil)
-        XCTAssertEqual(permissions["task"], nil)
+        XCTAssertEqual(permissions["write"], nil)
+        XCTAssertEqual(permissions["patch"], nil)
+        XCTAssertEqual(permissions["multiedit"], nil)
+        XCTAssertEqual(permissions.count, 13)
+    }
+
+    func testResearchSubagentIsReadOnlyAndCannotDelegateFurther() throws {
+        let json = ManagedOpenCodeConfiguration.rendered(
+            instructionPaths: [], permissionRules: [], extensions: .empty
+        )
+        let config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        let agents = try XCTUnwrap(config["agent"] as? [String: Any])
+        let research = try XCTUnwrap(agents[ManagedOpenCodeConfiguration.researchAgentName] as? [String: Any])
+        XCTAssertEqual(research["mode"] as? String, "subagent")
+        let permissions = try XCTUnwrap(research["permission"] as? [String: String])
+        XCTAssertEqual(permissions["*"], "deny")
+        XCTAssertEqual(permissions["read"], "allow")
+        XCTAssertEqual(permissions["glob"], "allow")
+        XCTAssertEqual(permissions["grep"], "allow")
+        XCTAssertEqual(permissions["list"], "allow")
+        XCTAssertEqual(permissions["lsp"], "allow")
+        XCTAssertEqual(permissions["question"], "allow")
+        XCTAssertEqual(permissions["websearch"], "allow")
+        XCTAssertEqual(permissions["webfetch"], "allow")
+        XCTAssertEqual(permissions["todowrite"], "allow")
+        XCTAssertEqual(permissions["task"], "deny")
+        XCTAssertEqual(permissions["external_directory"], "allow")
+        XCTAssertEqual(permissions["skill"], "allow")
+        XCTAssertEqual(permissions["bash"], nil)
+        XCTAssertEqual(permissions["edit"], nil)
+        XCTAssertEqual(permissions["write"], nil)
+        XCTAssertEqual(permissions["patch"], nil)
+        XCTAssertEqual(permissions["multiedit"], nil)
+        XCTAssertEqual(permissions.count, 13)
     }
 
     func testQuestionReplyAndRejectUseBackendRequestIDAndStructuredAnswers() async throws {
@@ -300,16 +372,20 @@ final class OpenCodeClientTests: XCTestCase {
         try await client.rejectQuestion(requestID: "que_456")
 
         let requests = await transport.requests()
-        XCTAssertEqual(requests.map(\.url?.path), [
-            "/question/que_123/reply",
-            "/question/que_456/reject"
-        ])
+        XCTAssertEqual(
+            requests.map(\.url?.path),
+            [
+                "/question/que_123/reply",
+                "/question/que_456/reject",
+            ])
         XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Content-Type"), "application/json")
         let body = try XCTUnwrap(requests[0].httpBody)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        XCTAssertEqual(object["answers"] as? [[String]], [
-            ["PostgreSQL"], ["Redis", "Custom detail"]
-        ])
+        XCTAssertEqual(
+            object["answers"] as? [[String]],
+            [
+                ["PostgreSQL"], ["Redis", "Custom detail"],
+            ])
         XCTAssertNil(requests[1].httpBody)
         XCTAssertNotNil(requests[0].value(forHTTPHeaderField: "Authorization"))
         XCTAssertNotNil(requests[1].value(forHTTPHeaderField: "Authorization"))
@@ -431,7 +507,7 @@ private actor OpenCodeCancellationProbe {
     func count() -> Int { cancellationCount }
 }
 
-private func XCTAssertThrowsErrorAsync<T>(
+private func assertThrowsErrorAsync<T>(
     _ expression: @autoclosure () async throws -> T,
     _ errorHandler: (Error) -> Void,
     file: StaticString = #filePath,

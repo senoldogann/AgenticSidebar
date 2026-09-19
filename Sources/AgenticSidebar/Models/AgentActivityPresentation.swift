@@ -71,9 +71,19 @@ enum ChatMessagePresenter {
             text.removeSubrange(ocrRange)
         }
 
-        text = text.replacingOccurrences(of: #"\s*\(No machine-readable text found in screenshot\)\s*"#, with: "", options: .regularExpression)
+        text = text.replacingOccurrences(
+            of: #"\s*\(No machine-readable text found in screenshot\)\s*"#, with: "", options: .regularExpression)
         text = text.replacingOccurrences(of: #"\[Screenshot captured:[^\]]*\]\s*"#, with: "", options: .regularExpression)
         text = text.replacingOccurrences(of: #"\s*Please inspect this screenshot carefully:.*"#, with: "", options: .regularExpression)
+
+        // Sağlayıcı çerçevesi (`<user_turn>…</user_turn>`) istemciye giden metne
+        // aittir; model yankısı, yapıştırma ya da geri yükleme artığı olarak
+        // saklanan metne bulaşırsa balonda ham etiket görünür. Yalnız TÜM mesaj
+        // çerçeveliyse soyulur: etiketlerden bahseden normal bir metin
+        // (`"<user_turn> şöyle görünüyor"`) aynen korunur.
+        if let unwrapped = Self.unwrapUserTurnFrame(text) {
+            text = unwrapped
+        }
 
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -86,5 +96,28 @@ enum ChatMessagePresenter {
         }
 
         return trimmed
+    }
+
+    /// Baştan sona `<user_turn>` ile çerçeveli metnin içini döndürür; şekil
+    /// tutmazsa `nil`. Tek katman soyulur, içi boşsa çerçeve sayılmaz.
+    static func unwrapUserTurnFrame(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            trimmed.hasPrefix("<user_turn>"),
+            trimmed.hasSuffix("</user_turn>"),
+            trimmed.count > "<user_turn>".count + "</user_turn>".count
+        else {
+            return nil
+        }
+        let inner = String(
+            trimmed
+                .dropFirst("<user_turn>".count)
+                .dropLast("</user_turn>".count)
+        )
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !inner.isEmpty else {
+            return nil
+        }
+        return inner
     }
 }

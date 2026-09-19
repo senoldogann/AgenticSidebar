@@ -24,10 +24,10 @@ enum OpenCodePromptPart: Encodable, Equatable, Sendable {
         var container = encoder.container(keyedBy: CodingKeys.self)
 
         switch self {
-        case let .text(text):
+        case .text(let text):
             try container.encode("text", forKey: .type)
             try container.encode(text, forKey: .text)
-        case let .file(mime, filename, url):
+        case .file(let mime, let filename, let url):
             try container.encode("file", forKey: .type)
             try container.encode(mime, forKey: .mime)
             try container.encodeIfPresent(filename, forKey: .filename)
@@ -131,7 +131,7 @@ enum OpenCodePromptBuilder {
         guard
             let mimeType = inlineMIMEType(forPath: path),
             let attributes = try? fileManager.attributesOfItem(atPath: path),
-            let size = attributes[.size] as? Int,
+            let size = SessionArchiveStore.fileSize(from: attributes[.size]),
             size > 0,
             size <= maximumInlineBytes,
             let data = fileManager.contents(atPath: path),
@@ -185,7 +185,7 @@ enum OpenCodePromptBuilder {
         // Büyük ikili dosyayı tamamını okuyup sonra elememek için önden ele:
         // alıntı bütçesinin birkaç katından büyük dosya zaten yola düşer.
         if let attributes = try? fileManager.attributesOfItem(atPath: path),
-            let size = attributes[.size] as? Int,
+            let size = SessionArchiveStore.fileSize(from: attributes[.size]),
             size > maximumCharacters * 4 + 1024
         {
             return nil
@@ -249,17 +249,20 @@ enum OpenCodePromptBuilder {
         sections.append(contentsOf: quotedDocuments.map(quotedSection))
 
         if !referencedOnly.isEmpty {
-            let list = referencedOnly
+            let list =
+                referencedOnly
                 .map { "- \($0)" }
                 .joined(separator: "\n")
 
-            sections.append("""
-            Attached files on this machine (read them directly when needed):
-            \(list)
-            """)
+            sections.append(
+                """
+                Attached files on this machine (read them directly when needed):
+                \(list)
+                """)
         }
 
-        let body = sections
+        let body =
+            sections
             .joined(separator: "\n\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -273,11 +276,10 @@ enum OpenCodePromptBuilder {
         }
 
         var composed: [String] = []
-        if
-            let instruction = mode.instructions(
-                speedMode: speedMode,
-                extensionContext: extensionTags.turnInstruction
-            ),
+        if let instruction = mode.instructions(
+            speedMode: speedMode,
+            extensionContext: extensionTags.turnInstruction
+        ),
             !instruction.isEmpty
         {
             composed.append(instruction)
@@ -285,7 +287,12 @@ enum OpenCodePromptBuilder {
         if let historyPreamble, !historyPreamble.isEmpty {
             composed.append(historyPreamble)
         }
-        composed.append(body)
+        composed.append(
+            """
+            <user_turn>
+            \(body)
+            </user_turn>
+            """)
         return composed.joined(separator: "\n\n")
     }
 
@@ -296,12 +303,12 @@ enum OpenCodePromptBuilder {
         let fence = self.fence(for: document.text)
 
         return """
-        Attached file “\(document.filename)” (\(document.path)):
+            Attached file “\(document.filename)” (\(document.path)):
 
-        \(fence)
-        \(document.text)
-        \(fence)
-        """
+            \(fence)
+            \(document.text)
+            \(fence)
+            """
     }
 
     /// A fence longer than any backtick run in the document.

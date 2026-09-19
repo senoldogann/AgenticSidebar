@@ -29,8 +29,9 @@ final class NativeComposerTextView: NSTextView {
 
     override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
         if let handler = onSpillLargePaste,
-           let text = pboard.string(forType: .string),
-           PastedTextAttachment.shouldSpillToFile(text) {
+            let text = pboard.string(forType: .string),
+            PastedTextAttachment.shouldSpillToFile(text)
+        {
             if handler(text) {
                 return true
             }
@@ -109,7 +110,7 @@ final class NativeComposerTextView: NSTextView {
         let semanticModifiers: NSEvent.ModifierFlags = [
             .command,
             .control,
-            .option
+            .option,
         ]
         if modifiers.intersection(semanticModifiers).isEmpty {
             return .plain
@@ -131,6 +132,24 @@ struct ComposerTextEditor: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text)
+    }
+
+    /// Modeldeki metin görünüme yazılsın mı?
+    ///
+    /// İşaretli metin (giriş yönteminin bitmemiş hecesi) varken yazılmaz:
+    /// temsilci o metni modele taşımaz, bu yüzden modeldeki eski metin
+    /// görünümdeki yeni heceyi ezmemeli. Arka plandaki sohbetler akarken
+    /// gövde saniyede defalarca tazelenir; koruma yoksa bitmemiş girdi her
+    /// tazede silinir ve başka sohbette yazıyormuş gibi görünür.
+    static func shouldApplyModelText(
+        hasMarkedText: Bool,
+        viewString: String,
+        modelText: String
+    ) -> Bool {
+        guard !hasMarkedText else {
+            return false
+        }
+        return viewString != modelText
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -171,7 +190,13 @@ struct ComposerTextEditor: NSViewRepresentable {
         }
         updateConfiguration(textView)
 
-        guard textView.string != text else {
+        guard
+            Self.shouldApplyModelText(
+                hasMarkedText: textView.hasMarkedText(),
+                viewString: textView.string,
+                modelText: text
+            )
+        else {
             return
         }
 
@@ -201,9 +226,11 @@ struct ComposerTextEditor: NSViewRepresentable {
         // change, which is what made a large paste feel stuck.
         let prefix = ComposerDraftMetrics.measuredPrefix(of: textView.string)
         let measuredText = prefix.isEmpty ? " " : prefix
-        let font = textView.font ?? NSFont.systemFont(
-            ofSize: NSFont.systemFontSize
-        )
+        let font =
+            textView.font
+            ?? NSFont.systemFont(
+                ofSize: NSFont.systemFontSize
+            )
         let measuredBounds = (measuredText as NSString).boundingRect(
             with: NSSize(
                 width: width,

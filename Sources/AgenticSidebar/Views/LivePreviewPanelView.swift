@@ -72,7 +72,7 @@ private struct IsolatedWebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        configuration.preferences.javaScriptEnabled = true
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -102,10 +102,11 @@ private struct IsolatedWebView: NSViewRepresentable {
             self.loadedHTML = loadedHTML
         }
 
+        @MainActor
         func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,
-            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+            decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
         ) {
             decisionHandler(PreviewNavigationPolicy.policy(for: navigationAction))
         }
@@ -116,20 +117,21 @@ private struct IsolatedWebView: NSViewRepresentable {
 
 enum PreviewNavigationPolicy {
     /// Ana çerçeve gezinmesi her zaman iptal (bağlantı tıklamaları dahil).
-    /// Alt kaynaklara yalnızca Mermaid CDN ana bilgisayarından izin verilir.
-    static func allowsMainFrameNavigation(to url: URL?) -> Bool {
+    /// Yalnızca sabitlenmiş Mermaid betiğinin alt kaynak yüklemesi geçer
+    /// (ana çerçeve gezinmesi asla).
+    static func allowsMainFrameNavigation(_: URL?) -> Bool {
         false
     }
 
-    static func allowsSubresourceLoad(fromHost host: String?) -> Bool {
-        host == PreviewArtifactBuilder.mermaidCDNHost
+    static func allowsSubresourceLoad(url: URL?) -> Bool {
+        url?.absoluteString == PreviewArtifactBuilder.mermaidScriptURL
     }
 
+    @MainActor
     static func policy(for action: WKNavigationAction) -> WKNavigationActionPolicy {
         if action.targetFrame?.isMainFrame != false {
             return .cancel
         }
-        let host = action.request.url?.host?.lowercased()
-        return allowsSubresourceLoad(fromHost: host) ? .allow : .cancel
+        return allowsSubresourceLoad(url: action.request.url) ? .allow : .cancel
     }
 }

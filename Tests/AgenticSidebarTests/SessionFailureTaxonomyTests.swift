@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -7,7 +8,7 @@ final class SessionFailureTaxonomyTests: XCTestCase {
         let service = AgentSessionService(
             runtimes: [
                 FailingRuntime(id: ProviderID("openai"), error: .missingCredential),
-                FailingRuntime(id: ProviderID("opencode"), error: .unavailable)
+                FailingRuntime(id: ProviderID("opencode"), error: .unavailable),
             ]
         )
 
@@ -91,6 +92,79 @@ final class SessionFailureTaxonomyTests: XCTestCase {
         XCTAssertEqual(service.state.status, .completed)
     }
 
+    /// Sağlayıcı "bitti" dedi ama hiç metin/araç üretmediyse bu sessiz bir
+    /// başarı değildir: kullanıcı ekranda yeni hiçbir şey göremez ve "ajan
+    /// başlamadı" der. Ölçülen olay (OpenCode oturum günlüğü): kullanıcı mesajı
+    /// oluşur, yalnız `agent=title` koşar, model turu hiç başlamaz ve gelen tek
+    /// olay `session.idle` olur.
+    func testATurnThatCompletesWithNoOutputIsReportedAsAFailure() async throws {
+        let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+        let runtime = TestProviderRuntime(
+            id: ProviderID("alpha"),
+            displayName: "Alpha",
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("alpha-1"),
+                    displayName: "Alpha 1",
+                    variants: []
+                )
+            ],
+            streamFactory: { _ in ProviderStream(events: pair.stream) }
+        )
+        let service = AgentSessionService(runtimes: [runtime])
+        await service.refreshCapabilities()
+
+        let task = try XCTUnwrap(service.submit("Hi"))
+
+        pair.continuation.yield(.completed)
+        pair.continuation.finish()
+        await task.value
+
+        XCTAssertEqual(service.state.status, .failed)
+        XCTAssertEqual(service.state.error, .unexpectedBackendResponse)
+        XCTAssertEqual(
+            service.state.messages.map(\.role),
+            [.user],
+            "boş tur transkripte sahte bir yanıt yazmamalı"
+        )
+    }
+
+    /// Araç çalıştırıp metin üretmeyen bir tur normaldir; başarısız sayılmaz.
+    func testAToolOnlyTurnIsNotReportedAsAFailure() async throws {
+        let activityID = ProviderActivityID("part-tool")
+        let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+        let runtime = TestProviderRuntime(
+            id: ProviderID("alpha"),
+            displayName: "Alpha",
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("alpha-1"),
+                    displayName: "Alpha 1",
+                    variants: []
+                )
+            ],
+            streamFactory: { _ in ProviderStream(events: pair.stream) }
+        )
+        let service = AgentSessionService(runtimes: [runtime])
+        await service.refreshCapabilities()
+
+        let task = try XCTUnwrap(service.submit("Hi"))
+
+        pair.continuation.yield(
+            .activityStarted(
+                ProviderActivityDescriptor(id: activityID, kind: .read)
+            )
+        )
+        pair.continuation.yield(
+            .activityFinished(activityID, outcome: .completed)
+        )
+        pair.continuation.yield(.completed)
+        pair.continuation.finish()
+        await task.value
+
+        XCTAssertEqual(service.state.status, .completed)
+    }
+
     func testFinishedActivityKeepsItsDescriptorAndTiming() async throws {
         let activityID = ProviderActivityID("part-command")
         let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
@@ -155,7 +229,7 @@ final class SessionFailureTaxonomyTests: XCTestCase {
             .unsupportedCapability,
             .transportFailure,
             .streamInterrupted,
-            .unexpectedBackendResponse
+            .unexpectedBackendResponse,
         ]
 
         for error in errors {

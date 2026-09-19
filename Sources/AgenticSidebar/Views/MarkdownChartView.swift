@@ -97,7 +97,8 @@ enum MarkdownCharts {
     }
 
     private static func point(fromCommaSeparated line: String) -> MarkdownChartPoint? {
-        let parts = line
+        let parts =
+            line
             .split(separator: ",", omittingEmptySubsequences: true)
             .map { $0.trimmingCharacters(in: .whitespaces) }
 
@@ -109,7 +110,8 @@ enum MarkdownCharts {
     }
 
     private static func number(from value: String) -> Double? {
-        let sanitized = value
+        let sanitized =
+            value
             .replacingOccurrences(of: "%", with: "")
             .replacingOccurrences(of: " ", with: "")
 

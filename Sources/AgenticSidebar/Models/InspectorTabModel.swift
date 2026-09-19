@@ -5,10 +5,10 @@ enum InspectorTabKind: Equatable, Hashable, Sendable {
     case file(url: URL)
     case subagentReport(activityID: ProviderActivityID, title: String, report: String)
     case changesReview(turnID: UUID, summary: TurnFileChangesSummary, initialFile: FileChangeItem?)
-    /// LLM üretimi işaretlemeden canlı önizleme. Ham HTML saklanır; CSP ve
-    /// izolasyon `PreviewArtifactBuilder` + `LivePreviewPanelView` tarafında
-    /// uygulanır, burada yalnızca veri taşınır.
-    case livePreview(id: String, title: String, html: String)
+    /// Sağ panelde açılan gömülü kabuk. Kabuğun kendisi
+    /// `TerminalServiceCenter` tarafında yaşar; sekme yalnız kimlik ve dizin
+    /// taşır, kapanınca kabuk da kapatılır.
+    case terminal(id: String, workingDirectory: String)
 }
 
 /// Represents one tab in the right-side inspector panel.
@@ -18,20 +18,6 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
     let title: String
     let iconName: String
     let iconColorName: String
-
-    init(
-        id: String,
-        kind: InspectorTabKind,
-        title: String,
-        iconName: String,
-        iconColorName: String
-    ) {
-        self.id = id
-        self.kind = kind
-        self.title = title
-        self.iconName = iconName
-        self.iconColorName = iconColorName
-    }
 
     static func forFile(url: URL) -> InspectorTab {
         let ext = url.pathExtension.lowercased()
@@ -100,12 +86,15 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
         )
     }
 
-    static func forLivePreview(id: String, title: String, html: String) -> InspectorTab {
-        InspectorTab(
-            id: "preview:\(id)",
-            kind: .livePreview(id: id, title: title, html: html),
-            title: title,
-            iconName: "eye",
+    /// Bölme başına tek terminal sekmesi: kimlik bölmeye bağlıdır, böylece yan
+    /// yana iki sohbetin kabuğu birbirine karışmaz.
+    static func forTerminal(paneID: String, workingDirectory: String) -> InspectorTab {
+        let id = "terminal:\(paneID)"
+        return InspectorTab(
+            id: id,
+            kind: .terminal(id: id, workingDirectory: workingDirectory),
+            title: "Terminal",
+            iconName: "terminal",
             iconColorName: "green"
         )
     }
@@ -120,7 +109,7 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
             }
             let index = (agentTabs.firstIndex(where: { $0.id == tab.id }) ?? 0) + 1
             return "Agent \(index)"
-        case .file, .changesReview, .livePreview:
+        case .file, .changesReview, .terminal:
             let fileTabs = tabs.filter {
                 if case .subagentReport = $0.kind { return false }
                 return true
@@ -128,5 +117,34 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
             let index = (fileTabs.firstIndex(where: { $0.id == tab.id }) ?? 0) + 1
             return "Sekme \(index)"
         }
+    }
+}
+
+/// Bir sohbetin sağ panel durumu: açık sekmeler, seçili sekme, genişletme.
+/// Bölme görünümü (`ConversationDetailView`) bölme kimliğiyle yaşar, sohbet
+/// değişiminde yok olmaz; o yüzden sekmeler oturum başına burada saklanır.
+/// Yoksa A sohbetinde açılan rapor B sohbetine geçince de görünür — her
+/// sohbetin alanı kendine özel olmalı.
+struct InspectorPaneState: Equatable, Sendable {
+    var tabs: [InspectorTab] = []
+    var selectedID: String?
+    var expanded: Bool = false
+
+    /// Oturum değişimi: çıkanı sözlüğe kaldır, geleni sözlükten çıkar.
+    /// Silinmiş oturumların kayıtları tutulmaz.
+    static func switched(
+        _ states: [UUID: InspectorPaneState],
+        from oldID: UUID,
+        to newID: UUID,
+        current: InspectorPaneState,
+        liveIDs: Set<UUID>
+    ) -> (states: [UUID: InspectorPaneState], restored: InspectorPaneState) {
+        guard oldID != newID else {
+            return (states, current)
+        }
+        var next = states
+        next[oldID] = current
+        next = next.filter { liveIDs.contains($0.key) }
+        return (next, next[newID] ?? InspectorPaneState())
     }
 }

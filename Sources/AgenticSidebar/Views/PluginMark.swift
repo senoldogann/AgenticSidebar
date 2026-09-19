@@ -17,7 +17,7 @@ struct PluginMark: View {
                 LinearGradient(
                     colors: [
                         tint.opacity(0.95),
-                        tint.opacity(0.65)
+                        tint.opacity(0.65),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -41,12 +41,14 @@ struct PluginMark: View {
             bare = String(bare[bare.index(after: slash)...])
         }
 
-        let stripped = bare
+        let stripped =
+            bare
             .split(whereSeparator: { $0 == "/" || $0 == "-" || $0 == "_" || $0 == "." })
             .map(String.init)
             .filter { !["opencode", "plugin", "plugins", "oc", "ai"].contains($0.lowercased()) }
 
-        let words = stripped.isEmpty
+        let words =
+            stripped.isEmpty
             ? name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
             : stripped
 
@@ -68,7 +70,7 @@ struct PluginMark: View {
             Color(red: 0.85, green: 0.42, blue: 0.36),
             Color(red: 0.30, green: 0.72, blue: 0.58),
             Color(red: 0.72, green: 0.45, blue: 0.88),
-            Color(red: 0.93, green: 0.66, blue: 0.25)
+            Color(red: 0.93, green: 0.66, blue: 0.25),
         ]
 
         var hash = 5381
@@ -76,6 +78,6 @@ struct PluginMark: View {
             hash = (hash &* 33) &+ Int(byte)
         }
 
-        return palette[abs(hash) % palette.count]
+        return palette[Int(bitPattern: hash.magnitude) % palette.count]
     }
 }

@@ -99,6 +99,7 @@ extension SettingsView {
             }
             .buttonStyle(.plain)
             .pointingHandCursor()
+            .help(isExpanded.wrappedValue ? "Collapse \(title)" : "Expand \(title)")
 
             if isExpanded.wrappedValue {
                 content()
@@ -172,6 +173,7 @@ extension SettingsView {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+        .help(title)
     }
 
     @ViewBuilder
@@ -219,6 +221,7 @@ extension SettingsView {
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .opacity(isDisabled ? 0.5 : 1)
+        .help(title)
     }
 
     @ViewBuilder
@@ -252,6 +255,7 @@ extension SettingsView {
         .buttonStyle(.plain)
         .disabled(isDisabled)
         .pointingHandCursor()
+        .help(title)
     }
 
     @ViewBuilder

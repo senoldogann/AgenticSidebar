@@ -24,7 +24,7 @@ final class ScreenshotMonitorService {
         "képernyőkép", "zrzut ekranu", "snímek obrazovky", "snímka obrazovky",
         "zaslonska slika", "ekraanipilt", "ekrānuzņēmums", "ekrano kopija",
         "captură de ecran", "snimak ekrana", "στιγμιότυπο οθόνης",
-        "צילום מסך", "لقطة الشاشة", "स्क्रीनशॉट", "สกรีนช็อต", "ảnh chụp màn hình"
+        "צילום מסך", "لقطة الشاشة", "स्क्रीनशॉट", "สกรีนช็อต", "ảnh chụp màn hình",
     ]
 
     /// Image types macOS writes for a screenshot, including the `.jpeg` and
@@ -95,10 +95,15 @@ final class ScreenshotMonitorService {
         return isScreenCapture
     }
 
-
     struct PendingSubmission {
         let prompt: String
         let attachmentPath: String?
+        /// Yakalama anındaki mod/hız: kuyrukta beklerken kullanıcı modu
+        /// değiştirse bile gönderim kayıtlı değerle yapılır. Güncel modu
+        /// flush anında okumak, exam için hazırlanmış güvenilmez girdiyi
+        /// `build` yetkisiyle koştururdu (TOCTOU yetki tırmanması).
+        let mode: AgentMode
+        let speedMode: ResponseSpeedMode
     }
 
     static let defaultScreenshotsDirectoryURL = FileManager.default
@@ -112,7 +117,7 @@ final class ScreenshotMonitorService {
 
     /// Read by ``scanRecentScreenshots``, which runs off the main actor.
     nonisolated private static let recentFileWindow: TimeInterval = 60
-    private static let temporaryScreenshotLifetime: TimeInterval = 24 * 60 * 60
+    nonisolated private static let temporaryScreenshotLifetime: TimeInterval = 24 * 60 * 60
     private static let maximumTrackedPaths = 256
 
     /// Oturumun henüz kabul edemediği yakalamalar sırasını burada bekler.
@@ -123,6 +128,9 @@ final class ScreenshotMonitorService {
 
     private let sessionService: AgentSessionService
     private let settingsStore: SettingsStore
+    /// Oturum başına besteci tercihleri: ekran gönderimi aktif sohbete gider,
+    /// o sohbetin modu ve hızı kullanılır. Yoksa genel değer geçerlidir.
+    var composerPrefs: SessionComposerPrefs?
     private let textRecognizer: any ScreenshotTextRecognizing
     private let pasteboard: any PasteboardReading
     private let screenshotsDirectoryURL: URL
@@ -177,14 +185,19 @@ final class ScreenshotMonitorService {
             return
         }
 
-        // Startup seeding happens only when the feature is enabled: it stops
-        // a folder full of yesterday's screenshots from being analysed on the
-        // first tick.
-        trackedFilePathSet = Set(Self.scanRecentScreenshots(
-            in: screenshotsDirectoryURL,
-            now: Date()
-        ).map(\.path))
-        Self.removeStaleTemporaryScreenshots(in: temporaryDirectoryURL)
+        // Geçici süpürme eşzamanlı: küçük dizin, test de bunu bekler.
+        // Açılış tohumlaması arka planda: büyük klasör ana işi tutmasın.
+        let screenshotsURL = screenshotsDirectoryURL
+        let temporaryURL = temporaryDirectoryURL
+        Self.removeStaleTemporaryScreenshots(in: temporaryURL)
+        Task.detached(priority: .utility) { [weak self] in
+            let seeded = Set(
+                Self.scanRecentScreenshots(in: screenshotsURL, now: Date()).map(\.path)
+            )
+            await MainActor.run { [weak self] in
+                self?.trackedFilePathSet = seeded
+            }
+        }
 
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -254,19 +267,28 @@ final class ScreenshotMonitorService {
 
         if mode == .exam {
             return """
-            [Screenshot captured: \(fileName)]
-            \(contentSection)
+                [Screenshot captured: \(fileName)]
+                \(contentSection)
 
-            EXAM SOLVER: Inspect this screenshot carefully. Identify any test, exam, quiz, or homework questions visible in the image. State the direct answer first (e.g. "**Correct Answer: B**"), then provide the step-by-step mathematical derivation, reasoning, or code solution.
-            """
+                EXAM SOLVER: Inspect this screenshot carefully. Identify any test, exam, quiz, or homework questions visible in the image. State the direct answer first (e.g. "**Correct Answer: B**"), then provide the step-by-step mathematical derivation, reasoning, or code solution.
+                """
+        }
+
+        if mode == .review {
+            return """
+                [Screenshot captured: \(fileName)]
+                \(contentSection)
+
+                REVIEW MODE: Inspect this screenshot for bugs, security vulnerabilities, performance bottlenecks, or code quality issues. Provide your review findings grouped by severity and conclude with a prioritized remediation plan in a ```plan block. Do not modify files directly.
+                """
         }
 
         return """
-        [Screenshot captured: \(fileName)]
-        \(contentSection)
+            [Screenshot captured: \(fileName)]
+            \(contentSection)
 
-        Please inspect this screenshot carefully: infer intent, if there is a question or problem solve it and provide the direct answer, or describe what is shown.
-        """
+            Please inspect this screenshot carefully: infer intent, if there is a question or problem solve it and provide the direct answer, or describe what is shown.
+            """
     }
 
     private func analyzeScreenshot(at fileURL: URL) async {
@@ -276,9 +298,11 @@ final class ScreenshotMonitorService {
             Self.buildIntentPrompt(
                 fileName: fileURL.lastPathComponent,
                 extractedText: extractedText,
-                mode: settingsStore.agentMode
+                mode: effectiveAgentMode
             ),
-            attachmentPath: fileURL.path
+            attachmentPath: fileURL.path,
+            mode: effectiveAgentMode,
+            speedMode: effectiveSpeedMode
         )
     }
 
@@ -311,9 +335,11 @@ final class ScreenshotMonitorService {
             Self.buildIntentPrompt(
                 fileName: "Clipboard Screenshot",
                 extractedText: extractedText,
-                mode: settingsStore.agentMode
+                mode: effectiveAgentMode
             ),
-            attachmentPath: attachmentPath
+            attachmentPath: attachmentPath,
+            mode: effectiveAgentMode,
+            speedMode: effectiveSpeedMode
         )
     }
 
@@ -344,11 +370,13 @@ final class ScreenshotMonitorService {
         }
     }
 
-    private func enqueue(_ prompt: String, attachmentPath: String?) {
+    private func enqueue(_ prompt: String, attachmentPath: String?, mode: AgentMode, speedMode: ResponseSpeedMode) {
         pendingSubmissions.append(
             PendingSubmission(
                 prompt: prompt,
-                attachmentPath: attachmentPath
+                attachmentPath: attachmentPath,
+                mode: mode,
+                speedMode: speedMode
             )
         )
 
@@ -365,13 +393,27 @@ final class ScreenshotMonitorService {
     /// `send` çalışan bir turun arkasına ekler; böylece ekran görüntüleri de
     /// diğer mesajlarla aynı kuyruktan geçer. Oturumun hiç kabul edemediği bir
     /// istek sırada kalır.
+    private var effectiveAgentMode: AgentMode {
+        composerPrefs?.effectiveAgentMode(
+            for: sessionService.activeSessionID,
+            default: settingsStore.agentMode
+        ) ?? settingsStore.agentMode
+    }
+
+    private var effectiveSpeedMode: ResponseSpeedMode {
+        composerPrefs?.effectiveSpeedMode(
+            for: sessionService.activeSessionID,
+            default: settingsStore.responseSpeedMode
+        ) ?? settingsStore.responseSpeedMode
+    }
+
     private func flushPendingSubmissions() {
         while let next = pendingSubmissions.first, sessionService.canAcceptPrompt {
             let acceptance = sessionService.send(
                 next.prompt,
                 attachmentPaths: next.attachmentPath.map { [$0] } ?? [],
-                speedMode: settingsStore.responseSpeedMode,
-                mode: settingsStore.agentMode
+                speedMode: next.speedMode,
+                mode: next.mode
             )
 
             guard acceptance.wasAccepted else {
@@ -411,24 +453,29 @@ final class ScreenshotMonitorService {
         now: Date,
         fileManager: FileManager = .default
     ) -> [URL] {
-        guard let contents = try? fileManager.contentsOfDirectory(
-            at: directoryURL,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
+        guard
+            let contents = try? fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
             return []
         }
 
         return contents.filter { url in
-            guard isScreenshotCandidate(
-                fileURL: url,
-                metadataProbe: isScreenCaptureByMetadata
-            ) else {
+            guard
+                isScreenshotCandidate(
+                    fileURL: url,
+                    metadataProbe: isScreenCaptureByMetadata
+                )
+            else {
                 return false
             }
 
             guard let resourceValues = try? url.resourceValues(forKeys: [.contentModificationDateKey]),
-                  let modDate = resourceValues.contentModificationDate else {
+                let modDate = resourceValues.contentModificationDate
+            else {
                 return false
             }
 
@@ -436,14 +483,16 @@ final class ScreenshotMonitorService {
         }
     }
 
-    private static func removeStaleTemporaryScreenshots(in directoryURL: URL) {
+    nonisolated private static func removeStaleTemporaryScreenshots(in directoryURL: URL) {
         let fileManager = FileManager.default
 
-        guard let contents = try? fileManager.contentsOfDirectory(
-            at: directoryURL,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
+        guard
+            let contents = try? fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
             return
         }
 
@@ -451,7 +500,8 @@ final class ScreenshotMonitorService {
 
         for fileURL in contents {
             guard
-                let modified = try? fileURL
+                let modified =
+                    try? fileURL
                     .resourceValues(forKeys: [.contentModificationDateKey])
                     .contentModificationDate,
                 modified < cutoff

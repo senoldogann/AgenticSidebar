@@ -1,19 +1,20 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class MarkdownBlockParsingTests: XCTestCase {
     func testUnderscoreDividerTerminatesAParagraph() {
         let blocks = parseMarkdownBlocks(
             from: """
-            First paragraph line
-            ___
-            Second paragraph
-            """
+                First paragraph line
+                ___
+                Second paragraph
+                """
         )
 
         XCTAssertEqual(blocks.count, 3)
 
-        guard case let .paragraph(_, firstParagraph) = blocks[0] else {
+        guard case .paragraph(_, let firstParagraph) = blocks[0] else {
             XCTFail("Expected a paragraph before the divider")
             return
         }
@@ -24,7 +25,7 @@ final class MarkdownBlockParsingTests: XCTestCase {
             return
         }
 
-        guard case let .paragraph(_, secondParagraph) = blocks[2] else {
+        guard case .paragraph(_, let secondParagraph) = blocks[2] else {
             XCTFail("Expected a paragraph after the divider")
             return
         }
@@ -36,7 +37,7 @@ final class MarkdownBlockParsingTests: XCTestCase {
             from: "2026. was a busy year for this project."
         )
 
-        guard case let .paragraph(_, content) = blocks.first else {
+        guard case .paragraph(_, let content) = blocks.first else {
             XCTFail("A four-digit prefix must stay prose")
             return
         }
@@ -46,9 +47,9 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testShortOrderedListMarkersStillParse() {
         let blocks = parseMarkdownBlocks(
             from: """
-            1. First step
-            12. Twelfth step
-            """
+                1. First step
+                12. Twelfth step
+                """
         )
 
         XCTAssertEqual(blocks.count, 2)
@@ -59,14 +60,14 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testCodeFenceContentIsNotTreatedAsMarkdown() {
         let blocks = parseMarkdownBlocks(
             from: """
-            ```swift
-            let value = 42
-            ```
-            """
+                ```swift
+                let value = 42
+                ```
+                """
         )
 
         XCTAssertEqual(blocks.count, 1)
-        guard case let .code(_, language, code) = blocks[0] else {
+        guard case .code(_, let language, let code) = blocks[0] else {
             XCTFail("Expected a code block")
             return
         }
@@ -77,15 +78,15 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testPipeTableParsesHeadersAlignmentAndRows() {
         let blocks = parseMarkdownBlocks(
             from: """
-            | Name | Score | Rank |
-            | :--- | :---: | ---: |
-            | Ada | 98 | 1 |
-            | Grace | 91 | 2 |
-            """
+                | Name | Score | Rank |
+                | :--- | :---: | ---: |
+                | Ada | 98 | 1 |
+                | Grace | 91 | 2 |
+                """
         )
 
         XCTAssertEqual(blocks.count, 1)
-        guard case let .table(_, headers, alignments, rows) = blocks[0] else {
+        guard case .table(_, let headers, let alignments, let rows) = blocks[0] else {
             XCTFail("Expected a table block")
             return
         }
@@ -98,14 +99,14 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testTablePadsAndTrimsRowsToTheHeaderWidth() {
         let blocks = parseMarkdownBlocks(
             from: """
-            | A | B |
-            | --- | --- |
-            | 1 |
-            | 1 | 2 | 3 |
-            """
+                | A | B |
+                | --- | --- |
+                | 1 |
+                | 1 | 2 | 3 |
+                """
         )
 
-        guard case let .table(_, _, _, rows) = blocks.first else {
+        guard case .table(_, _, _, let rows) = blocks.first else {
             XCTFail("Expected a table block")
             return
         }
@@ -116,17 +117,17 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testTableBreaksOutOfAParagraphAndEndsAtProse() {
         let blocks = parseMarkdownBlocks(
             from: """
-            Intro line
-            | A | B |
-            | --- | --- |
-            | 1 | 2 |
-            After the table
-            """
+                Intro line
+                | A | B |
+                | --- | --- |
+                | 1 | 2 |
+                After the table
+                """
         )
 
         XCTAssertEqual(blocks.count, 3)
 
-        guard case let .paragraph(_, intro) = blocks[0] else {
+        guard case .paragraph(_, let intro) = blocks[0] else {
             XCTFail("Expected the intro to stay a paragraph")
             return
         }
@@ -137,7 +138,7 @@ final class MarkdownBlockParsingTests: XCTestCase {
             return
         }
 
-        guard case let .paragraph(_, outro) = blocks[2] else {
+        guard case .paragraph(_, let outro) = blocks[2] else {
             XCTFail("Expected the trailing prose to stay a paragraph")
             return
         }
@@ -147,7 +148,7 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testPipesInProseWithoutADelimiterRowStayProse() {
         let blocks = parseMarkdownBlocks(from: "Use a | b for alternation")
 
-        guard case let .paragraph(_, content) = blocks.first else {
+        guard case .paragraph(_, let content) = blocks.first else {
             XCTFail("A lone pipe must not start a table")
             return
         }
@@ -157,16 +158,16 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testChartFenceParsesIntoAChartBlock() {
         let blocks = parseMarkdownBlocks(
             from: """
-            ```chart
-            type: line
-            title: Revenue
-            Q1 = 10
-            Q2 = 22.5
-            ```
-            """
+                ```chart
+                type: line
+                title: Revenue
+                Q1 = 10
+                Q2 = 22.5
+                ```
+                """
         )
 
-        guard case let .chart(_, spec) = blocks.first else {
+        guard case .chart(_, let spec) = blocks.first else {
             XCTFail("Expected a chart block")
             return
         }
@@ -177,7 +178,7 @@ final class MarkdownBlockParsingTests: XCTestCase {
             spec.points,
             [
                 MarkdownChartPoint(label: "Q1", value: 10),
-                MarkdownChartPoint(label: "Q2", value: 22.5)
+                MarkdownChartPoint(label: "Q2", value: 22.5),
             ]
         )
     }
@@ -185,14 +186,14 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testChartFenceAcceptsLabelsAndValuesLists() {
         let blocks = parseMarkdownBlocks(
             from: """
-            ```chart bar
-            labels: Jan, Feb, Mar
-            values: 3, 5, 8
-            ```
-            """
+                ```chart bar
+                labels: Jan, Feb, Mar
+                values: 3, 5, 8
+                ```
+                """
         )
 
-        guard case let .chart(_, spec) = blocks.first else {
+        guard case .chart(_, let spec) = blocks.first else {
             XCTFail("Expected a chart block")
             return
         }
@@ -205,59 +206,112 @@ final class MarkdownBlockParsingTests: XCTestCase {
     func testChartFenceWithoutDataStaysACodeBlock() {
         let blocks = parseMarkdownBlocks(
             from: """
-            ```chart
-            there is no series here
-            ```
-            """
+                ```chart
+                there is no series here
+                ```
+                """
         )
 
-        guard case let .code(_, language, _) = blocks.first else {
+        guard case .code(_, let language, _) = blocks.first else {
             XCTFail("A malformed chart must fall back to a code block")
             return
         }
         XCTAssertEqual(language, "chart")
     }
 
+    func testChartFenceWithUnknownKindStaysACodeBlock() {
+        let blocks = parseMarkdownBlocks(
+            from: """
+                ```chart histogram
+                labels: Jan, Feb
+                values: 3, 5
+                ```
+                """
+        )
+
+        guard case .code(_, let language, _) = blocks.first else {
+            XCTFail("An unknown chart kind must not silently become a bar chart")
+            return
+        }
+        XCTAssertEqual(language, "chart histogram")
+    }
+
     func testMathFenceAndBlockParsing() {
         let blocks = parseMarkdownBlocks(
             from: """
-            The quadratic formula is:
-            $$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$
-            And in a code fence:
-            ```math
-            \\int_{0}^{\\infty} e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}
-            ```
-            """
+                The quadratic formula is:
+                $$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$
+                And in a code fence:
+                ```math
+                \\int_{0}^{\\infty} e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}
+                ```
+                """
         )
 
         XCTAssertEqual(blocks.count, 4)
-        guard case let .paragraph(_, p1) = blocks[0] else {
+        guard case .paragraph(_, let p1) = blocks[0] else {
             XCTFail("Expected first paragraph")
             return
         }
         XCTAssertTrue(p1.contains("quadratic formula"))
 
-        guard case let .math(_, f1) = blocks[1] else {
+        guard case .math(_, let f1) = blocks[1] else {
             XCTFail("Expected first math block for $$ equation")
             return
         }
         XCTAssertTrue(f1.contains("\\frac{-b"))
 
-        guard case let .paragraph(_, p2) = blocks[2] else {
+        guard case .paragraph(_, let p2) = blocks[2] else {
             XCTFail("Expected second paragraph")
             return
         }
         XCTAssertTrue(p2.contains("code fence"))
 
-        guard case let .math(_, f2) = blocks[3] else {
+        guard case .math(_, let f2) = blocks[3] else {
             XCTFail("Expected math block from ```math fence")
             return
         }
         XCTAssertTrue(f2.contains("e^{-x^2}"))
     }
 
+    func testUnclosedDisplayMathDoesNotSwallowTheRest() {
+        var lines = ["$$ unclosed formula"]
+        lines += (1...50).map { "filler line \($0)" }
+        lines += ["```swift", "let rescued = true", "```"]
+        let blocks = parseMarkdownBlocks(from: lines.joined(separator: "\n"))
+
+        XCTAssertFalse(
+            blocks.contains {
+                if case .math = $0 { return true }
+                return false
+            },
+            "An unclosed $$ must not become a math block"
+        )
+        XCTAssertTrue(
+            blocks.contains {
+                if case .code(_, let language, let code) = $0 {
+                    return language == "swift" && code.contains("let rescued = true")
+                }
+                return false
+            },
+            "Content after an unclosed $$ must still parse"
+        )
+    }
+
+    func testMathFenceAcceptsTrailingParameters() {
+        let blocks = parseMarkdownBlocks(
+            from: "```math display\nx^2\n```"
+        )
+
+        guard case .math(_, let formula) = blocks.first else {
+            XCTFail("```math display must parse as math, like plan/chart fences")
+            return
+        }
+        XCTAssertTrue(formula.contains("x^2"))
+    }
+
     private func numberedItem(from block: MarkdownBlock) -> String? {
-        guard case let .numberedItem(_, number, _) = block else {
+        guard case .numberedItem(_, let number, _) = block else {
             return nil
         }
 

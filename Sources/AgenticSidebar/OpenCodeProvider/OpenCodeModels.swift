@@ -86,12 +86,20 @@ struct OpenCodeModelDescriptor: Decodable, Sendable {
     let providerID: String
     let name: String
     let variants: [String]
+    /// `limit.context`: modelin kabul ettiği en fazla girdi jetonu
+    /// (OpenCode model kataloğu; yokluğu bilinmiyor demektir, uydurulmaz).
+    let contextLimit: Int?
 
     private enum CodingKeys: String, CodingKey {
         case id
         case providerID
         case name
         case variants
+        case limit
+    }
+
+    private enum LimitKeys: String, CodingKey {
+        case context
     }
 
     private struct VariantKey: CodingKey {
@@ -121,6 +129,24 @@ struct OpenCodeModelDescriptor: Decodable, Sendable {
             variants = variantsContainer.allKeys.map(\.stringValue).sorted()
         } else {
             variants = []
+        }
+
+        // Sayı biçimi garanti değildir (katalog tam sayı, bazı sunucular
+        // ondalık yazar); iki hâl de toleranslı okunur, yoksa `nil` kalır.
+        if container.contains(.limit),
+            let limitContainer = try? container.nestedContainer(keyedBy: LimitKeys.self, forKey: .limit)
+        {
+            if let context = try? limitContainer.decode(Int.self, forKey: .context) {
+                contextLimit = context > 0 ? context : nil
+            } else if let context = try? limitContainer.decode(Double.self, forKey: .context),
+                context.isFinite, context > 0
+            {
+                contextLimit = Int(context)
+            } else {
+                contextLimit = nil
+            }
+        } else {
+            contextLimit = nil
         }
     }
 }

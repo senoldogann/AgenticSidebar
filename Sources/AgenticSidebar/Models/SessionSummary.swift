@@ -62,4 +62,12 @@ struct SessionSummary: Identifiable, Equatable, Sendable {
     var referenceDate: Date {
         lastUsedAt ?? createdAt
     }
+
+    /// Sol menüde satırın en sağında duran tamamlanma rozeti görünsün mü.
+    ///
+    /// Tur bitmiş (`.completed`) ve artık meşgul değilse mavi nokta + Done
+    /// gösterilir; koşan turda ilerleme göstergesi bunun yerini alır.
+    var showsDoneBadge: Bool {
+        !isBusy && status == .completed
+    }
 }

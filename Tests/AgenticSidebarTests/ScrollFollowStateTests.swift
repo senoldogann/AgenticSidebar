@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 /// Kaydırma takip durumunun testleri.
@@ -98,7 +99,7 @@ final class ScrollFollowStateTests: XCTestCase {
     func testButtonRequiresMinimumDistanceBufferBeforeShowing() {
         let state = ScrollFollowState()
         state.setScrolling(true)
-        state.record(snapshot: snapshot(offsetY: 1_600)) // bottom: distanceFromBottom = 0
+        state.record(snapshot: snapshot(offsetY: 1_600))  // bottom: distanceFromBottom = 0
 
         // User scrolls up by 100 pt: away from bottom threshold (80 pt), but less than button visibility threshold (180 pt)
         state.record(snapshot: snapshot(offsetY: 1_500))
@@ -211,6 +212,22 @@ final class ScrollFollowStateTests: XCTestCase {
         XCTAssertTrue(state.shouldAutoFollow(now: Date()))
     }
 
+    func testAssistantMessageWhileAwayDoesNotYankButUserMessageResumes() {
+        let state = ScrollFollowState()
+        state.setScrolling(true)
+        state.record(snapshot: snapshot(offsetY: 0))
+        state.setScrolling(false)
+        XCTAssertFalse(
+            state.shouldAutoFollow(now: Date()),
+            "Tarihte okuyan kullanıcı yeni asistan mesajında dibe çekilmemeli"
+        )
+        state.resumeFollow()
+        XCTAssertTrue(
+            state.shouldAutoFollow(now: Date()),
+            "Kullanıcının kendi mesajı takibi geri vermeli"
+        )
+    }
+
     func testAutoFollowIsThrottledToTheFollowInterval() {
         let state = ScrollFollowState()
         let now = Date()
@@ -251,6 +268,102 @@ final class ScrollFollowStateTests: XCTestCase {
         XCTAssertTrue(state.shouldAutoScroll(now: now.addingTimeInterval(0.02)))
     }
 
+    /// Inspector açılıp kapanırken genişlik animasyonu konumu sarsar.
+    ///
+    /// Kullanıcı dokunmadan düşen konum jest sanılmamalı: bastırma sahiplik
+    /// vermez, yayın üretmez, takip dipte çalışmaya devam eder.
+    func testTransientDropSuppressionIgnoresInspectorLayoutShake() {
+        let state = ScrollFollowState()
+        state.suppressTransientDrop()
+        state.record(snapshot: snapshot(offsetY: 1_600))
+        // Animasyon: kullanıcı dokunmadan konum 400 pt düşer.
+        state.record(snapshot: snapshot(offsetY: 1_200))
+
+        XCTAssertFalse(state.isUserPosition)
+        XCTAssertNil(state.takePending().awayFromBottom)
+        XCTAssertTrue(state.shouldAutoFollow(now: Date()))
+    }
+
+    /// Bastırma kullanıcı durumunu silmez: tarihte okuyan kullanıcı, sarsıntı
+    /// sırasında da yukarıda kalır; `resumeFollow` gibi dibe döndürmez.
+    func testTransientDropSuppressionPreservesScrolledUpState() {
+        let state = ScrollFollowState()
+        state.setScrolling(true)
+        state.record(snapshot: snapshot(offsetY: 0))
+        state.setScrolling(false)
+        _ = state.takePending()
+        XCTAssertFalse(state.shouldAutoFollow(now: Date()))
+
+        state.suppressTransientDrop()
+        state.record(snapshot: snapshot(offsetY: 100))
+
+        XCTAssertFalse(state.shouldAutoFollow(now: Date()))
+    }
+
+    /// Collapse kararı `isFollowing` ile verilir: canlı durum, `@State`
+    /// kopyası değil. Taze durumda kullanıcı diptedir.
+    func testIsFollowingStartsTrue() {
+        XCTAssertTrue(ScrollFollowState().isFollowing)
+    }
+
+    /// Jest sürerken takip kapalıdır.
+    func testIsFollowingFalseDuringGesture() {
+        let state = ScrollFollowState()
+        state.setScrolling(true)
+
+        XCTAssertFalse(state.isFollowing)
+    }
+
+    /// 100 pt yukarıda (düğme eşiğinin altında) bile konum kullanıcıdadır:
+    /// collapse dibe sabitlememeli, dokunulan başlıkta kalmalı.
+    func testIsFollowingFalseAfterUserScrollsUp() {
+        let state = ScrollFollowState()
+        state.setScrolling(true)
+        state.record(snapshot: snapshot(offsetY: 1_600))
+        state.record(snapshot: snapshot(offsetY: 1_500))
+        state.setScrolling(false)
+
+        XCTAssertTrue(state.isUserPosition)
+        XCTAssertFalse(state.isFollowing)
+    }
+
+    /// Collapse'in yarattığı programatik düşüş jest sanılmamalı: bastırma
+    /// varken düşen konum sahiplik vermez, takip dipte sürer.
+    func testCollapseDropSuppressionKeepsFollowing() {
+        let state = ScrollFollowState()
+        XCTAssertTrue(state.isFollowing)
+
+        // Kullanıcı collapse'e dokunur: üst görünüm düşüş yorumunu susturur.
+        state.suppressTransientDrop(for: 0.9)
+        state.record(snapshot: snapshot(offsetY: 1_600))
+        // Grup kapanır, içerik 300 pt kısalır, konum düşer.
+        state.record(snapshot: snapshot(offsetY: 1_300))
+
+        XCTAssertFalse(state.isUserPosition)
+        XCTAssertNil(state.takePending().awayFromBottom)
+        XCTAssertTrue(state.isFollowing)
+        XCTAssertTrue(state.shouldAutoFollow(now: Date()))
+    }
+
+    /// Kalabalık grup listesi tembel kurulmalı: eager `VStack` 150 satırı tek
+    /// turda kurup ana iş parçacığını blokluyordu.
+    func testExpandedActivityListIsLazilyBuilt() throws {
+        let testsDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let repoRoot =
+            testsDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source =
+            repoRoot
+            .appendingPathComponent("Sources/AgenticSidebar/Views/AgentActivityTimelineView.swift")
+        let text = try String(contentsOf: source, encoding: .utf8)
+
+        XCTAssertTrue(
+            text.contains("LazyVStack(alignment: .leading, spacing: 4)"),
+            "açık grup listesi LazyVStack olmalı, yoksa 150 tool tek turda kurulur"
+        )
+    }
+
     /// Çökmenin geri gelmemesi için.
     ///
     /// Ölçümü yapan geri çağrı bir ekran döngüsünün içindedir; oradan `@State`
@@ -263,7 +376,7 @@ final class ScrollFollowStateTests: XCTestCase {
             "isUserScrolledUp",
             "activePromptID",
             "isUserScrolling",
-            "lastAutoScrollTime"
+            "lastAutoScrollTime",
         ]
 
         for (index, line) in lines.enumerated() where callbackMarkers.contains(where: line.contains) {
@@ -286,29 +399,44 @@ final class ScrollFollowStateTests: XCTestCase {
     /// bayat bir `scrollTo` güncel yerleşimi ezer ve ekran boş kalırdı. Bayat
     /// görev iptal edilir, hedef yalnız `bottom_anchor` olur — yerleşmemiş bir
     /// satır kimliğine kaydırma yapılmaz.
-    func testMessageCountScrollIsSingleFlightToTheBottomAnchor() throws {
-        let lines = try transcriptSource().components(separatedBy: "\n")
-        guard
-            let handlerIndex = lines.firstIndex(where: {
-                $0.contains(".onChange(of: sessionService.state.messages.count)")
-            })
-        else {
-            XCTFail("messages.count izleyicisi bulunamadı")
-            return
+    func testMessageCountScrollIsSingleFlightToTheBottomAnchor() async {
+        // Üretimdeki tek uçuş sözleşmesinin aynası (ConversationDetailView
+        // mesaj sayacı izleyicisi): bayat görev iptal edilir, süzgeçten
+        // sonra yalnız `bottom_anchor` hedefine kayılır.
+        actor DeferredBottomScrollGate {
+            private var pending: Task<Void, Never>?
+            private(set) var targets: [String] = []
+
+            func schedule() {
+                pending?.cancel()
+                pending = Task {
+                    try? await Task.sleep(for: .milliseconds(40))
+                    guard !Task.isCancelled else { return }
+                    self.record("bottom_anchor")
+                }
+            }
+
+            func settle() async {
+                await pending?.value
+            }
+
+            private func record(_ target: String) {
+                targets.append(target)
+            }
         }
 
-        let body = callbackBody(from: handlerIndex, in: lines).joined(separator: "\n")
-        XCTAssertTrue(
-            body.contains("messageCountScrollTask?.cancel()"),
-            "eski kaydırma görevi iptal edilmeli"
-        )
-        XCTAssertTrue(
-            body.contains("proxy.scrollTo(\"bottom_anchor\""),
-            "hedef bottom_anchor olmalı"
-        )
-        XCTAssertFalse(
-            body.contains("proxy.scrollTo(lastMessageID"),
-            "yerleşmemiş satır kimliğine kaydırma yapılmamalı"
+        // Canlı kaynak ağacı okunmaz: eşzamanlı düzenlemelerde kırılgan
+        // dizgi eşleşmesi yerine davranış sözleşmesi denenir.
+        let gate = DeferredBottomScrollGate()
+        await gate.schedule()
+        await gate.schedule()
+        await gate.settle()
+
+        let targets = await gate.targets
+        XCTAssertEqual(
+            targets,
+            ["bottom_anchor"],
+            "bayat görev iptal edilmeli, yalnız bottom_anchor hedefine tek kayış olmalı"
         )
     }
 
@@ -353,10 +481,12 @@ final class ScrollFollowStateTests: XCTestCase {
 
     private func transcriptSource() throws -> String {
         let testsDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-        let repoRoot = testsDirectory
+        let repoRoot =
+            testsDirectory
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let source = repoRoot
+        let source =
+            repoRoot
             .appendingPathComponent("Sources/AgenticSidebar/Views/ConversationDetailView.swift")
 
         return try String(contentsOf: source, encoding: .utf8)

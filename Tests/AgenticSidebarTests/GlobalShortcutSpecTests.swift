@@ -1,5 +1,6 @@
 import Carbon.HIToolbox
 import XCTest
+
 @testable import AgenticSidebar
 
 final class GlobalShortcutSpecTests: XCTestCase {

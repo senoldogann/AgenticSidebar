@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class ProviderActivityTests: XCTestCase {
@@ -9,7 +10,7 @@ final class ProviderActivityTests: XCTestCase {
             ("delete_file", .delete),
             ("write", .update),
             ("apply_patch", .edit),
-            ("web_search", .webSearch)
+            ("web_search", .webSearch),
         ]
 
         for (toolName, expectedKind) in cases {
@@ -132,7 +133,7 @@ final class SubagentAndMCPActivityKindTests: XCTestCase {
             "delegate_task",
             "delegate_agent",
             "delegate",
-            "agent"
+            "agent",
         ]
         for tool in subagentTools {
             XCTAssertEqual(
@@ -157,7 +158,7 @@ final class SubagentAndMCPActivityKindTests: XCTestCase {
             from: "call_mcp_tool",
             input: [
                 "ServerName": "chrome-devtools-mcp",
-                "ToolName": "take_screenshot"
+                "ToolName": "take_screenshot",
             ]
         )
         XCTAssertEqual(parsed.server, "chrome-devtools-mcp")

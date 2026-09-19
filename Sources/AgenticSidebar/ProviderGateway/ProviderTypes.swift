@@ -33,29 +33,89 @@ struct ProviderModelCapability: Equatable, Sendable {
     let id: ProviderModelID
     let displayName: String
     let variants: [ProviderVariant]
+    /// Modelin en fazla girdi jetonu (bağlam penceresi). OpenCode `/provider`
+    /// `limit.context`, OpenAI kataloğu model belgelerindeki değerdir.
+    /// `nil` bilinmiyor demektir: halka gönderim bütçesine göre tahmini gösterir.
+    let contextLimit: Int?
+
+    init(
+        id: ProviderModelID,
+        displayName: String,
+        variants: [ProviderVariant],
+        contextLimit: Int? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.variants = variants
+        self.contextLimit = contextLimit
+    }
 
     var supportsThinking: Bool {
-        let nameLower = displayName.lowercased()
-        let idLower = id.rawValue.lowercased()
+        // Ad, kimlik ve varyantlar tek havuzda taranır: yetenek bazen
+        // varyant adında yazar (`XHigh Thinking` gibi).
+        let fields =
+            [displayName, id.rawValue]
+            + variants.flatMap { [$0.displayName, $0.id.rawValue] }
+        let normalized = fields.map(Self.normalizedModelToken)
 
-        if variants.contains(where: { variant in
-            let vName = variant.displayName.lowercased()
-            let vID = variant.id.rawValue.lowercased()
-            return vName.contains("thinking") || vName.contains("reasoning")
-                || vID.contains("thinking") || vID.contains("reasoning")
-        }) {
+        // 1. Açık yetenek sözcükleri en güçlü sinyaldir.
+        if normalized.contains(where: { $0.contains("thinking") || $0.contains("reasoning") }) {
             return true
         }
-
-        let thinkingTokens = [
-            "r1", "reasoning", "thinking", "qwq", "o1", "o3",
-            "deepseek-r1", "deepseek r1", "claude-3-7-sonnet",
-            "flash-thinking",
-        ]
-
-        return thinkingTokens.contains { token in
-            nameLower.contains(token) || idLower.contains(token)
+        // 2. Kısa kodlar yalnız bütün jeton olarak eşleşir: `deepseek-r1`
+        // evet, `command-r` hayır. Çıplak alt-dize her şeyi yakalıyordu.
+        let tokens = Set(normalized.flatMap { $0.split(separator: "-") }.map(String.init))
+        if !tokens.isDisjoint(with: Self.thinkingCodes) {
+            return true
         }
+        // 3. Aile önekleri: akıl yürütmeyi bizzat taşıyan aileler.
+        return normalized.contains { haystack in
+            Self.thinkingFamilies.contains { haystack.contains($0) }
+        }
+    }
+
+    /// Kısa akıl yürütme kodları: yalnız bütün jeton eşleşir. `r1` bilerek
+    /// yoktur: `command-r1` gibi akıl yürütmeyen adları da yakalıyordu;
+    /// DeepSeek akıl yürütmesi `deepseek-r1` ailesiyle kapsanır.
+    private static let thinkingCodes: Set<String> = ["o1", "o3", "o4", "qwq"]
+
+    /// Akıl yürütmeyi bizzat taşıyan aile önekleri (Eylül 2026 itibarıyla).
+    /// Bilinçli olarak muhafazakârdır: listede yoksa rozet çıkmaz.
+    /// Yeni aile eklerken `ProviderThinkingTests` genişletilir.
+    private static let thinkingFamilies = [
+        "deepseek-r1",
+        "deepseek-reasoner",
+        "qwen3",
+        "claude-3-7",
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-haiku-4",
+        "gemini-2-5",
+        "gemini-3",
+        "gpt-5",
+        "gpt-6",
+        "grok-4",
+    ]
+
+    /// Ayraçlar (`-`, `_`, `.`, `/`, boşluk) tek tireye indirgenir:
+    /// `Claude Sonnet 4.5` ile `claude-sonnet-4-5` aynı sayılır.
+    private static func normalizedModelToken(_ raw: String) -> String {
+        var out = ""
+        out.reserveCapacity(raw.count)
+        var dashed = true
+        for scalar in raw.lowercased() {
+            if scalar.isLetter || scalar.isNumber {
+                out.append(scalar)
+                dashed = false
+            } else if !dashed {
+                out.append("-")
+                dashed = true
+            }
+        }
+        if out.hasSuffix("-") {
+            out.removeLast()
+        }
+        return out
     }
 }
 

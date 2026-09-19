@@ -195,7 +195,8 @@ final class ComputerUseStatus {
                 "Computer Use: the helper did not answer its permission check"
             )
         case .missingPermissions(let missing):
-            let names = missing
+            let names =
+                missing
                 .map { "\($0.rawValue)(\($0.subject == .app ? "this app" : "helper"))" }
                 .joined(separator: ", ")
             AppLog.settings.error(
@@ -298,12 +299,13 @@ final class ComputerUseStatus {
                 return
             }
             self.finishSetup(
-                outcome ?? ComputerUseSetupOutcome(
-                    step: step,
-                    exitCode: 127,
-                    didLaunch: false,
-                    didCancel: false
-                )
+                outcome
+                    ?? ComputerUseSetupOutcome(
+                        step: step,
+                        exitCode: 127,
+                        didLaunch: false,
+                        didCancel: false
+                    )
             )
         }
     }

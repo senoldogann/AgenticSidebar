@@ -36,7 +36,13 @@ final class AgentSessionService {
     private(set) var activeSessionID: UUID
 
     /// Hook for notifications or observers when any session finishes a turn.
-    var onSessionTurnCompleted: (@MainActor (_ sessionID: UUID, _ sessionTitle: String, _ status: AgentSessionStatus, _ previewText: String?) -> Void)?
+    var onSessionTurnCompleted:
+        (@MainActor (_ sessionID: UUID, _ sessionTitle: String, _ status: AgentSessionStatus, _ previewText: String?) -> Void)?
+    /// Tur sınırları: izin seviyesi tur başında anlık görüntülenir. Uygulama
+    /// bu kancalarla merkeze turun kuralını verir; koşan tur eski kuralla
+    /// devam eder, değişim sonraki turda geçerli olur.
+    var onSessionTurnStarted: (@MainActor (_ sessionID: UUID, _ turnID: UUID) -> Void)?
+    var onSessionTurnEnded: (@MainActor (_ sessionID: UUID, _ turnID: UUID) -> Void)?
 
     init(
         runtimes: [any ProviderRuntime],
@@ -49,8 +55,7 @@ final class AgentSessionService {
         let restored: [AgentSession]
         let restoredActiveID: UUID
 
-        if
-            let archive = archiveStore?.load(),
+        if let archive = archiveStore?.load(),
             !archive.sessions.isEmpty
         {
             // Sabitliler önce, sonra oluşturulma yeniden eskiye.
@@ -60,9 +65,19 @@ final class AgentSessionService {
                 }
                 return lhs.createdAt > rhs.createdAt
             }
-            restored = snapshots.map { AgentSession(runtimes: runtimes, snapshot: $0) }
-            restoredActiveID = restored.first { $0.id == archive.activeSessionID }?.id
-                ?? restored[0].id
+            let mapped = snapshots.map { AgentSession(runtimes: runtimes, snapshot: $0) }
+            if mapped.isEmpty {
+                // `map` boş üretemez (girdi boş değil), ama savunma tuzağa
+                // düşürmez: taze oturum yoluna düşülür.
+                let session = AgentSession(runtimes: runtimes, state: state)
+                restored = [session]
+                restoredActiveID = session.id
+            } else {
+                restored = mapped
+                restoredActiveID =
+                    mapped.first { $0.id == archive.activeSessionID }?.id
+                    ?? mapped[0].id
+            }
         } else {
             let session = AgentSession(runtimes: runtimes, state: state)
             restored = [session]
@@ -75,6 +90,7 @@ final class AgentSessionService {
         for session in restored {
             adopt(session)
         }
+        refreshSessionList()
     }
 
     // MARK: - Active session
@@ -82,7 +98,48 @@ final class AgentSessionService {
     /// The session the views are bound to. The list always holds at least one
     /// session, so this never has to fall back to an optional.
     var activeSession: AgentSession {
-        sessions.first { $0.id == activeSessionID } ?? sessions[0]
+        if let match = sessions.first(where: { $0.id == activeSessionID }) {
+            return match
+        }
+        if let first = sessions.first {
+            return first
+        }
+        // Değişmez ihlali (boş liste): tuzağa düşmek yerine taze oturum
+        // açılır. Silme yolları zaten bunu garanti eder; bu dal yalnız
+        // gelecekteki bir kaymaya karşı son savunmadır.
+        AppLog.agentSession.error("Session list was empty; opening a fresh session")
+        let session = AgentSession(runtimes: runtimes, state: AgentSessionState())
+        adopt(session)
+        sessions = [session]
+        activeSessionID = session.id
+        refreshSessionList()
+        return session
+    }
+
+    /// Kimliğe göre oturum: yan yana görünümün ikincil bölmesi aktif olmayan
+    /// oturumu doğrudan buradan çözer, görünüm `activeSessionID` değiştirmez.
+    func session(for id: UUID) -> AgentSession? {
+        sessions.first { $0.id == id }
+    }
+
+    /// Yan soru (`/btw`) anlık görüntüsü: soru anındaki runtime,
+    /// yapılandırma ve geçmiş. Turn makinesine, kuyruğa ve transkripte
+    /// dokunulmaz; meşgul oturumdan da alınabilir.
+    func sideQuestionContext(for id: UUID) -> SideQuestionContext? {
+        guard
+            let session = session(for: id),
+            let configuration = session.configuration,
+            let runtime = runtimes.first(where: { $0.id == configuration.providerID })
+        else {
+            return nil
+        }
+        return SideQuestionContext(
+            runtime: runtime,
+            configuration: configuration,
+            messages: session.state.messages,
+            activityGroups: session.state.activityGroups,
+            contextSummary: session.contextSummary
+        )
     }
 
     var state: AgentSessionState {
@@ -124,19 +181,33 @@ final class AgentSessionService {
         activeSession.queuedPrompts
     }
 
-    var sessionList: [SessionSummary] {
-        sessions.map { session in
+    private(set) var sessionList: [SessionSummary] = []
+
+    func refreshSessionList() {
+        let newList = sessions.map { session in
             SessionSummary(
                 id: session.id,
                 title: session.title,
                 isBusy: session.isBusy,
-                status: session.state.status,
+                status: session.status,
                 completedAt: session.state.completedAt,
                 lastMessageAt: session.state.messages.last?.createdAt,
                 createdAt: session.createdAt,
                 customTitle: session.customTitle,
                 isPinned: session.isPinned
             )
+        }
+        if sessionList != newList {
+            sessionList = newList
+        }
+    }
+
+    func updateVisibleSessions(_ visibleIDs: Set<UUID>) {
+        for session in sessions {
+            let isVisible = visibleIDs.contains(session.id)
+            if session.isVisibleInUI != isVisible {
+                session.isVisibleInUI = isVisible
+            }
         }
     }
 
@@ -154,6 +225,7 @@ final class AgentSessionService {
         session.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
         sessions.insert(session, at: 0)
         activeSessionID = session.id
+        refreshSessionList()
         saveImmediately()
         return session.id
     }
@@ -200,6 +272,7 @@ final class AgentSessionService {
             replacement.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
             sessions = [replacement]
             activeSessionID = replacement.id
+            refreshSessionList()
             saveImmediately()
             return
         }
@@ -208,6 +281,7 @@ final class AgentSessionService {
             activeSessionID = sessions[min(index, sessions.count - 1)].id
         }
 
+        refreshSessionList()
         saveImmediately()
     }
 
@@ -253,8 +327,12 @@ final class AgentSessionService {
         let runtimes = self.runtimes
         let removedIDs = Set(targets.map(\.id))
         let removedActive = removedIDs.contains(activeSessionID)
-        // Kalan listedeki aktifin eski konumu; silinenlerden sonraki seçimi bulur.
-        let activeOldIndex = sessions.firstIndex(where: { $0.id == activeSessionID })
+        // Seçim sıralı KİMLİK listesinden türetilir. Eskiden aktifin eski indeksi
+        // silme sonrası diziye uygulanıyordu; aktiften daha yeni bir sohbet de
+        // silindiğinde indeks kayıyor ve "aktiften sonraki ilk kalan" seçimi
+        // tesadüfe kalıyordu (bir sonraki yerine daha yaşlısı seçilebiliyordu).
+        let orderedIDs = sessions.map(\.id)
+        let activeOldIndex = orderedIDs.firstIndex(of: activeSessionID)
 
         sessions.removeAll { removedIDs.contains($0.id) }
 
@@ -274,29 +352,30 @@ final class AgentSessionService {
             replacement.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
             sessions = [replacement]
             activeSessionID = replacement.id
+            refreshSessionList()
             saveImmediately()
             return
         }
 
         if removedActive {
-            let fallbackIndex: Int
-            if let activeOldIndex {
-                // Silinen aktiften sonra gelen ilk kalan oturumu seçer.
-                let survivorsAfter = sessions.indices.filter { $0 >= min(activeOldIndex, sessions.count) }
-                fallbackIndex = survivorsAfter.first ?? (sessions.count - 1)
-            } else {
-                fallbackIndex = 0
+            let survivors = Set(sessions.map(\.id))
+            // Silinen aktiften sonraki ilk kalan; aktif sondaydıysa sondaki
+            // kalan. Bir sohbet her zaman seçili olmalı.
+            let nextAfter = activeOldIndex.flatMap { index in
+                orderedIDs.dropFirst(index + 1).first { survivors.contains($0) }
             }
-            activeSessionID = sessions[fallbackIndex].id
+            activeSessionID = nextAfter ?? sessions[sessions.count - 1].id
         }
 
+        refreshSessionList()
         saveImmediately()
     }
 
     /// Mesaj dizisindeki bir dönüm noktasından yeni bir dal oturumu açar.
     ///
     /// Kaynak oturuma dokunulmaz; ön ek yeni bir `AgentSession` olarak başa
-    /// eklenir ve aktif yapılır. Backend tarafında istekli (lazy) çalışır:
+    /// eklenir. Kaynak aktif oturumsa dal aktif yapılır, yoksa aktiflik
+    /// korunur. Backend tarafında istekli (lazy) çalışır:
     /// burada sunucuya `POST` yapılmaz, ilk gönderimde runtime ön eki history
     /// preamble olarak tekrar oynatır. Meşgul bir kaynaktan da dallanılabilir,
     /// çünkü yalnızca bitmiş `state` kopyalanır, çalışan turun görevi değil.
@@ -307,13 +386,17 @@ final class AgentSessionService {
         guard let source = sessions.first(where: { $0.id == id }) else {
             return nil
         }
-        guard let fork = SessionFork.plan(
-            sourceMessages: source.state.messages,
-            sourceActivityGroups: source.state.activityGroups,
-            sourceAutomaticTitle: source.automaticTitle,
-            sourceCustomTitle: source.customTitle,
-            throughMessageID: throughMessageID
-        ) else {
+        guard
+            let fork = SessionFork.plan(
+                sourceMessages: source.state.messages,
+                sourceActivityGroups: source.state.activityGroups,
+                sourceAutomaticTitle: source.automaticTitle,
+                sourceCustomTitle: source.customTitle,
+                throughMessageID: throughMessageID,
+                isSourceBusy: source.isBusy
+            )
+        else {
+            source.state.notice = .forkUnavailable
             return nil
         }
         var forkedState = AgentSessionState(
@@ -330,7 +413,12 @@ final class AgentSessionService {
         adopt(branch)
         branch.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
         sessions.insert(branch, at: 0)
-        activeSessionID = branch.id
+        // Odağı yalnız kaynaktan dallanıldıysa taşı: ikincil bölmedeki ya da
+        // arşivdeki bir sohbetten dallanma aktif sohbeti çalmamalıdır.
+        if activeSessionID == id {
+            activeSessionID = branch.id
+        }
+        refreshSessionList()
         saveImmediately()
         return branch.id
     }
@@ -470,6 +558,10 @@ final class AgentSessionService {
         activeSession.removeQueuedPrompt(id)
     }
 
+    func sendQueuedPromptImmediately(_ id: UUID) {
+        activeSession.sendQueuedPromptImmediately(id)
+    }
+
     @discardableResult
     func updateQueuedPrompt(_ id: UUID, text: String) -> Bool {
         activeSession.updateQueuedPrompt(id, text: text)
@@ -511,8 +603,20 @@ final class AgentSessionService {
         session.onImmediatePersistentChange = { [weak self] in
             self?.saveImmediately()
         }
+        session.onSummaryChange = { [weak self] in
+            self?.refreshSessionList()
+        }
         session.onTurnFinished = { [weak self] sessionID, sessionTitle, status, snippet in
+            self?.refreshSessionList()
             self?.onSessionTurnCompleted?(sessionID, sessionTitle, status, snippet)
+        }
+        session.onTurnStarted = { [weak self] sessionID, turnID in
+            self?.refreshSessionList()
+            self?.onSessionTurnStarted?(sessionID, turnID)
+        }
+        session.onTurnEnded = { [weak self] sessionID, turnID in
+            self?.refreshSessionList()
+            self?.onSessionTurnEnded?(sessionID, turnID)
         }
     }
 
@@ -526,7 +630,7 @@ final class AgentSessionService {
             return
         }
 
-        saveTask = Task { [weak self] in
+        saveTask = Task { @MainActor [weak self] in
             while let self, self.hasPendingSave {
                 try? await Task.sleep(for: Self.saveDebounce)
                 guard !Task.isCancelled else {
@@ -547,7 +651,7 @@ final class AgentSessionService {
     /// Yapısal değişiklikler beklemeden yazılır; çağıran ana iş parçacığını
     /// tutmaz çünkü kodlama ve disk yazımı arşiv aktöründe çalışır.
     private func saveImmediately() {
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             await self?.saveNow()
         }
     }
@@ -579,7 +683,8 @@ final class AgentSessionService {
 
         hasPendingSave = false
 
-        var snapshots = sessions
+        var snapshots =
+            sessions
             .map { $0.snapshot() }
             .filter { snapshot in
                 // A blank selected conversation still owns the current provider/model.
@@ -632,7 +737,7 @@ final class AgentSessionService {
             .transportFailure,
             .unsupportedCapability,
             .streamInterrupted,
-            .unexpectedBackendResponse
+            .unexpectedBackendResponse,
         ]
 
         return priority.first { errors.contains($0) } ?? .providerUnavailable

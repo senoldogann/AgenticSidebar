@@ -16,6 +16,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     private let passwordGenerator: @Sendable () async throws -> String
 
     private var processHandle: (any OpenCodeProcessHandling)?
+    private var activePID: Int32?
 
     /// Reaping runs once per app launch: it is a scan of the process table, and
     /// the answer cannot change while this process is starting servers.
@@ -99,6 +100,15 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 // The child can exit without telling us (crash, external kill).
                 // Report the real state instead of the last known one.
                 AppLog.openCode.error("Managed OpenCode process is no longer running")
+                if let processHandle {
+                    let handlePID = await processHandle.processIdentifier()
+                    let pid = activePID ?? handlePID ?? 0
+                    await processHandle.terminate()
+                    if pid > 0 {
+                        OpenCodeServerLedger.release(pid: pid, in: workingDirectoryURL)
+                    }
+                }
+                activePID = nil
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
@@ -110,6 +120,10 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
 
     func currentConnection() -> OpenCodeServerConnection? {
         connection
+    }
+
+    func workingDirectory() -> URL? {
+        workingDirectoryURL
     }
 
     func start(
@@ -175,30 +189,30 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             let port: UInt16
             do {
                 port = try portAllocator.allocate()
-            } catch let error as ProviderRuntimeError {
-                throw error
             } catch {
+                serverStatus = .stopped
                 throw ProviderRuntimeError.startupFailure
             }
 
             guard let baseURL = URL(string: "http://127.0.0.1:\(port)") else {
+                serverStatus = .stopped
                 throw ProviderRuntimeError.startupFailure
             }
+
             let candidateConnection = OpenCodeServerConnection(
                 baseURL: baseURL,
                 username: "opencode",
                 password: password
             )
+
             let request = OpenCodeProcessLaunchRequest(
                 executableURL: executableURL,
-                // No `--pure`: that flag means "run without external plugins",
-                // so it silently disabled every plugin the app writes into the
-                // managed configuration. The app's own servers are recognised by
-                // `OPENCODE_CONFIG` instead (``OpenCodeProcessTree/isManagedServer``).
                 arguments: [
                     "serve",
-                    "--hostname", "127.0.0.1",
-                    "--port", String(port)
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    "\(port)",
                 ],
                 environment: Self.launchEnvironment(
                     connection: candidateConnection,
@@ -220,7 +234,8 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             }
 
             processHandle = launchedHandle
-            let launchedPID = await launchedHandle.processIdentifier() ?? 0
+            let launchedPID = await launchedHandle.processIdentifier()
+            activePID = launchedPID
 
             do {
                 // Before the first request that carries the password: the child
@@ -228,7 +243,8 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 // this could hand `Basic base64("opencode:<keychain password>")`
                 // to a process that merely won the race for the freed port, and
                 // the impostor only has to answer a plausible health check.
-                let isChildListener = await listenerVerifier
+                let isChildListener =
+                    await listenerVerifier
                     .waitUntilProcessOwnsListeningPort(
                         port,
                         processIdentifier: await launchedHandle.processIdentifier()
@@ -248,22 +264,27 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 // Written down while it is known to be ours: if this process is
                 // killed before it can stop the server, the next launch reads the
                 // lease and ends it instead of leaving a second server behind.
-                OpenCodeServerLedger.record(
-                    OpenCodeServerLease(
-                        pid: launchedPID,
-                        port: port,
-                        executablePath: executableURL.path,
-                        startedAt: Date()
-                    ),
-                    in: workingDirectoryURL
-                )
+                if let launchedPID, launchedPID > 0 {
+                    OpenCodeServerLedger.record(
+                        OpenCodeServerLease(
+                            pid: launchedPID,
+                            port: port,
+                            executablePath: executableURL.path,
+                            startedAt: Date()
+                        ),
+                        in: workingDirectoryURL
+                    )
+                }
                 AppLog.openCode.info(
                     "OpenCode \(version, privacy: .public) listening on authenticated loopback"
                 )
                 return candidateConnection
             } catch let error as ProviderRuntimeError {
                 await launchedHandle.terminate()
-                OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                if let launchedPID, launchedPID > 0 {
+                    OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                }
+                activePID = nil
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
@@ -282,14 +303,20 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 // start nobody is waiting for and then reporting it as a failure
                 // was both wasteful and misleading.
                 await launchedHandle.terminate()
-                OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                if let launchedPID, launchedPID > 0 {
+                    OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                }
+                activePID = nil
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
                 throw CancellationError()
             } catch {
                 await launchedHandle.terminate()
-                OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                if let launchedPID, launchedPID > 0 {
+                    OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                }
+                activePID = nil
                 processHandle = nil
                 connection = nil
                 serverStatus = .stopped
@@ -302,11 +329,15 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
 
     func stop() async {
         if let processHandle {
-            let pid = await processHandle.processIdentifier() ?? 0
+            let handlePID = await processHandle.processIdentifier()
+            let pid = activePID ?? handlePID ?? 0
             await processHandle.terminate()
-            OpenCodeServerLedger.release(pid: pid, in: workingDirectoryURL)
+            if pid > 0 {
+                OpenCodeServerLedger.release(pid: pid, in: workingDirectoryURL)
+            }
         }
 
+        activePID = nil
         processHandle = nil
         connection = nil
         serverStatus = .stopped
@@ -339,7 +370,6 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         }
     }
 
-
     private static func launchEnvironment(
         connection: OpenCodeServerConnection,
         configurationPath: String
@@ -350,7 +380,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             // Uygulamanın ürettiği izin/talimat/MCP dosyası; kullanıcının
             // opencode.json dosyasına dokunulmaz, OpenCode yapılandırmaları
             // birleştirir.
-            "OPENCODE_CONFIG": configurationPath
+            "OPENCODE_CONFIG": configurationPath,
         ]
     }
 
@@ -454,10 +484,10 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         // configuration, and this file only exists so OpenCode treats the folder
         // as a project root.
         let configContent = """
-        {
-          "$schema": "https://opencode.ai/config.json"
-        }
-        """
+            {
+              "$schema": "https://opencode.ai/config.json"
+            }
+            """
         do {
             try configContent.write(
                 to: configFileURL,
@@ -523,8 +553,8 @@ struct URLSessionOpenCodeHealthChecker: OpenCodeHealthChecking {
                 }
 
                 if response.statusCode == 200,
-                   let health = try? JSONDecoder().decode(HealthResponse.self, from: data),
-                   health.healthy
+                    let health = try? JSONDecoder().decode(HealthResponse.self, from: data),
+                    health.healthy
                 {
                     return health.version
                 }

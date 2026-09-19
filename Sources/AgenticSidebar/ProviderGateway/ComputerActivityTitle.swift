@@ -61,17 +61,11 @@ enum ComputerActivityTitle {
         return lowered
     }
 
+    /// Yalnızca `chatgpt-system_computer_` öneki bilgisayar adımı sayılır.
+    /// Çıplak adlar (`run`, `observe`, `screenshot`…) başka provider'lara ait
+    /// olabilir; önek şartsız eşleşme onları yanlış türe düşürürdü.
     static func isComputerTool(_ tool: String) -> Bool {
-        let action = strippedAction(from: tool)
-        if tool.lowercased().hasPrefix(toolPrefix) {
-            return true
-        }
-        return [
-            "click", "double_click", "move_mouse", "mouse_down", "mouse_up",
-            "drag", "scroll", "press_key", "type_text", "screenshot", "observe",
-            "focus_app", "open_app", "pointer_position", "release_inputs",
-            "wait_for_text", "wait_until_changed", "wait_for_frontmost",
-        ].contains(action)
+        tool.lowercased().hasPrefix(toolPrefix)
     }
 
     private static func number(_ value: Any?) -> String? {
@@ -104,12 +98,14 @@ enum ComputerActivityTitle {
     }
 
     private static func dragSpan(_ input: [String: Any]) -> String {
-        let from = (input["from"] as? [String: Any]).flatMap {
-            coordinatePair(x: $0["x"], y: $0["y"])
-        } ?? coordinatePair(x: input["fromX"], y: input["fromY"])
-        let to = (input["to"] as? [String: Any]).flatMap {
-            coordinatePair(x: $0["x"], y: $0["y"])
-        } ?? coordinatePair(x: input["toX"], y: input["toY"]) ?? coordinate(input)
+        let from =
+            (input["from"] as? [String: Any]).flatMap {
+                coordinatePair(x: $0["x"], y: $0["y"])
+            } ?? coordinatePair(x: input["fromX"], y: input["fromY"])
+        let to =
+            (input["to"] as? [String: Any]).flatMap {
+                coordinatePair(x: $0["x"], y: $0["y"])
+            } ?? coordinatePair(x: input["toX"], y: input["toY"]) ?? coordinate(input)
         guard let from else {
             return to
         }
@@ -120,11 +116,11 @@ enum ComputerActivityTitle {
         let vertical = number(input["vertical"])
         let horizontal = number(input["horizontal"])
         switch (vertical, horizontal) {
-        case let (v?, h?) where h != "0":
+        case (let v?, let h?) where h != "0":
             return "(\(h), \(v))"
-        case let (v?, _):
+        case (let v?, _):
             return v
-        case let (_, h?):
+        case (_, let h?):
             return h
         default:
             return "…"
@@ -147,7 +143,8 @@ enum ComputerActivityTitle {
             return "text"
         }
         let firstLine = text.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? text
-        let clipped = firstLine.count > maximumTypedPreviewLength
+        let clipped =
+            firstLine.count > maximumTypedPreviewLength
             ? String(firstLine.prefix(maximumTypedPreviewLength)) + "…"
             : firstLine
         return "“\(clipped)”"
@@ -168,7 +165,8 @@ enum ComputerActivityTitle {
 
     private static func waitSummary(_ input: [String: Any]) -> String {
         if let text = (input["text"] as? String), !text.isEmpty {
-            let clipped = text.count > maximumTypedPreviewLength
+            let clipped =
+                text.count > maximumTypedPreviewLength
                 ? String(text.prefix(maximumTypedPreviewLength)) + "…"
                 : text
             return "for “\(clipped)”"

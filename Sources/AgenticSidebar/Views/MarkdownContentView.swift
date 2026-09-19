@@ -24,28 +24,25 @@ enum MarkdownBlock: Identifiable, Equatable {
 
     var id: String {
         switch self {
-        case let .paragraph(id, _): id
-        case let .heading(id, _, _): id
-        case let .code(id, _, _): id
-        case let .bulletItem(id, _): id
-        case let .numberedItem(id, _, _): id
-        case let .blockquote(id, _): id
-        case let .divider(id): id
-        case let .table(id, _, _, _): id
-        case let .chart(id, _): id
-        case let .plan(id, _): id
-        case let .math(id, _): id
+        case .paragraph(let id, _): id
+        case .heading(let id, _, _): id
+        case .code(let id, _, _): id
+        case .bulletItem(let id, _): id
+        case .numberedItem(let id, _, _): id
+        case .blockquote(let id, _): id
+        case .divider(let id): id
+        case .table(let id, _, _, _): id
+        case .chart(let id, _): id
+        case .plan(let id, _): id
+        case .math(let id, _): id
         }
     }
 }
 
 struct MarkdownContentView: View {
     let markdown: String
-
-    /// Plan documents are only recognised in a message body, never inside the
-    /// body of a plan itself: a nested fence stays an ordinary code block, so the
-    /// renderer cannot recurse.
     let allowsPlanDocuments: Bool
+    let isStreaming: Bool
 
     @Environment(SettingsStore.self) private var settingsStore: SettingsStore?
     @Environment(\.colorScheme) private var systemColorScheme
@@ -60,15 +57,40 @@ struct MarkdownContentView: View {
     /// içerik yok, metin değişmedikçe yeniden ayrıştırma yok.
     @State private var cache = MarkdownParseCache()
 
-    init(markdown: String, allowsPlanDocuments: Bool = true) {
+    init(
+        markdown: String,
+        allowsPlanDocuments: Bool,
+        isStreaming: Bool
+    ) {
         self.markdown = markdown
         self.allowsPlanDocuments = allowsPlanDocuments
+        self.isStreaming = isStreaming
+    }
+
+    init(
+        markdown: String,
+        allowsPlanDocuments: Bool
+    ) {
+        self.init(
+            markdown: markdown,
+            allowsPlanDocuments: allowsPlanDocuments,
+            isStreaming: false
+        )
+    }
+
+    init(markdown: String) {
+        self.init(
+            markdown: markdown,
+            allowsPlanDocuments: true,
+            isStreaming: false
+        )
     }
 
     private var blocks: [MarkdownBlock] {
         cache.blocks(
             for: markdown,
-            allowsPlanDocuments: allowsPlanDocuments
+            allowsPlanDocuments: allowsPlanDocuments,
+            isStreaming: isStreaming
         )
     }
 
@@ -106,11 +128,11 @@ struct MarkdownContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(rows) { row in
                 switch row {
-                case let .text(id, blocks):
+                case .text(let id, let blocks):
                     SelectableMarkdownTextView(blocks: blocks, typography: runTypography)
                         .id(id)
 
-                case let .block(block):
+                case .block(let block):
                     renderBlock(block)
                 }
             }
@@ -130,8 +152,8 @@ struct MarkdownContentView: View {
 
         var id: String {
             switch self {
-            case let .text(id, _): "run-\(id)"
-            case let .block(block): block.id
+            case .text(let id, _): "run-\(id)"
+            case .block(let block): block.id
             }
         }
     }
@@ -173,24 +195,26 @@ struct MarkdownContentView: View {
     @ViewBuilder
     private func renderBlock(_ block: MarkdownBlock) -> some View {
         switch block {
-        case let .paragraph(_, content):
+        case .paragraph(_, let content):
             Text(MarkdownInlineText.attributed(from: content))
                 .font(.system(size: fontSize.pointSize, weight: .regular, design: fontFamily.fontDesign))
                 .lineSpacing(lineSpacing.spacing)
                 .foregroundStyle(.primary)
 
-        case let .heading(_, level, text):
+        case .heading(_, let level, let text):
             headingView(level: level, text: text)
 
-        case let .code(_, language, code):
+        case .code(_, let language, let code):
             CodeBlockView(
                 language: language,
                 code: code,
                 fontSize: codeFontSize.pointSize,
-                wordWrap: codeWordWrap
+                wordWrap: codeWordWrap,
+                preset: themePreset,
+                previewIsDark: isDarkMode
             )
 
-        case let .bulletItem(_, text):
+        case .bulletItem(_, let text):
             HStack(alignment: .top, spacing: 8) {
                 Text("•")
                     .font(.system(size: fontSize.pointSize, weight: .bold, design: fontFamily.fontDesign))
@@ -204,7 +228,7 @@ struct MarkdownContentView: View {
             }
             .padding(.leading, 4)
 
-        case let .numberedItem(_, number, text):
+        case .numberedItem(_, let number, let text):
             HStack(alignment: .top, spacing: 8) {
                 Text(number)
                     .font(.system(size: max(11, fontSize.pointSize - 1.0), weight: .semibold, design: .monospaced))
@@ -218,7 +242,7 @@ struct MarkdownContentView: View {
             }
             .padding(.leading, 4)
 
-        case let .blockquote(_, text):
+        case .blockquote(_, let text):
             HStack(alignment: .top, spacing: 10) {
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
                     .fill(Color.accentColor.opacity(0.7))
@@ -238,7 +262,7 @@ struct MarkdownContentView: View {
                 .opacity(0.5)
                 .padding(.vertical, 4)
 
-        case let .table(_, headers, alignments, rows):
+        case .table(_, let headers, let alignments, let rows):
             MarkdownTableView(
                 headers: headers,
                 alignments: alignments,
@@ -249,7 +273,7 @@ struct MarkdownContentView: View {
                 preset: themePreset
             )
 
-        case let .chart(_, spec):
+        case .chart(_, let spec):
             MarkdownChartView(
                 spec: spec,
                 isDark: isDarkMode,
@@ -257,10 +281,10 @@ struct MarkdownContentView: View {
                 fontSize: fontSize.pointSize
             )
 
-        case let .plan(_, content):
+        case .plan(_, let content):
             PlanDocumentView(markdown: content)
 
-        case let .math(_, formula):
+        case .math(_, let formula):
             MathBlockView(
                 formula: formula,
                 fontSize: fontSize.pointSize,
@@ -301,12 +325,29 @@ private struct CodeBlockView: View {
     let code: String
     let fontSize: CGFloat
     let wordWrap: Bool
+    let preset: AppThemePreset
+    let previewIsDark: Bool
 
     @Environment(\.colorScheme) private var colorScheme
 
-    @State private var isCopied: Bool = false
+    @State private var confirmation = CopyConfirmation()
+    @State private var showingPreview: Bool = false
 
     private var isDark: Bool { colorScheme == .dark }
+
+    /// Yalnızca güvenli önizlenebilir dillerde buton çıkar; diğerleri salt kod kalır.
+    private var previewSource: PreviewArtifactBuilder.Source? {
+        switch language.lowercased() {
+        case "html":
+            return .html(code)
+        case "svg":
+            return .svg(code)
+        case "mermaid":
+            return .mermaid(code)
+        default:
+            return nil
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -317,13 +358,33 @@ private struct CodeBlockView: View {
 
                 Spacer()
 
+                if previewSource != nil {
+                    Button {
+                        showingPreview = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye")
+                                .font(.system(size: 10, weight: .medium))
+                            Text("Preview")
+                                .font(.caption2.weight(.medium))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .interactiveHoverPill(cornerRadius: 6)
+                    }
+                    .buttonStyle(.plain)
+                    .pointingHandCursor()
+                    .foregroundStyle(.secondary)
+                    .help("Yalıtılmış önizlemeyi aç")
+                }
+
                 Button {
-                    copyToClipboard()
+                    confirmation.copy(code)
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                        Image(systemName: confirmation.isCopied ? "checkmark" : "doc.on.doc")
                             .font(.system(size: 10, weight: .medium))
-                        Text(isCopied ? "Copied" : "Copy")
+                        Text(confirmation.isCopied ? "Copied" : "Copy")
                             .font(.caption2.weight(.medium))
                     }
                     .padding(.horizontal, 8)
@@ -332,7 +393,8 @@ private struct CodeBlockView: View {
                 }
                 .buttonStyle(.plain)
                 .pointingHandCursor()
-                .foregroundStyle(isCopied ? .green : .secondary)
+                .foregroundStyle(confirmation.isCopied ? .green : .secondary)
+                .help("Copy code to clipboard")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
@@ -370,15 +432,17 @@ private struct CodeBlockView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
-    }
-
-    private func copyToClipboard() {
-        Pasteboard.copy(code)
-
-        isCopied = true
-        Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            isCopied = false
+        .sheet(isPresented: $showingPreview) {
+            if let source = previewSource {
+                LivePreviewPanelView(
+                    title: language.lowercased(),
+                    html: PreviewArtifactBuilder.document(for: source),
+                    preset: preset,
+                    isDark: previewIsDark,
+                    onDismiss: { showingPreview = false }
+                )
+                .frame(minWidth: 560, minHeight: 420)
+            }
         }
     }
 }
@@ -388,7 +452,7 @@ private struct MathBlockView: View {
     let fontSize: CGFloat
     let isDark: Bool
 
-    @State private var isCopied: Bool = false
+    @State private var confirmation = CopyConfirmation()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -404,12 +468,12 @@ private struct MathBlockView: View {
                 Spacer()
 
                 Button {
-                    copyToClipboard()
+                    confirmation.copy(cleanFormula(formula))
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                        Image(systemName: confirmation.isCopied ? "checkmark" : "doc.on.doc")
                             .font(.system(size: 10, weight: .medium))
-                        Text(isCopied ? "Copied" : "Copy")
+                        Text(confirmation.isCopied ? "Copied" : "Copy")
                             .font(.caption2.weight(.medium))
                     }
                     .padding(.horizontal, 8)
@@ -418,7 +482,8 @@ private struct MathBlockView: View {
                 }
                 .buttonStyle(.plain)
                 .pointingHandCursor()
-                .foregroundStyle(isCopied ? .green : .secondary)
+                .foregroundStyle(confirmation.isCopied ? .green : .secondary)
+                .help("Copy formula to clipboard")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -457,15 +522,6 @@ private struct MathBlockView: View {
         }
         return text
     }
-
-    private func copyToClipboard() {
-        Pasteboard.copy(cleanFormula(formula))
-        isCopied = true
-        Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            isCopied = false
-        }
-    }
 }
 
 /// Tek bir mesajın ayrıştırma sonucunu tutan önbellek.
@@ -479,18 +535,22 @@ final class MarkdownParseCache {
     private var allowsPlanDocuments: Bool?
     private var parsed: [MarkdownBlock] = []
 
-    func blocks(for markdown: String, allowsPlanDocuments: Bool) -> [MarkdownBlock] {
+    func blocks(
+        for markdown: String,
+        allowsPlanDocuments: Bool,
+        isStreaming: Bool
+    ) -> [MarkdownBlock] {
         if source == markdown, self.allowsPlanDocuments == allowsPlanDocuments {
             return parsed
         }
 
-        // A second chance before parsing: the same text is commonly rendered by a
-        // *new* view instance after the user switches conversations and comes
-        // back, which loses this per-view cache but not the shared one.
-        if let shared = MarkdownParseStore.shared.blocks(
-            for: markdown,
-            allowsPlanDocuments: allowsPlanDocuments
-        ) {
+        // A second chance before parsing: check shared store only if NOT streaming.
+        if !isStreaming,
+            let shared = MarkdownParseStore.shared.blocks(
+                for: markdown,
+                allowsPlanDocuments: allowsPlanDocuments
+            )
+        {
             source = markdown
             self.allowsPlanDocuments = allowsPlanDocuments
             parsed = shared
@@ -501,15 +561,31 @@ final class MarkdownParseCache {
             from: markdown,
             allowsPlanDocuments: allowsPlanDocuments
         )
-        MarkdownParseStore.shared.store(
-            blocks,
-            for: markdown,
-            allowsPlanDocuments: allowsPlanDocuments
-        )
+
+        // Do not thrash the shared store with rapid intermediate streaming fragments!
+        if !isStreaming {
+            MarkdownParseStore.shared.store(
+                blocks,
+                for: markdown,
+                allowsPlanDocuments: allowsPlanDocuments
+            )
+        }
+
         source = markdown
         self.allowsPlanDocuments = allowsPlanDocuments
         parsed = blocks
         return blocks
+    }
+
+    func blocks(
+        for markdown: String,
+        allowsPlanDocuments: Bool
+    ) -> [MarkdownBlock] {
+        blocks(
+            for: markdown,
+            allowsPlanDocuments: allowsPlanDocuments,
+            isStreaming: false
+        )
     }
 }
 
@@ -568,7 +644,8 @@ final class MarkdownParseStore {
         totalCharacters += text.count
 
         while recency.count > Self.maximumEntries
-            || (totalCharacters > Self.maximumTotalCharacters && recency.count > 1) {
+            || (totalCharacters > Self.maximumTotalCharacters && recency.count > 1)
+        {
             let oldest = recency.removeFirst()
             totalCharacters -= oldest.text.count
             entries[oldest] = nil
@@ -596,6 +673,9 @@ func parseMarkdownBlocks(
     from rawText: String,
     allowsPlanDocuments: Bool = true
 ) -> [MarkdownBlock] {
+    /// Kapanmamış `$$` bloğunun yutabileceği en fazla satır; üstünde açılış
+    /// satırı düz metindir, mesajın geri kalanı kurtulur.
+    let maximumMathBlockLines = 40
     var blocks: [MarkdownBlock] = []
     let lines = rawText.components(separatedBy: "\n")
     var index = 0
@@ -623,13 +703,13 @@ func parseMarkdownBlocks(
             blockCounter += 1
             let fenceContent = codeLines.joined(separator: "\n")
 
-            let languageLower = language.lowercased()
             if allowsPlanDocuments,
-               isPlanFenceLanguage(language) {
+                isPlanFenceLanguage(language)
+            {
                 blocks.append(.plan(id: "plan-\(blockCounter)", content: fenceContent))
             } else if let chartSpec = chartSpec(fromFenceLanguage: language, content: fenceContent) {
                 blocks.append(.chart(id: "chart-\(blockCounter)", spec: chartSpec))
-            } else if languageLower == "math" || languageLower == "latex" {
+            } else if isMathFenceLanguage(language) {
                 blocks.append(.math(id: "math-\(blockCounter)", formula: fenceContent))
             } else {
                 blocks.append(
@@ -651,18 +731,29 @@ func parseMarkdownBlocks(
                 continue
             }
 
+            let mathStart = index
             index += 1
             var mathLines: [String] = [trimmed]
-            while index < lines.count {
+            var closed = false
+            // Kapanmamış `$$` mesajın geri kalanını yutmasın: makul bir
+            // pencerede kapanış yoksa açılış satırı düz metindir, tüketilen
+            // satırlar geri sarılıp normal akışta ayrıştırılır.
+            while index < lines.count, mathLines.count <= maximumMathBlockLines {
                 let mLine = lines[index]
                 mathLines.append(mLine)
                 index += 1
                 if mLine.trimmingCharacters(in: .whitespaces).hasSuffix("$$") {
+                    closed = true
                     break
                 }
             }
             blockCounter += 1
-            blocks.append(.math(id: "math-\(blockCounter)", formula: mathLines.joined(separator: "\n")))
+            if closed {
+                blocks.append(.math(id: "math-\(blockCounter)", formula: mathLines.joined(separator: "\n")))
+            } else {
+                index = mathStart + 1
+                blocks.append(.paragraph(id: "para-\(blockCounter)", content: trimmed))
+            }
             continue
         }
 
@@ -775,19 +866,11 @@ func parseMarkdownBlocks(
             let nextLine = lines[index]
             let nextTrimmed = nextLine.trimmingCharacters(in: .whitespaces)
 
-            if nextTrimmed.isEmpty ||
-                nextTrimmed.hasPrefix("```") ||
-                nextTrimmed.hasPrefix("$$") ||
-                nextTrimmed.hasPrefix("#") ||
-                nextTrimmed.hasPrefix("> ") ||
-                nextTrimmed.hasPrefix("- ") ||
-                nextTrimmed.hasPrefix("* ") ||
-                nextTrimmed.hasPrefix("+ ") ||
-                parseNumberedList(line: nextTrimmed) != nil ||
-                nextTrimmed == "---" ||
-                nextTrimmed == "***" ||
-                nextTrimmed == "___" ||
-                MarkdownTables.isTableStart(in: lines, at: index) {
+            if nextTrimmed.isEmpty || nextTrimmed.hasPrefix("```") || nextTrimmed.hasPrefix("$$") || nextTrimmed.hasPrefix("#")
+                || nextTrimmed.hasPrefix("> ") || nextTrimmed.hasPrefix("- ") || nextTrimmed.hasPrefix("* ") || nextTrimmed.hasPrefix("+ ")
+                || parseNumberedList(line: nextTrimmed) != nil || nextTrimmed == "---" || nextTrimmed == "***" || nextTrimmed == "___"
+                || MarkdownTables.isTableStart(in: lines, at: index)
+            {
                 break
             }
 
@@ -812,6 +895,13 @@ func parseMarkdownBlocks(
 func isPlanFenceLanguage(_ language: String) -> Bool {
     let tokens = language.lowercased().split(separator: " ").map(String.init)
     return tokens.first == AgentMode.planFenceLanguage
+}
+
+/// `plan`/`chart` ile aynı kural: ilk token `math`/`latex` ise dildir,
+/// arkası parametredir (örn. ` ```math display`).
+func isMathFenceLanguage(_ language: String) -> Bool {
+    let tokens = language.lowercased().split(separator: " ").map(String.init)
+    return tokens.first == "math" || tokens.first == "latex"
 }
 
 /// Whether a reply holds a plan document the user can approve.
@@ -839,9 +929,17 @@ private func chartSpec(
         return nil
     }
 
-    let defaultKind = tokens.count > 1
-        ? (MarkdownChartSpec.Kind(rawValue: tokens[1]) ?? .bar)
-        : .bar
+    // Bilinmeyen tür sessizce çubuğa düşmez: üstteki kural gereği
+    // bozuk grafik kod bloğu kalır, model yazım hatası maskelenmez.
+    let defaultKind: MarkdownChartSpec.Kind
+    if tokens.count > 1 {
+        guard let kind = MarkdownChartSpec.Kind(rawValue: tokens[1]) else {
+            return nil
+        }
+        defaultKind = kind
+    } else {
+        defaultKind = .bar
+    }
 
     return MarkdownCharts.parseSpec(from: content, defaultKind: defaultKind)
 }
@@ -855,7 +953,7 @@ private func parseNumberedList(line: String) -> (number: String, text: String)? 
 
     // Ordered lists stay short in practice; the bound keeps prose that happens to
     // open with a four-digit number ("2026. yılında ...") in the paragraph path.
-    guard prefix.count <= 3, prefix.allSatisfy(\.isNumber), let _ = Int(prefix) else {
+    guard prefix.count <= 3, prefix.allSatisfy(\.isNumber), Int(prefix) != nil else {
         return nil
     }
 

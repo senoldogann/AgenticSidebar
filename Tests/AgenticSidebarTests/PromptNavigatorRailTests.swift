@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class PromptNavigatorRailTests: XCTestCase {
@@ -54,7 +55,7 @@ final class PromptNavigatorRailTests: XCTestCase {
             ids[1]: -120,
             ids[2]: 6,
             ids[3]: 180,
-            ids[4]: 900
+            ids[4]: 900,
         ]
 
         XCTAssertEqual(

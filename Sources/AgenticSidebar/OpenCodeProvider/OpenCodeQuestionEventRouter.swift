@@ -40,16 +40,20 @@ struct OpenCodeQuestionEventRouter: Sendable {
         guard line.hasPrefix("data:") else { return [] }
         let dataField = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
         guard let data = dataField.data(using: .utf8),
-              let envelope = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let type = envelope["type"] as? String,
-              let properties = envelope["properties"] as? [String: Any]
+            let envelope = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            let type = envelope["type"] as? String,
+            let properties = envelope["properties"] as? [String: Any]
         else {
+            AppLog.openCode.error("Bozuk soru olayı atlandı: \(line.prefix(120), privacy: .public)")
             return []
         }
 
         switch type {
         case "question.asked":
-            guard let request = Self.parse(properties) else { return [] }
+            guard let request = Self.parse(properties) else {
+                AppLog.openCode.error("question.asked ayrıştırılamadı, atlandı")
+                return []
+            }
             guard !deliveredIDs.contains(request.requestID) else { return [] }
             if request.remoteSessionID == sessionID || ownedChildSessions.contains(request.remoteSessionID) {
                 markDelivered(request.requestID)
@@ -63,7 +67,11 @@ struct OpenCodeQuestionEventRouter: Sendable {
                 (properties["sessionID"] as? String) == sessionID,
                 let part = properties["part"] as? [String: Any],
                 (part["type"] as? String) == "tool",
-                (part["tool"] as? String) == "task",
+                let tool = part["tool"] as? String,
+                // Tek yüklem (`ProviderActivityDescriptor.isSubagentTool`):
+                // normalizer hangi aracı delege sayarsa sahiplik de ondan
+                // öğrenilir, yoksa delege sorular panele hiç çıkmaz.
+                ProviderActivityDescriptor.isSubagentTool(tool),
                 let state = part["state"] as? [String: Any],
                 let metadata = state["metadata"] as? [String: Any],
                 let childID = metadata["sessionId"] as? String,
@@ -107,7 +115,8 @@ struct OpenCodeQuestionEventRouter: Sendable {
         }
         unknownQuestions[request.remoteSessionID] = requests
         if unknownQuestions.count > Self.maximumUnknownSessions,
-           let evicted = unknownQuestions.keys.sorted().first {
+            let evicted = unknownQuestions.keys.sorted().first
+        {
             unknownQuestions.removeValue(forKey: evicted)
         }
     }
@@ -126,13 +135,14 @@ struct OpenCodeQuestionEventRouter: Sendable {
         var questions: [OpenCodeQuestionItem] = []
         for raw in rawQuestions {
             guard let prompt = raw["question"] as? String,
-                  !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  let choices = raw["options"] as? [[String: Any]]
+                !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                let choices = raw["options"] as? [[String: Any]]
             else { return nil }
             let options = choices.enumerated().compactMap { index, choice -> AgentQuestionOption? in
                 guard let label = choice["label"] as? String, !label.isEmpty else { return nil }
                 let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-                let isRec = (choice["isRecommended"] as? Bool)
+                let isRec =
+                    (choice["isRecommended"] as? Bool)
                     ?? (choice["recommended"] as? Bool)
                     ?? AgentQuestionParser.isRecommendedTag(trimmed)
                 return AgentQuestionOption(
@@ -143,13 +153,14 @@ struct OpenCodeQuestionEventRouter: Sendable {
                 )
             }
             guard options.count == choices.count else { return nil }
-            questions.append(OpenCodeQuestionItem(
-                prompt: prompt,
-                header: raw["header"] as? String,
-                options: options,
-                isMultiSelect: raw["multiple"] as? Bool ?? false,
-                allowCustomAnswer: raw["custom"] as? Bool ?? true
-            ))
+            questions.append(
+                OpenCodeQuestionItem(
+                    prompt: prompt,
+                    header: raw["header"] as? String,
+                    options: options,
+                    isMultiSelect: raw["multiple"] as? Bool ?? false,
+                    allowCustomAnswer: raw["custom"] as? Bool ?? true
+                ))
         }
         let tool = properties["tool"] as? [String: Any]
         return OpenCodeQuestionRequest(

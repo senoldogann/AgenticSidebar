@@ -210,7 +210,8 @@ struct GitHubSkillFetcher: Sendable {
         }
 
         if let subpath, !subpath.isEmpty {
-            let normalized = subpath.hasPrefix("./")
+            let normalized =
+                subpath.hasPrefix("./")
                 ? String(subpath.dropFirst(2))
                 : subpath
             if folders.contains(normalized) {
@@ -255,7 +256,8 @@ struct GitHubSkillFetcher: Sendable {
                 reference: reference
             ),
             var components = URLComponents(
-                url: base
+                url:
+                    base
                     .appendingPathComponent("git")
                     .appendingPathComponent("trees")
                     .appendingPathComponent("HEAD"),

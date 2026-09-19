@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The prompt shape is not guesswork: OpenCode 1.18.31 accepts file parts as
@@ -23,7 +24,7 @@ final class OpenCodePromptPartTests: XCTestCase {
         )
 
         XCTAssertEqual(parts.count, 2)
-        XCTAssertEqual(parts.first, .text("What is broken here?"))
+        XCTAssertEqual(parts.first, .text("<user_turn>\nWhat is broken here?\n</user_turn>"))
         XCTAssertEqual(
             parts.last,
             .file(
@@ -46,12 +47,14 @@ final class OpenCodePromptPartTests: XCTestCase {
             JSONSerialization.jsonObject(with: data) as? [String: String]
         )
 
-        XCTAssertEqual(object, [
-            "type": "file",
-            "mime": "image/png",
-            "filename": "shot.png",
-            "url": "data:image/png;base64,AAAA"
-        ])
+        XCTAssertEqual(
+            object,
+            [
+                "type": "file",
+                "mime": "image/png",
+                "filename": "shot.png",
+                "url": "data:image/png;base64,AAAA",
+            ])
     }
 
     func testPlainTextMessagesStayASingleTextPart() throws {
@@ -60,7 +63,7 @@ final class OpenCodePromptPartTests: XCTestCase {
             speedMode: .normal
         )
 
-        XCTAssertEqual(parts, [.text("Just a question")])
+        XCTAssertEqual(parts, [.text("<user_turn>\nJust a question\n</user_turn>")])
     }
 
     func testFastModeLeadsThePromptWithTheSpeedInstruction() throws {
@@ -69,17 +72,18 @@ final class OpenCodePromptPartTests: XCTestCase {
             speedMode: .fast
         )
 
-        guard case let .text(fastText) = try XCTUnwrap(fastParts.first) else {
+        guard case .text(let fastText) = try XCTUnwrap(fastParts.first) else {
             return XCTFail("Expected a text part")
         }
         XCTAssertTrue(fastText.hasPrefix("FAST MODE:"))
-        XCTAssertTrue(fastText.hasSuffix("Explain the failure"))
+        XCTAssertTrue(fastText.contains("Explain the failure"))
+        XCTAssertTrue(fastText.hasSuffix("</user_turn>"))
 
         let normalParts = OpenCodePromptBuilder.parts(
             for: ChatMessage(role: .user, text: "Explain the failure"),
             speedMode: .normal
         )
-        XCTAssertEqual(normalParts, [.text("Explain the failure")])
+        XCTAssertEqual(normalParts, [.text("<user_turn>\nExplain the failure\n</user_turn>")])
     }
 
     func testUnsupportedOrMissingFilesAreReferencedByPathInsteadOfDropped() throws {
@@ -99,7 +103,7 @@ final class OpenCodePromptPartTests: XCTestCase {
         )
 
         XCTAssertEqual(parts.count, 1)
-        guard case let .text(text) = try XCTUnwrap(parts.first) else {
+        guard case .text(let text) = try XCTUnwrap(parts.first) else {
             return XCTFail("Expected a text part")
         }
         XCTAssertTrue(text.contains("See attached"))
@@ -179,7 +183,7 @@ final class OpenCodePromptPartTests: XCTestCase {
         )
 
         XCTAssertEqual(parts.count, 1, "A text attachment adds no file part")
-        guard case let .text(text) = try XCTUnwrap(parts.first) else {
+        guard case .text(let text) = try XCTUnwrap(parts.first) else {
             return XCTFail("Expected a text part")
         }
 

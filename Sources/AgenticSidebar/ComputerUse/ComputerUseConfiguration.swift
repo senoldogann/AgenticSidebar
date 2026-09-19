@@ -40,7 +40,7 @@ struct ComputerUseConfiguration: Equatable, Sendable {
     static let nodeExecutableCandidates = [
         "/opt/homebrew/bin/node",
         "/usr/local/bin/node",
-        "/usr/bin/node"
+        "/usr/bin/node",
     ]
 
     var cliURL: URL {
@@ -75,7 +75,7 @@ struct ComputerUseConfiguration: Equatable, Sendable {
                 "stdio",
                 "--root", workingDirectoryURL.path,
                 "--personal-admin",
-                "--enable-computer-use"
+                "--enable-computer-use",
             ],
             environment: nil,
             enabled: true,
@@ -113,7 +113,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         workingDirectoryURL: URL,
         environment: [String: String],
         fileManager: FileManager
-    ) -> Result<ComputerUseConfiguration, ComputerUseConfigurationError> {        let expanded = expand(
+    ) -> Result<ComputerUseConfiguration, ComputerUseConfigurationError> {
+        let expanded = expand(
             rootPath: rootPath,
             homeDirectoryURL: fileManager.homeDirectoryForCurrentUser
         )
@@ -122,7 +123,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         }
 
         let projectRootURL = URL(fileURLWithPath: expanded, isDirectory: true)
-        let cliURL = projectRootURL
+        let cliURL =
+            projectRootURL
             .appendingPathComponent("dist", isDirectory: true)
             .appendingPathComponent("cli.js")
 
@@ -159,7 +161,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
             return homeDirectoryURL.path
         }
         if trimmed.hasPrefix("~/") {
-            return homeDirectoryURL
+            return
+                homeDirectoryURL
                 .appendingPathComponent(String(trimmed.dropFirst(2)))
                 .path
         }

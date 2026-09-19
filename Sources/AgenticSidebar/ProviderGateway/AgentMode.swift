@@ -76,8 +76,9 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             """
             REVIEW MODE (Alibaba Open Code Review standard): \
             Perform a thorough, read-only code review on the repository, target project, or Git diff. \
-            Do not create, edit, or delete any files, and do not run destructive commands. \
-            Inspect the code using read-only tools and skills. \
+            STRICT READ-ONLY CONSTRAINT: Do not create, edit, delete, or modify any files, and do not run destructive or state-changing commands. \
+            Do not execute any edit/write/patch tools during this turn. \
+            Inspect the codebase using read-only tools (read, grep, glob, ast/lsp) and skills. \
             Analyze for: \
             1. Correctness & logic bugs \
             2. Null Pointer / Optional safety \
@@ -86,12 +87,14 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             5. Performance bottlenecks \
             6. Code style & maintainability \
             Format your review findings grouped by severity (Critical, High, Medium, Low) with exact file and line references. \
-            Conclude with a prioritized remediation plan in a fenced ```\(Self.planFenceLanguage) block so the user can review and approve fixes.
+            Conclude with a prioritized remediation plan in a fenced ```\(Self.planFenceLanguage) block so the user can review and approve fixes. \
+            DO NOT start implementing fixes in Review mode: the user will review your findings, approve the plan, and switch to Build mode to implement the changes.
             """
         case .exam:
             """
             EXAM & TEST SOLVER MODE: \
             You are an expert exam, test, and quiz solving assistant with rigorous domain mastery across mathematics, science, engineering, programming, logic, and general subjects. \
+            STRICT READ-ONLY CONSTRAINT: Do not create, edit, or modify any project files. Answer the questions directly. \
             When answering any question (from an image, screenshot, copied text, or problem description): \
             1. DIRECT & DEFINITIVE ANSWER FIRST: \
             State the clear, unambiguous final answer at the very beginning (e.g. "**Correct Answer: C**" or "**Final Answer: 42**"). \

@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class OpenAIProviderRuntimeTests: XCTestCase {
@@ -8,7 +9,8 @@ final class OpenAIProviderRuntimeTests: XCTestCase {
             sendResponse: OpenAIHTTPResponse(
                 statusCode: 200,
                 data: Data(
-                    #"{"object":"list","data":[{"id":"gpt-5.6","object":"model","created":1,"owned_by":"openai"},{"id":"gpt-6-astra","object":"model","created":1,"owned_by":"openai"},{"id":"future-unverified-model","object":"model","created":1,"owned_by":"openai"}]}"#.utf8
+                    #"{"object":"list","data":[{"id":"gpt-5.6","object":"model","created":1,"owned_by":"openai"},{"id":"gpt-6-astra","object":"model","created":1,"owned_by":"openai"},{"id":"future-unverified-model","object":"model","created":1,"owned_by":"openai"}]}"#
+                        .utf8
                 )
             )
         )
@@ -43,7 +45,7 @@ final class OpenAIProviderRuntimeTests: XCTestCase {
             baseURL: URL(string: "https://example.test/v1")!
         )
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await runtime.capabilities()
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .missingCredential)
@@ -96,7 +98,7 @@ final class OpenAIProviderRuntimeTests: XCTestCase {
             [
                 .assistantTextDelta("Hello"),
                 .assistantTextDelta(" world"),
-                .completed
+                .completed,
             ]
         )
 
@@ -219,7 +221,7 @@ private actor RuntimeCancellationProbe {
     }
 }
 
-private func XCTAssertThrowsErrorAsync<T>(
+private func assertThrowsErrorAsync<T>(
     _ expression: @autoclosure () async throws -> T,
     _ errorHandler: (Error) -> Void,
     file: StaticString = #filePath,

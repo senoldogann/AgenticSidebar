@@ -86,9 +86,9 @@ extension SettingsView {
     /// It sits above the provider cards because it is the question a user answers
     /// before anything runs, and because the composer's per-turn controls do not
     /// cover it: this is a long-lived choice about the agent's reach. The level is
-    /// read per tool call rather than written into the agent's configuration, so
-    /// changing it applies to the running agent immediately — there is no restart
-    /// row here because there is nothing to restart.
+    /// captured at the start of each turn, not written into server configuration.
+    /// Changes apply from the next turn without restarting the server.
+    /// This does not override permissions pre-authorized by external configuration.
     @ViewBuilder
     var toolApprovalCard: some View {
         toolApprovalCardBody
@@ -100,7 +100,8 @@ extension SettingsView {
     var toolApprovalCardBody: some View {
         settingsCard(
             title: "Tool approvals",
-            subtitle: "How much the agent may do without asking. One level for every tool: shell commands, edits, the network and computer use. Changes apply to the running agent on its next tool call.",
+            subtitle:
+                "How much the agent may do without asking. One level for every tool: shell commands, edits, the network and computer use. Changes apply from the next turn.",
             icon: "lock.shield.fill"
         ) {
             VStack(alignment: .leading, spacing: 8) {
@@ -114,7 +115,8 @@ extension SettingsView {
                     .fixedSize(horizontal: false, vertical: true)
 
                 if let override = externalPermissionOverride,
-                   !override.isEmpty {
+                    !override.isEmpty
+                {
                     let conflictingRules = override.displayText
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -127,7 +129,7 @@ extension SettingsView {
                                 .foregroundStyle(.primary)
 
                             Text(
-                                "Your external configuration at \(override.sourceURL.path) defines `\(conflictingRules)`. OpenCode applies these rules with higher priority, which may allow tools (e.g. bash) without prompting regardless of the policy selected above."
+                                "Your external configuration at \(override.sourceURL.path) defines `\(conflictingRules)`, which the app's managed configuration does not cover. OpenCode takes these rules from your external file, so they may allow tools (e.g. bash) without prompting regardless of the policy selected above."
                             )
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
@@ -163,7 +165,7 @@ extension SettingsView {
                             .textSelection(.enabled)
 
                         Text(
-                            "These are the strictest rules the app writes; the level above is applied per tool call, which is why changing it takes effect immediately."
+                            "These are the strictest rules the app writes; the level above is captured at turn start. Changes apply from the next turn."
                         )
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
@@ -215,143 +217,16 @@ extension SettingsView {
                 return
             }
             externalPermissionOverrideChecked = true
+            let managedURL = policyConfigurationURL
             let override = await Task.detached(priority: .utility) {
-                GlobalOpenCodeConfigReader.live().globalPermissionOverrides()
+                let reader = GlobalOpenCodeConfigReader.live()
+                let managedKeys = GlobalOpenCodeConfigReader.managedKeys(
+                    at: managedURL,
+                    fileManager: FileManager.default
+                )
+                return reader.effectiveGlobalPermissionOverrides(managedKeys: managedKeys)
             }.value
             externalPermissionOverride = override
-        }
-    }
-
-    /// What the app actually decided, in order, with the reason for each one.
-    ///
-    /// On a level that does not ask, this list is the substitute for the prompt:
-    /// the record of what ran, from where, and whether a level, an earlier
-    /// "Always allow" or the user answered it. Kapalı bir görüntüleyicidir —
-    /// kayıt `audit.jsonl` dosyasına zaten yazılır, bu kart yalnız kuyruğunu
-    /// gösterir, o yüzden varsayılan olarak kapalı durur.
-    @ViewBuilder
-    var toolDecisionLogCard: some View {
-        collapsibleSettingsCard(
-            title: "Recent tool activity",
-            subtitle: "Observed executions and permission decisions are recorded separately, newest first.",
-            icon: "list.bullet.rectangle",
-            isExpanded: $isToolDecisionLogExpanded,
-            trailingText: recentDecisions.isEmpty && recentExecutions.isEmpty
-                ? nil : "\(recentDecisions.count + recentExecutions.count)"
-        ) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Observed executions")
-                    .font(.system(size: 12, weight: .semibold))
-                if recentExecutions.isEmpty {
-                    Text("No tool execution has been observed yet.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(recentExecutions.reversed()) { record in
-                        toolExecutionRow(record)
-                    }
-                }
-
-                Divider().opacity(0.3)
-                Text("Permission decisions")
-                    .font(.system(size: 12, weight: .semibold))
-                if recentDecisions.isEmpty {
-                    Text("No permission decisions have been recorded yet.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(recentDecisions.reversed()) { record in
-                        toolDecisionRow(record)
-                    }
-                }
-
-                HStack(spacing: 10) {
-                    secondaryActionButton(
-                        title: "Refresh",
-                        icon: "arrow.clockwise"
-                    ) {
-                        Task { await reloadRecentToolActivity() }
-                    }
-
-                    secondaryActionButton(
-                        title: "Reveal audit log",
-                        icon: "folder"
-                    ) {
-                        NSWorkspace.shared.activateFileViewerSelecting([toolAuditLogURL])
-                    }
-                }
-            }
-        }
-        // Kart kapalıyken de başlıktaki sayı güncel kalsın diye kuyruk kart
-        // görünür olduğunda okunur; satırlar yalnız açılınca kurulur.
-        .task { await reloadRecentToolActivity() }
-    }
-
-    @ViewBuilder
-    private func toolDecisionRow(_ record: ToolAuditLog.Record) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(toolDecisionTint(record.reply))
-                    .frame(width: 6, height: 6)
-
-                Text(record.title)
-                    .font(.system(size: 12, weight: .semibold))
-
-                Text(record.reply.rawValue)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(toolDecisionTint(record.reply))
-
-                Spacer(minLength: 8)
-
-                Text(record.timestamp.formatted(date: .omitted, time: .standard))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-
-            Text(
-                record.patterns.isEmpty
-                    ? "\(record.source.label) · \(record.toolName)"
-                    : "\(record.source.label) · \(record.patterns.joined(separator: ", "))"
-            )
-            .font(.system(size: 11))
-            .foregroundStyle(.secondary)
-            .lineLimit(2)
-            .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    @ViewBuilder
-    private func toolExecutionRow(_ record: ToolAuditLog.ExecutionRecord) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(record.event == .failed ? Color.red : Color.secondary)
-                    .frame(width: 6, height: 6)
-                Text(record.title ?? record.toolKind.rawValue.capitalized)
-                    .font(.system(size: 12, weight: .semibold))
-                Text(record.event.rawValue.capitalized)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(record.event == .failed ? .red : .secondary)
-                Spacer(minLength: 8)
-                Text(record.timestamp.formatted(date: .omitted, time: .standard))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            Text(record.detail ?? record.toolKind.rawValue)
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private func toolDecisionTint(_ reply: ProviderPermissionReply) -> Color {
-        switch reply {
-        case .once, .always:
-            return .green
-        case .reject:
-            return .red
         }
     }
 
@@ -360,14 +235,42 @@ extension SettingsView {
             .appendingPathComponent(ManagedOpenCodeConfiguration.fileName)
     }
 
-    private var toolAuditLogURL: URL {
-        ManagedAppDirectories.openCodeWorkingDirectory()
-            .appendingPathComponent("audit.jsonl")
-    }
+    /// Ajan sorularının davranışı: onay kartının yanında durur, çünkü ikisi de
+    /// turun nasıl sorup nasıl ilerleyeceğini anlatır (genel pencere kromu değil).
+    @ViewBuilder
+    var interactiveQuestionsCard: some View {
+        @Bindable var settings = settingsStore
 
-    private func reloadRecentToolActivity() async {
-        recentDecisions = await permissionApprovalCenter.recentDecisions(limit: 20)
-        recentExecutions = await permissionApprovalCenter.recentExecutions(limit: 20)
+        settingsCard(
+            title: "Interactive Questions",
+            subtitle: "Behavior for interactive questions, quick-reply options, and choices.",
+            icon: "questionmark.bubble.fill"
+        ) {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(
+                    "Offer 'All' choice in question options",
+                    isOn: $settings.autoOfferAllOption
+                )
+                .tint(currentTheme.accentGradient.first ?? .accentColor)
+
+                Text("Automatically adds an 'All (apply everything)' option when the agent presents multiple choices.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+                    .padding(.vertical, 2)
+
+                Toggle(
+                    "Auto-select recommended option",
+                    isOn: $settings.autoSelectRecommendedOption
+                )
+                .tint(currentTheme.accentGradient.first ?? .accentColor)
+
+                Text("Pre-selects the recommended option by default when a question is presented.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
     @ViewBuilder
@@ -446,7 +349,7 @@ extension SettingsView {
 
         toolApprovalCard
 
-        toolDecisionLogCard
+        interactiveQuestionsCard
 
         // OpenAI Configuration
         settingsCard(
@@ -634,9 +537,11 @@ extension SettingsView {
                     }
 
                     if !oauthProviderIDs.isEmpty {
-                        Text("OAuth sign-in is available for \(oauthProviderIDs.joined(separator: ", ")), but browser OAuth setup is not implemented in this milestone.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "OAuth sign-in is available for \(oauthProviderIDs.joined(separator: ", ")), but browser OAuth setup is not implemented in this milestone."
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     }
                 }
 
@@ -724,7 +629,7 @@ extension SettingsView {
                 : "OpenCode executable not found"
         case .starting:
             "Starting local server…"
-        case let .running(version, _):
+        case .running(let version, _):
             "Running OpenCode \(version) on authenticated loopback"
         }
     }

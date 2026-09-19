@@ -83,14 +83,17 @@ enum OpenCodeServerLedger {
         fileManager: FileManager = .default
     ) -> [OpenCodeServerLease] {
         let directory = directoryURL(in: workingDirectoryURL)
-        guard let entries = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        ) else {
+        guard
+            let entries = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )
+        else {
             return []
         }
 
-        return entries
+        return
+            entries
             .filter { $0.pathExtension == "json" }
             .compactMap { url in
                 guard let data = try? Data(contentsOf: url) else {
@@ -149,7 +152,8 @@ enum OpenCodeServerLedger {
                 shouldReap(
                     lease,
                     facts: facts[lease.pid],
-                    configurationPath: ManagedOpenCodeConfiguration
+                    configurationPath:
+                        ManagedOpenCodeConfiguration
                         .fileURL(in: workingDirectoryURL).path
                 )
             else {
@@ -170,7 +174,8 @@ enum OpenCodeServerLedger {
         if includeUnownedScan {
             killed += reapUnownedServers(
                 excluding: [],
-                configurationPath: ManagedOpenCodeConfiguration
+                configurationPath:
+                    ManagedOpenCodeConfiguration
                     .fileURL(in: workingDirectoryURL).path
             )
         }

@@ -19,9 +19,11 @@ extension SettingsView {
                 )
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
 
-                Text("Whenever you copy text anywhere on macOS using Command+C, AgenticSidebar automatically receives it and prompts the agent, even when running in the background.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Whenever you copy text anywhere on macOS using Command+C, AgenticSidebar automatically receives it and prompts the agent, even when running in the background."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             }
         }
 
@@ -37,9 +39,11 @@ extension SettingsView {
                 )
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
 
-                Text("Automatically detect newly saved desktop screenshots or clipboard captures, perform on-device OCR, and let the agent deduce problem solutions or descriptions.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Automatically detect newly saved desktop screenshots or clipboard captures, perform on-device OCR, and let the agent deduce problem solutions or descriptions."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             }
         }
 
@@ -55,9 +59,11 @@ extension SettingsView {
                 )
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
 
-                Text("Copies the frontmost app name, window title, browser URL and selected text into the composer as a reviewable draft. URL needs Automation permission, selected text needs Accessibility permission — without them the snap degrades to app and window title only.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Copies the frontmost app name, window title, browser URL and selected text into the composer as a reviewable draft. URL needs Automation permission, selected text needs Accessibility permission — without them the snap degrades to app and window title only."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             }
         }
     }

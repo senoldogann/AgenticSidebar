@@ -15,10 +15,6 @@ protocol OpenCodeTransport: ProviderHTTPTransport {}
 struct URLSessionOpenCodeTransport: OpenCodeTransport {
     private let http: URLSessionHTTPTransport
 
-    private init(http: URLSessionHTTPTransport) {
-        self.http = http
-    }
-
     /// Uzun süre sessiz kalabilen olay akışı için ayarlanmış bir oturum kurar.
     /// Her çağrı kendi oturumunu açar.
     static func streaming() -> Self {

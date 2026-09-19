@@ -31,6 +31,9 @@ struct SettingsMCPServersView: View {
     @State private var customServerTransport: MCPTransport = .local
     @State private var configuringEntry: MCPMarketplaceEntry? = nil
     @State private var envValues: [String: String] = [:]
+    /// Sunucuların canlı bağlantı durumu: satırda gösterilir, yoksa Auth
+    /// sonucu gibi geri bildirimler listenin altında kaybolur.
+    @State private var serverStatuses: [String: OpenCodeMCPServerStatus] = [:]
 
     private var isDarkMode: Bool {
         settingsStore.isDark(systemColorScheme: systemColorScheme)
@@ -44,15 +47,19 @@ struct SettingsMCPServersView: View {
         VStack(alignment: .leading, spacing: 18) {
             headerBar
 
+            // Geri bildirim listenin üstünde durur: altta kalsa sekiz
+            // sunuclu listede ekran dışına taşar, kullanıcı "hiçbir şey
+            // olmuyor" sanır (Auth akışı dahil).
+            if let status = extensionStore.status {
+                statusBanner(status)
+            }
+
             switch selectedSegment {
             case .marketplace:
                 marketplaceSection
             case .installed:
                 installedSection
-            }
-
-            if let status = extensionStore.status {
-                statusBanner(status)
+                    .task { await refreshServerStatuses() }
             }
         }
         .sheet(item: $configuringEntry) { entry in
@@ -90,6 +97,7 @@ struct SettingsMCPServersView: View {
                 ) {
                     Task {
                         await extensionStore.restart()
+                        await refreshServerStatuses()
                     }
                 }
             }
@@ -166,6 +174,7 @@ struct SettingsMCPServersView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Clear search")
                     }
                 }
                 .padding(.horizontal, 10)
@@ -212,7 +221,8 @@ struct SettingsMCPServersView: View {
         MCPMarketplaceCatalog.entries.filter { entry in
             let matchesCategory = selectedCategory == .all || entry.category == selectedCategory
             let trimmedQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let matchesSearch = trimmedQuery.isEmpty
+            let matchesSearch =
+                trimmedQuery.isEmpty
                 || entry.name.lowercased().contains(trimmedQuery)
                 || entry.displayName.lowercased().contains(trimmedQuery)
                 || entry.summary.lowercased().contains(trimmedQuery)
@@ -472,10 +482,9 @@ struct SettingsMCPServersView: View {
     }
 
     private func addCustomServer() {
-        let command = customServerTarget
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .components(separatedBy: " ")
-            .filter { !$0.isEmpty }
+        let command = SettingsView.splitCommand(
+            customServerTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
 
         let definition = MCPDefinition(
             transport: customServerTransport,
@@ -491,6 +500,11 @@ struct SettingsMCPServersView: View {
     }
 
     // MARK: - Installed Section
+
+    /// Sunucunun bildiği bağlantı durumu satırlara taşınır.
+    private func refreshServerStatuses() async {
+        serverStatuses = await extensionStore.mcpServerStatuses()
+    }
 
     private var installedSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -526,7 +540,10 @@ struct SettingsMCPServersView: View {
                 "",
                 isOn: Binding(
                     get: { record.isEnabled },
-                    set: { extensionStore.setMCPEnabled(record.name, $0) }
+                    set: {
+                        extensionStore.setMCPEnabled(record.name, $0)
+                        Task { await refreshServerStatuses() }
+                    }
                 )
             )
             .labelsHidden()
@@ -566,6 +583,8 @@ struct SettingsMCPServersView: View {
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                serverStatusLine(for: record)
             }
 
             Spacer(minLength: 8)
@@ -576,11 +595,13 @@ struct SettingsMCPServersView: View {
                         if let url = await extensionStore.authorizationURL(for: record.name) {
                             NSWorkspace.shared.open(url)
                         }
+                        await refreshServerStatuses()
                     }
                 }
                 .font(.system(size: 11, weight: .medium))
                 .buttonStyle(.plain)
                 .pointingHandCursor()
+                .help("Open the provider page that authorizes this server")
             }
 
             if !record.isInherited {
@@ -607,6 +628,32 @@ struct SettingsMCPServersView: View {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .stroke(currentTheme.border(isDark: isDarkMode).opacity(settingsStore.contrast), lineWidth: 0.5)
         )
+    }
+
+    /// Satırın canlı durumu: bağlı, hatalı, kapalı ya da bilinmiyor. Yoksa
+    /// kullanıcı hangi sunucunun neden çalışmadığını anlayamaz.
+    private func serverStatusLine(for record: MCPServerRecord) -> some View {
+        let (text, color): (String, Color) =
+            if let live = serverStatuses[record.name] {
+                if live.isConnected {
+                    ("Connected", .green)
+                } else if let error = live.error, !error.isEmpty {
+                    (error, .orange)
+                } else if record.definition.transport == .remote {
+                    ("Needs authorization — use Auth", .orange)
+                } else {
+                    ("Not connected", .orange)
+                }
+            } else if !record.isEnabled {
+                ("Switched off", .gray)
+            } else {
+                ("Status unknown — start the agent to connect", .gray)
+            }
+        return Text(text)
+            .font(.system(size: 10.5))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .truncationMode(.tail)
     }
 
     private func statusBanner(_ status: ExtensionStatus) -> some View {
@@ -671,10 +718,13 @@ struct SettingsMCPServersView: View {
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.primary)
 
-                    SecureField("Value for \(key)", text: Binding(
-                        get: { envValues[key] ?? "" },
-                        set: { envValues[key] = $0 }
-                    ))
+                    SecureField(
+                        "Value for \(key)",
+                        text: Binding(
+                            get: { envValues[key] ?? "" },
+                            set: { envValues[key] = $0 }
+                        )
+                    )
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
                     .padding(8)
@@ -690,9 +740,12 @@ struct SettingsMCPServersView: View {
 
                 Button("Save and Add") {
                     var def = entry.createDefinition()
-                    def.environment = envValues
-                    extensionStore.addMCPServer(name: entry.name, definition: def, source: .manual)
-                    configuringEntry = nil
+                    def.environment = envValues.filter {
+                        !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }
+                    if extensionStore.addMCPServer(name: entry.name, definition: def, source: .manual) {
+                        configuringEntry = nil
+                    }
                 }
                 .font(.system(size: 12, weight: .semibold))
                 .padding(.horizontal, 14)
@@ -703,6 +756,17 @@ struct SettingsMCPServersView: View {
                 )
                 .foregroundStyle(.white)
                 .buttonStyle(.plain)
+                .disabled(
+                    entry.environmentKeys.contains {
+                        envValues[$0]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true
+                    }
+                )
+                .opacity(
+                    entry.environmentKeys.contains {
+                        envValues[$0]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true
+                    } ? 0.5 : 1
+                )
+                .help("All required keys must be filled before the server is added")
             }
         }
         .padding(20)
@@ -739,11 +803,47 @@ struct SettingsMCPServersView: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+        .help(title)
     }
 }
 
 extension SettingsView {
     var mcpServersMainView: some View {
         SettingsMCPServersView()
+    }
+
+    /// Tırnaklı komut satırını belirteçlere böler: `npx -y "my pkg"` tek kalır.
+    nonisolated static func splitCommand(_ line: String) -> [String] {
+        var tokens: [String] = []
+        var current = ""
+        var quote: Character?
+        var index = line.startIndex
+        while index < line.endIndex {
+            let char = line[index]
+            if let open = quote {
+                if char == open {
+                    quote = nil
+                } else if char == "\\", line.index(after: index) < line.endIndex {
+                    index = line.index(after: index)
+                    current.append(line[index])
+                } else {
+                    current.append(char)
+                }
+            } else if char == "\"" || char == "'" {
+                quote = char
+            } else if char.isWhitespace {
+                if !current.isEmpty {
+                    tokens.append(current)
+                    current = ""
+                }
+            } else {
+                current.append(char)
+            }
+            index = line.index(after: index)
+        }
+        if !current.isEmpty {
+            tokens.append(current)
+        }
+        return tokens
     }
 }

@@ -30,7 +30,7 @@ enum OpenCodeMCPOAuthSetting: Encodable, Equatable, Sendable {
         case .disabled:
             var container = encoder.singleValueContainer()
             try container.encode(false)
-        case let .registered(clientID, clientSecret, scope):
+        case .registered(let clientID, let clientSecret, let scope):
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(clientID, forKey: .clientId)
             try container.encodeIfPresent(clientSecret, forKey: .clientSecret)
@@ -169,7 +169,8 @@ struct OpenCodeClient: OpenCodeClientProtocol {
                                 id: ProviderVariantID($0),
                                 displayName: Self.variantDisplayName($0)
                             )
-                        }
+                        },
+                        contextLimit: model.contextLimit
                     )
                 }
             }
@@ -504,6 +505,11 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         do {
             return try JSONDecoder().decode(type, from: data)
         } catch {
+            ProviderResponseDiagnostics.shared.record(
+                provider: "opencode",
+                statusCode: nil,
+                body: String(data: data.prefix(512), encoding: .utf8) ?? ""
+            )
             throw ProviderRuntimeError.unexpectedResponse
         }
     }

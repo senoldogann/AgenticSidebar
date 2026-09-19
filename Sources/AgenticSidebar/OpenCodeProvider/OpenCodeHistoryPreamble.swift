@@ -19,7 +19,8 @@ enum OpenCodeHistoryPreamble {
     static let maximumCharacters = 96_000
 
     /// Onarım bloğunun sınırları.
-    static let openingMarker = "[Conversation history restored for a new backend session. Treat the following as shared context and continue from the new message below. Do not re-run any tools mentioned here.]"
+    static let openingMarker =
+        "[Conversation history restored for a new backend session. Treat the following as shared context and continue from the new message below. Do not re-run any tools mentioned here.]"
     static let closingMarker = "[End of restored history.]"
 
     /// Taşınan metinde ayırıcı yerine geçen işaret.
@@ -32,7 +33,8 @@ enum OpenCodeHistoryPreamble {
         from messages: [ChatMessage],
         activityGroups: [AgentTurnActivityGroup] = [],
         newMessageID: UUID,
-        maximumCharacters: Int = OpenCodeHistoryPreamble.maximumCharacters
+        maximumCharacters: Int = OpenCodeHistoryPreamble.maximumCharacters,
+        contextSummary: String = ""
     ) -> String? {
         // The newest turn is submitted as the prompt itself; only what came
         // before it is history.
@@ -78,7 +80,7 @@ enum OpenCodeHistoryPreamble {
             used += line.count
         }
 
-        guard !kept.isEmpty else {
+        guard !kept.isEmpty || !contextSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
         }
 
@@ -86,16 +88,21 @@ enum OpenCodeHistoryPreamble {
         // "[End of restored history.]" yanılsaması, modelin tarihçenin bittiğine
         // inanmasına ve arkasındaki satırları yeni bir kullanıcı turu sanmasına
         // yol açabilirdi.
-        let history = kept.reversed()
-            .map(sanitize)
-            .joined(separator: "\n")
+        var blocks = kept.reversed().map(sanitize)
+        let summary = contextSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !summary.isEmpty {
+            // Özet en başa: düşen ön ekin yerini tutar, taze satırlar canlı
+            // bağlam olarak arkasından gelir.
+            blocks.insert(sanitize(ContextCompactor.summaryBlock(summary)), at: 0)
+        }
+        let history = blocks.joined(separator: "\n")
         return """
-        \(Self.openingMarker)
+            \(Self.openingMarker)
 
-        \(history)
+            \(history)
 
-        \(Self.closingMarker)
-        """
+            \(Self.closingMarker)
+            """
     }
 
     /// Taşınan satırdaki ayırıcıları etkisizleştirir.

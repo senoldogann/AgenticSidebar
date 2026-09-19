@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -224,4 +225,3 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(reloadedStore.sessionNotificationSound, "Hero")
     }
 }
-

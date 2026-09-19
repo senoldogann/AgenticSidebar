@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -41,7 +42,7 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
     func testNewScreenshotIsAnalysedOnceAndSubmittedWithItsPath() async throws {
         let recorder = ScreenshotSubmissionRecorder()
         let service = await makeService(recorder: recorder)
-        let monitor = makeMonitor(service: service, recognizer: "Solve for x: 2x + 4 = 10")
+        let (monitor, _) = makeMonitor(service: service, recognizer: "Solve for x: 2x + 4 = 10")
 
         monitor.start()
         monitor.stop()
@@ -72,10 +73,12 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
     func testScreenshotCapturedWhileBusyIsQueuedUntilIdle() async throws {
         let recorder = ScreenshotSubmissionRecorder()
         let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
-        let service = await makeService(recorder: recorder, streamFactory: { _ in
-            ProviderStream(events: pair.stream)
-        })
-        let monitor = makeMonitor(service: service, recognizer: "queued text")
+        let service = await makeService(
+            recorder: recorder,
+            streamFactory: { _ in
+                ProviderStream(events: pair.stream)
+            })
+        let (monitor, _) = makeMonitor(service: service, recognizer: "queued text")
 
         monitor.start()
         monitor.stop()
@@ -97,6 +100,42 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
         XCTAssertTrue(submissions[1].prompt.contains("queued text"))
     }
 
+    /// Exam modunda yakalanıp kuyrukta bekleyen ekran görüntüsü, flush anında
+    /// kullanıcı Build'e geçmiş olsa bile kayıtlı modla (readonly exam) gider.
+    func testQueuedSubmissionKeepsCaptureTimeMode() async throws {
+        let recorder = ScreenshotSubmissionRecorder()
+        let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+        let service = await makeService(
+            recorder: recorder,
+            streamFactory: { _ in
+                ProviderStream(events: pair.stream)
+            })
+        let (monitor, store) = makeMonitor(service: service, recognizer: "exam text", mode: .exam)
+
+        monitor.start()
+        monitor.stop()
+
+        let activeTask = try XCTUnwrap(service.submit("busy turn"))
+        _ = try writeScreenshot(named: "Screenshot 2026-09-16 at 12.00.00.png")
+
+        await monitor.tick()
+        var submissions = await waitForSubmissions(recorder, count: 1)
+        XCTAssertEqual(submissions.count, 1, "Only the manual turn ran so far")
+
+        // Kuyrukta beklerken mod değişir: flush güncel modu değil kayıtlıyı kullanmalı.
+        store.agentMode = .build
+
+        pair.continuation.yield(.completed)
+        pair.continuation.finish()
+        await activeTask.value
+
+        await monitor.tick()
+        submissions = await waitForSubmissions(recorder, count: 2)
+        XCTAssertEqual(submissions.count, 2)
+        XCTAssertTrue(submissions[1].prompt.contains("EXAM SOLVER"))
+        XCTAssertEqual(submissions[1].mode, .exam)
+    }
+
     func testExpiredTemporaryScreenshotsAreRemovedAtStartup() async throws {
         let expiredURL = temporaryDirectoryURL.appendingPathComponent("expired.png")
         let freshURL = temporaryDirectoryURL.appendingPathComponent("fresh.png")
@@ -109,7 +148,7 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
 
         let recorder = ScreenshotSubmissionRecorder()
         let service = await makeService(recorder: recorder)
-        let monitor = makeMonitor(service: service, recognizer: "")
+        let (monitor, _) = makeMonitor(service: service, recognizer: "")
 
         monitor.start()
         monitor.stop()
@@ -146,19 +185,23 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
 
     private func makeMonitor(
         service: AgentSessionService,
-        recognizer: String
-    ) -> ScreenshotMonitorService {
+        recognizer: String,
+        mode: AgentMode = .build
+    ) -> (ScreenshotMonitorService, SettingsStore) {
         let defaults = UserDefaults(suiteName: settingsSuiteName)!
         let store = SettingsStore(defaults: defaults)
         store.autoAnalyzeScreenshots = true
+        store.agentMode = mode
 
-        return ScreenshotMonitorService(
-            sessionService: service,
-            settingsStore: store,
-            textRecognizer: StubScreenshotTextRecognizer(text: recognizer),
-            pasteboard: EmptyPasteboardReader(),
-            screenshotsDirectoryURL: screenshotsDirectoryURL,
-            temporaryDirectoryURL: temporaryDirectoryURL
+        return (
+            ScreenshotMonitorService(
+                sessionService: service,
+                settingsStore: store,
+                textRecognizer: StubScreenshotTextRecognizer(text: recognizer),
+                pasteboard: EmptyPasteboardReader(),
+                screenshotsDirectoryURL: screenshotsDirectoryURL,
+                temporaryDirectoryURL: temporaryDirectoryURL
+            ), store
         )
     }
 
@@ -226,6 +269,7 @@ private struct EmptyPasteboardReader: PasteboardReading {
 private struct ScreenshotSubmission: Sendable {
     let prompt: String
     let attachmentPaths: [String]
+    let mode: AgentMode
 }
 
 private actor ScreenshotSubmissionRecorder {
@@ -237,7 +281,8 @@ private actor ScreenshotSubmissionRecorder {
         recorded.append(
             ScreenshotSubmission(
                 prompt: message?.text ?? "",
-                attachmentPaths: message?.attachmentPaths ?? []
+                attachmentPaths: message?.attachmentPaths ?? [],
+                mode: request.mode
             )
         )
     }

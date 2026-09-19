@@ -17,6 +17,31 @@ struct AgenticSidebarApp: App {
     @State private var composerDraftCenter = ComposerDraftCenter()
     /// Unsent composer drafts, kept across relaunches next to the archive.
     @State private var composerDraftStore: ComposerDraftStore
+    /// Çalışırken yazılmamış taslaklar: görünüm yok olsa da yaşar, böylece
+    /// tekli↔yan yana geçiş besteci içeriğini silmez.
+    @State private var composerDraftMemory = ComposerDraftMemory()
+    /// Ajan modu ve hız modu oturum başınadır; bir sohbetteki değişim
+    /// diğerini etkilemez.
+    @State private var composerPrefs: SessionComposerPrefs
+    /// Timeline kartlarının açık/kapalı durumu; sohbet değişiminde korunur.
+    @State private var collapseStore = TimelineCollapseStore()
+    /// Yan yana sohbet düzeni; yeniden başlatmada korunur.
+    @State private var splitStore = SplitLayoutStore()
+
+    /// HUD'un gördüğü bilgisayar adımları: odaklı bölmenin oturumu. Dört akış
+    /// üst üste bindirilmez; odaksız bölme başlığındaki meşgul noktasıyla yetinir.
+    private var hudActivities: [AgentActivity] {
+        let focusID = splitStore.resolvedFocusSessionID(
+            activeID: sessionService.activeSessionID,
+            liveIDs: Set(sessionService.sessionList.map(\.id))
+        )
+        guard focusID != sessionService.activeSessionID,
+            let focused = sessionService.session(for: focusID)
+        else {
+            return sessionService.state.activityGroups.flatMap(\.activities)
+        }
+        return focused.state.activityGroups.flatMap(\.activities)
+    }
 
     init() {
         let credentialStore = KeychainCredentialStore()
@@ -53,11 +78,13 @@ struct AgenticSidebarApp: App {
         // screen reads it, so both have to be the same instance.
         let toolAuditLog = ToolAuditLog.live()
 
-        // Every tool decision passes through here. The level is read per request
-        // from the settings store, which is what makes changing it take effect on
-        // the next tool call instead of at the next backend start; a request the
-        // selected level has no answer for is deferred to the user, never granted
-        // on the agent's behalf.
+        // Every tool decision passes through here. Without a running turn the
+        // level is read per request from the settings store; once a turn
+        // starts its level is snapshotted (see `onSessionTurnStarted`), so a
+        // mid-turn change waits for the next turn instead of rewriting the
+        // rules under a working agent. A request the effective level has no
+        // answer for is deferred to the user, never granted on the agent's
+        // behalf.
         let permissionApprovalCenter = PermissionApprovalCenter(
             automaticReplyProvider: { toolName, patterns in
                 initialSettingsStore.toolApprovalPolicy.automaticReply(
@@ -88,7 +115,7 @@ struct AgenticSidebarApp: App {
                 OpenAIProviderRuntime(
                     transport: URLSessionOpenAITransport.streaming(),
                     credentialStore: credentialStore
-                )
+                ),
             ],
             // Conversations survive a relaunch; a damaged archive is kept aside
             // and the app starts clean instead of failing to open.
@@ -109,8 +136,27 @@ struct AgenticSidebarApp: App {
                 previewText: snippet,
                 soundName: initialSettingsStore.sessionNotificationSound,
                 playSound: initialSettingsStore.sessionNotificationSoundEnabled,
-                enabled: initialSettingsStore.sessionNotificationsEnabled
+                enabled: initialSettingsStore.sessionNotificationsEnabled,
+                includePreview: initialSettingsStore.sessionNotificationPreviewEnabled
             )
+        }
+
+        // İzin seviyesi turun kuralıdır: tur başlarken o anki seviye merkeze
+        // anlık görüntü olarak verilir. Tur ortasında besteciden seviye
+        // değişirse koşan tur eski kuralla devam eder; yeni kural tur bitince
+        // sonraki mesajlarda geçerli olur.
+        initialSessionService.onSessionTurnStarted = { [weak permissionApprovalCenter, weak initialSettingsStore] sessionID, turnID in
+            guard let permissionApprovalCenter, let initialSettingsStore else {
+                return
+            }
+            permissionApprovalCenter.beginTurn(
+                appSessionID: sessionID,
+                turnID: turnID,
+                policy: initialSettingsStore.toolApprovalPolicy
+            )
+        }
+        initialSessionService.onSessionTurnEnded = { [weak permissionApprovalCenter] sessionID, turnID in
+            permissionApprovalCenter?.endTurn(appSessionID: sessionID, turnID: turnID)
         }
 
         Task {
@@ -125,6 +171,9 @@ struct AgenticSidebarApp: App {
             sessionService: initialSessionService,
             settingsStore: initialSettingsStore
         )
+        let initialComposerPrefs = SessionComposerPrefs()
+        initialClipboardMonitor.composerPrefs = initialComposerPrefs
+        initialScreenshotMonitor.composerPrefs = initialComposerPrefs
 
         let initialOpenAICredentialSettings = OpenAICredentialSettings(
             credentialStore: credentialStore
@@ -151,6 +200,7 @@ struct AgenticSidebarApp: App {
 
         _settingsStore = State(initialValue: initialSettingsStore)
         _sessionService = State(initialValue: initialSessionService)
+        _composerPrefs = State(initialValue: initialComposerPrefs)
         _clipboardMonitor = State(initialValue: initialClipboardMonitor)
         _screenshotMonitor = State(initialValue: initialScreenshotMonitor)
         _openAICredentialSettings = State(initialValue: initialOpenAICredentialSettings)
@@ -178,13 +228,18 @@ struct AgenticSidebarApp: App {
         appDelegate.settingsStore = initialSettingsStore
         appDelegate.settingsWindowController.setStealthMode(initialSettingsStore.stealthModeEnabled)
 
-        appDelegate.settingsWindowController.configure { [weak initialSettingsStore, weak initialOpenAICredentialSettings, weak initialOpenCodeSettings, weak initialSessionService, weak initialExtensionStore, weak appDelegate] in
+        appDelegate.settingsWindowController.configure {
+            [
+                weak initialSettingsStore, weak initialOpenAICredentialSettings, weak initialOpenCodeSettings, weak initialSessionService,
+                weak initialExtensionStore, weak appDelegate
+            ] in
             guard let initialSettingsStore,
-                  let initialOpenAICredentialSettings,
-                  let initialOpenCodeSettings,
-                  let initialSessionService,
-                  let initialExtensionStore,
-                  let appDelegate else {
+                let initialOpenAICredentialSettings,
+                let initialOpenCodeSettings,
+                let initialSessionService,
+                let initialExtensionStore,
+                let appDelegate
+            else {
                 return AnyView(EmptyView())
             }
 
@@ -249,6 +304,8 @@ struct AgenticSidebarApp: App {
                 permissionApprovalCenter: permissionApprovalCenter,
                 clipboardMonitor: clipboardMonitor,
                 screenshotMonitor: screenshotMonitor,
+                collapseStore: collapseStore,
+                splitStore: splitStore,
                 onApplyGlobalShortcut: { spec in
                     appDelegate.applyGlobalShortcut(spec)
                 }
@@ -257,10 +314,31 @@ struct AgenticSidebarApp: App {
             .environment(extensionStore)
             .environment(composerDraftCenter)
             .environment(composerDraftStore)
+            .environment(composerDraftMemory)
+            .environment(composerPrefs)
             .preferredColorScheme(settingsStore.colorSchemeMode.preferredColorScheme)
+            // Canlı HUD: görünmez ana bilgisayar bilgisayar adımlarını panele
+            // taşır; boşken gizlenir, `AgentSession` dosyasına dokunulmaz.
+            // Aktif oturumun yanında ikincil bölmedeki oturum da izlenir,
+            // yoksa yan sohbetteki bilgisayar adımları HUD'a hiç düşmezdi.
+            .background {
+                FloatingHUDHostView(
+                    activities: hudActivities
+                )
+            }
             // Yetenek keşfi yalnızca burada yapılır; `RootChatView` de çağırdığında
             // her açılışta iki kez /provider ve /models isteği gidiyordu.
             .task {
+                // Snap Context bağlantısı: kısayol AppDelegate'de hazırdır,
+                // koordinatör atanır atanmaz `didSet` üzerinden kendini kaydeder.
+                if appDelegate.snapCoordinator == nil {
+                    appDelegate.snapCoordinator = ContextSnapCoordinator(
+                        snapService: ContextSnapService.live(),
+                        draftCenter: composerDraftCenter,
+                        settings: settingsStore,
+                        activeSessionID: { sessionService.activeSessionID }
+                    )
+                }
                 // Extensions first: the server reads its configuration once, so a
                 // start that ran before discovery would load the user's own MCP
                 // servers with nothing silencing them.

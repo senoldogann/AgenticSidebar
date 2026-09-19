@@ -9,16 +9,16 @@ struct MenuBarSessionView: View {
     @Environment(SettingsWindowController.self) private var settingsWindowController: SettingsWindowController?
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            let presentationState = SessionPresentationState(
-                agentSessionState: sessionService.state
-            )
-            contentView(presentationState: presentationState, date: context.date)
-        }
+        // Menü tamamı her saniye yeniden kurulmuyor: durum değişimleri gözlem
+        // yoluyla gelir, saniye saati yalnız geçen-süre etiketini besler.
+        let presentationState = SessionPresentationState(
+            agentSessionState: sessionService.state
+        )
+        contentView(presentationState: presentationState)
     }
 
     @ViewBuilder
-    private func contentView(presentationState: SessionPresentationState, date: Date) -> some View {
+    private func contentView(presentationState: SessionPresentationState) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             // Header Card
             HStack(spacing: 10) {
@@ -58,69 +58,74 @@ struct MenuBarSessionView: View {
                             .font(.system(size: 11))
                             .foregroundStyle(.tertiary)
 
-                        Text(
-                            ElapsedTimeFormatter.string(
-                                seconds: presentationState.elapsed(at: date)
+                        SecondTick { date in
+                            Text(
+                                ElapsedTimeFormatter.string(
+                                    seconds: presentationState.elapsed(at: date)
+                                )
                             )
-                        )
-                        .font(.system(size: 11).monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                            .font(.system(size: 11).monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                        }
                     }
                 }
 
                 Spacer()
 
-                Toggle("", isOn: Binding(
-                    get: { settingsStore.menuBarSessionEnabled },
-                    set: { settingsStore.menuBarSessionEnabled = $0 }
-                ))
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .labelsHidden()
-                    .accessibilityLabel("Show session status in the menu bar")
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { settingsStore.menuBarSessionEnabled },
+                        set: { settingsStore.menuBarSessionEnabled = $0 }
+                    )
+                )
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .labelsHidden()
+                .accessibilityLabel("Show session status in the menu bar")
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
 
-                Divider()
-                    .opacity(0.4)
-                    .padding(.vertical, 2)
+            Divider()
+                .opacity(0.4)
+                .padding(.vertical, 2)
 
-                // Menu Items
-                MenuBarRowButton(
-                    title: "Show AgenticSidebar",
-                    icon: settingsStore.menuBarIconChoice.systemImage,
-                    shortcut: settingsStore.globalShortcutChoice.displayName,
-                    action: {
-                        mainWindowController.show()
-                        NSApp.activate()
-                    }
-                )
+            // Menu Items
+            MenuBarRowButton(
+                title: "Show AgenticSidebar",
+                icon: settingsStore.menuBarIconChoice.systemImage,
+                shortcut: settingsStore.globalShortcutChoice.displayName,
+                action: {
+                    mainWindowController.show()
+                    NSApp.activate()
+                }
+            )
 
-                MenuBarRowButton(
-                    title: "Settings",
-                    icon: "gearshape",
-                    shortcut: "⌘ ,",
-                    action: {
-                        settingsWindowController?.show()
-                    }
-                )
+            MenuBarRowButton(
+                title: "Settings",
+                icon: "gearshape",
+                shortcut: "⌘ ,",
+                action: {
+                    settingsWindowController?.show()
+                }
+            )
 
-                Divider()
-                    .opacity(0.4)
-                    .padding(.vertical, 2)
+            Divider()
+                .opacity(0.4)
+                .padding(.vertical, 2)
 
-                MenuBarRowButton(
-                    title: "Quit AgenticSidebar",
-                    icon: "power",
-                    shortcut: "⌘ Q",
-                    action: {
-                        NSApp.terminate(nil)
-                    }
-                )
-            }
-            .padding(8)
-            .frame(width: 260)
+            MenuBarRowButton(
+                title: "Quit AgenticSidebar",
+                icon: "power",
+                shortcut: "⌘ Q",
+                action: {
+                    NSApp.terminate(nil)
+                }
+            )
+        }
+        .padding(8)
+        .frame(width: 260)
     }
 }
 
@@ -176,6 +181,7 @@ private struct MenuBarRowButton: View {
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
+        .help(title)
         .onHover { hovering in
             isHovered = hovering
         }

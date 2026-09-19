@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class OpenCodeServerManagerTests: XCTestCase {
@@ -16,7 +17,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             passwordGenerator: { "generated-password" }
         )
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await manager.start(computerUse: nil)
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .executableUnavailable)
@@ -123,7 +124,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             passwordGenerator: { "generated-password" }
         )
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await manager.start(computerUse: nil)
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .startupFailure)
@@ -166,7 +167,7 @@ final class OpenCodeServerManagerTests: XCTestCase {
             passwordGenerator: { "generated-password" }
         )
 
-        await XCTAssertThrowsErrorAsync(
+        await assertThrowsErrorAsync(
             try await manager.start(computerUse: nil)
         ) { error in
             XCTAssertEqual(error as? ProviderRuntimeError, .startupFailure)
@@ -275,13 +276,24 @@ private actor CountingOpenCodeHealthChecker: OpenCodeHealthChecking {
 
 private actor RecordingOpenCodeProcessHandle: OpenCodeProcessHandling {
     private var terminations = 0
+    private var crashed = false
+    private let reportedPID: Int32?
+
+    init(reportedPID: Int32? = 4242) {
+        self.reportedPID = reportedPID
+    }
+
+    /// The child exited without telling the manager (crash, external kill).
+    func crash() {
+        crashed = true
+    }
 
     func isRunning() async -> Bool {
-        terminations == 0
+        terminations == 0 && !crashed
     }
 
     func processIdentifier() async -> Int32? {
-        terminations == 0 ? 4242 : nil
+        terminations == 0 && !crashed ? reportedPID : nil
     }
 
     func terminate() async {
@@ -296,10 +308,15 @@ private actor RecordingOpenCodeProcessHandle: OpenCodeProcessHandling {
 private actor RecordingOpenCodeProcessLauncher: OpenCodeProcessLaunching {
     private var recordedRequests: [OpenCodeProcessLaunchRequest] = []
     private var handles: [RecordingOpenCodeProcessHandle] = []
+    private let reportedPID: Int32?
+
+    init(reportedPID: Int32? = 4242) {
+        self.reportedPID = reportedPID
+    }
 
     func launch(_ request: OpenCodeProcessLaunchRequest) async throws -> any OpenCodeProcessHandling {
         recordedRequests.append(request)
-        let handle = RecordingOpenCodeProcessHandle()
+        let handle = RecordingOpenCodeProcessHandle(reportedPID: reportedPID)
         handles.append(handle)
         return handle
     }
@@ -348,7 +365,7 @@ private actor RotatingPasswordGenerator {
     }
 }
 
-private func XCTAssertThrowsErrorAsync<T>(
+private func assertThrowsErrorAsync<T>(
     _ expression: @autoclosure () async throws -> T,
     _ errorHandler: (Error) -> Void,
     file: StaticString = #filePath,
@@ -359,5 +376,85 @@ private func XCTAssertThrowsErrorAsync<T>(
         XCTFail("Expected expression to throw", file: file, line: line)
     } catch {
         errorHandler(error)
+    }
+}
+
+/// Runtime lifecycle (T3): noticing a dead child must end its tree and forget
+/// its lease, like stop() does — not just drop the handles.
+final class OpenCodeServerManagerDeadChildTests: XCTestCase {
+    func testStatusAfterChildDeathTerminatesTreeAndReleasesLease() async throws {
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let workingDirectoryURL = makeWorkingDirectory()
+        let manager = ManagedOpenCodeServerManager(
+            executableLocator: StubOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            processLauncher: launcher,
+            healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
+            portAllocator: StubOpenCodePortAllocator(port: 51170),
+            listenerVerifier: StubListenerVerifier(owns: true),
+            credentialStore: InMemoryOpenCodeCredentialStore(),
+            workingDirectoryURL: workingDirectoryURL,
+            passwordGenerator: { "generated-password" }
+        )
+
+        _ = try await manager.start(computerUse: nil)
+        let launchedHandle = await launcher.lastHandle()
+        let handle = try XCTUnwrap(launchedHandle)
+        XCTAssertEqual(OpenCodeServerLedger.leases(in: workingDirectoryURL).count, 1)
+
+        await handle.crash()
+
+        let status = await manager.status()
+        XCTAssertEqual(status, .stopped)
+        let connectionAfterDeath = await manager.currentConnection()
+        XCTAssertNil(connectionAfterDeath)
+        let terminationCount = await handle.terminationCount()
+        XCTAssertEqual(
+            terminationCount,
+            1,
+            "The dead child's MCP tree must be terminated, not left behind"
+        )
+        XCTAssertTrue(
+            OpenCodeServerLedger.leases(in: workingDirectoryURL).isEmpty,
+            "The stale lease must be released so the next launch starts clean"
+        )
+    }
+
+    func testUnknownPidRecordsNoLeaseAndReleasesNothing() async throws {
+        let launcher = RecordingOpenCodeProcessLauncher(reportedPID: nil)
+        let workingDirectoryURL = makeWorkingDirectory()
+        let manager = ManagedOpenCodeServerManager(
+            executableLocator: StubOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            processLauncher: launcher,
+            healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
+            portAllocator: StubOpenCodePortAllocator(port: 51171),
+            listenerVerifier: StubListenerVerifier(owns: true),
+            credentialStore: InMemoryOpenCodeCredentialStore(),
+            workingDirectoryURL: workingDirectoryURL,
+            passwordGenerator: { "generated-password" }
+        )
+
+        _ = try await manager.start(computerUse: nil)
+        XCTAssertTrue(
+            OpenCodeServerLedger.leases(in: workingDirectoryURL).isEmpty,
+            "An unknown pid must not leave a 0.json lease behind"
+        )
+        let status = await manager.status()
+        XCTAssertEqual(
+            status,
+            .running(
+                version: "1.18.31",
+                baseURL: URL(string: "http://127.0.0.1:51171")!
+            )
+        )
+
+        await manager.stop()
+        XCTAssertTrue(
+            OpenCodeServerLedger.leases(in: workingDirectoryURL).isEmpty,
+            "Stopping without a known pid releases nothing, and crashes nothing"
+        )
     }
 }

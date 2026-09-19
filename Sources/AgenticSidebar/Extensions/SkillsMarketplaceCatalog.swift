@@ -145,6 +145,6 @@ enum SkillsMarketplaceCatalog {
             category: "Design",
             author: "Anthropic",
             repository: "anthropics/skills/skills/brand-guidelines"
-        )
+        ),
     ]
 }

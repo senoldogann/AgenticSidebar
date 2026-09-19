@@ -2,6 +2,9 @@ import Foundation
 
 enum ElapsedTimeFormatter {
     static func string(seconds: TimeInterval) -> String {
+        guard seconds.isFinite else {
+            return "0:00"
+        }
         let totalSeconds = max(0, Int(seconds.rounded(.down)))
         let hours = totalSeconds / 3_600
         let minutes = (totalSeconds % 3_600) / 60

@@ -63,14 +63,20 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
 
 /// The single writer of the app's OpenCode configuration.
 ///
-/// OpenCode merges this file into the user's own `opencode.json`, which is why
-/// the app can configure the agent without ever editing someone else's file — and
-/// why switching an extension off here has to be expressed as an override
-/// (`tools` patterns, `permission.skill`) rather than as an absence.
+/// OpenCode bu dosyayı kullanıcının kendi `opencode.json` dosyasıyla birleştirir
+/// ve çakışan anahtarda BU dosya kazanır (opencode 1.18.31'de `debug config`
+/// ile doğrulandı: managed `bash: ask` + genel `bash: allow` = efektif `ask`).
+/// Bu yüzden uygulama başkasının dosyasına dokunmadan ajanı yapılandırır; bir
+/// uzantıyı kapatmak da yoklukla değil ezici kuralla (`tools` desenleri,
+/// `permission.skill`) anlatılır. Uyarı eşiği için önemli sonuç: genel
+/// dosyadaki bir kural, ancak burada karşılığı YOKSA davranışa etki eder.
 enum ManagedOpenCodeConfiguration {
     static let fileName = "managed-config.json"
     static let schemaURL = "https://opencode.ai/config.json"
     static let planAgentName = "agenticsidebar-readonly"
+    /// Salt-okunur birincil ajanın analiz delegasyonu için tek hedefi:
+    /// yazma yetkisi olmayan araştırma alt-ajanı.
+    static let researchAgentName = "agenticsidebar-research"
 
     /// Where the configuration lives for a given managed directory.
     ///
@@ -145,14 +151,12 @@ enum ManagedOpenCodeConfiguration {
         // as enabled.
         let enabledNames = Set(extensions.mcpServers.keys)
         let mcp = JSONValue.object(
-            (
-                extensions.mcpServers.map { ($0.key, $0.value, true) }
-                    + extensions.disabledMCPServers
-                    .filter { !enabledNames.contains($0.key) }
-                    .map { ($0.key, $0.value, false) }
-            )
-            .sorted { $0.0 < $1.0 }
-            .map { JSONValue.Member($0.0, mcpValue($0.1, isEnabled: $0.2)) }
+            (extensions.mcpServers.map { ($0.key, $0.value, true) }
+                + extensions.disabledMCPServers
+                .filter { !enabledNames.contains($0.key) }
+                .map { ($0.key, $0.value, false) })
+                .sorted { $0.0 < $1.0 }
+                .map { JSONValue.Member($0.0, mcpValue($0.1, isEnabled: $0.2)) }
         )
         if !mcp.isEmptyCollection {
             members.append(("mcp", mcp))
@@ -173,26 +177,54 @@ enum ManagedOpenCodeConfiguration {
             )
         }
 
-        // The plan agent is a backend-enforced tool boundary, not just a prompt.
-        // A catch-all deny includes plugins, subagents, shell and computer use;
-        // only known read-only capabilities are re-enabled for this agent.
-        let readOnlyPermissions = JSONValue.object([
-            JSONValue.Member("*", .string("deny")),
-            JSONValue.Member("read", .string("allow")),
-            JSONValue.Member("glob", .string("allow")),
-            JSONValue.Member("grep", .string("allow")),
-            JSONValue.Member("list", .string("allow")),
-            JSONValue.Member("lsp", .string("allow")),
-            JSONValue.Member("question", .string("allow")),
-            JSONValue.Member("websearch", .string("allow"))
-        ])
-        members.append(("agent", .object([
-            JSONValue.Member(planAgentName, .object([
-                JSONValue.Member("description", .string("Read-only planning without file or host mutations")),
-                JSONValue.Member("mode", .string("primary")),
-                JSONValue.Member("permission", readOnlyPermissions)
-            ]))
-        ])))
+        // The plan/review/exam agent is a backend-enforced tool boundary, not just
+        // a prompt. A catch-all deny blocks file mutations, shell and computer
+        // use: read-only modes must propose, inspect and research — never mutate,
+        // not even through shell. `edit`/`write`/`patch`/`multiedit`/`bash` stay
+        // denied via `*` on purpose.
+        // `task` is allowed so analysis can be delegated, but the primary agent's
+        // description names the read-only research subagent below as the sole
+        // delegation target, and that subagent itself denies `task`, so no chain
+        // can reach a writable agent. (OpenCode cannot scope `task` to one
+        // subagent at the config level; a model that disobeys the directive and
+        // spawns a writable subagent is a residual risk and is logged through the
+        // normal approval flow.)
+        // `external_directory` is allowed so attachments and out-of-project
+        // sources can be read during review; writes stay impossible because every
+        // mutation tool above is denied.
+        var primaryMembers = readOnlyBaseMembers(taskRule: "allow")
+        primaryMembers.append(skillMember(deniedSkills: extensions.deniedSkills))
+        let readOnlyPermissions = JSONValue.object(primaryMembers)
+        var researchMembers = readOnlyBaseMembers(taskRule: "deny")
+        researchMembers.append(skillMember(deniedSkills: extensions.deniedSkills))
+        let researchPermissions = JSONValue.object(researchMembers)
+        members.append(
+            (
+                "agent",
+                .object([
+                    JSONValue.Member(
+                        planAgentName,
+                        .object([
+                            JSONValue.Member(
+                                "description",
+                                .string(
+                                    "Read-only planning, review and exam without file or host mutations; analysis may only be delegated to \(researchAgentName)"
+                                )),
+                            JSONValue.Member("mode", .string("primary")),
+                            JSONValue.Member("permission", readOnlyPermissions),
+                        ])),
+                    JSONValue.Member(
+                        researchAgentName,
+                        .object([
+                            JSONValue.Member(
+                                "description",
+                                .string(
+                                    "Read-only research subagent for analysis delegation; cannot mutate files or spawn further subagents")),
+                            JSONValue.Member("mode", .string("subagent")),
+                            JSONValue.Member("permission", researchPermissions),
+                        ])),
+                ])
+            ))
 
         return .object(members)
     }
@@ -241,6 +273,45 @@ enum ManagedOpenCodeConfiguration {
         return fileURL
     }
 
+    /// The shared read-only tool boundary. Only `taskRule` differs: the primary
+    /// read-only agent may delegate (sole target: the research subagent), the
+    /// research subagent may not (no delegation chains into writable agents).
+    private static func readOnlyBaseMembers(taskRule: String) -> [JSONValue.Member] {
+        [
+            JSONValue.Member("*", .string("deny")),
+            JSONValue.Member("read", .string("allow")),
+            JSONValue.Member("glob", .string("allow")),
+            JSONValue.Member("grep", .string("allow")),
+            JSONValue.Member("list", .string("allow")),
+            JSONValue.Member("lsp", .string("allow")),
+            JSONValue.Member("question", .string("allow")),
+            JSONValue.Member("websearch", .string("allow")),
+            JSONValue.Member("webfetch", .string("allow")),
+            JSONValue.Member("todowrite", .string("allow")),
+            JSONValue.Member("task", .string(taskRule)),
+            JSONValue.Member("external_directory", .string("allow")),
+        ]
+    }
+
+    /// Tek `skill` üyesi: JSON nesnesi aynı anahtarı iki kez taşıyamaz ve
+    /// OpenCode okuduğu son `skill` anahtarını tutar; battaniye izinle
+    /// kapatmalar bu yüzden tek üyede birleşir (önce izin, sonra retler —
+    /// içeride de son kural kazanır).
+    private static func skillMember(deniedSkills: [String]) -> JSONValue.Member {
+        if deniedSkills.isEmpty {
+            return JSONValue.Member("skill", .string("allow"))
+        }
+        return JSONValue.Member(
+            "skill",
+            .object(
+                [("*", JSONValue.string("allow"))]
+                    + deniedSkills
+                    .sorted()
+                    .map { ($0, JSONValue.string("deny")) }
+            )
+        )
+    }
+
     /// Bir MCP girdisi, çalışan sunucuya `POST /mcp` ile gönderilen yükün
     /// aynısından üretilir; ikisi birbirinden sapamaz.
     ///
@@ -258,7 +329,8 @@ enum ManagedOpenCodeConfiguration {
         isEnabled: Bool = true
     ) -> JSONValue {
         let effective = isEnabled ? definition : definition.redactedForDisabled()
-        let payload = JSONValue(encoding: effective.openCodePayload)
+        let payload =
+            JSONValue(encoding: effective.openCodePayload)
             ?? JSONValue.object([JSONValue.Member]())
 
         guard !isEnabled, case .object(var members) = payload else {

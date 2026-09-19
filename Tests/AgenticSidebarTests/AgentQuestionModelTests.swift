@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import AgenticSidebar
 
 final class AgentQuestionModelTests: XCTestCase {
@@ -15,7 +16,7 @@ final class AgentQuestionModelTests: XCTestCase {
                 label: "SQLite",
                 description: "Local embedded database",
                 isRecommended: false
-            )
+            ),
         ]
 
         let answer = AgentQuestion.formatAnswer(
@@ -42,7 +43,7 @@ final class AgentQuestionModelTests: XCTestCase {
                 label: "Redis",
                 description: nil,
                 isRecommended: false
-            )
+            ),
         ]
 
         let answer = AgentQuestion.formatAnswer(
@@ -74,10 +75,10 @@ final class AgentQuestionModelTests: XCTestCase {
             "options": [
                 "Vite (Recommended)",
                 "Next.js",
-                "Remix"
+                "Remix",
             ],
             "allowCustomAnswer": true,
-            "isMultiSelect": false
+            "isMultiSelect": false,
         ]
 
         let parsed = AgentQuestionParser.parseFromToolInput(
@@ -107,16 +108,16 @@ final class AgentQuestionModelTests: XCTestCase {
                     "id": "jwt",
                     "label": "JWT Tokens",
                     "description": "Stateless bearer tokens",
-                    "isRecommended": true
+                    "isRecommended": true,
                 ],
                 [
                     "id": "session",
                     "label": "Server Session",
                     "description": "Cookie-based stateful sessions",
-                    "isRecommended": false
-                ]
+                    "isRecommended": false,
+                ],
             ],
-            "is_multi_select": true
+            "is_multi_select": true,
         ]
 
         let parsed = AgentQuestionParser.parseFromToolInput(
@@ -137,11 +138,11 @@ final class AgentQuestionModelTests: XCTestCase {
 
     func testParseQuickReplyOptionsFromMarkdownText() {
         let text = """
-        I have analyzed your architecture. Which direction should we take?
-        1. Refactor to Modular Monolith (Recommended)
-        2. Split into Microservices
-        3. Keep Current Structure
-        """
+            I have analyzed your architecture. Which direction should we take?
+            1. Refactor to Modular Monolith (Recommended)
+            2. Split into Microservices
+            3. Keep Current Structure
+            """
 
         let options = AgentQuestionParser.parseQuickReplyOptions(from: text)
         XCTAssertEqual(options.count, 3)
@@ -163,7 +164,7 @@ final class AgentQuestionModelTests: XCTestCase {
             prompt: "Confirm deployment?",
             options: [
                 AgentQuestionOption(id: "yes", label: "Yes", description: nil, isRecommended: true),
-                AgentQuestionOption(id: "no", label: "No", description: nil, isRecommended: false)
+                AgentQuestionOption(id: "no", label: "No", description: nil, isRecommended: false),
             ],
             allowCustomAnswer: true,
             isMultiSelect: false,
@@ -193,7 +194,7 @@ final class AgentQuestionModelTests: XCTestCase {
         let options = [
             AgentQuestionOption(id: "opt_1", label: "Kritik - secret ve şema", description: nil, isRecommended: true),
             AgentQuestionOption(id: "opt_2", label: "High - model çağrısı", description: nil, isRecommended: false),
-            AgentQuestionOption(id: "opt_3", label: "Medium - dayanıklılık", description: nil, isRecommended: false)
+            AgentQuestionOption(id: "opt_3", label: "Medium - dayanıklılık", description: nil, isRecommended: false),
         ]
 
         let answer = AgentQuestion.formatAnswer(
@@ -211,17 +212,35 @@ final class AgentQuestionModelTests: XCTestCase {
 
     func testParseTurkishRecommendationTags() {
         let text = """
-        Sorunları çözmek için seçenekler:
-        1. Kritik güvenlik açığını kapat (Önerilen)
-        2. Performans iyileştirmesi yap
-        3. Testleri çalıştır
-        """
+            Sorunları çözmek için seçenekler:
+            1. Kritik güvenlik açığını kapat (Önerilen)
+            2. Performans iyileştirmesi yap
+            3. Testleri çalıştır
+            """
 
         let options = AgentQuestionParser.parseQuickReplyOptions(from: text)
         XCTAssertEqual(options.count, 3)
         XCTAssertTrue(options[0].isRecommended)
         XCTAssertFalse(options[1].isRecommended)
         XCTAssertFalse(options[2].isRecommended)
+    }
+
+    /// Bilgi amaçlı yanıttaki liste soru değildir: seçeneklerden sonra paragraf
+    /// ve kod bloğu geliyorsa kart açılmamalı.
+    func testMidMessageListWithTrailingContentIsNotAQuestion() {
+        let text = """
+            Mantık şöyle:
+            - Developer ID Application: SENOL DOGAN
+            - Apple Distribution: SENOL DOGAN
+            - ComputerUse Dev
+            Farklı bir kimlikle imzalamak istersen:
+            ```bash
+            FOO=bar ./script/build.sh
+            ```
+            Hiç kimlik bulunamazsa ad-hoc imzaya düşer.
+            """
+
+        XCTAssertTrue(AgentQuestionParser.parseQuickReplyOptions(from: text).isEmpty)
     }
 
     @MainActor

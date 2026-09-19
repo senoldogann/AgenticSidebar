@@ -20,7 +20,7 @@ final class GlobalHotKeyController {
     /// - Parameter hotKeyID: Aynı imzadaki (ASBR) ek kayıtlar için farklı
     ///   kimlik (ör. 1: göster/gizle, 2: snap). Varsayılan tekil davranışı korur.
     init(action: @escaping @MainActor () -> Void, hotKeyID: UInt32 = 1) {
-        self.identifier = EventHotKeyID(signature: 0x41534252, id: hotKeyID)
+        self.identifier = EventHotKeyID(signature: 0x4153_4252, id: hotKeyID)
         self.action = action
     }
 
@@ -115,7 +115,8 @@ final class GlobalHotKeyController {
 
     func handle(_ receivedIdentifier: EventHotKeyID) -> OSStatus {
         guard receivedIdentifier.signature == identifier.signature,
-              receivedIdentifier.id == identifier.id else {
+            receivedIdentifier.id == identifier.id
+        else {
             return OSStatus(eventNotHandledErr)
         }
 

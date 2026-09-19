@@ -34,9 +34,9 @@ indirect enum JSONValue: Equatable, Sendable {
 
     var isEmptyCollection: Bool {
         switch self {
-        case let .object(members):
+        case .object(let members):
             members.isEmpty
-        case let .array(values):
+        case .array(let values):
             values.isEmpty
         default:
             false
@@ -74,6 +74,19 @@ indirect enum JSONValue: Equatable, Sendable {
         switch any {
         case let value as String:
             self = .string(value)
+        case let number as NSNumber:
+            // JSONSerialization sayıları NSNumber verir: 0/1 Bool sanılmasın.
+            switch CFGetTypeID(number) {
+            case CFBooleanGetTypeID():
+                self = .bool(number.boolValue)
+            default:
+                let objCType = String(cString: number.objCType)
+                if objCType == "d" || objCType == "f" {
+                    self = .double(number.doubleValue)
+                } else {
+                    self = .int(number.intValue)
+                }
+            }
         case let value as Bool:
             self = .bool(value)
         case let value as Int:
@@ -91,17 +104,17 @@ indirect enum JSONValue: Equatable, Sendable {
 
     private func render(into output: inout String, depth: Int) {
         switch self {
-        case let .string(value):
+        case .string(let value):
             output.append(Self.quoted(value))
-        case let .bool(value):
+        case .bool(let value):
             output.append(value ? "true" : "false")
-        case let .int(value):
+        case .int(let value):
             output.append(String(value))
-        case let .double(value):
+        case .double(let value):
             output.append(String(value))
         case .null:
             output.append("null")
-        case let .array(values):
+        case .array(let values):
             guard !values.isEmpty else {
                 output.append("[]")
                 return
@@ -115,7 +128,7 @@ indirect enum JSONValue: Equatable, Sendable {
             }
             output.append(Self.indent(depth))
             output.append("]")
-        case let .object(members):
+        case .object(let members):
             guard !members.isEmpty else {
                 output.append("{}")
                 return
@@ -154,7 +167,8 @@ indirect enum JSONValue: Equatable, Sendable {
                 output.append("\\t")
             default:
                 if let scalar = character.unicodeScalars.first,
-                   scalar.value < 0x20 {
+                    scalar.value < 0x20
+                {
                     output.append(String(format: "\\u%04x", scalar.value))
                 } else {
                     output.append(character)

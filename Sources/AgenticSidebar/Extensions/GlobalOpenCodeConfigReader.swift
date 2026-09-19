@@ -30,13 +30,16 @@ struct GlobalOpenCodeConfigReader: Sendable {
                 configDirectory.appendingPathComponent("opencode.json"),
                 configDirectory.appendingPathComponent("opencode.jsonc"),
                 altConfigDirectory.appendingPathComponent("opencode.json"),
-                altConfigDirectory.appendingPathComponent("opencode.jsonc")
+                altConfigDirectory.appendingPathComponent("opencode.jsonc"),
             ]
         )
     }
 
-    /// Harici dosyada bulunan ve uygulama seviyesini ezebilen kurallar.
+    /// Harici dosyada bulunan kurallar.
     ///
+    /// Bu ham okumadır: dosyanın yazdığını aynen verir. Davranışa gerçekten
+    /// etki eden kurallar için `effectiveGlobalPermissionOverrides(managedKeys:)`
+    /// kullanılır — managed dosyanın karşılığı olan anahtarlar etkisizdir.
     /// `permission` tek biçim değildir: `"bash": "allow"` yanında
     /// `"bash": {"*": "allow"}` gibi desen-haritaları da yazılır. İkincisi
     /// eskiden sessizce atlanıyordu; uyarı kaybolurken ezme sürüyordu.
@@ -61,6 +64,36 @@ struct GlobalOpenCodeConfigReader: Sendable {
             parts += agentRules.map { "agent.\($0.key): \($0.value)" }
             return parts.sorted().joined(separator: ", ")
         }
+
+        /// Managed dosyanın karşılığını yazdığı kuralları eleyip yalnız
+        /// davranışa gerçekten etki edeni bırakır.
+        func excluding(managedKeys: ManagedPermissionKeys) -> GlobalPermissionOverride {
+            GlobalPermissionOverride(
+                rules: rules.filter { !managedKeys.permission.contains($0.key) },
+                complexPermissionKeys: complexPermissionKeys.filter {
+                    !managedKeys.permission.contains($0)
+                },
+                toolRules: toolRules.filter { !managedKeys.tools.contains($0.key) },
+                agentRules: agentRules.filter { !managedKeys.agents.contains($0.key) },
+                sourceURL: sourceURL
+            )
+        }
+    }
+
+    /// Managed dosyanın (`OPENCODE_CONFIG`) karar verdiği izin anahtarları.
+    ///
+    /// Deneyle doğrulandı (opencode 1.18.31): `OPENCODE_CONFIG` dosyası ile
+    /// kullanıcının genel dosyası birleştirilir ve çakışan anahtarda managed
+    /// dosya kazanır. Bu yüzden genel dosyadaki bir kural, ancak managed
+    /// dosyada karşılığı YOKSA davranışa etki eder; karşılığı varsa genel
+    /// değer etkisizdir ve uyarıda yeri yoktur.
+    struct ManagedPermissionKeys: Equatable, Sendable {
+        var permission: Set<String>
+        var tools: Set<String>
+        /// `"ajanadı.anahtar"` biçiminde düzleştirilmiş ajan izin anahtarları.
+        var agents: Set<String>
+
+        static let empty = ManagedPermissionKeys(permission: [], tools: [], agents: [])
     }
 
     /// Permission rules declared in the user's global configuration files,
@@ -133,6 +166,65 @@ struct GlobalOpenCodeConfigReader: Sendable {
             }
         }
         return nil
+    }
+
+    /// Davranışa gerçekten etki eden harici kurallar.
+    ///
+    /// Managed dosyanın karşılığını yazdığı anahtarlar elenir; geriye kalan
+    /// yoksa `nil` döner ve çağıran uyarı göstermez. Managed dosya okunamazsa
+    /// anahtar kümesi boş sayılır, yani her kural eskisi gibi gösterilir
+    /// (güvenli yöne açık: yanlış suskunluk yok).
+    func effectiveGlobalPermissionOverrides(
+        managedKeys: ManagedPermissionKeys
+    ) -> GlobalPermissionOverride? {
+        guard let override = globalPermissionOverrides() else {
+            return nil
+        }
+        let filtered = override.excluding(managedKeys: managedKeys)
+        return filtered.isEmpty ? nil : filtered
+    }
+
+    /// Managed yapılandırma dosyasının karar verdiği anahtarlar.
+    ///
+    /// Dosya yoksa ya da okunamazsa boş küme döner; çağıran o durumda her
+    /// harici kuralı gösterir.
+    static func managedKeys(
+        at url: URL,
+        fileManager: FileManager
+    ) -> ManagedPermissionKeys {
+        guard
+            fileManager.fileExists(atPath: url.path),
+            let raw = try? String(contentsOf: url, encoding: .utf8),
+            let object = decodeObject(raw)
+        else {
+            return .empty
+        }
+        return managedKeys(from: object)
+    }
+
+    /// Çözümlenmiş bir yapılandırma nesnesinden anahtar kümeleri çıkarır.
+    static func managedKeys(from object: [String: Any]) -> ManagedPermissionKeys {
+        var permission = Set<String>()
+        if let map = object["permission"] as? [String: Any] {
+            permission = Set(map.keys)
+        }
+        var tools = Set<String>()
+        if let map = object["tools"] as? [String: Any] {
+            tools = Set(map.keys)
+        }
+        var agents = Set<String>()
+        if let agentMap = object["agent"] as? [String: Any] {
+            for (agentName, agentValue) in agentMap {
+                guard let agentObject = agentValue as? [String: Any] else {
+                    continue
+                }
+                let permissionMap = agentObject["permission"] as? [String: Any] ?? [:]
+                for key in permissionMap.keys {
+                    agents.insert("\(agentName).\(key)")
+                }
+            }
+        }
+        return ManagedPermissionKeys(permission: permission, tools: tools, agents: agents)
     }
 
     /// The `mcp` map of the user's configuration, keyed by server name.
@@ -290,7 +382,8 @@ enum JSONCCommentStripper {
                 index = raw.index(after: nextIndex)
                 while index < raw.endIndex {
                     let current = raw[index]
-                    let following = raw.index(after: index) < raw.endIndex
+                    let following =
+                        raw.index(after: index) < raw.endIndex
                         ? raw[raw.index(after: index)]
                         : nil
                     if current == "*", following == "/" {

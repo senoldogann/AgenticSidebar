@@ -362,6 +362,7 @@ deletes its own throwaway item in the login keychain.
 - `docs/superpowers/specs/` — product/architecture specification
 - `docs/superpowers/plans/` — milestone implementation plans
 - `docs/verification/` — recorded host verification evidence
+- `docs/reviews/` — code review reports (findings, evidence and their resolution)
 - `.ai-architect/` — architecture contract and accepted ADRs
 
 ## Continuous integration
@@ -373,5 +374,6 @@ Both steps run with `-Xswiftc -warnings-as-errors` — the tree is warning-free,
 that is the state worth holding. Superseded pushes are cancelled by a `concurrency`
 group, the SwiftPM build is cached, and the single test that touches the real login
 keychain skips itself unless `RUN_KEYCHAIN_TESTS=1` is set, so what CI proves is the
-hermetic suite. A `swift-format` report runs alongside as advisory output: this
-repository has no `.swift-format` yet, so formatting is not a gate.
+hermetic suite. `swift-format lint` runs as a third step and **is a gate**: the
+tree is formatted to the checked-in `.swift-format`, so a new violation fails the
+build the same way a new warning does.

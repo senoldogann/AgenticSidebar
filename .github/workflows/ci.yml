@@ -61,20 +61,32 @@ jobs:
             --scratch-path "$SWIFT_SCRATCH" \
             -Xswiftc -warnings-as-errors
 
-  # Advisory, but visible: `.swift-format` states the 4-space style the code
-  # follows by hand, so this report is meaningful. It stays a report rather
-  # than a gate because the tree has pre-existing violations; reformatting the
-  # whole tree is a separate decision. `continue-on-error` is the single
-  # tolerance — a failure shows as an orange job instead of a silent green.
-  format-report:
+  # A gate, not a report: the tree is formatted to the checked-in
+  # `.swift-format` (4-space indent, 140 columns), so the lint is clean today
+  # and a new violation fails the build the same way a new warning does.
+  #
+  # The tool is PINNED. `brew install swift-format` ships whatever is current,
+  # and a formatter's output is only reproducible for the version the tree was
+  # formatted with — an unpinned gate would fail on a tool release rather than
+  # on a code change. Bumping the pin is therefore a deliberate act that comes
+  # with a reformat, not a side effect.
+  format:
     runs-on: macos-26
     timeout-minutes: 15
-    continue-on-error: true
+
+    env:
+      SWIFT_FORMAT_VERSION: "604.0.0"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Format report
+      - name: Format check
         run: |
           brew install swift-format
-          swift-format lint -r Sources Tests
+          installed="$(swift-format --version)"
+          echo "swift-format on the runner: $installed"
+          if [[ "$installed" != "$SWIFT_FORMAT_VERSION" ]]; then
+            echo "::error::swift-format $SWIFT_FORMAT_VERSION is required (found: $installed). Reformat deliberately with that version and move this pin in the same change."
+            exit 1
+          fi
+          swift-format lint -r --strict Sources Tests

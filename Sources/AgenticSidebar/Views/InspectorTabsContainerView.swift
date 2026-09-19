@@ -7,6 +7,9 @@ struct InspectorTabsContainerView: View {
     let preset: AppThemePreset
     let isDark: Bool
     let isExpanded: Bool
+    /// Terminal sekmelerinin kabukları burada yaşar; sekme değişiminde kabuk
+    /// kapanmaz, sekme kapanınca kapatılır.
+    let terminalCenter: TerminalServiceCenter
     let onSelectTab: (String) -> Void
     let onCloseTab: (String) -> Void
     let onToggleExpand: () -> Void
@@ -180,7 +183,7 @@ struct InspectorTabsContainerView: View {
     @ViewBuilder
     private func content(for tab: InspectorTab) -> some View {
         switch tab.kind {
-        case let .file(url):
+        case .file(let url):
             FileInspectorPanelView(
                 url: url,
                 preset: preset,
@@ -190,7 +193,7 @@ struct InspectorTabsContainerView: View {
                 }
             )
 
-        case let .subagentReport(_, title, report):
+        case .subagentReport(_, let title, let report):
             SubagentReportPanelView(
                 title: title,
                 report: report,
@@ -201,7 +204,7 @@ struct InspectorTabsContainerView: View {
                 }
             )
 
-        case let .changesReview(_, summary, initialFile):
+        case .changesReview(_, let summary, let initialFile):
             FileChangesReviewPanelView(
                 summary: summary,
                 initialSelectedFile: initialFile,
@@ -213,10 +216,11 @@ struct InspectorTabsContainerView: View {
             )
             .id("review:\(summary.id.uuidString):\(initialFile?.id.uuidString ?? "all")")
 
-        case let .livePreview(_, title, html):
-            LivePreviewPanelView(
-                title: title,
-                html: html,
+        case .terminal(let id, let workingDirectory):
+            TerminalHostView(
+                center: terminalCenter,
+                tabID: id,
+                workingDirectoryPath: workingDirectory,
                 preset: preset,
                 isDark: isDark,
                 onDismiss: {

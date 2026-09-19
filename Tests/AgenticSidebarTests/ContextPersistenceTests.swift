@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -30,8 +31,8 @@ final class ContextPersistenceTests: XCTestCase {
 
     func testOldArchivesWithoutAQueueStillDecode() throws {
         let payload = """
-        {"id":"\(UUID().uuidString)","createdAt":"2026-09-16T12:00:00Z","messages":[],"activityGroups":[]}
-        """.data(using: .utf8)!
+            {"id":"\(UUID().uuidString)","createdAt":"2026-09-16T12:00:00Z","messages":[],"activityGroups":[]}
+            """.data(using: .utf8)!
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601

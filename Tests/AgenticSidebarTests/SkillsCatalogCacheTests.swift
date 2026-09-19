@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// Discovery used to read and parse every `SKILL.md` on the main actor on every

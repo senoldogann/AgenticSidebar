@@ -29,6 +29,34 @@ enum AgentSessionError: Error, Equatable, Sendable {
 /// had to be trimmed to fit the model context window.
 enum AgentSessionNotice: Equatable, Sendable {
     case transcriptTrimmed(droppedMessageCount: Int)
+    case forkUnavailable
+    case dictationUnavailable
+    case contextCompacted
+    case compactionFailed(reason: CompactionFailureReason)
+
+    /// Kırpma bildirimi mi.
+    ///
+    /// Tek bir bildirim yuvası var, ama onu beş farklı sebep kullanıyor. Tur
+    /// başındaki kırpma değerlendirmesi yalnız *kendi* bildirimini geri
+    /// çekebilmeli: aksi halde yeni bir mesaj göndermek, saniyeler önce çıkmış
+    /// ilgisiz bir uyarıyı (başarısız `/compact` gibi) sessizce siliyordu.
+    var isTranscriptTrim: Bool {
+        if case .transcriptTrimmed = self {
+            return true
+        }
+        return false
+    }
+}
+
+/// Why a context-compaction run did not produce a summary. Surfaced, never
+/// silent: a failed auto-compact retries at the next settle, a failed manual
+/// one tells the user what to do instead.
+enum CompactionFailureReason: Equatable, Sendable {
+    case busy
+    case compacting
+    case unavailable
+    case nothingToCompact
+    case summarizerError
 }
 
 struct AgentSessionState: Equatable, Sendable {

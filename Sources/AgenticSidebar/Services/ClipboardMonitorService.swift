@@ -6,6 +6,9 @@ final class ClipboardMonitorService {
     private let sessionService: AgentSessionService
     private let settingsStore: SettingsStore
     private let pasteboard: any PasteboardReading
+    /// Oturum başına besteci tercihleri: pano gönderimi aktif sohbete gider,
+    /// o sohbetin modu ve hızı kullanılır. Yoksa genel değer geçerlidir.
+    var composerPrefs: SessionComposerPrefs?
 
     /// Oturumun henüz kabul edemediği kopyalar sırasını burada bekler.
     ///
@@ -15,7 +18,16 @@ final class ClipboardMonitorService {
 
     private var lastChangeCount: Int
     private var lastSubmittedText = ""
-    private var pendingSubmissions: [String] = []
+    private struct PendingClipboardSubmission: Equatable, Sendable {
+        let text: String
+        let sessionID: UUID
+        /// Yakalama anındaki mod/hız: kuyrukta beklerken kullanıcı modu
+        /// değiştirse bile gönderim kayıtlı değerle yapılır.
+        let mode: AgentMode
+        let speedMode: ResponseSpeedMode
+    }
+
+    private var pendingSubmissions: [PendingClipboardSubmission] = []
     private var timer: Timer?
 
     init(
@@ -115,7 +127,14 @@ final class ClipboardMonitorService {
         }
 
         lastSubmittedText = trimmed
-        pendingSubmissions.append(trimmed)
+        pendingSubmissions.append(
+            PendingClipboardSubmission(
+                text: trimmed,
+                sessionID: sessionService.activeSessionID,
+                mode: effectiveAgentMode,
+                speedMode: effectiveSpeedMode
+            )
+        )
 
         while pendingSubmissions.count > Self.maximumPendingSubmissions {
             pendingSubmissions.removeFirst()
@@ -130,24 +149,44 @@ final class ClipboardMonitorService {
     /// `send` çalışan bir turun arkasına ekler; böylece yakalamalar da diğer
     /// mesajlarla aynı kuyruktan geçer ve kullanıcı ne beklediğini görür.
     /// Oturumun hiç kabul edemediği bir istek sırada kalır.
-    private func flushPendingSubmissions() {
-        while let next = pendingSubmissions.first, sessionService.canAcceptPrompt {
-            let promptText: String
-            if settingsStore.agentMode == .exam {
-                promptText = """
-                EXAM SOLVER: Please solve the following question. State the direct answer first, followed by a step-by-step derivation:
+    private var effectiveAgentMode: AgentMode {
+        composerPrefs?.effectiveAgentMode(
+            for: sessionService.activeSessionID,
+            default: settingsStore.agentMode
+        ) ?? settingsStore.agentMode
+    }
 
-                \(next)
-                """
+    private var effectiveSpeedMode: ResponseSpeedMode {
+        composerPrefs?.effectiveSpeedMode(
+            for: sessionService.activeSessionID,
+            default: settingsStore.responseSpeedMode
+        ) ?? settingsStore.responseSpeedMode
+    }
+    private func flushPendingSubmissions() {
+        while let next = pendingSubmissions.first {
+            guard let target = sessionService.session(for: next.sessionID) else {
+                pendingSubmissions.removeFirst()
+                AppLog.automation.error("A clipboard capture was dropped because its session no longer exists")
+                continue
+            }
+            guard target.canAcceptPrompt else { return }
+
+            let promptText: String
+            if next.mode == .exam {
+                promptText = """
+                    EXAM SOLVER: Please solve the following question. State the direct answer first, followed by a step-by-step derivation:
+
+                    \(next.text)
+                    """
             } else {
-                promptText = next
+                promptText = next.text
             }
 
-            let acceptance = sessionService.send(
+            let acceptance = target.send(
                 promptText,
                 attachmentPaths: [],
-                speedMode: settingsStore.responseSpeedMode,
-                mode: settingsStore.agentMode
+                speedMode: next.speedMode,
+                mode: next.mode
             )
 
             guard acceptance.wasAccepted else {

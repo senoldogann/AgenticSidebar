@@ -20,6 +20,30 @@ struct OpenCodeStreamNormalizer: Sendable {
     private var bufferedPartOrder: [String] = []
     private var runningToolDescriptors: [String: ProviderActivityDescriptor] = [:]
     private var finishedToolPartIDs: Set<String> = []
+    private var finishedToolPartOrder: [String] = []
+    /// Text parts whose content already reached the transcript — via streamed
+    /// deltas or one full-text fallback — so a later update carrying the same
+    /// text is not emitted a second time.
+    private var emittedTextPartIDs: Set<String> = []
+    private var emittedTextPartOrder: [String] = []
+    /// Thinking içeriği yüzeye çıkan reasoning parçaları; sıra, en eskiyi
+    /// düşürmek için. Asistan metninden ayrı kümedir: aynı partID iki kanalda
+    /// da geçebilir, biri diğerini susturmamalı.
+    private var emittedReasoningPartIDs: Set<String> = []
+    private var emittedReasoningPartOrder: [String] = []
+
+    /// Hedef oturumda görülen KULLANICI mesajı kimlikleri.
+    ///
+    /// OpenCode kullanıcının kendi mesajını da parça olarak yayar ve o parçanın
+    /// metni, gönderilen çerçeveli prompt'un aynısıdır (`<user_turn>…`). Rol
+    /// ayrımı olmadan bu parça asistan metni sayılıyordu: sohbete kullanıcının
+    /// kendi mesajı asistan yanıtı olarak düşüyor ve ekranda gerçek bir yanıt
+    /// yerine `<user_turn>` gövdesi görünüyordu.
+    ///
+    /// Filtre, `message.updated`'in parça olaylarından ÖNCE gelmesine dayanır:
+    /// bir parça, ait olduğu mesaj yaratılmadan var olamaz.
+    private var userMessageIDs: Set<String> = []
+    private var userMessageOrder: [String] = []
 
     /// Çocuk oturum kimliğinden üstteki `task` aktivitesine eşleme.
     private var subagentOwnerByChildSession: [String: ProviderActivityID] = [:]
@@ -41,6 +65,16 @@ struct OpenCodeStreamNormalizer: Sendable {
     /// Eşlemesi bilinmeyen çocuk oturumlar için tampon sınırı.
     private static let maximumBufferedChildSessions = 8
     private static let maximumBufferedPermissionsPerSession = 16
+    /// Tura ait metin tamponu: kısmi `text` parçaları için en eski düşer.
+    private static let maximumBufferedTextParts = 128
+    /// Yinelenen bitiş olaylarını eleyen küme; sıra, en eskiyi düşürmek için.
+    private static let maximumFinishedToolParts = 256
+    /// Yüzeye çıkan metin parçaları; sıra, en eskiyi düşürmek için.
+    private static let maximumEmittedTextParts = 256
+    /// Yüzeye çıkan reasoning parçaları; sıra, en eskiyi düşürmek için.
+    private static let maximumEmittedReasoningParts = 256
+    /// Rolü öğrenilen kullanıcı mesajları; sıra, en eskiyi düşürmek için.
+    private static let maximumTrackedUserMessages = 256
 
     init(sessionID: String) {
         self.sessionID = sessionID
@@ -92,6 +126,10 @@ struct OpenCodeStreamNormalizer: Sendable {
             return consumePartDelta(properties)
         case "message.part.updated":
             return consumePartUpdated(properties)
+        case "message.updated":
+            // Rol kimliği ve asistan jeton sayımı burada okunur; başka
+            // yüzeye olay üretilmez.
+            return consumeMessageUpdated(properties)
         case "session.status":
             return consumeSessionStatus(properties)
         case "session.idle":
@@ -100,9 +138,12 @@ struct OpenCodeStreamNormalizer: Sendable {
             }
             return finishTurn()
         case "session.error":
-            if let eventSessionID = properties["sessionID"] as? String,
-               eventSessionID != sessionID
-            {
+            // An error that names no session — or another turn's session — is
+            // not this turn's failure. Throwing here killed an unrelated turn
+            // for a problem it never caused.
+            guard let eventSessionID = properties["sessionID"] as? String,
+                eventSessionID == sessionID
+            else {
                 return []
             }
             let failure = Self.error(fromSessionError: properties)
@@ -157,7 +198,7 @@ struct OpenCodeStreamNormalizer: Sendable {
             "context_length_exceeded",
             "context length",
             "context window",
-            "too many tokens"
+            "too many tokens",
         ]
 
         return markers.contains { serialized.contains($0) }
@@ -197,15 +238,30 @@ struct OpenCodeStreamNormalizer: Sendable {
             return []
         }
 
+        // Kullanıcının kendi mesajının parçası asistan metni değildir.
+        if let messageID = properties["messageID"] as? String, userMessageIDs.contains(messageID) {
+            return []
+        }
+
         switch partTypes[partID] {
         case "text":
+            markTextPartEmitted(partID)
             return [.assistantTextDelta(delta)]
         case "reasoning":
-            return []
+            // Akıl yürütme asistan metni değildir ama çöp de değildir: ayrı
+            // thinking kanalına akar, turdaki düşünme kartını doldurur.
+            markReasoningPartEmitted(partID)
+            return [.thinkingDelta(delta)]
         case .some:
             return []
         case .none:
             if bufferedTextDeltas[partID] == nil {
+                if bufferedPartOrder.count >= Self.maximumBufferedTextParts,
+                    let oldest = bufferedPartOrder.first
+                {
+                    bufferedPartOrder.removeFirst()
+                    bufferedTextDeltas.removeValue(forKey: oldest)
+                }
                 bufferedPartOrder.append(partID)
             }
             bufferedTextDeltas[partID, default: ""] += delta
@@ -218,10 +274,9 @@ struct OpenCodeStreamNormalizer: Sendable {
     ) -> [ProviderEvent] {
         guard
             let part = properties["part"] as? [String: Any],
-            let eventSessionID = (
-                properties["sessionID"] as? String
-                    ?? part["sessionID"] as? String
-            ),
+            let eventSessionID =
+                (properties["sessionID"] as? String
+                    ?? part["sessionID"] as? String),
             let partID = part["id"] as? String,
             let partType = part["type"] as? String
         else {
@@ -239,17 +294,47 @@ struct OpenCodeStreamNormalizer: Sendable {
             )
         }
 
+        // Kullanıcı mesajının parçaları (metin ve ekler) asistan içeriği değildir:
+        // burada düşmezlerse sohbete kullanıcının kendi prompt'u yazılır.
+        if let messageID = part["messageID"] as? String, userMessageIDs.contains(messageID) {
+            return []
+        }
+
         partTypes[partID] = partType
 
         switch partType {
         case "text":
-            guard let buffered = removeBufferedText(for: partID) else {
-                return []
+            if let buffered = removeBufferedText(for: partID) {
+                markTextPartEmitted(partID)
+                return [.assistantTextDelta(buffered)]
             }
-            return [.assistantTextDelta(buffered)]
+            // No streamed delta arrived for this part: the update itself
+            // carries the text (a complete part, not a streamed one). Dropping
+            // it here would silently lose the model's words. Once per part:
+            // text that already streamed stays a single emission.
+            if !emittedTextPartIDs.contains(partID),
+                let text = part["text"] as? String, !text.isEmpty
+            {
+                markTextPartEmitted(partID)
+                return [.assistantTextDelta(text)]
+            }
+            return []
 
         case "reasoning":
-            removeBufferedText(for: partID)
+            // Tipi geç öğrenilen parçanın deltası tamponda bekliyordu:
+            // asistan metni değil, thinking içeriğidir.
+            if let buffered = removeBufferedText(for: partID) {
+                markReasoningPartEmitted(partID)
+                return [.thinkingDelta(buffered)]
+            }
+            // Akışsız gelen bütün parça (delta'sız reasoning): metin kanalına
+            // düşmeden thinking'e tek seferlik taşınır.
+            if !emittedReasoningPartIDs.contains(partID),
+                let text = part["text"] as? String, !text.isEmpty
+            {
+                markReasoningPartEmitted(partID)
+                return [.thinkingDelta(text)]
+            }
             return []
 
         case "tool":
@@ -275,9 +360,14 @@ struct OpenCodeStreamNormalizer: Sendable {
                 state: state
             )
             // `task` parçası çocuk oturumun kimliğini metadata'da taşır; çocuğun
-            // araç olayları bu eşleme üzerinden üstteki karta yazılır.
+            // araç olayları bu eşleme üzerinden üstteki karta yazılır. Hangi
+            // aracın delege ettiği tek yüklemden okunur
+            // (`ProviderActivityDescriptor.isSubagentTool`): soru yönlendirici
+            // de aynısını kullanır, yoksa delege sorular panele hiç çıkmaz.
             let learningEvents: [ProviderEvent]
-            if kind == .subagent, let childSessionID = Self.childSessionID(in: state) {
+            if ProviderActivityDescriptor.isSubagentTool(tool),
+                let childSessionID = Self.childSessionID(in: state)
+            {
                 learningEvents = learnSubagentChild(
                     childSessionID,
                     at: activityID,
@@ -328,25 +418,27 @@ struct OpenCodeStreamNormalizer: Sendable {
                 // panel ve geçmiş yalnız rapor içeriğini görsün.
                 let terminalOutput = kind == .subagent ? output.map(Self.strippedTaskWrapper) : output
                 if runningToolDescriptors.removeValue(forKey: partID) != nil {
-                    finishedToolPartIDs.insert(partID)
+                    markToolPartFinished(partID)
                     var events = learningEvents
                     // Bitince kart adım listesini bırakır: `output` nihai rapordur
                     // ve sağ panelde okunur, kartta değil.
                     if kind == .subagent,
-                       let finalOutput = subagentStepsOutput(for: activityID, finished: true)
+                        let finalOutput = subagentStepsOutput(for: activityID, finished: true)
                     {
-                        events.append(.activityUpdated(ProviderActivityDescriptor.sanitizedTool(
-                            id: activityID,
-                            toolName: tool,
-                            title: toolTitle,
-                            detail: subagentStepsDetail(for: activityID),
-                            output: finalOutput
-                        )))
+                        events.append(
+                            .activityUpdated(
+                                ProviderActivityDescriptor.sanitizedTool(
+                                    id: activityID,
+                                    toolName: tool,
+                                    title: toolTitle,
+                                    detail: subagentStepsDetail(for: activityID),
+                                    output: finalOutput
+                                )))
                     }
                     events.append(.activityFinished(activityID, outcome: outcome, output: terminalOutput, diff: diff))
                     return events
                 } else if !finishedToolPartIDs.contains(partID) {
-                    finishedToolPartIDs.insert(partID)
+                    markToolPartFinished(partID)
                     let descriptor = ProviderActivityDescriptor.sanitizedTool(
                         id: activityID,
                         toolName: tool,
@@ -485,7 +577,7 @@ struct OpenCodeStreamNormalizer: Sendable {
         }
         bufferedChildPermissions[request.remoteSessionID] = pending
         if bufferedChildPermissions.count > Self.maximumBufferedChildSessions,
-           let evicted = bufferedChildPermissions.keys.sorted().first
+            let evicted = bufferedChildPermissions.keys.sorted().first
         {
             bufferedChildPermissions.removeValue(forKey: evicted)
         }
@@ -633,11 +725,12 @@ struct OpenCodeStreamNormalizer: Sendable {
 
     /// `✓ Read — Analyzed Session.swift` biçiminde tek adım satırı.
     static func stepLine(for step: OpenCodeSubagentStep) -> String {
-        let mark = switch step.status {
-        case "completed": "✓"
-        case "error", "failed": "✗"
-        default: "…"
-        }
+        let mark =
+            switch step.status {
+            case "completed": "✓"
+            case "error", "failed": "✗"
+            default: "…"
+            }
 
         if let title = step.title, !title.isEmpty {
             return "\(mark) \(step.name) — \(title)"
@@ -671,7 +764,8 @@ struct OpenCodeStreamNormalizer: Sendable {
             return nil
         }
 
-        let singleLine = text
+        let singleLine =
+            text
             .split(separator: "\n", omittingEmptySubsequences: true)
             .first
             .map(String.init)?
@@ -728,6 +822,13 @@ struct OpenCodeStreamNormalizer: Sendable {
         bufferedPartOrder.removeAll()
         runningToolDescriptors.removeAll()
         finishedToolPartIDs.removeAll()
+        finishedToolPartOrder.removeAll()
+        emittedTextPartIDs.removeAll()
+        emittedTextPartOrder.removeAll()
+        emittedReasoningPartIDs.removeAll()
+        emittedReasoningPartOrder.removeAll()
+        userMessageIDs.removeAll()
+        userMessageOrder.removeAll()
         subagentOwnerByChildSession.removeAll()
         subagentTitles.removeAll()
         subagentAgents.removeAll()
@@ -739,8 +840,102 @@ struct OpenCodeStreamNormalizer: Sendable {
         return pendingText + [.completed]
     }
 
+    /// Biten araç parçasını kayda geçirir; kapak aşılırsa en eski düşer.
+    private mutating func markToolPartFinished(_ partID: String) {
+        guard finishedToolPartIDs.insert(partID).inserted else {
+            return
+        }
+        finishedToolPartOrder.append(partID)
+        if finishedToolPartOrder.count > Self.maximumFinishedToolParts {
+            finishedToolPartIDs.remove(finishedToolPartOrder.removeFirst())
+        }
+    }
+
+    /// Yüzeye çıkan metin parçasını kayda geçirir; kapak aşılırsa en eski düşer.
+    private mutating func markTextPartEmitted(_ partID: String) {
+        guard emittedTextPartIDs.insert(partID).inserted else {
+            return
+        }
+        emittedTextPartOrder.append(partID)
+        if emittedTextPartOrder.count > Self.maximumEmittedTextParts {
+            emittedTextPartIDs.remove(emittedTextPartOrder.removeFirst())
+        }
+    }
+
+    /// Yüzeye çıkan reasoning parçasını kayda geçirir; kapak aşılırsa en eski
+    /// düşer. Akışlı reasoning hem delta hem bütün-metin güncellemesi taşır;
+    /// küme, bütün-metnin akmış içeriği ikinci kez yayınlamasını engeller.
+    private mutating func markReasoningPartEmitted(_ partID: String) {
+        guard emittedReasoningPartIDs.insert(partID).inserted else {
+            return
+        }
+        emittedReasoningPartOrder.append(partID)
+        if emittedReasoningPartOrder.count > Self.maximumEmittedReasoningParts {
+            emittedReasoningPartIDs.remove(emittedReasoningPartOrder.removeFirst())
+        }
+    }
+
+    /// Mesaj kimliğinin rolünü öğrenir; yalnız kullanıcı mesajları işaretlenir.
+    ///
+    /// Asistan mesajlarını işaretlemeye gerek yok: parçalar zaten varsayılan
+    /// olarak asistanındır ve filtrenin fail-open olması, `message.updated`
+    /// taşımayan bir akışta modelin kelimelerinin düşmesini engeller.
+    ///
+    /// Asistan mesajı bitince `info.tokens` (`{input, output, …}`) okunur:
+    /// sunucu tarafı oturumun o adımdaki girdi sayımı, bağlam boyutunun
+    /// gerçek karşılığıdır. Alan yoksa sessizce boş dönülür.
+    private mutating func consumeMessageUpdated(_ properties: [String: Any]) -> [ProviderEvent] {
+        guard
+            let info = properties["info"] as? [String: Any],
+            let messageID = info["id"] as? String,
+            let eventSessionID = info["sessionID"] as? String,
+            eventSessionID == sessionID,
+            let role = info["role"] as? String
+        else {
+            return []
+        }
+
+        guard role == "user" else {
+            guard
+                role == "assistant",
+                let tokens = info["tokens"] as? [String: Any],
+                let input = Self.tokenCount(tokens["input"]),
+                let output = Self.tokenCount(tokens["output"])
+            else {
+                return []
+            }
+            return [.turnUsage(TurnTokenUsage(inputTokens: input, outputTokens: output))]
+        }
+
+        guard userMessageIDs.insert(messageID).inserted else {
+            return []
+        }
+        userMessageOrder.append(messageID)
+        if userMessageOrder.count > Self.maximumTrackedUserMessages {
+            userMessageIDs.remove(userMessageOrder.removeFirst())
+        }
+        return []
+    }
+
+    /// SSE gövdesi `JSONSerialization` ile açılır: sayılar `NSNumber`
+    /// (`Int`/`Double`) gelir. Üç hâl de toleranslı okunur.
+    private static func tokenCount(_ value: Any?) -> Int? {
+        if let number = value as? Int {
+            return number >= 0 ? number : nil
+        }
+        if let number = value as? Double, number.isFinite, number >= 0 {
+            return Int(number)
+        }
+        if let number = value as? NSNumber {
+            let int = number.intValue
+            return int >= 0 ? int : nil
+        }
+        return nil
+    }
+
     @discardableResult
     private mutating func removeBufferedText(for partID: String) -> String? {
+
         bufferedPartOrder.removeAll { $0 == partID }
 
         guard let text = bufferedTextDeltas.removeValue(forKey: partID) else {
@@ -760,7 +955,8 @@ struct OpenCodeStreamNormalizer: Sendable {
         let normalizedTool = tool.lowercased()
 
         if normalizedTool.contains("write") || normalizedTool.contains("create") {
-            let content = (input["content"] as? String)
+            let content =
+                (input["content"] as? String)
                 ?? (input["CodeContent"] as? String)
                 ?? (input["code"] as? String)
                 ?? ""
@@ -775,11 +971,13 @@ struct OpenCodeStreamNormalizer: Sendable {
             return diff
         }
 
-        let oldValue = (input["oldString"] as? String)
+        let oldValue =
+            (input["oldString"] as? String)
             ?? (input["old_str"] as? String)
             ?? (input["targetContent"] as? String)
             ?? (input["target_content"] as? String)
-        let newValue = (input["newString"] as? String)
+        let newValue =
+            (input["newString"] as? String)
             ?? (input["new_str"] as? String)
             ?? (input["replacementContent"] as? String)
             ?? (input["replacement_content"] as? String)
@@ -812,7 +1010,8 @@ struct OpenCodeStreamNormalizer: Sendable {
             lines = Array(lines.prefix(maximumPreviewLines))
         }
 
-        var preview = lines
+        var preview =
+            lines
             .map { $0.isEmpty ? prefix.trimmingCharacters(in: .whitespaces) : prefix + $0 }
             .joined(separator: "\n")
 
@@ -832,11 +1031,15 @@ struct OpenCodeStreamNormalizer: Sendable {
         tool: String,
         input: [String: Any]
     ) -> (String?, String?) {
-        let description = ((input["description"] as? String)
+        // Ara değişken bilinçli: `??` zincirinin sonucuna doğrudan `?.`
+        // eklemek `swift-format` 604'ü `?` ile `.` arasında satır kırmaya
+        // itiyor ve ortaya çıkan kod derlenmiyor.
+        let rawDescription =
+            (input["description"] as? String)
             ?? (input["TaskName"] as? String)
             ?? (input["task_name"] as? String)
-            ?? (input["title"] as? String))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? (input["title"] as? String)
+        let description = rawDescription?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var agent = Self.subagentAgent(input: input)
 
@@ -853,28 +1056,30 @@ struct OpenCodeStreamNormalizer: Sendable {
 
         let title: String?
         switch (agent, description) {
-        case let (agent?, description?) where !agent.isEmpty && !description.isEmpty:
+        case (let agent?, let description?) where !agent.isEmpty && !description.isEmpty:
             title = "Delegated to \(agent): \(description)"
-        case let (_, description?) where !description.isEmpty:
+        case (_, let description?) where !description.isEmpty:
             title = "Delegated subagent: \(description)"
-        case let (agent?, _) where !agent.isEmpty:
+        case (let agent?, _) where !agent.isEmpty:
             title = "Delegated to \(agent)"
         default:
             title = nil
         }
 
-        let promptFirstLine = ((input["prompt"] as? String)
+        let rawPrompt =
+            (input["prompt"] as? String)
             ?? (input["Task"] as? String)
             ?? (input["task"] as? String)
-            ?? (input["instructions"] as? String))?
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .first
-            .map(String.init)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? (input["instructions"] as? String)
+        let promptFirstLine =
+            rawPrompt
+            .flatMap { $0.split(separator: "\n", omittingEmptySubsequences: true).first }
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
 
         let detail: String?
         if let promptFirstLine, !promptFirstLine.isEmpty {
-            detail = promptFirstLine.count > maximumSubagentDetailLength
+            detail =
+                promptFirstLine.count > maximumSubagentDetailLength
                 ? String(promptFirstLine.prefix(maximumSubagentDetailLength)) + "…"
                 : promptFirstLine
         } else {
@@ -888,10 +1093,11 @@ struct OpenCodeStreamNormalizer: Sendable {
 
     /// Delegasyon girdisindeki ajan adı (`subagent_type` ya da eşanlamlıları).
     static func subagentAgent(input: [String: Any]) -> String? {
-        ((input["subagent_type"] as? String)
+        let rawAgent =
+            (input["subagent_type"] as? String)
             ?? (input["agent"] as? String)
-            ?? (input["agent_type"] as? String))?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? (input["agent_type"] as? String)
+        return rawAgent?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// MCP title and detail with tool and input explicitly provided.
@@ -963,7 +1169,9 @@ struct OpenCodeStreamNormalizer: Sendable {
 
         let normalizedTool = tool.lowercased()
 
-        if normalizedTool.contains("bash") || normalizedTool.contains("command") || normalizedTool.contains("exec") || normalizedTool.contains("terminal") {
+        if normalizedTool.contains("bash") || normalizedTool.contains("command") || normalizedTool.contains("exec")
+            || normalizedTool.contains("terminal")
+        {
             let cmd = (input["command"] as? String) ?? (input["cmd"] as? String) ?? (input["script"] as? String) ?? ""
             let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
@@ -997,8 +1205,11 @@ struct OpenCodeStreamNormalizer: Sendable {
             return ("Analyzed \(filename)\(lineSuffix)", path)
         }
 
-        if normalizedTool.contains("edit") || normalizedTool.contains("write") || normalizedTool.contains("patch") || normalizedTool.contains("replace") || normalizedTool.contains("create") {
-            let path = (input["targetFile"] as? String)
+        if normalizedTool.contains("edit") || normalizedTool.contains("write") || normalizedTool.contains("patch")
+            || normalizedTool.contains("replace") || normalizedTool.contains("create")
+        {
+            let path =
+                (input["targetFile"] as? String)
                 ?? (input["TargetFile"] as? String)
                 ?? (input["filePath"] as? String)
                 ?? (input["path"] as? String)

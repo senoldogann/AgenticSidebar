@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// The channel exists to bound memory: `AsyncThrowingStream` accepts every

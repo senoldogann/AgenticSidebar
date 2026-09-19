@@ -279,6 +279,7 @@ struct FileInspectorPanelView: View {
             }
             .buttonStyle(.bordered)
             .padding(.top, 4)
+            .help("Open this file in its default application")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(32)
@@ -363,9 +364,9 @@ struct FileInspectorPanelView: View {
     }
 }
 
-private extension View {
+extension View {
     @ViewBuilder
-    func userSelectable(_ selectable: Bool) -> some View {
+    fileprivate func userSelectable(_ selectable: Bool) -> some View {
         if selectable {
             self.textSelection(.enabled)
         } else {

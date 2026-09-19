@@ -1,16 +1,17 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class FileChangesModelTests: XCTestCase {
     func testSingleFileEditDiffCounts() {
         let diff = """
-        - old line 1
-        - old line 2
-        + new line 1
-        + new line 2
-        + new line 3
-        """
+            - old line 1
+            - old line 2
+            + new line 1
+            + new line 2
+            + new line 3
+            """
 
         let activity = AgentActivity(
             id: ProviderActivityID("act-1"),
@@ -44,13 +45,13 @@ final class FileChangesModelTests: XCTestCase {
 
     func testMultipleEditsToSameFileAreConsolidated() {
         let diff1 = """
-        - line A
-        + line B
-        """
+            - line A
+            + line B
+            """
         let diff2 = """
-        + line C
-        + line D
-        """
+            + line C
+            + line D
+            """
 
         let act1 = AgentActivity(
             id: ProviderActivityID("act-1"),
@@ -200,5 +201,72 @@ final class FileChangesModelTests: XCTestCase {
         XCTAssertEqual(summary2.files.count, 1)
         XCTAssertEqual(summary1.files.first?.id, summary2.files.first?.id)
         XCTAssertEqual(summary1, summary2)
+    }
+
+    /// Oturum sonu kartı: gruplar yola göre birleşir, sayılar toplanır, sıra
+    /// ilk görünüm sırasıdır.
+    func testMergedSummaryAcrossGroups() {
+        func editAct(id: String, detail: String, diff: String) -> AgentActivity {
+            AgentActivity(
+                id: ProviderActivityID(id),
+                kind: .edit,
+                phase: .completed,
+                title: "Edited file",
+                detail: detail,
+                output: "Done",
+                diff: diff,
+                startedAt: Date(),
+                completedAt: Date()
+            )
+        }
+
+        let group1 = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [editAct(id: "a1", detail: "/workspace/A.swift", diff: "+ one\n- old")]
+        )
+        let group2 = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [
+                editAct(id: "a2", detail: "/workspace/A.swift", diff: "+ two"),
+                editAct(id: "a3", detail: "/workspace/B.swift", diff: "+ bee"),
+            ]
+        )
+
+        let merged = TurnFileChangesSummary.merged(from: [group1, group2])
+        XCTAssertEqual(merged.fileCount, 2)
+        XCTAssertEqual(merged.files.map(\.fileName), ["A.swift", "B.swift"])
+        XCTAssertEqual(merged.totalAdditions, 3)
+        XCTAssertEqual(merged.totalDeletions, 1)
+        XCTAssertTrue(TurnFileChangesSummary.merged(from: []).isEmpty)
+    }
+
+    func testDiffHeadersAreNotCountedAsChanges() {
+        let diff = """
+            --- a/Main.swift
+            +++ b/Main.swift
+            - old
+            + new
+            """
+        let activity = AgentActivity(
+            id: ProviderActivityID("act-header"),
+            kind: .edit,
+            phase: .completed,
+            title: "Edited Main.swift",
+            detail: "/workspace/Sources/Main.swift",
+            output: "Success",
+            diff: diff,
+            startedAt: Date(),
+            completedAt: Date()
+        )
+        let group = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [activity]
+        )
+        let summary = TurnFileChangesSummary.from(group: group)
+        XCTAssertEqual(summary.totalAdditions, 1)
+        XCTAssertEqual(summary.totalDeletions, 1)
     }
 }

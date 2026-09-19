@@ -29,6 +29,9 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
     }
 
     /// Posts a native macOS notification informing the user that a session has finished.
+    ///
+    /// `includePreview` kapalıyken transkript alıntısı bildirime konmaz:
+    /// alıntı Bildirim Merkezi'nde (kilit ekranı dahil) kalıcı durur.
     func postSessionCompletionNotification(
         sessionID: UUID,
         sessionTitle: String,
@@ -36,7 +39,8 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
         previewText: String?,
         soundName: String,
         playSound: Bool,
-        enabled: Bool
+        enabled: Bool,
+        includePreview: Bool = true
     ) {
         guard enabled else { return }
 
@@ -63,12 +67,11 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
 
         content.subtitle = sessionTitle
 
-        if let preview = previewText, !preview.isEmpty {
-            let truncated = preview.prefix(160)
-            content.body = String(truncated)
-        } else {
-            content.body = "Agent finished working on \(sessionTitle)."
-        }
+        content.body = Self.body(
+            previewText: previewText,
+            sessionTitle: sessionTitle,
+            includePreview: includePreview
+        )
 
         content.userInfo = ["sessionID": sessionID.uuidString]
 
@@ -87,6 +90,21 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
                 AppLog.agentSession.error("Failed to deliver session notification: \(error.localizedDescription, privacy: .public)")
             }
         }
+    }
+
+    // MARK: - Bildirim gövdesi (saf, test edilebilir)
+
+    /// Bildirim gövdesini kurar: önizleme açıksa ilk 160 karakter, kapalıysa
+    /// veya alıntı yoksa genel metin.
+    nonisolated static func body(
+        previewText: String?,
+        sessionTitle: String,
+        includePreview: Bool
+    ) -> String {
+        if includePreview, let preview = previewText, !preview.isEmpty {
+            return String(preview.prefix(160))
+        }
+        return "Agent finished working on \(sessionTitle)."
     }
 
     // MARK: - UNUserNotificationCenterDelegate

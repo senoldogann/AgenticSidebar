@@ -1,17 +1,22 @@
 import Foundation
 
 enum OpenAIStreamDecoder {
-    static func decode(line: String) throws -> ProviderEvent? {
+    /// Tek satırdan sıfır ya da daha fazla olay: `response.completed` gövdesi
+    /// `response.usage` taşıyorsa önce `.turnUsage`, sonra `.completed` döner.
+    /// Kullanım alanı yoksa ya da okunamazsa yalnız `.completed` — akış
+    /// istatistik yüzünden bozulmaz.
+    static func decode(line: String) throws -> [ProviderEvent] {
         guard line.hasPrefix("data:") else {
-            return nil
+            return []
         }
 
-        let payload = line
+        let payload =
+            line
             .dropFirst("data:".count)
             .trimmingCharacters(in: .whitespaces)
 
         guard !payload.isEmpty, payload != "[DONE]" else {
-            return nil
+            return []
         }
 
         guard let data = payload.data(using: .utf8) else {
@@ -34,16 +39,59 @@ enum OpenAIStreamDecoder {
                 AppLog.openAI.error(
                     "A \(envelope.type, privacy: .public) event arrived without a delta and was skipped"
                 )
-                return nil
+                return []
             }
-            return .assistantTextDelta(delta)
+            return [.assistantTextDelta(delta)]
+        case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+            // Akıl yürütme özeti: ham zincir değil, gösterilebilir özet.
+            // Asistan metninden ayrı thinking kanalına akar.
+            guard let delta = envelope.delta else {
+                AppLog.openAI.error(
+                    "A \(envelope.type, privacy: .public) event arrived without a delta and was skipped"
+                )
+                return []
+            }
+            return [.thinkingDelta(delta)]
         case "response.completed":
-            return .completed
+            if let usage = Self.usage(from: data) {
+                return [.turnUsage(usage), .completed]
+            }
+            return [.completed]
         case "response.failed", "response.incomplete", "error":
             throw failure(type: envelope.type, data: data)
         default:
+            return []
+        }
+    }
+
+    /// `response.completed` gövdesindeki `response.usage`:
+    /// `{input_tokens, output_tokens, total_tokens}`. Sayılar tam ya da
+    /// ondalık gelebilir; eksik ya da geçersizse `nil` (olay üretilmez).
+    private static func usage(from data: Data) -> TurnTokenUsage? {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let response = object["response"] as? [String: Any],
+            let usage = response["usage"] as? [String: Any],
+            let input = Self.tokenCount(usage["input_tokens"]),
+            let output = Self.tokenCount(usage["output_tokens"])
+        else {
             return nil
         }
+        return TurnTokenUsage(inputTokens: input, outputTokens: output)
+    }
+
+    private static func tokenCount(_ value: Any?) -> Int? {
+        if let number = value as? Int {
+            return number >= 0 ? number : nil
+        }
+        if let number = value as? Double, number.isFinite, number >= 0 {
+            return Int(number)
+        }
+        if let number = value as? NSNumber {
+            let int = number.intValue
+            return int >= 0 ? int : nil
+        }
+        return nil
     }
 
     /// Sağlayıcının bildirdiği sebebi korur.
@@ -55,7 +103,8 @@ enum OpenAIStreamDecoder {
     /// Ayrıntılar ayrı ve toleranslı bir çözümlemeyle okunur: beklenmedik bir
     /// gövde şekli sebebi genelleştirir, akışı bozmaz.
     private static func failure(type: String, data: Data) -> ProviderRuntimeError {
-        let details = (try? JSONDecoder().decode(FailureEnvelope.self, from: data))
+        let details =
+            (try? JSONDecoder().decode(FailureEnvelope.self, from: data))
             ?? FailureEnvelope.empty
 
         AppLog.openAI.error(
@@ -75,15 +124,13 @@ enum OpenAIStreamDecoder {
             return .rateLimited
         }
 
-        if
-            mentions([
-                "context_length_exceeded",
-                "context length",
-                "maximum context",
-                "context window",
-                "reduce the length"
-            ])
-        {
+        if mentions([
+            "context_length_exceeded",
+            "context length",
+            "maximum context",
+            "context window",
+            "reduce the length",
+        ]) {
             return .contextLimitExceeded
         }
 

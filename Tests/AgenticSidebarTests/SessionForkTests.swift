@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// `SessionFork` saf mantığı ile `AgentSessionService.forkSession` davranışı.
@@ -24,7 +25,12 @@ final class SessionForkTests: XCTestCase {
             throughMessageID: messages[1].id
         )
 
-        XCTAssertEqual(fork?.messages.map(\.id), [messages[0].id, messages[1].id])
+        XCTAssertEqual(fork?.messages.map(\.text), ["Birinci", "Yanıt"])
+        XCTAssertEqual(fork?.messages.count, 2)
+        XCTAssertTrue(
+            Set(fork?.messages.map(\.id) ?? []).isDisjoint(with: Set(messages.map(\.id))),
+            "Dal kaynakla aynı mesaj kimliklerini taşırsa bölme depoları karışır"
+        )
         XCTAssertEqual(fork?.title, "Birinci (branch)")
     }
 
@@ -42,7 +48,7 @@ final class SessionForkTests: XCTestCase {
         XCTAssertNil(fork)
     }
 
-    func testPlanKeepsOnlyGroupsAnchoredInsidePrefix() {
+    func testPlanKeepsOnlyGroupsAnchoredInsidePrefix() throws {
         let messages = [
             ChatMessage(role: .user, text: "Birinci"),
             ChatMessage(role: .user, text: "İkinci"),
@@ -66,7 +72,78 @@ final class SessionForkTests: XCTestCase {
             throughMessageID: messages[0].id
         )
 
-        XCTAssertEqual(fork?.activityGroups.map(\.id), [inside.id])
+        XCTAssertEqual(fork?.activityGroups.count, 1)
+        let kept = try XCTUnwrap(fork?.activityGroups.first)
+        XCTAssertNotEqual(kept.id, inside.id)
+        XCTAssertEqual(kept.anchorMessageID, fork?.messages.first?.id)
+    }
+
+    func testPlanRemapsActivityIDsAndKeepsAnchorConsistency() {
+        let messages = [ChatMessage(role: .user, text: "Birinci")]
+        let group = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: messages[0].id,
+            activities: [
+                AgentActivity(
+                    id: ProviderActivityID("part_1"),
+                    kind: .command,
+                    phase: .completed,
+                    title: "Run",
+                    detail: "ls",
+                    output: "ok",
+                    startedAt: Date(),
+                    completedAt: Date()
+                )
+            ]
+        )
+
+        let fork = SessionFork.plan(
+            sourceMessages: messages,
+            sourceActivityGroups: [group],
+            sourceAutomaticTitle: "Birinci",
+            sourceCustomTitle: nil,
+            throughMessageID: messages[0].id
+        )
+
+        let keptActivity = try? XCTUnwrap(fork?.activityGroups.first?.activities.first)
+        XCTAssertNotEqual(keptActivity?.id.rawValue, "part_1")
+        XCTAssertEqual(keptActivity?.detail, "ls")
+        XCTAssertEqual(keptActivity?.output, "ok")
+    }
+
+    func testBusySourceDropsTrailingPartialAssistantMessage() {
+        let messages = [
+            ChatMessage(role: .user, text: "Soru"),
+            ChatMessage(role: .assistant, text: "Yarım"),
+        ]
+
+        let busy = SessionFork.plan(
+            sourceMessages: messages,
+            sourceActivityGroups: [],
+            sourceAutomaticTitle: "Soru",
+            sourceCustomTitle: nil,
+            throughMessageID: messages[1].id,
+            isSourceBusy: true
+        )
+        XCTAssertEqual(busy?.messages.map(\.text), ["Soru"])
+
+        let idle = SessionFork.plan(
+            sourceMessages: messages,
+            sourceActivityGroups: [],
+            sourceAutomaticTitle: "Soru",
+            sourceCustomTitle: nil,
+            throughMessageID: messages[1].id,
+            isSourceBusy: false
+        )
+        XCTAssertEqual(idle?.messages.map(\.text), ["Soru", "Yarım"])
+        XCTAssertEqual(idle?.messages.count, 2)
+    }
+
+    func testBranchedTitleFallsBackForEmptyBase() {
+        XCTAssertEqual(
+            SessionFork.branchedTitle(customTitle: nil, automaticTitle: ""),
+            "New session (branch)"
+        )
     }
 
     func testBranchedTitlePrefersCustomTitleAndAvoidsDoubleSuffix() {
@@ -94,11 +171,13 @@ final class SessionForkTests: XCTestCase {
             ChatMessage(role: .user, text: "İkinci soru"),
         ]
         let service = AgentSessionService(
-            runtimes: [TestProviderRuntime(
-                id: ProviderID("test"),
-                displayName: "Test",
-                models: []
-            )],
+            runtimes: [
+                TestProviderRuntime(
+                    id: ProviderID("test"),
+                    displayName: "Test",
+                    models: []
+                )
+            ],
             state: AgentSessionState(messages: messages)
         )
         let sourceID = service.activeSessionID
@@ -113,7 +192,10 @@ final class SessionForkTests: XCTestCase {
         XCTAssertEqual(service.activeSessionID, branchID)
 
         let branch = service.activeSession
-        XCTAssertEqual(branch.state.messages.map(\.id), [messages[0].id, messages[1].id])
+        XCTAssertEqual(branch.state.messages.map(\.text), ["Birinci soru", "Birinci yanıt"])
+        XCTAssertTrue(
+            Set(branch.state.messages.map(\.id)).isDisjoint(with: Set(messages.map(\.id)))
+        )
         XCTAssertEqual(branch.state.status, .idle)
         XCTAssertTrue(branch.title.hasSuffix(" (branch)"))
 
@@ -124,13 +206,33 @@ final class SessionForkTests: XCTestCase {
     }
 
     @MainActor
+    func testForkFromABackgroundSessionDoesNotStealFocus() {
+        let messages = [ChatMessage(role: .user, text: "Arka plan sorusu")]
+        let service = AgentSessionService(
+            runtimes: [],
+            state: AgentSessionState(messages: messages)
+        )
+        let backgroundID = service.activeSessionID
+        let foregroundID = service.createSession()
+        XCTAssertEqual(service.activeSessionID, foregroundID)
+
+        guard let branchID = service.forkSession(id: backgroundID, throughMessageID: messages[0].id) else {
+            return XCTFail("Dal oturumu açılamadı")
+        }
+
+        XCTAssertNotEqual(branchID, backgroundID)
+        XCTAssertEqual(service.activeSessionID, foregroundID)
+    }
+
+    @MainActor
     func testForkSessionReturnsNilForUnknownSessionOrMessage() {
         let service = AgentSessionService(runtimes: [])
         XCTAssertNil(service.forkSession(id: UUID(), throughMessageID: UUID()))
-        XCTAssertNil(service.forkSession(
-            id: service.activeSessionID,
-            throughMessageID: UUID()
-        ))
+        XCTAssertNil(
+            service.forkSession(
+                id: service.activeSessionID,
+                throughMessageID: UUID()
+            ))
         XCTAssertEqual(service.sessions.count, 1)
     }
 }

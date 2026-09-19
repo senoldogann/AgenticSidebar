@@ -185,6 +185,7 @@ extension SettingsView {
                             .buttonStyle(.bordered)
                             .controlSize(.small)
                             .pointingHandCursor()
+                            .help("Set window opacity to \(Int(preset * 100))%")
                         }
                     }
                 }
@@ -349,10 +350,12 @@ extension SettingsView {
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("The quick brown fox jumps over the lazy dog. Modern agentic sidebar adapts seamlessly to your typography and color scheme.")
-                            .font(.system(size: settings.fontSize.pointSize, weight: .regular, design: settings.fontFamily.fontDesign))
-                            .lineSpacing(settings.lineSpacing.spacing)
-                            .foregroundStyle(.primary)
+                        Text(
+                            "The quick brown fox jumps over the lazy dog. Modern agentic sidebar adapts seamlessly to your typography and color scheme."
+                        )
+                        .font(.system(size: settings.fontSize.pointSize, weight: .regular, design: settings.fontFamily.fontDesign))
+                        .lineSpacing(settings.lineSpacing.spacing)
+                        .foregroundStyle(.primary)
 
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
@@ -462,10 +465,12 @@ extension SettingsView {
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.primary)
 
-                    Text("\(settingsStore.colorSchemeMode.displayName) · \(settingsStore.fontFamily.displayName) · \(settingsStore.fontSize.displayName)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    Text(
+                        "\(settingsStore.colorSchemeMode.displayName) · \(settingsStore.fontFamily.displayName) · \(settingsStore.fontSize.displayName)"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 }
 
                 Spacer(minLength: 8)
@@ -477,7 +482,9 @@ extension SettingsView {
 
             HStack(spacing: 8) {
                 Text("Looks great with your settings")
-                    .font(.system(size: settingsStore.fontSize.pointSize - 1, weight: .regular, design: settingsStore.fontFamily.fontDesign))
+                    .font(
+                        .system(size: settingsStore.fontSize.pointSize - 1, weight: .regular, design: settingsStore.fontFamily.fontDesign)
+                    )
                     .foregroundStyle(.primary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 7)
@@ -489,7 +496,9 @@ extension SettingsView {
                 Spacer(minLength: 0)
 
                 Text("Send")
-                    .font(.system(size: settingsStore.fontSize.pointSize - 1, weight: .semibold, design: settingsStore.fontFamily.fontDesign))
+                    .font(
+                        .system(size: settingsStore.fontSize.pointSize - 1, weight: .semibold, design: settingsStore.fontFamily.fontDesign)
+                    )
                     .foregroundStyle(.white)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)

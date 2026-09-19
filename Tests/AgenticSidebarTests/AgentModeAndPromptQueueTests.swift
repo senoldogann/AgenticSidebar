@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -74,23 +75,24 @@ final class AgentModeTests: XCTestCase {
             speedMode: .normal,
             mode: .plan
         )
-        guard case let .text(planPrompt) = try XCTUnwrap(planParts.first) else {
+        guard case .text(let planPrompt) = try XCTUnwrap(planParts.first) else {
             return XCTFail("The instruction travels in the first text part")
         }
         XCTAssertTrue(planPrompt.hasPrefix("PLAN MODE"))
-        XCTAssertTrue(planPrompt.hasSuffix("Add a settings toggle"))
+        XCTAssertTrue(planPrompt.contains("Add a settings toggle"))
+        XCTAssertTrue(planPrompt.hasSuffix("</user_turn>"))
 
         let buildParts = OpenCodePromptBuilder.parts(
             for: message,
             speedMode: .normal,
             mode: .build
         )
-        guard case let .text(buildPrompt) = try XCTUnwrap(buildParts.first) else {
+        guard case .text(let buildPrompt) = try XCTUnwrap(buildParts.first) else {
             return XCTFail("Expected a text part")
         }
         XCTAssertEqual(
             buildPrompt,
-            "Add a settings toggle",
+            "<user_turn>\nAdd a settings toggle\n</user_turn>",
             "Build mode must not decorate the prompt"
         )
     }
@@ -175,7 +177,7 @@ final class PlanDocumentParsingTests: XCTestCase {
         )
 
         XCTAssertEqual(blocks.count, 3)
-        guard case let .plan(_, content) = blocks[1] else {
+        guard case .plan(_, let content) = blocks[1] else {
             return XCTFail("Expected a plan document, got \(blocks[1])")
         }
         XCTAssertTrue(content.contains("# Goal"))
@@ -195,7 +197,7 @@ final class PlanDocumentParsingTests: XCTestCase {
             allowsPlanDocuments: false
         )
 
-        guard case let .code(_, language, _) = blocks.first else {
+        guard case .code(_, let language, _) = blocks.first else {
             return XCTFail("A nested fence must stay a code block")
         }
         XCTAssertEqual(language, "plan")
@@ -272,6 +274,43 @@ final class PromptQueueTests: XCTestCase {
         gate.completeNext()
     }
 
+    func testMixedReviewAndBuildQueuePreservesModePerMessage() async {
+        let gate = GatedProviderRuntime()
+        let service = AgentSessionService(runtimes: [gate.runtime])
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.send("first"), .started)
+        XCTAssertEqual(service.send("review this", mode: .review), .queued)
+        XCTAssertEqual(service.send("build that", mode: .build), .queued)
+
+        // Birinci mesaj review seçiliyken, arkadaki build seçiliyken gönderildi:
+        // kuyruk her birinin modunu kendi üzerinde taşır.
+        XCTAssertEqual(
+            service.queuedPrompts.map(\.mode),
+            [.review, .build]
+        )
+
+        gate.completeNext()
+        let reviewStarted = await waitUntil {
+            service.state.messages.contains { $0.text == "review this" }
+        }
+        XCTAssertTrue(reviewStarted)
+
+        gate.completeNext()
+        let buildStarted = await waitUntil {
+            service.state.messages.contains { $0.text == "build that" }
+        }
+        XCTAssertTrue(buildStarted)
+
+        gate.completeNext()
+        let settled = await waitUntil { !service.isBusy }
+        XCTAssertTrue(settled)
+        XCTAssertEqual(
+            service.state.messages.filter { $0.role == .user }.map(\.text),
+            ["first", "review this", "build that"]
+        )
+    }
+
     func testCancellingATurnStillSendsWhatWasQueued() async {
         let gate = GatedProviderRuntime()
         let service = AgentSessionService(runtimes: [gate.runtime])
@@ -294,6 +333,51 @@ final class PromptQueueTests: XCTestCase {
         gate.completeNext()
         let settled = await waitUntil { !service.isBusy }
         XCTAssertTrue(settled)
+    }
+
+    func testSendNowCancelsTheRunningTurnAndJumpsTheQueue() async {
+        let gate = GatedProviderRuntime()
+        let service = AgentSessionService(runtimes: [gate.runtime])
+        await service.refreshCapabilities()
+
+        XCTAssertEqual(service.send("first"), .started)
+        XCTAssertEqual(service.send("second"), .queued)
+        XCTAssertEqual(service.send("third"), .queued)
+
+        guard let thirdID = service.queuedPrompts.last?.id else {
+            XCTFail("expected a queued third prompt")
+            return
+        }
+        service.sendQueuedPromptImmediately(thirdID)
+        XCTAssertEqual(service.queuedPrompts.map(\.text), ["third", "second"])
+
+        let thirdStarted = await waitUntil {
+            service.state.messages.contains { $0.text == "third" }
+        }
+        XCTAssertTrue(
+            thirdStarted,
+            "The promoted message runs right after the running turn is stopped"
+        )
+        XCTAssertEqual(service.queuedPrompts.map(\.text), ["second"])
+
+        // İptal edilen turun kapıdaki kaydı önce boşaltılır: iptal akışı
+        // tüketiciyi uyandırır ama kaydını silmez, o yüzden ilk tamamlama
+        // ölü kayda gider, ikincisi dönen turu bitirir.
+        gate.completeNext()
+        gate.completeNext()
+        let secondStarted = await waitUntil {
+            service.state.messages.contains { $0.text == "second" }
+        }
+        XCTAssertTrue(secondStarted)
+
+        gate.completeNext()
+        let settled = await waitUntil { !service.isBusy }
+        XCTAssertTrue(settled)
+
+        let userMessages = service.state.messages
+            .filter { $0.role == .user }
+            .map(\.text)
+        XCTAssertEqual(userMessages, ["first", "third", "second"])
     }
 
     func testQueuedPromptsCanBeRemovedAndCleared() async {
@@ -540,7 +624,7 @@ final class PromptQueueTests: XCTestCase {
             activityGroups: [],
             queuedPrompts: [
                 QueuedPrompt(text: "existing queue 1"),
-                QueuedPrompt(text: "existing queue 2")
+                QueuedPrompt(text: "existing queue 2"),
             ]
         )
         let session = AgentSession(runtimes: [gate.runtime], snapshot: snapshot)

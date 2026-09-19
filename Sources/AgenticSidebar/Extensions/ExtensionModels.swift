@@ -69,11 +69,11 @@ enum ExtensionSource: Codable, Equatable, Sendable {
         switch self {
         case .manual:
             "Added by hand"
-        case let .skillsSh(source, _):
+        case .skillsSh(let source, _):
             "skills.sh · \(source)"
-        case let .gitHub(repository):
+        case .gitHub(let repository):
             "github.com/\(repository)"
-        case let .npm(module):
+        case .npm(let module):
             "npm · \(module)"
         }
     }
@@ -134,9 +134,16 @@ struct MCPDefinition: Codable, Equatable, Sendable {
     var isRunnable: Bool {
         switch transport {
         case .local:
-            !command.isEmpty && !(command.first ?? "").isEmpty
+            return !command.isEmpty && !(command.first ?? "").isEmpty
         case .remote:
-            (url?.hasPrefix("http") ?? false)
+            guard let url else {
+                return false
+            }
+            if url.hasPrefix("https://") {
+                return true
+            }
+            // Yalnız döngü adresinde düz http kabul edilir.
+            return url.hasPrefix("http://127.0.0.1") || url.hasPrefix("http://localhost")
         }
     }
 
@@ -168,7 +175,7 @@ struct MCPDefinition: Codable, Equatable, Sendable {
             return nil
         case .disabled:
             return .disabled
-        case let .registered(clientID, clientSecret, scope):
+        case .registered(let clientID, let clientSecret, let scope):
             return .registered(
                 clientID: clientID,
                 clientSecret: clientSecret,
@@ -187,7 +194,7 @@ struct MCPDefinition: Codable, Equatable, Sendable {
         var copy = self
         copy.environment = [:]
         copy.headers = [:]
-        if case let .registered(clientID, _, scope) = copy.oauth {
+        if case .registered(let clientID, _, let scope) = copy.oauth {
             copy.oauth = .registered(clientID: clientID, clientSecret: nil, scope: scope)
         }
         return copy
@@ -276,10 +283,10 @@ extension Array where Element == ExtensionTag {
         }
 
         return """
-        The user tagged these extensions for this request:\n\n\
-        \(lines.joined(separator: "\n"))\n\n\
-        Use these. Do not reach for other installed extensions this turn.
-        """
+            The user tagged these extensions for this request:\n\n\
+            \(lines.joined(separator: "\n"))\n\n\
+            Use these. Do not reach for other installed extensions this turn.
+            """
     }
 }
 

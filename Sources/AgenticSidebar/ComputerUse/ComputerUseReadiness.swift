@@ -149,8 +149,8 @@ enum ComputerUseHealthReply {
     /// envelope carries exactly these four keys.
     static func requestLine(requestId: String) -> Data {
         let payload = """
-        {"protocolVersion":\(protocolVersion),"requestId":"\(requestId)","method":"health","params":{}}
-        """
+            {"protocolVersion":\(protocolVersion),"requestId":"\(requestId)","method":"health","params":{}}
+            """
         return Data((payload + "\n").utf8)
     }
 
@@ -447,24 +447,39 @@ struct ComputerUseHelperStatus: Equatable, Sendable {
 struct SystemComputerUseSignatureReader: ComputerUseSignatureReading {
     func signingStatus(bundleURL: URL) async -> ComputerUseSigningStatus {
         // Off the caller's executor: `codesign` is a process launch followed by
-        // `waitUntilExit`, and the caller is the settings card.
-        await Task.detached(priority: .utility) { () -> ComputerUseSigningStatus in
-            let lines = Self.displayLines(bundleURL: bundleURL)
-            guard !lines.isEmpty else {
+        // `waitUntilExit`, and the caller is the settings card. 10 sn zaman aşımı.
+        await withTaskGroup(of: ComputerUseSigningStatus.self, returning: ComputerUseSigningStatus.self) { group in
+            group.addTask(priority: .utility) {
+                await Task.detached(priority: .utility) { () -> ComputerUseSigningStatus in
+                    let lines = Self.displayLines(bundleURL: bundleURL)
+                    guard !lines.isEmpty else {
+                        return .unknown
+                    }
+
+                    let identity =
+                        lines
+                        .first { $0.hasPrefix("Authority=") }
+                        .map { String($0.dropFirst("Authority=".count)) }
+
+                    // An unsigned bundle has no Authority either, and needs the same
+                    // treatment: grant it again after every rebuild.
+                    let isAdHoc =
+                        lines.contains { $0.hasPrefix("Signature=adhoc") }
+                        || identity == nil
+
+                    return ComputerUseSigningStatus(identity: identity, isAdHoc: isAdHoc)
+                }.value
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(10))
                 return .unknown
             }
-
-            let identity = lines
-                .first { $0.hasPrefix("Authority=") }
-                .map { String($0.dropFirst("Authority=".count)) }
-
-            // An unsigned bundle has no Authority either, and needs the same
-            // treatment: grant it again after every rebuild.
-            let isAdHoc = lines.contains { $0.hasPrefix("Signature=adhoc") }
-                || identity == nil
-
-            return ComputerUseSigningStatus(identity: identity, isAdHoc: isAdHoc)
-        }.value
+            for await result in group {
+                group.cancelAll()
+                return result
+            }
+            return .unknown
+        }
     }
 
     private static func displayLines(bundleURL: URL) -> [String] {
@@ -488,7 +503,8 @@ struct SystemComputerUseSignatureReader: ComputerUseSignatureReading {
             return []
         }
 
-        return text
+        return
+            text
             .split(separator: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
     }

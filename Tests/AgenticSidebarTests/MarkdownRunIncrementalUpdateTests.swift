@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+
 @testable import AgenticSidebar
 
 /// Akan yanıtın her boşaltmada baştan dizilmemesi kuralının testleri.

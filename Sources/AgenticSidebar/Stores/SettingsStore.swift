@@ -30,6 +30,7 @@ final class SettingsStore {
         static let stealthModeEnabled = "settings.stealthModeEnabled"
         static let menuBarIconChoice = "settings.menuBarIconChoice"
         static let sessionNotificationsEnabled = "settings.sessionNotificationsEnabled"
+        static let sessionNotificationPreviewEnabled = "settings.sessionNotificationPreviewEnabled"
         static let sessionNotificationSoundEnabled = "settings.sessionNotificationSoundEnabled"
         static let sessionNotificationSound = "settings.sessionNotificationSound"
         static let autoOfferAllOption = "settings.autoOfferAllOption"
@@ -222,6 +223,15 @@ final class SettingsStore {
         }
     }
 
+    /// Whether the completion banner carries a transcript excerpt (up to 160
+    /// characters). The excerpt persists in Notification Center, including on
+    /// the lock screen, so sensitive sessions should turn it off.
+    var sessionNotificationPreviewEnabled: Bool {
+        didSet {
+            defaults.set(sessionNotificationPreviewEnabled, forKey: Key.sessionNotificationPreviewEnabled)
+        }
+    }
+
     /// Whether a sound plays when a session completion notification arrives.
     var sessionNotificationSoundEnabled: Bool {
         didSet {
@@ -259,7 +269,7 @@ final class SettingsStore {
         "Submarine",
         "Tink",
         "Basso",
-        "Purr"
+        "Purr",
     ]
 
     func playTestNotificationSound() {
@@ -339,7 +349,8 @@ final class SettingsStore {
         }
 
         if let rawMode = defaults.string(forKey: Key.colorSchemeMode),
-           let mode = ColorSchemeMode(rawValue: rawMode) {
+            let mode = ColorSchemeMode(rawValue: rawMode)
+        {
             colorSchemeMode = mode
         } else {
             colorSchemeMode = .dark
@@ -352,7 +363,8 @@ final class SettingsStore {
         }
 
         if let rawShortcut = defaults.string(forKey: Key.globalShortcut),
-           let choice = GlobalShortcutChoice(rawValue: rawShortcut) {
+            let choice = GlobalShortcutChoice(rawValue: rawShortcut)
+        {
             // A stored choice is kept as it is, including the plain ⌘B that older
             // installs have: rebinding a shortcut the user is used to, without
             // asking, is its own bug. Only a fresh install gets the new default.
@@ -380,21 +392,24 @@ final class SettingsStore {
         contextSnapEnabled = defaults.bool(forKey: Key.contextSnapEnabled)
 
         if let rawFamily = defaults.string(forKey: Key.fontFamily),
-           let family = AppFontFamily(rawValue: rawFamily) {
+            let family = AppFontFamily(rawValue: rawFamily)
+        {
             fontFamily = family
         } else {
             fontFamily = .system
         }
 
         if let rawSize = defaults.string(forKey: Key.fontSize),
-           let size = AppFontSize(rawValue: rawSize) {
+            let size = AppFontSize(rawValue: rawSize)
+        {
             fontSize = size
         } else {
             fontSize = .regular
         }
 
         if let rawCodeSize = defaults.string(forKey: Key.codeFontSize),
-           let codeSize = CodeFontSize(rawValue: rawCodeSize) {
+            let codeSize = CodeFontSize(rawValue: rawCodeSize)
+        {
             codeFontSize = codeSize
         } else {
             codeFontSize = .standard
@@ -407,21 +422,24 @@ final class SettingsStore {
         }
 
         if let rawSpacing = defaults.string(forKey: Key.lineSpacing),
-           let spacing = AppLineSpacing(rawValue: rawSpacing) {
+            let spacing = AppLineSpacing(rawValue: rawSpacing)
+        {
             lineSpacing = spacing
         } else {
             lineSpacing = .normal
         }
 
         if let rawSpeedMode = defaults.string(forKey: Key.responseSpeedMode),
-           let speedMode = ResponseSpeedMode(rawValue: rawSpeedMode) {
+            let speedMode = ResponseSpeedMode(rawValue: rawSpeedMode)
+        {
             responseSpeedMode = speedMode
         } else {
             responseSpeedMode = .normal
         }
 
         if let rawAgentMode = defaults.string(forKey: Key.agentMode),
-           let mode = AgentMode(rawValue: rawAgentMode) {
+            let mode = AgentMode(rawValue: rawAgentMode)
+        {
             agentMode = mode
         } else {
             agentMode = .build
@@ -440,10 +458,10 @@ final class SettingsStore {
         }
 
         if let rawPolicy = defaults.string(forKey: Key.toolApprovalPolicy),
-           let policy = ToolApprovalPolicy(rawValue: rawPolicy) {
+            let policy = ToolApprovalPolicy(rawValue: rawPolicy)
+        {
             toolApprovalPolicy = policy
-        } else if
-            let legacy = defaults.string(forKey: Key.legacyComputerUseApprovalMode),
+        } else if let legacy = defaults.string(forKey: Key.legacyComputerUseApprovalMode),
             let migrated = Self.migratedPolicy(fromLegacyValue: legacy)
         {
             toolApprovalPolicy = migrated
@@ -463,7 +481,8 @@ final class SettingsStore {
         }
 
         if let rawIcon = defaults.string(forKey: Key.menuBarIconChoice),
-           let iconChoice = MenuBarIconChoice(rawValue: rawIcon) {
+            let iconChoice = MenuBarIconChoice(rawValue: rawIcon)
+        {
             menuBarIconChoice = iconChoice
         } else {
             menuBarIconChoice = .systemSliders
@@ -473,6 +492,12 @@ final class SettingsStore {
             sessionNotificationsEnabled = true
         } else {
             sessionNotificationsEnabled = defaults.bool(forKey: Key.sessionNotificationsEnabled)
+        }
+
+        if defaults.object(forKey: Key.sessionNotificationPreviewEnabled) == nil {
+            sessionNotificationPreviewEnabled = true
+        } else {
+            sessionNotificationPreviewEnabled = defaults.bool(forKey: Key.sessionNotificationPreviewEnabled)
         }
 
         if defaults.object(forKey: Key.sessionNotificationSoundEnabled) == nil {

@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 final class OpenAIResponsesRequestTests: XCTestCase {
@@ -13,7 +14,7 @@ final class OpenAIResponsesRequestTests: XCTestCase {
             ),
             messages: [
                 ChatMessage(role: .user, text: "Hello"),
-                ChatMessage(role: .assistant, text: "Hi there")
+                ChatMessage(role: .assistant, text: "Hi there"),
             ],
             speedMode: .normal
         )
@@ -42,6 +43,10 @@ final class OpenAIResponsesRequestTests: XCTestCase {
 
         let reasoning = try XCTUnwrap(object["reasoning"] as? [String: Any])
         XCTAssertEqual(reasoning["effort"] as? String, "high")
+        XCTAssertEqual(
+            reasoning["summary"] as? String, "auto",
+            "The displayable reasoning summary must be requested, or the stream carries no thought content"
+        )
 
         let input = try XCTUnwrap(object["input"] as? [[String: Any]])
         XCTAssertEqual(input.count, 2)

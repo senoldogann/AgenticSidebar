@@ -6,9 +6,17 @@ enum OpenAIResponsesRequest {
         apiKey: String,
         providerRequest: ProviderRequest
     ) throws -> URLRequest {
+        // Yuvarlanan özet (`/compact`) en başa: durumsuz sağlayıcı her turda
+        // tam listeyi gönderir, düşen ön ekin yerini özet tutar.
+        var inputMessages = providerRequest.messages
+        if !providerRequest.contextSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            let summaryMessage = ContextCompactor.summaryMessage(providerRequest.contextSummary)
+        {
+            inputMessages.insert(summaryMessage, at: 0)
+        }
         let body = Body(
             model: providerRequest.configuration.modelID.rawValue,
-            input: providerRequest.messages.map(InputMessage.init),
+            input: inputMessages.map(InputMessage.init),
             stream: true,
             // The Responses API persists responses by default; this app keeps the
             // transcript local, so storage is explicitly disabled.
@@ -119,16 +127,17 @@ enum OpenAIResponsesRequest {
                 return text
             }
 
-            let list = unsupportedFileNames
+            let list =
+                unsupportedFileNames
                 .map { "- \($0)" }
                 .joined(separator: "\n")
 
             return """
-            \(text)
+                \(text)
 
-            Attached files that could not be sent to the model (unsupported type or too large):
-            \(list)
-            """
+                Attached files that could not be sent to the model (unsupported type or too large):
+                \(list)
+                """
         }
     }
 
@@ -153,6 +162,9 @@ enum OpenAIResponsesRequest {
 
     private struct Reasoning: Encodable {
         let effort: String
+        /// Gösterilebilir akıl yürütme özeti: ham zincir değil, kartta
+        /// gösterilen özet deltası. İstenmezse API özet olayı yayınlamaz.
+        let summary: String = "auto"
     }
 }
 

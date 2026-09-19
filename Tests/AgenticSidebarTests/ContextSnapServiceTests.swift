@@ -1,5 +1,7 @@
+import CoreGraphics
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 /// Snap Context: degrade katmanları, markdown biçimi ve koordinatör akışı.
@@ -63,6 +65,26 @@ final class ContextSnapServiceTests: XCTestCase {
         let long = String(repeating: "x", count: ContextSnap.maximumSelectedCharacters + 10)
         let clipped = service(text: long).snap()?.markdown()
         XCTAssertTrue(clipped?.contains("kırpıldı") == true)
+    }
+
+    func testCodeFenceEscapesBacktickRuns() {
+        XCTAssertEqual(ContextSnap.codeFence(for: "düz metin"), "```")
+        XCTAssertEqual(ContextSnap.codeFence(for: "a ``` b"), "````")
+
+        let fenced = service(text: "önce ``` sonra").snap()?.markdown()
+        XCTAssertTrue(fenced?.contains("**Selected:**\n````\n") == true)
+    }
+
+    func testFirstWindowTitleMatchesPIDAcrossNumberTypes() {
+        let pid: pid_t = 4242
+        let entries: [[String: Any]] = [
+            [kCGWindowOwnerPID as String: NSNumber(value: 1111), kCGWindowLayer as String: 0, kCGWindowName as String: "Yanlış"],
+            [kCGWindowOwnerPID as String: NSNumber(value: pid), kCGWindowLayer as String: 1, kCGWindowName as String: "Katman"],
+            [kCGWindowOwnerPID as String: pid, kCGWindowLayer as String: 0, kCGWindowName as String: "Belge"],
+        ]
+
+        XCTAssertEqual(SystemFrontmostAppProvider.firstWindowTitle(forPID: pid, in: entries), "Belge")
+        XCTAssertNil(SystemFrontmostAppProvider.firstWindowTitle(forPID: 9999, in: entries))
     }
 
     // MARK: - Koordinatör

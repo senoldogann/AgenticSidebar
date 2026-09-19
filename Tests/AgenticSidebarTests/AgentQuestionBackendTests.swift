@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import AgenticSidebar
 
 @MainActor
@@ -21,29 +22,31 @@ final class AgentQuestionBackendTests: XCTestCase {
                     prompt: "Extras?", header: "Extras",
                     options: [
                         AgentQuestionOption(id: "opt_1", label: "Redis", description: nil, isRecommended: false),
-                        AgentQuestionOption(id: "opt_2", label: "Postgres", description: nil, isRecommended: false)
+                        AgentQuestionOption(id: "opt_2", label: "Postgres", description: nil, isRecommended: false),
                     ],
                     isMultiSelect: true, allowCustomAnswer: true
-                )
+                ),
             ]
         )
         pair.continuation.yield(.questionAsked(request))
         let database = await waitFor { session.state.activeQuestion?.prompt == "Database?" }
         XCTAssertTrue(database)
         XCTAssertEqual(session.state.activeQuestion?.toolCallID, "call_question")
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: request.questions[0].options, selectedIDs: ["opt_1"], customText: nil
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: request.questions[0].options, selectedIDs: ["opt_1"], customText: nil
+            ))
         XCTAssertEqual(session.state.activeQuestion?.prompt, "Extras?")
         XCTAssertTrue(session.state.questionHistory.isEmpty, "A partial batch is not a backend answer")
         let callsBefore = await probe.answers()
         XCTAssertTrue(callsBefore.isEmpty)
 
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: request.questions[1].options,
-            selectedIDs: ["opt_2", "opt_1"],
-            customText: "Custom detail"
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: request.questions[1].options,
+                selectedIDs: ["opt_2", "opt_1"],
+                customText: "Custom detail"
+            ))
         let sent = await waitFor { await probe.answers().count == 1 }
         XCTAssertTrue(sent)
         XCTAssertNotNil(session.state.activeQuestion, "The card must remain while the server awaits its reply")
@@ -54,10 +57,11 @@ final class AgentQuestionBackendTests: XCTestCase {
         XCTAssertEqual(calls[0].answers, [["SQLite"], ["Redis", "Postgres", "Custom detail"]])
 
         // A second click while the HTTP request is in flight must not send a duplicate.
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: request.questions[1].options,
-            selectedIDs: ["opt_1"], customText: nil
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: request.questions[1].options,
+                selectedIDs: ["opt_1"], customText: nil
+            ))
         let duplicateCalls = await probe.answers()
         XCTAssertEqual(duplicateCalls.count, 1)
 
@@ -77,13 +81,17 @@ final class AgentQuestionBackendTests: XCTestCase {
         await probe.failNextRejection()
         let session = makeSession(pair: pair, probe: probe)
         let turn = try XCTUnwrap(session.submit("Confirm"))
-        pair.continuation.yield(.questionAsked(OpenCodeQuestionRequest(
-            requestID: "que_cancel", remoteSessionID: "ses_owner", toolCallID: nil,
-            questions: [OpenCodeQuestionItem(
-                prompt: "Proceed?", header: "Confirm", options: [],
-                isMultiSelect: false, allowCustomAnswer: true
-            )]
-        )))
+        pair.continuation.yield(
+            .questionAsked(
+                OpenCodeQuestionRequest(
+                    requestID: "que_cancel", remoteSessionID: "ses_owner", toolCallID: nil,
+                    questions: [
+                        OpenCodeQuestionItem(
+                            prompt: "Proceed?", header: "Confirm", options: [],
+                            isMultiSelect: false, allowCustomAnswer: true
+                        )
+                    ]
+                )))
         let prompt = await waitFor { session.state.activeQuestion?.prompt == "Proceed?" }
         XCTAssertTrue(prompt)
         session.dismissActiveQuestion()
@@ -112,28 +120,34 @@ final class AgentQuestionBackendTests: XCTestCase {
         let turn = try XCTUnwrap(session.submit("Pick a database"))
         let choices = [
             AgentQuestionOption(id: "opt_1", label: "SQLite", description: nil, isRecommended: false),
-            AgentQuestionOption(id: "opt_2", label: "Postgres", description: nil, isRecommended: false)
+            AgentQuestionOption(id: "opt_2", label: "Postgres", description: nil, isRecommended: false),
         ]
-        pair.continuation.yield(.questionAsked(OpenCodeQuestionRequest(
-            requestID: "que_retry", remoteSessionID: "ses_owner", toolCallID: nil,
-            questions: [OpenCodeQuestionItem(
-                prompt: "Database?", header: "DB", options: choices,
-                isMultiSelect: false, allowCustomAnswer: false
-            )]
-        )))
+        pair.continuation.yield(
+            .questionAsked(
+                OpenCodeQuestionRequest(
+                    requestID: "que_retry", remoteSessionID: "ses_owner", toolCallID: nil,
+                    questions: [
+                        OpenCodeQuestionItem(
+                            prompt: "Database?", header: "DB", options: choices,
+                            isMultiSelect: false, allowCustomAnswer: false
+                        )
+                    ]
+                )))
         let appeared = await waitFor { session.state.activeQuestion?.prompt == "Database?" }
         XCTAssertTrue(appeared)
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: choices, selectedIDs: ["opt_1"], customText: nil
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: choices, selectedIDs: ["opt_1"], customText: nil
+            ))
         let failed = await waitFor { session.state.questionSubmissionFailed }
         XCTAssertTrue(failed)
         XCTAssertNotNil(session.state.activeQuestion)
         XCTAssertTrue(session.state.questionHistory.isEmpty)
 
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: choices, selectedIDs: ["opt_2"], customText: nil
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: choices, selectedIDs: ["opt_2"], customText: nil
+            ))
         let retried = await waitFor { await probe.answers().count == 2 }
         XCTAssertTrue(retried)
         let attempts = await probe.answers()
@@ -155,24 +169,27 @@ final class AgentQuestionBackendTests: XCTestCase {
         let option = AgentQuestionOption(
             id: "opt_1", label: "SQLite", description: nil, isRecommended: false
         )
-        pair.continuation.yield(.questionAsked(OpenCodeQuestionRequest(
-            requestID: "que_rejected_batch", remoteSessionID: "ses_owner", toolCallID: nil,
-            questions: [
-                OpenCodeQuestionItem(
-                    prompt: "Database?", header: "Database", options: [option],
-                    isMultiSelect: false, allowCustomAnswer: false
-                ),
-                OpenCodeQuestionItem(
-                    prompt: "Extras?", header: "Extras", options: [],
-                    isMultiSelect: false, allowCustomAnswer: true
-                )
-            ]
-        )))
+        pair.continuation.yield(
+            .questionAsked(
+                OpenCodeQuestionRequest(
+                    requestID: "que_rejected_batch", remoteSessionID: "ses_owner", toolCallID: nil,
+                    questions: [
+                        OpenCodeQuestionItem(
+                            prompt: "Database?", header: "Database", options: [option],
+                            isMultiSelect: false, allowCustomAnswer: false
+                        ),
+                        OpenCodeQuestionItem(
+                            prompt: "Extras?", header: "Extras", options: [],
+                            isMultiSelect: false, allowCustomAnswer: true
+                        ),
+                    ]
+                )))
         let shown = await waitFor { session.state.activeQuestion?.prompt == "Database?" }
         XCTAssertTrue(shown)
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: [option], selectedIDs: ["opt_1"], customText: nil
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: [option], selectedIDs: ["opt_1"], customText: nil
+            ))
         XCTAssertEqual(session.state.activeQuestion?.prompt, "Extras?")
         XCTAssertTrue(session.state.questionHistory.isEmpty)
 
@@ -198,18 +215,23 @@ final class AgentQuestionBackendTests: XCTestCase {
         let option = AgentQuestionOption(
             id: "opt_1", label: "SQLite", description: nil, isRecommended: false
         )
-        pair.continuation.yield(.questionAsked(OpenCodeQuestionRequest(
-            requestID: "que_cancel_turn", remoteSessionID: "ses_owner", toolCallID: nil,
-            questions: [OpenCodeQuestionItem(
-                prompt: "Database?", header: "Database", options: [option],
-                isMultiSelect: false, allowCustomAnswer: false
-            )]
-        )))
+        pair.continuation.yield(
+            .questionAsked(
+                OpenCodeQuestionRequest(
+                    requestID: "que_cancel_turn", remoteSessionID: "ses_owner", toolCallID: nil,
+                    questions: [
+                        OpenCodeQuestionItem(
+                            prompt: "Database?", header: "Database", options: [option],
+                            isMultiSelect: false, allowCustomAnswer: false
+                        )
+                    ]
+                )))
         let appeared = await waitFor { session.state.activeQuestion != nil }
         XCTAssertTrue(appeared)
-        session.answerActiveQuestion(AgentQuestion.formatAnswer(
-            options: [option], selectedIDs: ["opt_1"], customText: nil
-        ))
+        session.answerActiveQuestion(
+            AgentQuestion.formatAnswer(
+                options: [option], selectedIDs: ["opt_1"], customText: nil
+            ))
         let delivered = await waitFor { await probe.answers().count == 1 }
         XCTAssertTrue(delivered)
 
@@ -238,9 +260,11 @@ final class AgentQuestionBackendTests: XCTestCase {
     ) -> AgentSession {
         let runtime = TestProviderRuntime(
             id: ProviderID("opencode"), displayName: "OpenCode",
-            models: [ProviderModelCapability(
-                id: ProviderModelID("test/model"), displayName: "Test Model", variants: []
-            )],
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("test/model"), displayName: "Test Model", variants: []
+                )
+            ],
             streamFactory: { _ in
                 ProviderStream(
                     events: pair.stream,
@@ -253,12 +277,14 @@ final class AgentQuestionBackendTests: XCTestCase {
                 )
             }
         )
-        return AgentSession(runtimes: [runtime], state: AgentSessionState(
-            configuration: SessionConfiguration(
-                providerID: ProviderID("opencode"),
-                modelID: ProviderModelID("test/model"), variantID: nil
-            )
-        ))
+        return AgentSession(
+            runtimes: [runtime],
+            state: AgentSessionState(
+                configuration: SessionConfiguration(
+                    providerID: ProviderID("opencode"),
+                    modelID: ProviderModelID("test/model"), variantID: nil
+                )
+            ))
     }
 
     private func waitFor(_ condition: @escaping () async -> Bool) async -> Bool {

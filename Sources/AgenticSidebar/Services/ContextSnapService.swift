@@ -30,13 +30,31 @@ struct ContextSnap: Equatable, Sendable {
         if let selectedText {
             let trimmed = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                let clipped = trimmed.count > Self.maximumSelectedCharacters
+                let clipped =
+                    trimmed.count > Self.maximumSelectedCharacters
                     ? String(trimmed.prefix(Self.maximumSelectedCharacters)) + "\n[…kırpıldı]"
                     : trimmed
-                lines.append("**Selected:**\n```\n\(clipped)\n```")
+                let fence = Self.codeFence(for: clipped)
+                lines.append("**Selected:**\n\(fence)\n\(clipped)\n\(fence)")
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// İçerikteki en uzun ters-tırnak koşusundan bir uzun çit seçer; seçili
+    /// metin ``` içeriyorsa bloğu kırmaz.
+    static func codeFence(for text: String) -> String {
+        var longest = 0
+        var run = 0
+        for character in text {
+            if character == "`" {
+                run += 1
+                longest = max(longest, run)
+            } else {
+                run = 0
+            }
+        }
+        return String(repeating: "`", count: max(3, longest + 1))
     }
 }
 
@@ -102,11 +120,21 @@ struct SystemFrontmostAppProvider: ContextFrontmostAppProvider {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else {
             return nil
         }
-        for entry in list {
-            guard (entry[kCGWindowOwnerPID as String] as? Int32) == pid,
-                  (entry[kCGWindowLayer as String] as? Int) == 0,
-                  let title = entry[kCGWindowName as String] as? String,
-                  !title.isEmpty
+        return firstWindowTitle(forPID: pid, in: list)
+    }
+
+    /// Pencere listesinden başlık seçimi (saf; test edilebilir).
+    ///
+    /// PID karşılaştırması `NSNumber` üzerinden yapılır: `CGWindowList`
+    /// değerleri `CFNumber` taşır ve `as? Int32` kalıbı köprülemede tutmayıp
+    /// başlığı sessizce `nil` bırakabilirdi.
+    static func firstWindowTitle(forPID pid: pid_t, in entries: [[String: Any]]) -> String? {
+        for entry in entries {
+            guard let owner = entry[kCGWindowOwnerPID as String] as? NSNumber,
+                owner.int32Value == pid,
+                (entry[kCGWindowLayer as String] as? Int) == 0,
+                let title = entry[kCGWindowName as String] as? String,
+                !title.isEmpty
             else {
                 continue
             }
@@ -119,8 +147,32 @@ struct SystemFrontmostAppProvider: ContextFrontmostAppProvider {
 /// Safari/Chrome etkin sekme URL'si (AppleEvent → Otomasyon TCC gerekir).
 struct AppleScriptBrowserURLProvider: ContextBrowserURLProvider {
     func url() -> String? {
+        // Eşzamanlı AppleEvent ana işi saniyeler tutabilir; çağıran detached
+        // görevden `urlAsync()` kullanmalı, bu yol uyumluluk içindir.
+        return Self.urlSync()
+    }
+
+    /// 2 sn zaman aşımlı arka plan okuma.
+    func urlAsync() async -> String? {
+        await withTaskGroup(of: String?.self, returning: String?.self) { group in
+            group.addTask(priority: .utility) {
+                await Task.detached(priority: .utility) { Self.urlSync() }.value
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(2))
+                return nil
+            }
+            for await result in group {
+                group.cancelAll()
+                return result
+            }
+            return nil
+        }
+    }
+
+    private static func urlSync() -> String? {
         guard let frontmost = NSWorkspace.shared.frontmostApplication,
-              let bundleID = frontmost.bundleIdentifier
+            let bundleID = frontmost.bundleIdentifier
         else {
             return nil
         }
@@ -154,19 +206,30 @@ struct AXSelectedTextReader: ContextSelectedTextProvider {
         }
         let systemWide = AXUIElementCreateSystemWide()
         var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            systemWide,
-            kAXFocusedUIElementAttribute as CFString,
-            &focused
-        ) == .success, let element = focused else {
+        guard
+            AXUIElementCopyAttributeValue(
+                systemWide,
+                kAXFocusedUIElementAttribute as CFString,
+                &focused
+            ) == .success, let element = focused
+        else {
             return nil
         }
         var selected: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element as! AXUIElement,
-            kAXSelectedTextAttribute as CFString,
-            &selected
-        ) == .success else {
+        // Odak öğesi dış süreçten gelir: türü doğrulanmadan indirgenemez.
+        // `CFGetTypeID` uyuşmazsa `nil` dönülür, tuzak kurulmaz.
+        let rawElement = element as CFTypeRef
+        guard CFGetTypeID(rawElement) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        let axElement = unsafeDowncast(rawElement, to: AXUIElement.self)
+        guard
+            AXUIElementCopyAttributeValue(
+                axElement,
+                kAXSelectedTextAttribute as CFString,
+                &selected
+            ) == .success
+        else {
             return nil
         }
         guard let text = selected as? String, !text.isEmpty else {

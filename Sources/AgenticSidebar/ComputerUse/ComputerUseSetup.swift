@@ -158,9 +158,15 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
                 }
                 _ = await reader.value
 
-                process.waitUntilExit()
-                let status = process.terminationStatus
-                let reason = process.terminationReason
+                // Havuz iş parçacığını tutmamak için bekleme ayrı iş parçacığında.
+                let exitStatus: (Int32, Process.TerminationReason) = await withCheckedContinuation { continuation in
+                    Thread.detachNewThread {
+                        process.waitUntilExit()
+                        continuation.resume(returning: (process.terminationStatus, process.terminationReason))
+                    }
+                }
+                let status = exitStatus.0
+                let reason = exitStatus.1
 
                 if timedOut.value {
                     return ComputerUseSetupOutcome(
@@ -232,9 +238,9 @@ private final class LockedFlag: @unchecked Sendable {
     }
 }
 
-private extension ComputerUseSetupStep {
+extension ComputerUseSetupStep {
     /// Short human text for the timeout notice line.
-    var timeoutDescription: String {
+    fileprivate var timeoutDescription: String {
         switch self {
         case .buildCLI:
             "120s"

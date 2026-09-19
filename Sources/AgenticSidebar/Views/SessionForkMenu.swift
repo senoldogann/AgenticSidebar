@@ -2,11 +2,8 @@ import SwiftUI
 
 /// Mesaj satırına "Buradan dallan" menüsünü ekler.
 ///
-/// `ConversationDetailView` şu anda başka bir çalışmanın kirli alanında olduğu
-/// için kablo oraya çekilmedi; o dosya temizlendiğinde mesaj satırına
-/// `.sessionForkMenu(messageID:onFork:)` eklenmesi yeterlidir. Mantık
-/// `SessionFork` + `AgentSessionService.forkSession` içinde, burada yalnızca
-/// menü etiketi yaşar.
+/// Mantık `SessionFork` + `AgentSessionService.forkSession` içindedir, burada
+/// yalnızca menü etiketi yaşar.
 struct SessionForkMenuModifier: ViewModifier {
     let messageID: UUID
     let onFork: (UUID) -> Void
