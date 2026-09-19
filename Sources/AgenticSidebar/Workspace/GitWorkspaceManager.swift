@@ -63,15 +63,30 @@ actor GitWorkspaceManager: WorkspaceManaging {
             try verifySourceIsClean(project: project)
             try verifyBranchIsWritable(project: project)
             let manifests = try publishableManifests(projectID: project.id, taskID: task.id)
+            guard manifests.count <= 1 else {
+                throw WorkspaceGuardError.foreignManifest(
+                    workspaceID: nil,
+                    reason: "task \(task.id.uuidString) has \(manifests.count) manifests"
+                )
+            }
             guard let manifestURL = manifests.first else {
                 return .notOwned(reason: "no owned workspace for task \(task.id.uuidString)")
             }
+            // A preflight may only offer a workspace whose manifest and Git registration
+            // both exist: metadata alone could describe a phantom worktree.
             let record = try validatedRecord(
                 at: manifestURL,
                 expectedWorkspaceID: nil,
                 expectedProject: project,
                 expectedTaskID: task.id
             )
+            guard FileManager.default.fileExists(atPath: record.workspacePath) else {
+                throw WorkspaceGuardError.foreignManifest(
+                    workspaceID: record.workspaceID,
+                    reason: "workspace directory is missing at \(record.workspacePath)"
+                )
+            }
+            try verifyWorktreeRegistration(record: record, repositoryURL: URL(fileURLWithPath: record.repositoryPath))
             return .owned(record, holder: holder(for: record))
         } catch let error as WorkspaceGuardError {
             return .blocked(error)

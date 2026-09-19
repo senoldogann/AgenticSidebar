@@ -461,6 +461,68 @@ final class GitWorkspaceManagerTests: XCTestCase {
         XCTAssertEqual(actual, try commonDirIdentity(of: fixture.repositoryURL))
     }
 
+    func testPreflightRefusesManifestWithoutRegisteredWorktree() async throws {
+        let fixture = try makeCleanFixture(name: "phantom-manifest")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+
+        let workspaceID = UUID()
+        let phantomRecord = WorkspaceRecord(
+            workspaceID: workspaceID,
+            projectID: project.id,
+            taskID: task.id,
+            attemptID: UUID(),
+            repositoryPath: fixture.repositoryURL.path,
+            workspacePath: workspaceTarget(fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: workspaceID).path,
+            commonDirIdentity: try commonDirIdentity(of: fixture.repositoryURL),
+            baseSHA: fixture.baseSHA,
+            nonce: UUID().uuidString,
+            createdAt: startDate
+        )
+        try writeManifest(
+            WorkspaceManifest(record: phantomRecord),
+            to: manifestFile(fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: workspaceID)
+        )
+
+        assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_FOREIGN_MANIFEST")
+    }
+
+    func testPreflightRefusesMultipleManifestsForOneTask() async throws {
+        let fixture = try makeCleanFixture(name: "duplicate-manifests")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let commonDir = try commonDirIdentity(of: fixture.repositoryURL)
+
+        for _ in 0..<2 {
+            let workspaceID = UUID()
+            let record = WorkspaceRecord(
+                workspaceID: workspaceID,
+                projectID: project.id,
+                taskID: task.id,
+                attemptID: UUID(),
+                repositoryPath: fixture.repositoryURL.path,
+                workspacePath: workspaceTarget(
+                    fixture: fixture,
+                    projectID: project.id,
+                    taskID: task.id,
+                    workspaceID: workspaceID
+                ).path,
+                commonDirIdentity: commonDir,
+                baseSHA: fixture.baseSHA,
+                nonce: UUID().uuidString,
+                createdAt: startDate
+            )
+            try writeManifest(
+                WorkspaceManifest(record: record),
+                to: manifestFile(fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: workspaceID)
+            )
+        }
+
+        assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_FOREIGN_MANIFEST")
+    }
+
     // MARK: - Creation and provenance
 
     func testCreateOwnedWorkspaceKeepsSourceBranchHashAndIgnoredFilesUnchanged() async throws {
