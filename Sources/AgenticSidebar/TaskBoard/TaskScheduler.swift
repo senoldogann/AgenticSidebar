@@ -193,7 +193,6 @@ actor TaskScheduler {
     private let schedulerID: String
 
     private var activeAttempts: [UUID: ActiveAttemptRecord] = [:]
-    private var heldRepositoryLeases: [String: UUID] = [:]
     private var pausedTaskIDs: Set<UUID> = []
     private var stoppedTaskIDs: Set<UUID> = []
 
@@ -493,7 +492,6 @@ actor TaskScheduler {
                     modelID: modelID,
                     history: history
                 )
-                heldRepositoryLeases[workspace.repositoryPath] = task.id
                 return TaskScheduleEntry(
                     taskID: task.id,
                     disposition: .claimed(attemptID: attempt.id, generation: attempt.generation)
@@ -627,7 +625,6 @@ actor TaskScheduler {
     }
 
     private func releaseLease(for repositoryPath: String, taskID: UUID) async {
-        heldRepositoryLeases.removeValue(forKey: repositoryPath)
         try? await repository.releaseRepositoryLease(repositoryPath: repositoryPath, taskID: taskID)
     }
 
