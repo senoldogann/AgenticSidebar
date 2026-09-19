@@ -711,6 +711,8 @@ final class TaskSchedulerTests: XCTestCase {
         private var endAttemptDelay: Duration?
         private var claimAttemptError: TaskRepositoryError?
         private var evidenceWrites: Int = 0
+        private var forcedRepositoryLeaseTimeout: TimeInterval?
+        private var releaseRepositoryLeaseError: TaskRepositoryError?
 
         init(base: CodingTaskRepository) {
             self.base = base
@@ -722,6 +724,14 @@ final class TaskSchedulerTests: XCTestCase {
 
         func setClaimAttemptError(_ error: TaskRepositoryError?) {
             claimAttemptError = error
+        }
+
+        func setForcedRepositoryLeaseTimeout(_ timeout: TimeInterval?) {
+            forcedRepositoryLeaseTimeout = timeout
+        }
+
+        func setReleaseRepositoryLeaseError(_ error: TaskRepositoryError?) {
+            releaseRepositoryLeaseError = error
         }
 
         func recordedEvidenceCount() -> Int {
@@ -795,11 +805,17 @@ final class TaskSchedulerTests: XCTestCase {
             attemptID: UUID,
             leaseTimeoutSeconds: TimeInterval
         ) async throws {
+            let timeout = forcedRepositoryLeaseTimeout ?? leaseTimeoutSeconds
             try await base.acquireRepositoryLease(
-                repositoryPath: repositoryPath, taskID: taskID, attemptID: attemptID, leaseTimeoutSeconds: leaseTimeoutSeconds)
+                repositoryPath: repositoryPath, taskID: taskID, attemptID: attemptID, leaseTimeoutSeconds: timeout)
         }
 
         func releaseRepositoryLease(repositoryPath: String, taskID: UUID, attemptID: UUID) async throws {
+            let injected = releaseRepositoryLeaseError
+            releaseRepositoryLeaseError = nil
+            if let injected {
+                throw injected
+            }
             try await base.releaseRepositoryLease(repositoryPath: repositoryPath, taskID: taskID, attemptID: attemptID)
         }
 
@@ -1075,5 +1091,88 @@ final class TaskSchedulerTests: XCTestCase {
 
         let followUp = try await scheduler.schedule(projectID: projectID)
         XCTAssertNotNil(claim(in: followUp, taskID: other.id), "Ended completion must release the repository lease")
+    }
+
+    // MARK: - Expired lease reconciliation
+
+    func testRetryReclaimsLeaseFromTerminalAttemptAfterSwallowedRelease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/swallowed-release-repo"
+        let task = makeTask(projectID: projectID, title: "Swallowed Release", priority: 9, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+
+        let repository = HookingTaskRepository(base: store)
+        await repository.setForcedRepositoryLeaseTimeout(0.01)
+        await repository.setReleaseRepositoryLeaseError(.underlying("swallowed release failure"))
+        let scheduler = TaskScheduler(
+            repository: repository,
+            providers: TestProviderRegistry(result: .eligible(runtimeID: "runtime", modelID: "model")),
+            workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: sharedPath),
+            verifier: TestVerifier(passed: true),
+            clock: clock,
+            schedulerID: "scheduler-swallowed-release"
+        )
+
+        let report = try await scheduler.schedule(projectID: projectID)
+        let firstClaim = try XCTUnwrap(claim(in: report, taskID: task.id))
+        let firstLease = try await activeLease(for: scheduler, taskID: task.id)
+        let completion = try await finish(
+            scheduler: scheduler, taskID: task.id, attemptID: firstClaim.attemptID, generation: firstClaim.generation,
+            ownerNonce: firstLease.ownerNonce, outcome: .failed, usage: TaskAttemptUsage(toolCallCount: nil, durationSeconds: nil))
+        XCTAssertEqual(completion.disposition, .accepted)
+        let terminalHistory = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(terminalHistory.first?.outcome, .failed)
+
+        clock.advance(seconds: 5000)
+        try await Task.sleep(for: .milliseconds(50))
+
+        let retryEntry = try await scheduler.retry(taskID: task.id)
+        guard case .claimed(let secondAttemptID, let secondGeneration) = retryEntry.disposition else {
+            XCTFail("Retry must reclaim the expired lease of its own terminal attempt")
+            return
+        }
+        XCTAssertNotEqual(secondAttemptID, firstClaim.attemptID)
+        XCTAssertEqual(secondGeneration, 2)
+        let retriedHistory = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(retriedHistory.count, 2)
+        XCTAssertEqual(retriedHistory.last?.outcome, .inProgress)
+    }
+
+    func testStopReleasesDanglingAttemptLease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/dangling-stop-repo"
+        let owningTask = makeTask(projectID: projectID, title: "Dangling Owner", priority: 9, status: .ready, createdAt: startDate)
+        let waitingTask = makeTask(
+            projectID: projectID, title: "Waiting Writer", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(owningTask)
+        try await store.createTask(waitingTask)
+
+        let owningScheduler = makeScheduler(
+            store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            workspaceOwned: true, sharedRepositoryPath: sharedPath, verifierPassed: true, schedulerID: "scheduler-dangling-owner")
+        let report = try await owningScheduler.schedule(projectID: projectID)
+        XCTAssertNotNil(claim(in: report, taskID: owningTask.id))
+
+        let danglingScheduler = makeScheduler(
+            store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            workspaceOwned: true, sharedRepositoryPath: sharedPath, verifierPassed: true, schedulerID: "scheduler-dangling-stop")
+        try await danglingScheduler.stop(taskID: owningTask.id)
+
+        let stoppedTask = try await store.task(id: owningTask.id)
+        XCTAssertEqual(stoppedTask?.status, .blocked)
+        XCTAssertEqual(stoppedTask?.blockReason, .custom("stopped"))
+        let stoppedHistory = try await store.attemptHistory(taskID: owningTask.id)
+        XCTAssertEqual(stoppedHistory.count, 1)
+        XCTAssertEqual(stoppedHistory.first?.outcome, .cancelled)
+
+        let followUp = try await danglingScheduler.schedule(projectID: projectID)
+        XCTAssertNotNil(
+            claim(in: followUp, taskID: waitingTask.id),
+            "Stopping a dangling attempt must release its repository lease by the exact attempt identity"
+        )
     }
 }

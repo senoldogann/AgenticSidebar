@@ -301,10 +301,11 @@ actor TaskScheduler {
             clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
             await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
             try await cancelAttempt(taskID: taskID, attemptID: record.attempt.id)
-        } else if try await repository.task(id: taskID) != nil {
+        } else if let task = try await repository.task(id: taskID) {
             let history = try await repository.attemptHistory(taskID: taskID)
             if let dangling = history.first(where: { $0.outcome == .inProgress }) {
                 try await cancelAttempt(taskID: taskID, attemptID: dangling.id)
+                await releaseLeaseOfTerminalAttempt(taskID: taskID, projectID: task.projectID, attemptID: dangling.id)
             }
         }
 
@@ -723,6 +724,25 @@ actor TaskScheduler {
             toolCallCount: nil,
             durationSeconds: duration
         )
+    }
+
+    /// Releases the repository lease of a dangling attempt once it is provably terminal.
+    ///
+    /// The dangling path has no in-memory workspace record, so the repository path is resolved
+    /// through the workspace preflight port and the lease is released by the exact attempt
+    /// identity that held it. Release stays best-effort: `stop` must not fail after the attempt
+    /// is already cancelled.
+    private func releaseLeaseOfTerminalAttempt(taskID: UUID, projectID: UUID, attemptID: UUID) async {
+        guard let history = try? await repository.attemptHistory(taskID: taskID),
+            let attempt = history.first(where: { $0.id == attemptID }),
+            attempt.outcome != .inProgress
+        else {
+            return
+        }
+        guard case .owned(let workspace) = await workspaces.preflight(projectID: projectID, taskID: taskID) else {
+            return
+        }
+        await releaseLease(for: workspace.repositoryPath, taskID: taskID, attemptID: attemptID)
     }
 
     private func blockIfPossible(_ task: CodingTask, reason: TaskBlockReason) async {

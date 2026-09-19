@@ -298,6 +298,18 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
     }
 
+    /// Acquires or renews the exclusive repository lease for an attempt identity.
+    ///
+    /// The lease stays bound to the `(taskID, attemptID)` pair that acquired it: only that exact
+    /// identity may renew or release it, and a non-expired lease can never be taken over by a
+    /// different identity. Lease expiry marks staleness instead of granting a takeover; an expired
+    /// lease is reclaimable only once ownership is reconciled:
+    /// - the held attempt reached a terminal outcome (any task may reclaim), or
+    /// - the held attempt row is missing and the requester is the task recorded on the lease
+    ///   (the owning task re-adopts its orphaned lease).
+    ///
+    /// A still-active attempt keeps its lease past expiry; crash-orphaned active attempts stay
+    /// protected until recovery reconciles them.
     public func acquireRepositoryLease(
         repositoryPath: String,
         taskID: UUID,
@@ -310,7 +322,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 let now = Date().timeIntervalSince1970
                 let expiry = now + leaseTimeoutSeconds
 
-                let checkSql = "SELECT task_id, attempt_id FROM repository_leases WHERE repository_path = ?;"
+                let checkSql = "SELECT task_id, attempt_id, lease_expiry FROM repository_leases WHERE repository_path = ?;"
                 var checkStmt: OpaquePointer?
                 defer { sqlite3_finalize(checkStmt) }
                 try prepare(checkSql, &checkStmt)
@@ -329,10 +341,22 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                         guard let heldByTaskID else {
                             throw TaskRepositoryError.storeCorrupt("Repository lease for \(repositoryPath) has an invalid owner")
                         }
-                        throw TaskRepositoryError.repositoryLeaseConflict(
-                            repositoryPath: repositoryPath,
-                            heldByTaskID: heldByTaskID
-                        )
+                        let heldExpiry = sqlite3_column_double(checkStmt, 2)
+                        let isExpired = heldExpiry <= now
+                        let canReclaim =
+                            isExpired
+                            ? try canReclaimExpiredLease(
+                                heldByAttemptID: heldByAttemptID,
+                                heldByTaskID: heldByTaskID,
+                                requesterTaskID: taskID
+                            )
+                            : false
+                        guard canReclaim else {
+                            throw TaskRepositoryError.repositoryLeaseConflict(
+                                repositoryPath: repositoryPath,
+                                heldByTaskID: heldByTaskID
+                            )
+                        }
                     }
                 }
 
@@ -980,6 +1004,33 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         let outcome = String(cString: sqlite3_column_text(stmt, 0))
         let isEnded = sqlite3_column_type(stmt, 1) != SQLITE_NULL
         return !isEnded && outcome == AttemptOutcome.inProgress.rawValue
+    }
+
+    /// Returns true when an expired lease may accept the requester because ownership is reconciled.
+    ///
+    /// A terminal attempt provably stopped writing, so any task may reclaim its lease after expiry.
+    /// A lease whose attempt row is missing (or unreadable) is an unknown owner: only the task
+    /// recorded on the lease may re-adopt it. An active attempt keeps the conflict.
+    private func canReclaimExpiredLease(
+        heldByAttemptID: UUID?,
+        heldByTaskID: UUID,
+        requesterTaskID: UUID
+    ) throws -> Bool {
+        guard let heldByAttemptID else {
+            return requesterTaskID == heldByTaskID
+        }
+        let sql = "SELECT outcome FROM task_attempts WHERE id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, heldByAttemptID.uuidString)
+        guard sqlite3_step(stmt) == SQLITE_ROW, let text = sqlite3_column_text(stmt, 0) else {
+            return requesterTaskID == heldByTaskID
+        }
+        guard let outcome = AttemptOutcome(rawValue: String(cString: text)) else {
+            return false
+        }
+        return outcome != .inProgress
     }
 
     private func maxAttemptGeneration(for taskID: UUID) throws -> Int {
