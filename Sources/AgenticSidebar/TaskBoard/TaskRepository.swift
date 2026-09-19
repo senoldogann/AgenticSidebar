@@ -6,6 +6,8 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
     case staleVersion(taskID: UUID, expected: Int, actual: Int)
     case activeAttemptConflict(taskID: UUID, existingAttemptID: UUID)
     case repositoryLeaseConflict(repositoryPath: String, heldByTaskID: UUID)
+    case attemptNotActive(taskID: UUID, attemptID: UUID)
+    case nonMonotonicGeneration(taskID: UUID, minimumExclusive: Int, actual: Int)
     case foreignKeyViolation(String)
     case storeCorrupt(String)
     case readOnly(String)
@@ -21,6 +23,10 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
             return "Task \(taskID) already has an active attempt: \(existingAttemptID)"
         case .repositoryLeaseConflict(let path, let heldBy):
             return "Repository lease for \(path) is currently held by task \(heldBy)"
+        case .attemptNotActive(let taskID, let attemptID):
+            return "Attempt \(attemptID) is not active for task \(taskID)"
+        case .nonMonotonicGeneration(let taskID, let minimumExclusive, let actual):
+            return "Attempt generation for task \(taskID) must exceed \(minimumExclusive), got \(actual)"
         case .foreignKeyViolation(let message):
             return "Foreign key constraint violation: \(message)"
         case .storeCorrupt(let message):
@@ -136,6 +142,8 @@ public protocol CodingTaskRepository: Sendable {
     func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot
     func createTask(_ task: CodingTask) async throws
     func addDependency(_ dependency: TaskDependency) async throws
+    func task(id: UUID) async throws -> CodingTask?
+    func attemptHistory(taskID: UUID) async throws -> [TaskAttempt]
     func transition(
         taskID: UUID,
         expectedVersion: Int,
@@ -147,6 +155,14 @@ public protocol CodingTaskRepository: Sendable {
         expectedVersion: Int,
         attempt: TaskAttempt
     ) async throws -> TaskAttempt
+    func endAttempt(
+        taskID: UUID,
+        attemptID: UUID,
+        expectedVersion: Int,
+        outcome: AttemptOutcome,
+        toolCallCount: Int?,
+        durationSeconds: Int?
+    ) async throws -> CodingTask
     func acquireRepositoryLease(
         repositoryPath: String,
         taskID: UUID,

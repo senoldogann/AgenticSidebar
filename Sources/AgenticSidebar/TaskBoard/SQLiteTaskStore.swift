@@ -29,7 +29,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
 
         try configurePragmas(on: db)
-        try TaskStoreMigrations.apply(migrations: TaskStoreMigrations.standardMigrations, to: db)
+        try TaskStoreMigrations.apply(migrations: SQLiteTaskStore.allMigrations, to: db)
         return SQLiteTaskStore(db: db, isMemory: true)
     }
 
@@ -46,7 +46,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
 
         try configurePragmas(on: db)
-        try TaskStoreMigrations.apply(migrations: TaskStoreMigrations.standardMigrations, to: db)
+        try TaskStoreMigrations.apply(migrations: SQLiteTaskStore.allMigrations, to: db)
         return SQLiteTaskStore(db: db, isMemory: false)
     }
 
@@ -125,6 +125,97 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
     }
 
+    public func task(id: UUID) async throws -> CodingTask? {
+        try queue.sync {
+            try checkOpen()
+            return try loadTask(id: id)
+        }
+    }
+
+    public func attemptHistory(taskID: UUID) async throws -> [TaskAttempt] {
+        try queue.sync {
+            try checkOpen()
+            let sql = """
+                SELECT
+                    id, task_id, attempt_sequence, role, provider_id, model_id,
+                    variant_snapshot, workspace_id, generation, lease_owner,
+                    lease_token, lease_expiry, started_at, ended_at, outcome,
+                    tool_call_count, duration_seconds
+                FROM task_attempts
+                WHERE task_id = ?
+                ORDER BY attempt_sequence ASC, started_at ASC;
+                """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            try prepare(sql, &stmt)
+            bindText(stmt, 1, taskID.uuidString)
+
+            var attempts: [TaskAttempt] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let attempt = parseAttempt(from: stmt!) {
+                    attempts.append(attempt)
+                }
+            }
+            return attempts
+        }
+    }
+
+    public func endAttempt(
+        taskID: UUID,
+        attemptID: UUID,
+        expectedVersion: Int,
+        outcome: AttemptOutcome,
+        toolCallCount: Int?,
+        durationSeconds: Int?
+    ) async throws -> CodingTask {
+        try queue.sync {
+            try checkOpen()
+            return try executeTransaction {
+                guard var task = try loadTask(id: taskID) else {
+                    throw TaskRepositoryError.taskNotFound(taskID)
+                }
+                guard task.version == expectedVersion else {
+                    throw TaskRepositoryError.staleVersion(taskID: taskID, expected: expectedVersion, actual: task.version)
+                }
+                guard try isAttemptActive(attemptID: attemptID, taskID: taskID) else {
+                    throw TaskRepositoryError.attemptNotActive(taskID: taskID, attemptID: attemptID)
+                }
+
+                let sql = """
+                    UPDATE task_attempts SET
+                        ended_at = ?,
+                        outcome = ?,
+                        tool_call_count = ?,
+                        duration_seconds = ?
+                    WHERE id = ? AND task_id = ?;
+                    """
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                sqlite3_bind_double(stmt, 1, Date().timeIntervalSince1970)
+                bindText(stmt, 2, outcome.rawValue)
+                if let toolCallCount {
+                    sqlite3_bind_int(stmt, 3, Int32(toolCallCount))
+                } else {
+                    sqlite3_bind_null(stmt, 3)
+                }
+                if let durationSeconds {
+                    sqlite3_bind_int(stmt, 4, Int32(durationSeconds))
+                } else {
+                    sqlite3_bind_null(stmt, 4)
+                }
+                bindText(stmt, 5, attemptID.uuidString)
+                bindText(stmt, 6, taskID.uuidString)
+                try stepDone(stmt)
+
+                task.version += 1
+                task.updatedAt = Date()
+                try updateTask(task)
+                return task
+            }
+        }
+    }
+
     public func transition(
         taskID: UUID,
         expectedVersion: Int,
@@ -176,6 +267,16 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                     throw TaskRepositoryError.activeAttemptConflict(
                         taskID: taskID,
                         existingAttemptID: active.id
+                    )
+                }
+
+                // Invariant: attempt generations increase monotonically per task.
+                let maxGeneration = try maxAttemptGeneration(for: taskID)
+                guard attempt.generation > maxGeneration else {
+                    throw TaskRepositoryError.nonMonotonicGeneration(
+                        taskID: taskID,
+                        minimumExclusive: maxGeneration,
+                        actual: attempt.generation
                     )
                 }
 
@@ -573,8 +674,11 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
         bindText(stmt, 15, attempt.outcome.rawValue)
 
-        let toolCalls = attempt.toolCallCount ?? 0
-        sqlite3_bind_int(stmt, 16, Int32(toolCalls))
+        if let toolCallCount = attempt.toolCallCount {
+            sqlite3_bind_int(stmt, 16, Int32(toolCallCount))
+        } else {
+            sqlite3_bind_null(stmt, 16)
+        }
 
         if let duration = attempt.durationSeconds {
             sqlite3_bind_int(stmt, 17, Int32(duration))
@@ -849,6 +953,29 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         )
     }
 
+    private func isAttemptActive(attemptID: UUID, taskID: UUID) throws -> Bool {
+        let sql = "SELECT outcome, ended_at FROM task_attempts WHERE id = ? AND task_id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, attemptID.uuidString)
+        bindText(stmt, 2, taskID.uuidString)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+        let outcome = String(cString: sqlite3_column_text(stmt, 0))
+        let isEnded = sqlite3_column_type(stmt, 1) != SQLITE_NULL
+        return !isEnded && outcome == AttemptOutcome.inProgress.rawValue
+    }
+
+    private func maxAttemptGeneration(for taskID: UUID) throws -> Int {
+        let sql = "SELECT COALESCE(MAX(generation), 0) FROM task_attempts WHERE task_id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, taskID.uuidString)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(stmt, 0))
+    }
+
     private func prepare(_ sql: String, _ stmt: inout OpaquePointer?) throws {
         guard let db else { throw TaskRepositoryError.readOnly("Store is closed") }
         if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) != SQLITE_OK {
@@ -874,5 +1001,56 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             }
             throw TaskRepositoryError.underlying(msg)
         }
+    }
+}
+
+extension SQLiteTaskStore {
+    /// Schema v2: attempt usage columns must keep "unknown" distinct from zero.
+    static let nullableUsageMigrationV2 = TaskStoreMigration(version: 2, name: "AttemptNullableUsage_v2") { db in
+        try TaskStoreMigrations.execute(
+            """
+            CREATE TABLE task_attempts_v2 (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                attempt_sequence INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                variant_snapshot TEXT,
+                workspace_id TEXT,
+                generation INTEGER NOT NULL,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expiry REAL,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                outcome TEXT NOT NULL,
+                tool_call_count INTEGER,
+                duration_seconds INTEGER
+            );
+
+            INSERT INTO task_attempts_v2 (
+                id, task_id, attempt_sequence, role, provider_id, model_id,
+                variant_snapshot, workspace_id, generation, lease_owner,
+                lease_token, lease_expiry, started_at, ended_at, outcome,
+                tool_call_count, duration_seconds
+            )
+            SELECT
+                id, task_id, attempt_sequence, role, provider_id, model_id,
+                variant_snapshot, workspace_id, generation, lease_owner,
+                lease_token, lease_expiry, started_at, ended_at, outcome,
+                tool_call_count, duration_seconds
+            FROM task_attempts;
+
+            DROP TABLE task_attempts;
+            ALTER TABLE task_attempts_v2 RENAME TO task_attempts;
+            CREATE INDEX IF NOT EXISTS idx_attempts_task ON task_attempts(task_id);
+            """,
+            on: db
+        )
+    }
+
+    static var allMigrations: [TaskStoreMigration] {
+        TaskStoreMigrations.standardMigrations + [nullableUsageMigrationV2]
     }
 }

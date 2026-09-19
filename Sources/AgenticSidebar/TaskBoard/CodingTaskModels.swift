@@ -193,6 +193,39 @@ public struct TaskAttempt: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
+/// Exclusive ownership lease for a single attempt generation.
+public struct TaskLease: Sendable, Codable, Equatable {
+    public let attemptID: UUID
+    public let generation: Int
+    public let ownerNonce: String
+    public let expiration: Date
+
+    public init(
+        attemptID: UUID,
+        generation: Int,
+        ownerNonce: String,
+        expiration: Date
+    ) {
+        self.attemptID = attemptID
+        self.generation = generation
+        self.ownerNonce = ownerNonce
+        self.expiration = expiration
+    }
+
+    /// Returns true when the lease is bound to the given attempt owner and has not expired.
+    public func isHeld(by ownerNonce: String, attemptID: UUID, generation: Int, at date: Date) -> Bool {
+        self.ownerNonce == ownerNonce
+            && self.attemptID == attemptID
+            && self.generation == generation
+            && date < expiration
+    }
+
+    /// Returns true when the lease has reached its expiration instant.
+    public func hasExpired(at date: Date) -> Bool {
+        date >= expiration
+    }
+}
+
 /// Scoped action in a human or system approval.
 public enum ApprovalAction: String, Sendable, Codable, Equatable {
     case executeRecipe
