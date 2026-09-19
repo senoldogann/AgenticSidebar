@@ -277,12 +277,10 @@ actor TaskScheduler {
 
     /// Suspends scheduling for a task without ending its attempt.
     func pause(taskID: UUID) async throws {
-        guard let record = activeAttempts[taskID] else {
+        guard activeAttempts[taskID] != nil else {
             throw TaskSchedulerError.noActiveAttempt(taskID)
         }
         pausedTaskIDs.insert(taskID)
-        clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
-        await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
 
         guard let task = try await repository.task(id: taskID) else {
             throw TaskSchedulerError.taskNotFound(taskID)

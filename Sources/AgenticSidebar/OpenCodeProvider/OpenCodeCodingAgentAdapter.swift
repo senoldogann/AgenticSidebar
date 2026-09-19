@@ -15,6 +15,7 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
 
     private var attemptRemoteSessions: [UUID: String] = [:]
     private var attemptConnections: [UUID: OpenCodeServerConnection] = [:]
+    private var cancelledAttemptIDs: Set<UUID> = []
 
     init(
         serverManager: any OpenCodeServerManaging,
@@ -87,13 +88,11 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
         let canonicalWorkspace = URL(fileURLWithPath: request.workspacePath).resolvingSymlinksInPath().standardized.path
         let canonicalServer = serverDir?.resolvingSymlinksInPath().standardized.path
 
-        if request.stage == .implementation {
-            guard canonicalServer == canonicalWorkspace else {
-                throw CodingAgentAdapterError.workspaceNotContained(
-                    expected: canonicalWorkspace,
-                    actual: canonicalServer
-                )
-            }
+        guard canonicalServer == canonicalWorkspace else {
+            throw CodingAgentAdapterError.workspaceNotContained(
+                expected: canonicalWorkspace,
+                actual: canonicalServer
+            )
         }
 
         guard let model = OpenCodeModelReference(flattenedID: request.configuration.modelID) else {
@@ -104,6 +103,7 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
         let remoteSessionID = try await client.createSession()
         attemptRemoteSessions[request.attemptID] = remoteSessionID
         attemptConnections[request.attemptID] = connection
+        cancelledAttemptIDs.remove(request.attemptID)
 
         var promptText = "Objective:\n\(request.objective)\n"
         if !request.acceptanceCriteria.isEmpty {
@@ -200,12 +200,20 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
                             )
                         )
 
-                        Task {
+                        Task { [weak self] in
                             let reply: OpenCodePermissionReply
                             if let permissionHandler {
                                 reply = await permissionHandler(permReq)
                             } else {
                                 reply = .reject
+                            }
+                            guard let self,
+                                await self.permissionReplyIsCurrent(
+                                    attemptID: request.attemptID,
+                                    remoteSessionID: remoteSessionID
+                                )
+                            else {
+                                return
                             }
                             try? await client.replyPermission(
                                 requestID: permReq.id,
@@ -334,7 +342,13 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
         return run
     }
 
+    private func permissionReplyIsCurrent(attemptID: UUID, remoteSessionID: String) -> Bool {
+        !cancelledAttemptIDs.contains(attemptID)
+            && attemptRemoteSessions[attemptID] == remoteSessionID
+    }
+
     func cancelAttempt(attemptID: UUID) async {
+        cancelledAttemptIDs.insert(attemptID)
         guard let remoteID = attemptRemoteSessions[attemptID] else { return }
         if let connection = attemptConnections[attemptID] {
             try? await clientFactory(connection).abort(sessionID: remoteID)
@@ -343,6 +357,7 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
     }
 
     func release(attemptID: UUID) async {
+        cancelledAttemptIDs.insert(attemptID)
         guard let remoteID = attemptRemoteSessions.removeValue(forKey: attemptID) else { return }
         let connection = attemptConnections.removeValue(forKey: attemptID)
         await cancelPendingPermissions?(remoteID, attemptID)

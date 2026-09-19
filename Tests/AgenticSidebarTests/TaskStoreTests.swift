@@ -181,6 +181,37 @@ final class TaskStoreTests: XCTestCase {
             repositoryPath: repoPath, taskID: task2ID, attemptID: task2AttemptID, leaseTimeoutSeconds: 60)
     }
 
+    func testExpiredRepositoryLeaseCannotBeStolenBeforeRelease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let repoPath = "/Users/test/expired-repo"
+        let originalTaskID = UUID()
+        let otherTaskID = UUID()
+
+        try await store.acquireRepositoryLease(
+            repositoryPath: repoPath,
+            taskID: originalTaskID,
+            attemptID: UUID(),
+            leaseTimeoutSeconds: 0.01
+        )
+        try await Task.sleep(for: .milliseconds(50))
+
+        do {
+            try await store.acquireRepositoryLease(
+                repositoryPath: repoPath,
+                taskID: otherTaskID,
+                attemptID: UUID(),
+                leaseTimeoutSeconds: 60
+            )
+            XCTFail("Expired lease must remain owned until the previous attempt is reconciled and released")
+        } catch let error as TaskRepositoryError {
+            guard case .repositoryLeaseConflict(let path, let owner) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, repoPath)
+            XCTAssertEqual(owner, originalTaskID)
+        }
+    }
+
     func testForeignKeyViolationOnOrphanDependency() async throws {
         let store = try SQLiteTaskStore.inMemory()
         let projectID = UUID()

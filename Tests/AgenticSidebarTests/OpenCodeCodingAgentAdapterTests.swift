@@ -89,6 +89,41 @@ final class OpenCodeCodingAgentAdapterTests: XCTestCase {
         XCTAssertFalse(calls.contains(.createSession), "Must not create a session on wrong workspace refusal")
     }
 
+    func testWrongWorkspaceIsRefusedForEveryTaskStage() async throws {
+        let client = AdapterMockOpenCodeClient()
+        let manager = AdapterMockServerManager(
+            workingDirectory: URL(fileURLWithPath: "/managed/app/directory")
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: manager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+
+        for stage in TaskStage.allCases {
+            let request = makeRequest(
+                attemptID: UUID(),
+                workspacePath: "/isolated/worktree-1",
+                stage: stage
+            )
+
+            do {
+                _ = try await adapter.start(request: request)
+                XCTFail("Stage \(stage.rawValue) must refuse a backend rooted outside the owned workspace")
+            } catch let error as CodingAgentAdapterError {
+                guard case .workspaceNotContained(let expected, let actual) = error else {
+                    return XCTFail("Unexpected error for stage \(stage.rawValue): \(error)")
+                }
+                XCTAssertEqual(expected, "/isolated/worktree-1")
+                XCTAssertEqual(actual, "/managed/app/directory")
+            }
+        }
+
+        let calls = await client.calls()
+        XCTAssertFalse(calls.contains(.createSession), "Wrong-workspace refusal must happen before remote session creation")
+    }
+
     func testChildPermissionAttribution() async throws {
         let taskSessionID = "task-session-root"
         let childSessionID = "child-subagent-session"
@@ -267,6 +302,76 @@ final class OpenCodeCodingAgentAdapterTests: XCTestCase {
         XCTAssertEqual(deleteCallsB.count, 0)
     }
 
+    func testCancelledAttemptDoesNotSendLatePermissionApproval() async throws {
+        let permID = "perm-late-approval"
+        let handlerStarted = Mutex(false)
+        let gate = AsyncStream<Void>.makeStream()
+        let handler: OpenCodeProviderRuntime.PermissionHandler = { _ in
+            handlerStarted.withLock { $0 = true }
+            _ = await gate.stream.first { _ in true }
+            return .once
+        }
+
+        let streamPair = AsyncThrowingStream<String, Error>.makeStream()
+        streamPair.continuation.yield(
+            "data: {\"type\":\"permission.asked\",\"properties\":{\"id\":\"\(permID)\",\"sessionID\":\"task-session-root\",\"permission\":\"bash\",\"patterns\":[\"git status\"],\"always\":[\"git status\"],\"metadata\":{\"detail\":\"git status\"}}}"
+        )
+        let lineStream = OpenCodeLineStream(statusCode: 200, lines: streamPair.stream)
+
+        let client = AdapterMockOpenCodeClient(
+            customSessionID: "task-session-root",
+            eventStreams: [lineStream]
+        )
+        let manager = AdapterMockServerManager(
+            workingDirectory: URL(fileURLWithPath: "/workspace/project-a")
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: manager,
+            clientFactory: { _ in client },
+            permissionHandler: handler,
+            cancelPendingPermissions: nil
+        )
+
+        let attemptID = UUID()
+        let request = makeRequest(
+            attemptID: attemptID,
+            workspacePath: "/workspace/project-a",
+            stage: .implementation
+        )
+        let run = try await adapter.start(request: request)
+
+        var sawApproval = false
+        for await event in run.events {
+            if case .approvalRequested(let requestID, _, _) = event.kind, requestID == permID {
+                sawApproval = true
+                break
+            }
+        }
+        XCTAssertTrue(sawApproval)
+
+        let handlerDeadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < handlerDeadline && !handlerStarted.withLock({ $0 }) {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(handlerStarted.withLock { $0 })
+
+        await run.cancel()
+        gate.continuation.yield(())
+        gate.continuation.finish()
+        try? await Task.sleep(for: .milliseconds(50))
+
+        let lateReplies = await client.calls().filter {
+            if case .replyPermission(let requestID, let reply) = $0 {
+                return requestID == permID && reply == OpenCodePermissionReply.once.rawValue
+            }
+            return false
+        }
+        XCTAssertTrue(
+            lateReplies.isEmpty,
+            "A cancelled attempt must not send an approval after its permission handler resolves"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeRequest(
@@ -303,6 +408,7 @@ private enum AdapterMockCall: Equatable, Sendable {
     case createSession
     case deleteSession(String)
     case abort(String)
+    case replyPermission(requestID: String, reply: String)
     case sendPrompt(sessionID: String, model: String)
     case eventStream
 }
@@ -389,7 +495,9 @@ private actor AdapterMockOpenCodeClient: OpenCodeClientProtocol {
         return OpenCodeLineStream(statusCode: 200, lines: pair.stream)
     }
 
-    func replyPermission(requestID: String, reply: String) async throws {}
+    func replyPermission(requestID: String, reply: String) async throws {
+        recordedCalls.append(.replyPermission(requestID: requestID, reply: reply))
+    }
     func sessionTodos(sessionID: String) async throws -> [AgentTodo] { [] }
     func mcpServerStatuses() async throws -> [String: OpenCodeMCPServerStatus] { [:] }
     func addMCPServer(name: String, config: OpenCodeMCPServerConfig) async throws -> [String: OpenCodeMCPServerStatus] { [:] }

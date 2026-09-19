@@ -630,6 +630,39 @@ final class TaskSchedulerTests: XCTestCase {
         XCTAssertEqual(cancelledAttempt.outcome, .cancelled)
     }
 
+    func testPauseRetainsRepositoryLeaseUntilAttemptIsReconciled() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let sharedPath = "/tmp/agentic-sidebar-scheduler-tests/paused-writer-repo"
+        let scheduler = makeScheduler(
+            store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            workspaceOwned: true, sharedRepositoryPath: sharedPath, verifierPassed: true, schedulerID: "scheduler-pause-writer")
+        let firstTask = makeTask(projectID: projectID, title: "Paused Writer", priority: 5, status: .ready, createdAt: startDate)
+        let secondTask = makeTask(
+            projectID: projectID, title: "Waiting Writer", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(firstTask)
+        try await store.createTask(secondTask)
+
+        let firstReport = try await scheduler.schedule(projectID: projectID)
+        XCTAssertNotNil(claim(in: firstReport, taskID: firstTask.id))
+        XCTAssertNil(claim(in: firstReport, taskID: secondTask.id))
+
+        try await scheduler.pause(taskID: firstTask.id)
+
+        let reportWhilePaused = try await scheduler.schedule(projectID: projectID)
+        XCTAssertNil(
+            claim(in: reportWhilePaused, taskID: secondTask.id),
+            "A paused in-progress attempt must retain repository ownership until it is stopped or reconciled"
+        )
+        guard case .deferred = try entry(in: reportWhilePaused, taskID: secondTask.id).disposition else {
+            XCTFail("Second writer must remain deferred while the paused attempt is still in progress")
+            return
+        }
+        let history = try await store.attemptHistory(taskID: firstTask.id)
+        XCTAssertEqual(history.first?.outcome, .inProgress)
+    }
+
     func testStopEndsAttemptAndRequiresExplicitRetry() async throws {
         let store = try SQLiteTaskStore.inMemory()
         let clock = TestTaskSchedulerClock(start: startDate)
