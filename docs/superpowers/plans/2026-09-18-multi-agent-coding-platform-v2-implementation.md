@@ -204,11 +204,11 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** `WorkspaceManaging.preflight(project:task:) async -> WorkspacePreflight`, `createOwnedWorkspace(task:attempt:base:) async throws -> WorkspaceRecord`, `inspect(workspaceID:) async -> WorkspaceInspection`, `retire(workspaceID:approval:) async throws`. `GitCommandRunner.run(executable:arguments:directory:)` uses `Process` and fixed argv only; no `sh -c` or interpolated user-supplied git flags. Manifest includes taskID/attemptID/base SHA/common-dir identity/nonce.
 
-- [ ] Step 1: RED tests with temporary fixture repository: dirty tracked/untracked root, protected branch, symlink escape, path outside authorized scope, fake foreign manifest, mismatched Git common dir, and dirty workspace retirement refusal.
-- [ ] Step 2: Run `swift test --filter GitWorkspaceManagerTests`; observe relevant RED. Tests may create disposable temp Git repos only within authorized test scope and cannot invoke a raw worktree to bypass an active real project guard.
-- [ ] Step 3: Implement preflight and exact ownership, guard-specific errors, creation only after the official authority preflight, manifest write and atomic store record. Refuse operation if guard or clean-baseline validation fails.
-- [ ] Step 4: Add tests for source branch/hash unchanged and byte-identical untracked files after successful disposable attempt; assert cleanup refuses unknown or dirty owned worktrees and reports manual inspection path.
-- [ ] Step 5: GREEN, full `swift test`, real-host authorized disposable worktree smoke using native managed operations only; check no orphaned worktree or child process. If authority cannot grant access, mark real-host integration blocked and leave live dispatch disabled.
+- [x] Step 1: RED tests with temporary fixture repository: dirty tracked/untracked root, protected branch, symlink escape, path outside authorized scope, fake foreign manifest, mismatched Git common dir, and dirty workspace retirement refusal.
+- [x] Step 2: Run `swift test --filter GitWorkspaceManagerTests`; observe relevant RED. Tests may create disposable temp Git repos only within authorized test scope and cannot invoke a raw worktree to bypass an active real project guard.
+- [x] Step 3: Implement preflight and exact ownership, guard-specific errors, creation only after the official authority preflight, manifest write and atomic store record. Refuse operation if guard or clean-baseline validation fails.
+- [x] Step 4: Add tests for source branch/hash unchanged and byte-identical untracked files after successful disposable attempt; assert cleanup refuses unknown or dirty owned worktrees and reports manual inspection path.
+- [x] Step 5: GREEN, full `swift test`, real-host authorized disposable worktree smoke using native managed operations only; check no orphaned worktree or child process. If authority cannot grant access, mark real-host integration blocked and leave live dispatch disabled.
 
 **Gate:** foreign files never changed; worktree provenance and disposal independently verified.
 
