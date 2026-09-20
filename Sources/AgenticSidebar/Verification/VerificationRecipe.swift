@@ -25,6 +25,9 @@ struct VerificationStepSkip: Sendable, Codable, Equatable {
 
 /// Versioned, ordered set of commands trusted to verify one project revision.
 struct VerificationRecipe: Sendable, Codable, Equatable {
+    /// Recipe semantics the runner understands; an unknown version is refused, never guessed.
+    static let currentVersion = 1
+
     /// Human-readable identity recorded with every evidence entry.
     let name: String
     /// Recipe schema version; a consumer must not guess the semantics of an unknown version.

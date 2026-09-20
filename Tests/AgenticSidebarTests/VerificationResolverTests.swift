@@ -87,6 +87,51 @@ final class VerificationResolverTests: XCTestCase {
         return url
     }
 
+    private func makeScript(named name: String, in directory: URL, body: String) throws -> URL {
+        let url = directory.appendingPathComponent(name, isDirectory: false)
+        try Data(body.utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+
+    private func makeScratch(named name: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-verification-probe-\(name)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return root
+    }
+
+    private static func killStrayProcesses(matching marker: String) {
+        let pkill = Process()
+        pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        pkill.arguments = ["-9", "-f", marker]
+        pkill.standardOutput = FileHandle.nullDevice
+        pkill.standardError = FileHandle.nullDevice
+        try? pkill.run()
+        pkill.waitUntilExit()
+    }
+
+    private static func waitForNoStrayProcess(matching marker: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let pgrep = Process()
+            pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            pgrep.arguments = ["-f", marker]
+            pgrep.standardOutput = FileHandle.nullDevice
+            pgrep.standardError = FileHandle.nullDevice
+            try? pgrep.run()
+            pgrep.waitUntilExit()
+            if pgrep.terminationStatus != 0 {
+                return true
+            }
+            usleep(100_000)
+        }
+        return false
+    }
+
     private func toolchain(
         fixture: Fixture,
         swiftExecutable: URL? = nil,
@@ -159,7 +204,7 @@ final class VerificationResolverTests: XCTestCase {
 
         let test = recipe.steps[1]
         XCTAssertEqual(test.executable, fixture.swiftExecutable.path)
-        XCTAssertEqual(test.arguments, ["test"])
+        XCTAssertEqual(test.arguments, ["test", "-Xswiftc", "-warnings-as-errors"])
         XCTAssertEqual(test.relativeWorkingDirectory, ".")
         XCTAssertTrue(test.required)
 
@@ -356,5 +401,87 @@ final class VerificationResolverTests: XCTestCase {
                 }
             }
         }
+    }
+
+    // MARK: - Tool probe bounds
+
+    func testToolProbeReadsReportedVersionWithinDeadline() throws {
+        let root = try makeScratch(named: "version")
+        let tool = try makeScript(named: "fake-format", in: root, body: "#!/bin/sh\necho 'fake-format 604.0.0'\n")
+
+        let version = VerificationToolProbe.version(of: tool, timeout: 5, drainGrace: 2)
+
+        XCTAssertEqual(version, "fake-format 604.0.0")
+    }
+
+    func testToolProbeWithPipeHoldingDescendantStaysBoundedAndKillsDescendant() throws {
+        let root = try makeScratch(named: "descendant")
+        let marker = "agentic-probe-descendant-\(UUID().uuidString)"
+        let tool = try makePipeHoldingDescendantScript(named: marker, in: root)
+        addTeardownBlock { Self.killStrayProcesses(matching: marker) }
+        let started = Date()
+
+        let version = VerificationToolProbe.version(of: tool, timeout: 2, drainGrace: 0.5)
+
+        XCTAssertNil(version, "a version read held open by a descendant must not be trusted")
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            5,
+            "the probe must bound its read instead of stalling resolution"
+        )
+        XCTAssertTrue(
+            Self.waitForNoStrayProcess(matching: marker, timeout: 3),
+            "a pipe-holding descendant must be killed, not left behind"
+        )
+    }
+
+    func testToolProbeTerminatesAndReapsHungTool() throws {
+        let root = try makeScratch(named: "hung")
+        let marker = "agentic-probe-hung-\(UUID().uuidString)"
+        let body = "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 1; done\n"
+        let tool = try makeScript(named: marker, in: root, body: body)
+        addTeardownBlock { Self.killStrayProcesses(matching: marker) }
+        let started = Date()
+
+        let version = VerificationToolProbe.version(of: tool, timeout: 0.3, drainGrace: 0.3)
+
+        XCTAssertNil(version)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(started),
+            5,
+            "a hung probe must be terminated and reaped inside its deadline"
+        )
+        XCTAssertTrue(Self.waitForNoStrayProcess(matching: marker, timeout: 3), "hung probe left running")
+    }
+
+    private func makePipeHoldingDescendantScript(named name: String, in directory: URL) throws -> URL {
+        let hasPython = FileManager.default.isExecutableFile(atPath: "/usr/bin/python3")
+        let hasRuby = FileManager.default.isExecutableFile(atPath: "/usr/bin/ruby")
+        try XCTSkipUnless(hasPython || hasRuby, "no validated /usr/bin interpreter for the fork fixture")
+        if hasPython {
+            let body = """
+                #!/usr/bin/python3
+                import os, signal, sys, time
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                pid = os.fork()
+                if pid == 0:
+                    time.sleep(300)
+                else:
+                    print("fake-format 604.0.0")
+                    sys.exit(0)
+                """
+            return try makeScript(named: name, in: directory, body: body)
+        }
+        let body = """
+            #!/usr/bin/ruby
+            Signal.trap("TERM", "IGNORE")
+            if Process.fork.nil? then
+              sleep 300
+            else
+              puts "fake-format 604.0.0"
+              exit 0
+            end
+            """
+        return try makeScript(named: name, in: directory, body: body)
     }
 }

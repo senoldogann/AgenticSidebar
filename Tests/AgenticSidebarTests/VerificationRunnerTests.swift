@@ -137,7 +137,7 @@ final class VerificationRunnerTests: XCTestCase {
         let build = step("build", "/usr/bin/false")
         let test = step("test", "/usr/bin/touch", ["ran-test"])
 
-        let evidence = await runner.verify(recipe: recipe(steps: [build, test]), workspace: workspace)
+        let evidence = try await runner.verify(recipe: recipe(steps: [build, test]), workspace: workspace)
 
         XCTAssertEqual(evidence.map(\.stepName), ["build", "test"])
         XCTAssertEqual(evidence[0].status, .failed)
@@ -159,21 +159,25 @@ final class VerificationRunnerTests: XCTestCase {
         let workspace = try makeWorkspace(name: "optional-failure")
         let runner = makeRunner()
         let optional = step("format", "/usr/bin/false", required: false)
-        let test = step("test", "/usr/bin/touch", ["ran-test"])
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-verification-optional-\(UUID().uuidString)"
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: marker) }
+        let test = step("test", "/usr/bin/touch", [marker.path])
 
-        let evidence = await runner.verify(recipe: recipe(steps: [optional, test]), workspace: workspace)
+        let evidence = try await runner.verify(recipe: recipe(steps: [optional, test]), workspace: workspace)
 
         XCTAssertEqual(evidence[0].status, .failed)
         XCTAssertFalse(evidence[0].passed)
         XCTAssertEqual(evidence[1].status, .passed)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.appendingPathComponent("ran-test").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
     }
 
     func testNonzeroTestExitIsRecordedAsFailure() async throws {
         let workspace = try makeWorkspace(name: "test-nonzero")
         let runner = makeRunner()
 
-        let evidence = await runner.verify(recipe: recipe(steps: [step("test", "/usr/bin/false")]), workspace: workspace)
+        let evidence = try await runner.verify(recipe: recipe(steps: [step("test", "/usr/bin/false")]), workspace: workspace)
 
         XCTAssertEqual(evidence.count, 1)
         XCTAssertEqual(evidence[0].status, .failed)
@@ -187,7 +191,7 @@ final class VerificationRunnerTests: XCTestCase {
         let runner = makeRunner()
         let missing = "/usr/bin/agentic-missing-lint-\(UUID().uuidString)"
 
-        let evidence = await runner.verify(
+        let evidence = try await runner.verify(
             recipe: recipe(steps: [step("format", missing, ["lint"])]),
             workspace: workspace
         )
@@ -205,7 +209,7 @@ final class VerificationRunnerTests: XCTestCase {
         let runner = makeRunner()
         let started = Date()
 
-        let evidence = await runner.verify(
+        let evidence = try await runner.verify(
             recipe: recipe(steps: [step("hang", "/usr/bin/tail", ["-f", "/dev/null"], timeout: 0.5)]),
             workspace: workspace
         )
@@ -233,13 +237,14 @@ final class VerificationRunnerTests: XCTestCase {
         let finished = DispatchSemaphore(value: 0)
         let hangRecipe = recipe(steps: [hang, dependent])
 
+        let runID = try await runner.beginRun(recipe: hangRecipe, workspace: workspace)
         Task {
-            box.store(await runner.verify(recipe: hangRecipe, workspace: workspace))
+            box.store((try? await runner.run(runID)) ?? [])
             finished.signal()
         }
 
         try await Task.sleep(for: .milliseconds(500))
-        await runner.cancel()
+        await runner.cancel(runID: runID)
 
         XCTAssertEqual(
             finished.wait(timeout: .now() + 15),
@@ -256,6 +261,110 @@ final class VerificationRunnerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: workspace.appendingPathComponent("ran-dependent").path))
     }
 
+    func testSecondRunWhileOneIsInFlightIsRefusedWithoutEvidence() async throws {
+        let workspace = try makeWorkspace(name: "single-flight")
+        let runner = makeRunner()
+        let hangRecipe = recipe(steps: [step("hang", "/usr/bin/tail", ["-f", "/dev/null"], timeout: 30)])
+        let activeRunID = try await runner.beginRun(recipe: hangRecipe, workspace: workspace)
+
+        do {
+            _ = try await runner.verify(recipe: hangRecipe, workspace: workspace)
+            XCTFail("a second concurrent run must be refused, never interleaved")
+        } catch {
+            guard case VerificationRunnerError.runAlreadyInFlight(let reportedRunID) = error else {
+                XCTFail("expected runAlreadyInFlight, got \(error)")
+                return
+            }
+            XCTAssertEqual(reportedRunID, activeRunID)
+        }
+
+        await runner.cancel(runID: activeRunID)
+        let evidence = try await runner.run(activeRunID)
+        XCTAssertEqual(evidence.map(\.stepName), ["hang"])
+        XCTAssertFalse(evidence[0].passed, "a refused concurrent run must never yield a pass")
+        XCTAssertEqual(evidence[0].blockedBy, "cancellation")
+    }
+
+    func testCancellingRunDoesNotPoisonFutureRuns() async throws {
+        let workspace = try makeWorkspace(name: "cancel-scope")
+        let runner = makeRunner()
+        let hangRecipe = recipe(steps: [step("hang", "/usr/bin/tail", ["-f", "/dev/null"], timeout: 30)])
+
+        let runID = try await runner.beginRun(recipe: hangRecipe, workspace: workspace)
+        let finished = DispatchSemaphore(value: 0)
+        Task {
+            _ = try? await runner.run(runID)
+            finished.signal()
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        await runner.cancel(runID: runID)
+        XCTAssertEqual(finished.wait(timeout: .now() + 15), .success)
+
+        let future = try await runner.verify(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+        XCTAssertEqual(future[0].status, .passed)
+        XCTAssertTrue(future[0].passed, "cancellation must be scoped to one run, never sticky")
+    }
+
+    func testCancelOfForeignRunIDDoesNotAffectActiveRun() async throws {
+        let workspace = try makeWorkspace(name: "cancel-foreign")
+        let runner = makeRunner()
+        let runID = try await runner.beginRun(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+
+        await runner.cancel(runID: VerificationRunID(rawValue: UUID()))
+
+        let evidence = try await runner.run(runID)
+        XCTAssertEqual(evidence[0].status, .passed)
+    }
+
+    func testRunnerRecordsRecipeVersionOnEveryEntry() async throws {
+        let workspace = try makeWorkspace(name: "recipe-version")
+        let runner = makeRunner()
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].recipeVersion, VerificationRecipe.currentVersion)
+    }
+
+    func testRunnerRefusesUnknownRecipeVersionWithoutEvidence() async throws {
+        let workspace = try makeWorkspace(name: "unsupported-version")
+        let runner = makeRunner()
+        let future = VerificationRecipe(
+            name: "fixture-future",
+            version: VerificationRecipe.currentVersion + 1,
+            trustedSource: "test-fixture",
+            steps: [step("build", "/usr/bin/true")],
+            skippedSteps: []
+        )
+
+        do {
+            _ = try await runner.verify(recipe: future, workspace: workspace)
+            XCTFail("an unknown recipe version must be refused")
+        } catch {
+            guard case VerificationRunnerError.unsupportedRecipeVersion(let name, let version, _) = error else {
+                XCTFail("expected unsupportedRecipeVersion, got \(error)")
+                return
+            }
+            XCTAssertEqual(name, "fixture-future")
+            XCTAssertEqual(version, VerificationRecipe.currentVersion + 1)
+        }
+
+        // A refused version must leave no run registered behind it.
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+        XCTAssertEqual(evidence[0].status, .passed)
+    }
+
     // MARK: - Revision fingerprint
 
     func testFingerprintChangeBetweenStepsPreventsPass() async throws {
@@ -265,10 +374,11 @@ final class VerificationRunnerTests: XCTestCase {
         let mutate = step("mutate", "/bin/cp", ["/dev/null", "tracked.txt"])
         let after = step("after", "/usr/bin/true")
 
-        let evidence = await runner.verify(recipe: recipe(steps: [first, mutate, after]), workspace: workspace)
+        let evidence = try await runner.verify(recipe: recipe(steps: [first, mutate, after]), workspace: workspace)
 
         XCTAssertEqual(evidence[0].status, .passed)
-        XCTAssertEqual(evidence[1].status, .passed)
+        XCTAssertEqual(evidence[1].status, .failed, "the drifted final step cannot report a pass")
+        XCTAssertTrue(evidence[1].detailsRedacted.contains("fingerprint"), evidence[1].detailsRedacted)
         XCTAssertEqual(evidence[2].status, .skipped)
         XCTAssertEqual(evidence[2].blockedBy, "workspaceFingerprint")
         XCTAssertFalse(evidence[2].passed)
@@ -285,7 +395,7 @@ final class VerificationRunnerTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner()
 
-        let evidence = await runner.verify(
+        let evidence = try await runner.verify(
             recipe: recipe(steps: [step("build", "/usr/bin/touch", ["ran-without-revision"])]),
             workspace: root
         )
@@ -303,7 +413,7 @@ final class VerificationRunnerTests: XCTestCase {
         let workspace = try makeWorkspace(name: "redaction")
         let runner = makeRunner()
 
-        let evidence = await runner.verify(
+        let evidence = try await runner.verify(
             recipe: recipe(steps: [step("echo", "/bin/echo", ["token=supersecretvalue123", "Bearer abcdefghijklmnopqrstuvwxyz"])]),
             workspace: workspace
         )
@@ -317,7 +427,7 @@ final class VerificationRunnerTests: XCTestCase {
         let workspace = try makeWorkspace(name: "clipping")
         let runner = makeRunner(maxDetailsCharacters: 512)
 
-        let evidence = await runner.verify(
+        let evidence = try await runner.verify(
             recipe: recipe(steps: [step("noisy", "/usr/bin/seq", ["1", "200000"])]),
             workspace: workspace
         )
@@ -335,7 +445,7 @@ final class VerificationRunnerTests: XCTestCase {
             reason: "swift-format 604.0.0 required; installed 603.0.0"
         )
 
-        let evidence = await runner.verify(
+        let evidence = try await runner.verify(
             recipe: recipe(steps: [step("build", "/usr/bin/true")], skipped: [skip]),
             workspace: workspace
         )
@@ -345,6 +455,104 @@ final class VerificationRunnerTests: XCTestCase {
         XCTAssertFalse(evidence[1].passed)
         XCTAssertNil(evidence[1].exitCode)
         XCTAssertTrue(evidence[1].detailsRedacted.contains("603.0.0"), evidence[1].detailsRedacted)
+    }
+
+    // MARK: - Review regressions
+
+    func testRunnerRedactsAuthorizationBearerInSingleArgument() async throws {
+        let workspace = try makeWorkspace(name: "redaction-authorization")
+        let runner = makeRunner()
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("echo", "/bin/echo", ["Authorization: Bearer \(token)"])]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].status, .passed)
+        XCTAssertFalse(evidence[0].detailsRedacted.contains(token), evidence[0].detailsRedacted)
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("<redacted>"), evidence[0].detailsRedacted)
+    }
+
+    func testPostFinalDriftMarksFinalPassedStepAsFailed() async throws {
+        let workspace = try makeWorkspace(name: "post-final-drift")
+        let runner = makeRunner()
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("mutate", "/usr/bin/touch", ["created-after-step"])]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence.count, 1)
+        XCTAssertEqual(evidence[0].status, .failed)
+        XCTAssertFalse(evidence[0].passed, "a step whose revision drifted after it ran cannot report a pass")
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("fingerprint"), evidence[0].detailsRedacted)
+    }
+
+    func testUntrackedContentDriftBetweenStepsPreventsPass() async throws {
+        let workspace = try makeWorkspace(name: "untracked-drift")
+        try Data("original\n".utf8).write(to: workspace.appendingPathComponent("untracked.txt"))
+        let runner = makeRunner()
+        let mutate = step("mutate", "/bin/cp", ["/dev/null", "untracked.txt"])
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("first", "/usr/bin/true"), mutate, step("after", "/usr/bin/true")]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].status, .passed)
+        XCTAssertEqual(evidence[1].status, .failed, "a step that changed untracked content cannot report a pass")
+        XCTAssertTrue(evidence[1].detailsRedacted.contains("fingerprint"), evidence[1].detailsRedacted)
+        XCTAssertEqual(evidence[2].status, .skipped)
+        XCTAssertEqual(evidence[2].blockedBy, "workspaceFingerprint")
+        XCTAssertFalse(evidence[2].passed)
+    }
+
+    func testRunnerMarksTruncatedOutputInDetails() async throws {
+        let workspace = try makeWorkspace(name: "truncation-flag")
+        let runner = makeRunner()
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("noisy", "/usr/bin/seq", ["1", "200000"])]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].status, .passed)
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("truncated=true"), evidence[0].detailsRedacted)
+    }
+
+    func testGitFingerprintTruncationFailsClosed() async throws {
+        let workspace = try makeWorkspace(name: "fingerprint-truncation")
+        try Data(repeating: 0x78, count: 600_000).write(to: workspace.appendingPathComponent("tracked.txt"))
+        let runner = makeRunner()
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].status, .failed)
+        XCTAssertFalse(evidence[0].passed)
+        XCTAssertNil(evidence[0].workspaceFingerprint)
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("fingerprint"), evidence[0].detailsRedacted)
+    }
+
+    func testExecTimeLaunchFailureIsRecordedAsFailed() async throws {
+        let workspace = try makeWorkspace(name: "exec-launch-failure")
+        let runner = makeRunner()
+        let invalid = workspace.appendingPathComponent("not-a-real-binary")
+        try Data([0x7f, 0x45, 0x4c, 0x46] + Array(repeating: 0x00, count: 64)).write(to: invalid)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: invalid.path)
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("build", invalid.path)]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].status, .failed)
+        XCTAssertNil(evidence[0].exitCode)
+        XCTAssertFalse(evidence[0].passed)
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("launch failed"), evidence[0].detailsRedacted)
     }
 
     // MARK: - Persistence
@@ -368,7 +576,8 @@ final class VerificationRunnerTests: XCTestCase {
             detailsRedacted: "step=build exit=1",
             workspaceFingerprint: "head=abc;status=def",
             blockedBy: nil,
-            recordedAt: recordedAt
+            recordedAt: recordedAt,
+            recipeVersion: 1
         )
         try await store.recordEvidence(taskEvidence)
         let loadedTaskEvidence = try await store.evidence(id: taskEvidence.id)
@@ -485,12 +694,13 @@ final class VerificationRunnerTests: XCTestCase {
             drainGrace: 2,
             gitExecutableDirectory: URL(fileURLWithPath: "/usr/bin")
         )
-        let evidence = await runner.verify(recipe: subset, workspace: workspaceURL)
+        let evidence = try await runner.verify(recipe: subset, workspace: workspaceURL)
 
         for entry in evidence {
             print(
                 "[verification-smoke] step=\(entry.stepName ?? "?") status=\(entry.status.rawValue) "
                     + "exit=\(entry.exitCode.map(String.init) ?? "none") timedOut=\(entry.timedOut) "
+                    + "recipeVersion=\(entry.recipeVersion.map(String.init) ?? "none") "
                     + "fingerprint=\(entry.workspaceFingerprint ?? "none") blockedBy=\(entry.blockedBy ?? "none")"
             )
             print("[verification-smoke] details:\n\(entry.detailsRedacted)")

@@ -139,6 +139,56 @@ final class TaskStoreMigrationTests: XCTestCase {
         }
     }
 
+    func testV1ToLatestMigrationPreservesPopulatedVerificationEvidence() async throws {
+        let dbURL = tempDirectory.appendingPathComponent("v1-evidence.sqlite")
+        try TaskStoreMigrations.apply(migrations: Array(TaskStoreMigrations.standardMigrations.prefix(1)), to: dbURL)
+
+        let projectID = UUID()
+        let taskID = UUID()
+        let passedEvidenceID = UUID()
+        let failedEvidenceID = UUID()
+        try withRawDatabase(at: dbURL) { db in
+            try TaskStoreMigrations.execute(
+                """
+                INSERT INTO tasks (
+                    id, project_id, title, objective, priority, status, stage,
+                    block_reason, previous_stage, version, budget, current_attempt_id,
+                    created_at, updated_at
+                ) VALUES (
+                    '\(taskID.uuidString)', '\(projectID.uuidString)', 'Legacy Evidence Task', 'Legacy Evidence', 1, 'running', 'verification',
+                    NULL, NULL, 1, '{}', NULL,
+                    1700000000, 1700000000
+                );
+
+                INSERT INTO verification_evidence (
+                    id, task_id, attempt_id, recipe_name, passed, details_redacted, recorded_at
+                ) VALUES
+                    ('\(passedEvidenceID.uuidString)', '\(taskID.uuidString)', '\(UUID().uuidString)', 'swiftpm:Legacy', 1, 'legacy pass details', 1700000000),
+                    ('\(failedEvidenceID.uuidString)', '\(taskID.uuidString)', '\(UUID().uuidString)', 'swiftpm:Legacy', 0, 'legacy fail details', 1700000001);
+                """,
+                on: db
+            )
+        }
+
+        let store = try SQLiteTaskStore.open(at: dbURL)
+        let version = store.currentSchemaVersionSync()
+        XCTAssertEqual(version, TaskStoreMigrations.standardMigrations.count)
+        XCTAssertGreaterThanOrEqual(version, 5)
+
+        let passed = try await store.evidence(id: passedEvidenceID)
+        XCTAssertEqual(passed?.status, .passed, "a legacy passed=1 row must migrate to status passed")
+        XCTAssertEqual(passed?.detailsRedacted, "legacy pass details")
+        XCTAssertEqual(passed?.recordedAt, Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertNil(passed?.stepName)
+        XCTAssertNil(passed?.recipeVersion, "a legacy row may not invent a recipe version")
+
+        let failed = try await store.evidence(id: failedEvidenceID)
+        XCTAssertEqual(failed?.status, .failed, "a legacy passed=0 row must migrate to status failed")
+        XCTAssertEqual(failed?.detailsRedacted, "legacy fail details")
+        XCTAssertEqual(failed?.recordedAt, Date(timeIntervalSince1970: 1_700_000_001))
+        await store.close()
+    }
+
     private func withRawDatabase(at url: URL, _ body: (OpaquePointer) throws -> Void) throws {
         var db: OpaquePointer?
         guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let db else {

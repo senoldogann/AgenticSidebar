@@ -266,9 +266,11 @@ public struct TaskApproval: Sendable, Identifiable, Codable, Equatable {
 
 /// Disposition of one verification step.
 public enum VerificationEvidenceStatus: String, Sendable, Codable, Equatable {
-    /// The command ran, exited zero and the workspace revision did not change.
+    /// The command ran and exited zero, and the workspace revision stayed unchanged
+    /// through the end of the run (including the post-final recomputation).
     case passed
-    /// The command ran and failed, timed out, was cancelled, or could not run at all.
+    /// The command ran and failed, timed out, was cancelled, could not run at all, or the
+    /// workspace revision changed after it ran.
     case failed
     /// The step did not run: an earlier required step failed, the caller cancelled, the
     /// workspace revision changed between steps, or the step is explicitly unavailable.
@@ -280,6 +282,8 @@ public enum VerificationEvidenceStatus: String, Sendable, Codable, Equatable {
 /// `taskID`/`attemptID` are optional so the verification runner can record standalone
 /// evidence before a task attaches it. `passed` is derived from `status`: only an actual
 /// zero exit code on an unchanged workspace revision may report a pass.
+/// `recipeVersion` records which recipe semantics produced the entry; nil means the row
+/// was written before recipe versions were tracked and no version may be assumed.
 public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
     public let taskID: UUID?
@@ -293,6 +297,7 @@ public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
     public let workspaceFingerprint: String?
     public let blockedBy: String?
     public let recordedAt: Date
+    public let recipeVersion: Int?
 
     public var passed: Bool { status == .passed }
 
@@ -304,7 +309,8 @@ public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
         recipeName: String,
         passed: Bool,
         detailsRedacted: String,
-        recordedAt: Date = Date()
+        recordedAt: Date = Date(),
+        recipeVersion: Int? = nil
     ) {
         self.init(
             id: id,
@@ -318,7 +324,8 @@ public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
             detailsRedacted: detailsRedacted,
             workspaceFingerprint: nil,
             blockedBy: nil,
-            recordedAt: recordedAt
+            recordedAt: recordedAt,
+            recipeVersion: recipeVersion
         )
     }
 
@@ -334,7 +341,8 @@ public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
         detailsRedacted: String,
         workspaceFingerprint: String? = nil,
         blockedBy: String? = nil,
-        recordedAt: Date = Date()
+        recordedAt: Date = Date(),
+        recipeVersion: Int? = nil
     ) {
         self.id = id
         self.taskID = taskID
@@ -348,6 +356,7 @@ public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
         self.workspaceFingerprint = workspaceFingerprint
         self.blockedBy = blockedBy
         self.recordedAt = recordedAt
+        self.recipeVersion = recipeVersion
     }
 }
 

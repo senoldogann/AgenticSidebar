@@ -431,9 +431,10 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 let sql = """
                     INSERT INTO verification_evidence (
                         id, task_id, attempt_id, recipe_name, step_name, status, passed,
-                        exit_code, timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at
+                        exit_code, timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at,
+                        recipe_version
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
@@ -475,6 +476,11 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                     sqlite3_bind_null(stmt, 12)
                 }
                 sqlite3_bind_double(stmt, 13, evidence.recordedAt.timeIntervalSince1970)
+                if let recipeVersion = evidence.recipeVersion {
+                    sqlite3_bind_int(stmt, 14, Int32(recipeVersion))
+                } else {
+                    sqlite3_bind_null(stmt, 14)
+                }
                 try stepDone(stmt)
             }
         }
@@ -487,7 +493,8 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             let sql = """
                 SELECT
                     id, task_id, attempt_id, recipe_name, step_name, status, exit_code,
-                    timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at
+                    timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at,
+                    recipe_version
                 FROM verification_evidence
                 WHERE id = ?;
                 """
@@ -508,6 +515,8 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
         guard let details = optionalText(stmt, 8) else { return nil }
         let exitCode: Int32? = sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : sqlite3_column_int(stmt, 6)
+        let recipeVersion: Int? =
+            sqlite3_column_type(stmt, 12) == SQLITE_NULL ? nil : Int(sqlite3_column_int(stmt, 12))
         return VerificationEvidence(
             id: id,
             taskID: optionalText(stmt, 1).flatMap(UUID.init(uuidString:)),
@@ -520,7 +529,8 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             detailsRedacted: details,
             workspaceFingerprint: optionalText(stmt, 9),
             blockedBy: optionalText(stmt, 10),
-            recordedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 11))
+            recordedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 11)),
+            recipeVersion: recipeVersion
         )
     }
 

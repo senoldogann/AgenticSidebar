@@ -3,6 +3,9 @@ import Foundation
 
 /// Cooperative cancellation shared between the runner actor and its off-actor process
 /// executor: `cancel()` may run while a step is waiting for its process to exit.
+///
+/// One flag belongs to exactly one run and is never shared between runs, so cancelling
+/// one run can neither cancel another nor poison a future run.
 private final class VerificationCancellationFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
@@ -13,6 +16,33 @@ private final class VerificationCancellationFlag: @unchecked Sendable {
 
     var isCancelled: Bool {
         lock.withLock { cancelled }
+    }
+}
+
+/// Stable identity of exactly one verification run.
+struct VerificationRunID: Sendable, Hashable {
+    let rawValue: UUID
+}
+
+/// Typed refusals raised before a run may start or continue.
+enum VerificationRunnerError: LocalizedError, Equatable, Sendable {
+    /// A second run was requested while another run is in flight.
+    case runAlreadyInFlight(activeRunID: VerificationRunID)
+    /// The runner does not understand the recipe version and must never guess at it.
+    case unsupportedRecipeVersion(recipe: String, version: Int, supported: Int)
+    /// The run identity does not match any in-flight run.
+    case unknownRun(runID: VerificationRunID)
+
+    var errorDescription: String? {
+        switch self {
+        case .runAlreadyInFlight(let activeRunID):
+            return "VERIFICATION_RUN_IN_FLIGHT: run \(activeRunID.rawValue.uuidString) is already in flight"
+        case .unsupportedRecipeVersion(let recipe, let version, let supported):
+            return
+                "VERIFICATION_UNSUPPORTED_RECIPE_VERSION: recipe \(recipe) version \(version) is not understood (supported: \(supported))"
+        case .unknownRun(let runID):
+            return "VERIFICATION_UNKNOWN_RUN: no run \(runID.rawValue.uuidString) is in flight"
+        }
     }
 }
 
@@ -30,10 +60,15 @@ private struct VerificationStepOutcome: Sendable {
 /// Secret redaction and clipping for recorded verification output.
 enum VerificationOutputRedactor {
     /// Masks credential-shaped values before any output is persisted.
+    ///
+    /// Scheme-aware rules run first: a `Bearer` token is masked as a whole before the
+    /// key/value rule sees the line, and the key/value rule refuses to swallow the
+    /// scheme word itself, so `Authorization: Bearer <token>` can never leave the token
+    /// unmasked behind a redacted scheme.
     static func redact(_ text: String) -> String {
         let patterns: [(pattern: String, template: String)] = [
-            (#"(?i)((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)(\S+)"#, "$1<redacted>"),
             (#"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"#, "$1<redacted>"),
+            (#"(?i)((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)(?!bearer\b)\S+"#, "$1<redacted>"),
             (#"AKIA[0-9A-Z]{16}"#, "<redacted>"),
             (#"gh[pousr]_[A-Za-z0-9]{20,}"#, "<redacted>"),
         ]
@@ -55,23 +90,42 @@ enum VerificationOutputRedactor {
 
 /// Runs a trusted verification recipe against one workspace.
 ///
+/// Concurrency: at most one run is in flight per runner. `beginRun` registers a run and
+/// returns its identity; a second concurrent registration is refused with
+/// `VerificationRunnerError.runAlreadyInFlight` instead of being queued, so two
+/// verifications on one workspace can never interleave steps or corrupt each other's
+/// fingerprint checks. Cancellation is scoped to a single run identity
+/// (`cancel(runID:)`): it never touches another run, and it is never a sticky flag that
+/// poisons future runs.
+///
 /// Execution is ordered and argv-only: there is no shell anywhere in this type. Every
 /// step gets a wall-clock deadline and a bounded, redacted output budget. A required
 /// step that fails prevents its dependents, which are recorded as skipped with the
 /// blocker name. Each evidence entry carries the workspace fingerprint observed before
 /// the step; when that fingerprint changes between steps the runner stops without a
-/// pass, because the tested revision is no longer the revision under test. Cancellation
-/// is cooperative: `cancel()` terminates the running step and skips the rest.
+/// pass. After the final step the fingerprint is recomputed and compared: when it
+/// drifted, the last passed step is recorded as failed, because the tested revision is
+/// no longer the revision under test.
 actor VerificationRunner {
     private static let pollInterval: TimeInterval = 0.05
     private static let fingerprintTimeout: TimeInterval = 10
+    /// Largest single untracked file whose bytes are folded into the fingerprint digest.
+    private static let untrackedFileDigestLimit = 1_048_576
 
     private let maxOutputBytes: Int
     private let maxDetailsCharacters: Int
     private let terminationGrace: TimeInterval
     private let drainGrace: TimeInterval
     private let gitRunner: GitCommandRunner
-    private let cancellation = VerificationCancellationFlag()
+
+    private var activeRun: ActiveRun?
+
+    private struct ActiveRun {
+        let id: VerificationRunID
+        let recipe: VerificationRecipe
+        let workspace: URL
+        let cancellation: VerificationCancellationFlag
+    }
 
     init(
         maxOutputBytes: Int,
@@ -87,16 +141,70 @@ actor VerificationRunner {
         self.gitRunner = GitCommandRunner(executableDirectory: gitExecutableDirectory, maxOutputBytes: maxOutputBytes)
     }
 
-    /// Requests cancellation of the running verification; the next step is not started.
-    func cancel() {
-        cancellation.cancel()
+    /// Registers one run and returns its identity.
+    ///
+    /// A second registration while a run is in flight is refused with
+    /// `.runAlreadyInFlight`; the runner deliberately rejects rather than queues, so the
+    /// caller learns immediately that its second request was not started. An unknown
+    /// recipe version is refused here, before anything can run or be recorded as passed.
+    func beginRun(recipe: VerificationRecipe, workspace: URL) throws -> VerificationRunID {
+        if let activeRun {
+            throw VerificationRunnerError.runAlreadyInFlight(activeRunID: activeRun.id)
+        }
+        guard (1...VerificationRecipe.currentVersion).contains(recipe.version) else {
+            throw VerificationRunnerError.unsupportedRecipeVersion(
+                recipe: recipe.name,
+                version: recipe.version,
+                supported: VerificationRecipe.currentVersion
+            )
+        }
+        let runID = VerificationRunID(rawValue: UUID())
+        activeRun = ActiveRun(
+            id: runID,
+            recipe: recipe,
+            workspace: workspace,
+            cancellation: VerificationCancellationFlag()
+        )
+        return runID
     }
 
-    var isCancelled: Bool {
-        cancellation.isCancelled
+    /// Executes a registered run to completion and deregisters it.
+    func run(_ runID: VerificationRunID) async throws -> [VerificationEvidence] {
+        guard let activeRun, activeRun.id == runID else {
+            throw VerificationRunnerError.unknownRun(runID: runID)
+        }
+        defer {
+            if self.activeRun?.id == runID {
+                self.activeRun = nil
+            }
+        }
+        return await execute(
+            recipe: activeRun.recipe,
+            workspace: activeRun.workspace,
+            cancellation: activeRun.cancellation
+        )
     }
 
-    func verify(recipe: VerificationRecipe, workspace: URL) async -> [VerificationEvidence] {
+    /// Registers and executes one verification; a concurrent second run is refused.
+    func verify(recipe: VerificationRecipe, workspace: URL) async throws -> [VerificationEvidence] {
+        let runID = try beginRun(recipe: recipe, workspace: workspace)
+        return try await run(runID)
+    }
+
+    /// Requests cancellation of exactly one in-flight run.
+    ///
+    /// A run that already finished, or an identity this runner never minted, is a no-op:
+    /// cancellation can never leak into another run.
+    func cancel(runID: VerificationRunID) {
+        guard let activeRun, activeRun.id == runID else { return }
+        activeRun.cancellation.cancel()
+    }
+
+    private func execute(
+        recipe: VerificationRecipe,
+        workspace: URL,
+        cancellation: VerificationCancellationFlag
+    ) async -> [VerificationEvidence] {
         let workspaceURL = workspace.standardizedFileURL.resolvingSymlinksInPath()
         var entries: [VerificationEvidence] = []
 
@@ -115,6 +223,7 @@ actor VerificationRunner {
                             exitCode: nil,
                             timedOut: false,
                             cancelled: false,
+                            truncated: false,
                             launchFailure: nil,
                             reason: "workspace fingerprint unavailable; no revision can be verified",
                             standardOutput: "",
@@ -131,6 +240,7 @@ actor VerificationRunner {
 
         var recordedFingerprint = initialFingerprint
         var blocker: String?
+        var lastExecutedIndex: Int?
 
         for step in recipe.steps {
             if cancellation.isCancelled, blocker == nil {
@@ -165,6 +275,7 @@ actor VerificationRunner {
                             exitCode: nil,
                             timedOut: false,
                             cancelled: false,
+                            truncated: false,
                             launchFailure: nil,
                             reason: "working directory \(step.relativeWorkingDirectory) escapes the workspace",
                             standardOutput: "",
@@ -193,6 +304,7 @@ actor VerificationRunner {
                             exitCode: nil,
                             timedOut: false,
                             cancelled: false,
+                            truncated: false,
                             launchFailure: nil,
                             reason: "workspace fingerprint unavailable; no revision can be verified",
                             standardOutput: "",
@@ -225,7 +337,7 @@ actor VerificationRunner {
                 continue
             }
 
-            let outcome = await runStep(step, workingDirectory: workingDirectory)
+            let outcome = await runStep(step, workingDirectory: workingDirectory, cancellation: cancellation)
             let status: VerificationEvidenceStatus =
                 (outcome.launchFailure == nil && outcome.exitCode == 0 && !outcome.timedOut && !outcome.cancelled)
                 ? .passed : .failed
@@ -242,6 +354,7 @@ actor VerificationRunner {
                         exitCode: outcome.exitCode,
                         timedOut: outcome.timedOut,
                         cancelled: outcome.cancelled,
+                        truncated: outcome.outputWasTruncated,
                         launchFailure: outcome.launchFailure,
                         reason: nil,
                         standardOutput: outcome.standardOutput,
@@ -252,13 +365,52 @@ actor VerificationRunner {
                 )
             )
             recordedFingerprint = currentFingerprint
+            lastExecutedIndex = entries.count - 1
             if status != .passed, step.required {
                 blocker = outcome.cancelled ? "cancellation" : step.name
             }
         }
 
+        applyPostFinalFingerprintCheck(
+            workspaceURL: workspaceURL,
+            recordedFingerprint: recordedFingerprint,
+            lastExecutedIndex: lastExecutedIndex,
+            entries: &entries
+        )
+
         appendRecipeSkips(recipe: recipe, entries: &entries, blockedBy: blocker)
         return entries
+    }
+
+    /// Recomputes the fingerprint after the final step. A revision that changed while the
+    /// last step was running (or after it) must not leave a PASS behind: the last passed
+    /// entry is rewritten as failed with the drift recorded, and an unreadable final
+    /// fingerprint fails the same way.
+    private func applyPostFinalFingerprintCheck(
+        workspaceURL: URL,
+        recordedFingerprint: String,
+        lastExecutedIndex: Int?,
+        entries: inout [VerificationEvidence]
+    ) {
+        guard let lastExecutedIndex else { return }
+        let previous = entries[lastExecutedIndex]
+        guard previous.status == .passed else { return }
+        guard let finalFingerprint = workspaceFingerprint(of: workspaceURL) else {
+            entries[lastExecutedIndex] = rewritten(
+                previous,
+                status: .failed,
+                details: previous.detailsRedacted
+                    + "\nfinal workspace fingerprint unavailable after the last step; the tested revision cannot be confirmed"
+            )
+            return
+        }
+        guard finalFingerprint != recordedFingerprint else { return }
+        entries[lastExecutedIndex] = rewritten(
+            previous,
+            status: .failed,
+            details: previous.detailsRedacted
+                + "\nfinal workspace fingerprint changed after the last step: \(recordedFingerprint) -> \(finalFingerprint)"
+        )
     }
 
     // MARK: - Evidence assembly
@@ -302,7 +454,30 @@ actor VerificationRunner {
             timedOut: timedOut,
             detailsRedacted: details,
             workspaceFingerprint: fingerprint,
-            blockedBy: blockedBy
+            blockedBy: blockedBy,
+            recipeVersion: recipe.version
+        )
+    }
+
+    private func rewritten(
+        _ evidence: VerificationEvidence,
+        status: VerificationEvidenceStatus,
+        details: String
+    ) -> VerificationEvidence {
+        VerificationEvidence(
+            id: evidence.id,
+            taskID: evidence.taskID,
+            attemptID: evidence.attemptID,
+            recipeName: evidence.recipeName,
+            stepName: evidence.stepName,
+            status: status,
+            exitCode: evidence.exitCode,
+            timedOut: evidence.timedOut,
+            detailsRedacted: VerificationOutputRedactor.clip(details, limit: maxDetailsCharacters),
+            workspaceFingerprint: evidence.workspaceFingerprint,
+            blockedBy: evidence.blockedBy,
+            recordedAt: evidence.recordedAt,
+            recipeVersion: evidence.recipeVersion
         )
     }
 
@@ -312,13 +487,14 @@ actor VerificationRunner {
         exitCode: Int32?,
         timedOut: Bool,
         cancelled: Bool,
+        truncated: Bool,
         launchFailure: String?,
         reason: String?,
         standardOutput: String,
         standardError: String
     ) -> String {
         var text =
-            "step=\(step.name) executable=\(step.executable) status=\(status.rawValue) exit=\(exitCode.map(String.init) ?? "none") timedOut=\(timedOut) cancelled=\(cancelled)"
+            "step=\(step.name) executable=\(step.executable) status=\(status.rawValue) exit=\(exitCode.map(String.init) ?? "none") timedOut=\(timedOut) cancelled=\(cancelled) truncated=\(truncated)"
         if let reason {
             text += "\n\(reason)"
         }
@@ -339,23 +515,96 @@ actor VerificationRunner {
 
     // MARK: - Workspace revision
 
-    /// Exact revision of the workspace under test: HEAD plus a digest of the tracked
-    /// working-tree state and diff. Ignored build artifacts do not change it.
+    /// Complete revision of the workspace under test, or nil when it cannot be trusted.
+    ///
+    /// The SHA-256 payload is:
+    /// 1. `git rev-parse HEAD`.
+    /// 2. `git status --porcelain=v1 -z --untracked-files=all`: staged, modified, deleted,
+    ///    renamed, conflicted and untracked non-ignored paths. Ignored files never appear,
+    ///    so ignored build artifacts do not change the fingerprint.
+    /// 3. `git diff HEAD --no-ext-diff --binary` for the tracked working-tree change.
+    /// 4. For every untracked non-ignored file: its path plus `sha256=<digest>;bytes=<size>;
+    ///    capped=<bool>` of the file's bytes, read up to `untrackedFileDigestLimit` bytes.
+    ///    Changing the content of an untracked file therefore changes the fingerprint.
+    ///
+    /// When a git invocation is refused, exits nonzero or reports clipped output, or when
+    /// an untracked file listed by status cannot be read, the fingerprint is unavailable:
+    /// a truncated or partial revision must fail closed instead of hashing partial state.
     private func workspaceFingerprint(of workspace: URL) -> String? {
         guard FileManager.default.fileExists(atPath: workspace.path) else { return nil }
-        guard let head = runGit(["rev-parse", "HEAD"], in: workspace), head.exitCode == 0 else { return nil }
-        guard let status = runGit(["status", "--porcelain=v1", "--untracked-files=all"], in: workspace), status.exitCode == 0
+        guard let head = runGit(["rev-parse", "HEAD"], in: workspace),
+            head.exitCode == 0, !head.outputWasTruncated
         else { return nil }
-        guard let diff = runGit(["diff", "HEAD", "--no-ext-diff", "--binary"], in: workspace), diff.exitCode == 0 else {
-            return nil
+        guard let status = runGit(["status", "--porcelain=v1", "-z", "--untracked-files=all"], in: workspace),
+            status.exitCode == 0, !status.outputWasTruncated
+        else { return nil }
+        guard let diff = runGit(["diff", "HEAD", "--no-ext-diff", "--binary"], in: workspace),
+            diff.exitCode == 0, !diff.outputWasTruncated
+        else { return nil }
+
+        let untrackedPaths = Self.untrackedPaths(fromPorcelainZ: status.standardOutput)
+        var untrackedDigests: [String] = []
+        untrackedDigests.reserveCapacity(untrackedPaths.count)
+        for path in untrackedPaths {
+            guard let digest = untrackedFileDigest(in: workspace, relativePath: path) else { return nil }
+            untrackedDigests.append("\(path)=\(digest)")
         }
+
         let payload = """
             head=\(head.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines))
             status=\(status.standardOutput)
             diff=\(diff.standardOutput)
+            untracked=\(untrackedDigests.joined(separator: "\n"))
             """
         let digest = SHA256.hash(data: Data(payload.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Paths of untracked non-ignored entries in `git status --porcelain=v1 -z` output.
+    ///
+    /// Rename and copy records carry a second NUL-terminated source path; those records
+    /// are consumed without ever being treated as untracked.
+    private static func untrackedPaths(fromPorcelainZ output: String) -> [String] {
+        let records = output.split(separator: "\0", omittingEmptySubsequences: true)
+        var paths: [String] = []
+        var index = 0
+        while index < records.count {
+            let record = records[index]
+            var consumed = 1
+            if record.count > 3 {
+                let first = record[record.startIndex]
+                let second = record[record.index(after: record.startIndex)]
+                if first == "R" || first == "C" || second == "R" || second == "C" {
+                    consumed = 2
+                } else if first == "?" && second == "?" {
+                    paths.append(String(record.dropFirst(3)))
+                }
+            }
+            index += consumed
+        }
+        return paths
+    }
+
+    /// `sha256` of an untracked file's bytes, capped per file, plus its total size.
+    private func untrackedFileDigest(in workspace: URL, relativePath: String) -> String? {
+        let fileURL = workspace.appendingPathComponent(relativePath)
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+            let size = (attributes[.size] as? NSNumber)?.int64Value
+        else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        var readBytes: Int64 = 0
+        let limit = Int64(Self.untrackedFileDigestLimit)
+        while readBytes < limit {
+            let remaining = Int(min(limit - readBytes, 1_048_576))
+            guard let chunk = try? handle.read(upToCount: remaining), !chunk.isEmpty else { break }
+            hasher.update(data: chunk)
+            readBytes += Int64(chunk.count)
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return "sha256=\(digest);bytes=\(size);capped=\(size > readBytes)"
     }
 
     private func runGit(_ arguments: [String], in directory: URL) -> GitCommandResult? {
@@ -384,11 +633,14 @@ actor VerificationRunner {
 
     // MARK: - Bounded process execution
 
-    private func runStep(_ step: VerificationStep, workingDirectory: URL) async -> VerificationStepOutcome {
+    private func runStep(
+        _ step: VerificationStep,
+        workingDirectory: URL,
+        cancellation: VerificationCancellationFlag
+    ) async -> VerificationStepOutcome {
         let maxOutputBytes = self.maxOutputBytes
         let terminationGrace = self.terminationGrace
         let drainGrace = self.drainGrace
-        let cancellation = self.cancellation
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let outcome = Self.executeProcess(

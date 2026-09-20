@@ -25,6 +25,7 @@ public enum TaskStoreMigrations {
         attemptNullableUsage,
         repositoryLeaseAttemptBinding,
         verificationEvidenceDetails,
+        verificationEvidenceRecipeVersion,
     ]
 
     private static let initialSchema = TaskStoreMigration(version: 1, name: "InitialSchema_v1") { db in
@@ -243,6 +244,19 @@ public enum TaskStoreMigrations {
             ALTER TABLE verification_evidence_v4 RENAME TO verification_evidence;
             CREATE INDEX IF NOT EXISTS idx_evidence_task ON verification_evidence(task_id);
             """,
+            on: db
+        )
+    }
+
+    /// Schema v5: verification evidence records the recipe version that produced it.
+    /// Existing rows keep every column and load with a nil version: the schema change may
+    /// not invent a version for evidence recorded before versions were tracked.
+    private static let verificationEvidenceRecipeVersion = TaskStoreMigration(
+        version: 5,
+        name: "VerificationEvidenceRecipeVersion_v5"
+    ) { db in
+        try execute(
+            "ALTER TABLE verification_evidence ADD COLUMN recipe_version INTEGER;",
             on: db
         )
     }

@@ -20,7 +20,11 @@ struct VerificationToolchain: Sendable, Equatable {
         let formatter = URL(fileURLWithPath: "/opt/homebrew/bin/swift-format")
         let installedVersion =
             FileManager.default.isExecutableFile(atPath: formatter.path)
-            ? VerificationToolProbe.version(of: formatter)
+            ? VerificationToolProbe.version(
+                of: formatter,
+                timeout: VerificationToolProbe.probeTimeout,
+                drainGrace: VerificationToolProbe.probeDrainGrace
+            )
             : nil
         return VerificationToolchain(
             swiftExecutable: swiftExecutable,
@@ -30,31 +34,96 @@ struct VerificationToolchain: Sendable, Equatable {
     }
 }
 
-/// Bounded probe for a tool's reported version.
-private enum VerificationToolProbe {
-    static func version(of executable: URL) -> String? {
+/// Deadline-bounded probe for a tool's reported version.
+///
+/// The probe never waits unbounded on the tool or on its pipe: `--version` output is
+/// drained with a bounded grace, a tool that outlives `timeout` is terminated (SIGTERM,
+/// then SIGKILL to its process group after the grace), the direct child is always reaped,
+/// and a descendant that inherited stdout and outlived the child is killed with its
+/// process group. A probe that cannot produce a complete version inside those bounds
+/// returns nil, which the resolver records as a mismatch rather than a guess.
+enum VerificationToolProbe {
+    static let probeTimeout: TimeInterval = 5
+    static let probeDrainGrace: TimeInterval = 2
+    static let maxVersionBytes = 64 * 1024
+
+    static func version(of executable: URL, timeout: TimeInterval, drainGrace: TimeInterval) -> String? {
         let process = Process()
         process.executableURL = executable
         process.arguments = ["--version"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
+
+        let readHandle = pipe.fileHandleForReading
+        let collector = BoundedOutputCollector(limit: maxVersionBytes)
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            collector.drain(readHandle)
+            drainGroup.leave()
+        }
+
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exitSemaphore.signal() }
         do {
             try process.run()
         } catch {
+            try? readHandle.close()
+            _ = drainGroup.wait(timeout: .now() + drainGrace)
             return nil
         }
-        let deadline = Date().addingTimeInterval(5)
-        while process.isRunning, Date() < deadline {
-            usleep(50_000)
+
+        let childLeadsProcessGroup = getpgid(process.processIdentifier) == process.processIdentifier
+        let exitedBeforeDeadline = exitSemaphore.wait(timeout: .now() + timeout) == .success
+        if !exitedBeforeDeadline {
+            terminate(process, exitSemaphore: exitSemaphore, grace: drainGrace)
         }
-        if process.isRunning {
-            process.terminate()
-            return nil
+        let drainFinished = drainGroup.wait(timeout: .now() + drainGrace) == .success
+        if !drainFinished {
+            // The child is gone but something still holds the write end of the pipe;
+            // close our end and kill the recorded process group so the drain cannot
+            // stall and no descendant is left behind.
+            try? readHandle.close()
+            killGroup(process, childLeadsProcessGroup: childLeadsProcessGroup)
+            _ = drainGroup.wait(timeout: .now() + drainGrace)
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        // Reap the direct child on every path, including the terminate branch.
+        process.waitUntilExit()
+        // A read that only completed after killing a pipe holder is not a complete read.
+        guard exitedBeforeDeadline, drainFinished else { return nil }
+
+        let data = collector.snapshot().data
         let version = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         return version.isEmpty ? nil : version
+    }
+
+    /// Terminates an overrunning tool, escalating to SIGKILL after the grace period.
+    ///
+    /// Foundation launches the child as its own process-group leader. SIGTERM reaches the
+    /// direct child only; the escalation reaches the whole group, which is what stops a
+    /// descendant that inherited the stdout pipe.
+    private static func terminate(_ process: Process, exitSemaphore: DispatchSemaphore, grace: TimeInterval) {
+        if process.isRunning {
+            process.terminate()
+        }
+        if exitSemaphore.wait(timeout: .now() + grace) == .timedOut, process.isRunning {
+            let pid = process.processIdentifier
+            if getpgid(pid) == pid {
+                killpg(pid, SIGKILL)
+            } else {
+                kill(pid, SIGKILL)
+            }
+            _ = exitSemaphore.wait(timeout: .now() + grace)
+        }
+    }
+
+    /// Kills the process group of a child that already exited but left a descendant holding the pipe.
+    private static func killGroup(_ process: Process, childLeadsProcessGroup: Bool) {
+        guard childLeadsProcessGroup else { return }
+        let pid = process.processIdentifier
+        guard pid > 0, killpg(pid, 0) == 0 else { return }
+        killpg(pid, SIGKILL)
     }
 }
 
@@ -106,7 +175,7 @@ struct NonStandardVerificationRequest: Sendable, Equatable {
 /// recorded as skipped, never substituted. A project without a recognized marker is refused,
 /// and a caller-supplied recipe may only run after explicit approval.
 struct VerificationResolver: Sendable {
-    static let recipeVersion = 1
+    static let recipeVersion = VerificationRecipe.currentVersion
     private static let buildTimeout: TimeInterval = 900
     private static let testTimeout: TimeInterval = 900
     private static let formatTimeout: TimeInterval = 300
@@ -152,7 +221,7 @@ struct VerificationResolver: Sendable {
             VerificationStep(
                 name: "test",
                 executable: toolchain.swiftExecutable.path,
-                arguments: ["test"],
+                arguments: ["test", "-Xswiftc", "-warnings-as-errors"],
                 relativeWorkingDirectory: ".",
                 timeoutSeconds: Self.testTimeout,
                 required: true
