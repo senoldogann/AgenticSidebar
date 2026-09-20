@@ -180,6 +180,102 @@ final class TaskApprovalTests: XCTestCase {
         await store.close()
     }
 
+    func testStoreRejectsRedismissalOfAlreadyDismissedFinding() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let taskID = UUID()
+        try await createTask(in: store, id: taskID)
+        let finding = ReviewFinding(taskID: taskID, severity: .high, summary: "Unsafe force unwrap")
+        try await store.recordFinding(finding)
+        let firstDismissal = try await store.dismissFinding(
+            findingID: finding.id,
+            actor: "reviewer",
+            reason: "False positive",
+            at: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        do {
+            _ = try await store.dismissFinding(
+                findingID: finding.id,
+                actor: "other-reviewer",
+                reason: "Still fine",
+                at: Date(timeIntervalSince1970: 1_700_000_100)
+            )
+            XCTFail("A second dismissal must not overwrite the recorded one")
+        } catch let error as TaskRepositoryError {
+            XCTAssertEqual(error, .findingAlreadyDismissed(findingID: finding.id))
+        }
+
+        let reloaded = try await store.findings(taskID: taskID)
+        XCTAssertEqual(reloaded, [firstDismissal])
+        await store.close()
+    }
+
+    func testDismissingNonexistentFindingThrowsNotFound() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let missingFindingID = UUID()
+
+        do {
+            _ = try await store.dismissFinding(findingID: missingFindingID, actor: "reviewer", reason: "N/A", at: Date())
+            XCTFail("Dismissing a finding that does not exist must be rejected")
+        } catch let error as TaskRepositoryError {
+            XCTAssertEqual(error, .findingNotFound(missingFindingID))
+        }
+        await store.close()
+    }
+
+    func testStoreRejectsApprovalWithoutHumanActor() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let taskID = UUID()
+        try await createTask(in: store, id: taskID)
+        let approval = TaskApproval(
+            taskID: taskID,
+            attemptID: UUID(),
+            fingerprint: "fingerprint-a",
+            actor: "   ",
+            action: .accept
+        )
+
+        do {
+            try await store.recordApproval(approval)
+            XCTFail("An approval without a human actor must be rejected")
+        } catch let error as TaskRepositoryError {
+            XCTAssertEqual(error, .invalidApprovalActor(approvalID: approval.id))
+        }
+
+        let stored = try await store.approvals(taskID: taskID)
+        XCTAssertEqual(stored, [])
+        await store.close()
+    }
+
+    func testStoreRejectsDuplicateApprovalRecord() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let taskID = UUID()
+        try await createTask(in: store, id: taskID)
+        let approval = TaskApproval(
+            taskID: taskID,
+            attemptID: UUID(),
+            fingerprint: "fingerprint-a",
+            actor: "reviewer",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_100),
+            action: .accept
+        )
+        try await store.recordApproval(approval)
+
+        do {
+            try await store.recordApproval(approval)
+            XCTFail("Re-recording the same approval identity must be rejected")
+        } catch let error as TaskRepositoryError {
+            guard case .duplicateRecord = error else {
+                XCTFail("Expected a duplicateRecord error, got \(error)")
+                return
+            }
+        }
+
+        let stored = try await store.approvals(taskID: taskID)
+        XCTAssertEqual(stored, [approval])
+        await store.close()
+    }
+
     func testStorePersistsInvalidDismissalButConsumersSeeItOpen() async throws {
         let store = try SQLiteTaskStore.inMemory()
         let taskID = UUID()

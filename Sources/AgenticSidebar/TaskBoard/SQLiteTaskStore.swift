@@ -554,6 +554,9 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
     }
 
     /// Applies an explicit human dismissal, refusing to record one without actor and reason.
+    ///
+    /// An already validly dismissed finding is refused instead of overwritten; a persisted row
+    /// whose dismissal lacks a human record counts as open, so it may be dismissed properly.
     public func dismissFinding(
         findingID: UUID,
         actor: String,
@@ -565,6 +568,9 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             return try executeTransaction {
                 guard let finding = try loadFinding(id: findingID) else {
                     throw TaskRepositoryError.findingNotFound(findingID)
+                }
+                guard finding.isOpen else {
+                    throw TaskRepositoryError.findingAlreadyDismissed(findingID: findingID)
                 }
                 let dismissed = try finding.dismissed(by: actor, reason: reason, at: date)
                 let sql = """
@@ -586,10 +592,14 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
     }
 
-    /// Persists one scoped approval record.
+    /// Persists one scoped approval record, refusing one without a human actor.
     public func recordApproval(_ approval: TaskApproval) async throws {
         try queue.sync {
             try checkOpen()
+            let actor = approval.actor.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !actor.isEmpty else {
+                throw TaskRepositoryError.invalidApprovalActor(approvalID: approval.id)
+            }
             try executeTransaction {
                 let sql = """
                     INSERT INTO task_approvals (id, task_id, attempt_id, fingerprint, actor, timestamp, action)
@@ -1377,6 +1387,9 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         let result = sqlite3_step(stmt)
         if result != SQLITE_DONE {
             let msg = String(cString: sqlite3_errmsg(db))
+            if msg.contains("UNIQUE constraint") {
+                throw TaskRepositoryError.duplicateRecord(msg)
+            }
             if (result & 0xFF) == SQLITE_CONSTRAINT || msg.contains("FOREIGN KEY") {
                 throw TaskRepositoryError.foreignKeyViolation(msg)
             }

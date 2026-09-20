@@ -80,24 +80,90 @@ final class AcceptanceGateTests: XCTestCase {
         )
     }
 
-    func testAbsentRequiredLintDeniesDone() {
+    func testAbsentOptionalLintDoesNotBlock() {
         let fixture = completeFixture()
-        let evidence = requiredEvidence(taskID: fixture.task.id, attemptID: fixture.attempt.id, omitting: ["format"])
 
-        let decision = evaluate(fixture, evidence: evidence)
+        let decision = evaluate(fixture, approvals: [acceptApproval(for: fixture)])
+
+        XCTAssertEqual(decision, .accepted)
+    }
+
+    func testSkippedOptionalLintDoesNotBlock() {
+        let fixture = completeFixture()
+        let evidence = requiredEvidence(
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            steps: AcceptanceGate.swiftPMRequiredSteps + ["format"],
+            statuses: ["format": .skipped]
+        )
+
+        let decision = evaluate(fixture, evidence: evidence, approvals: [acceptApproval(for: fixture)])
+
+        XCTAssertEqual(decision, .accepted)
+    }
+
+    func testFailedOptionalLintDeniesDone() {
+        let fixture = completeFixture()
+        let evidence = requiredEvidence(
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            steps: AcceptanceGate.swiftPMRequiredSteps + ["format"],
+            statuses: ["format": .failed]
+        )
+
+        let decision = evaluate(fixture, evidence: evidence, approvals: [acceptApproval(for: fixture)])
+
+        assertDeniesDone(decision)
+        assertBlocked(decision, contains: .optionalStepFailed(name: "format"))
+    }
+
+    func testCallerSuppliedRequiredStepDeniesWhenAbsent() {
+        let fixture = completeFixture()
+        let evidence = requiredEvidence(taskID: fixture.task.id, attemptID: fixture.attempt.id)
+
+        let decision = evaluate(
+            fixture,
+            evidence: evidence,
+            requiredSteps: AcceptanceGate.swiftPMRequiredSteps + ["format"]
+        )
 
         assertDeniesDone(decision)
         assertBlocked(decision, contains: .missingRequiredStep(name: "format"))
     }
 
-    func testSkippedRequiredLintDeniesDone() {
+    func testBlankActorApprovalDeniesDone() {
         let fixture = completeFixture()
-        let evidence = requiredEvidence(taskID: fixture.task.id, attemptID: fixture.attempt.id, statuses: ["format": .skipped])
+        let approval = TaskApproval(
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            fingerprint: currentFingerprint,
+            actor: "   ",
+            action: .accept
+        )
 
-        let decision = evaluate(fixture, evidence: evidence)
+        let decision = evaluate(fixture, approvals: [approval])
 
         assertDeniesDone(decision)
-        assertBlocked(decision, contains: .requiredStepNotPassed(name: "format", status: .skipped))
+        assertBlocked(decision, contains: .acceptanceApprovalMissingActor)
+    }
+
+    func testNoAcceptanceCriteriaDeniesDone() {
+        let fixture = completeFixture()
+        var task = fixture.task
+        task.criteria = []
+
+        let decision = AcceptanceGate.evaluate(
+            task: task,
+            attempt: fixture.attempt,
+            evidence: fixture.evidence,
+            findings: [],
+            approvals: [acceptApproval(for: fixture)],
+            currentFingerprint: currentFingerprint,
+            requiredSteps: AcceptanceGate.swiftPMRequiredSteps
+        )
+
+        assertDeniesDone(decision)
+        assertBlocked(decision, contains: .noAcceptanceCriteria)
     }
 
     func testOpenHighFindingDeniesDone() {
@@ -164,6 +230,21 @@ final class AcceptanceGateTests: XCTestCase {
         )
     }
 
+    func testApprovalFromAnotherTaskDoesNotAuthorizeCompletion() {
+        let fixture = completeFixture()
+        let foreignApproval = TaskApproval(
+            taskID: UUID(),
+            attemptID: fixture.attempt.id,
+            fingerprint: currentFingerprint,
+            actor: "reviewer",
+            action: .accept
+        )
+
+        let decision = evaluate(fixture, approvals: [foreignApproval])
+
+        XCTAssertEqual(decision, .readyForHumanReview)
+    }
+
     // MARK: - Fabricated or stale evidence never closes a task
 
     func testModelSuccessTextIsNotEvidence() {
@@ -210,6 +291,81 @@ final class AcceptanceGateTests: XCTestCase {
         assertBlocked(decision, contains: .currentFingerprintUnavailable)
     }
 
+    /// Evidence is content-bound and task-scoped: it satisfies a step by task and fingerprint,
+    /// never by the attempt that produced it. A superseded attempt's passing run on the current
+    /// content still counts, which is what lets a small follow-up attempt reuse prior evidence.
+    func testPassedEvidenceFromSupersededAttemptOnCurrentFingerprintSatisfiesRequiredStep() {
+        let fixture = completeFixture()
+        let supersededAttemptID = UUID()
+        let evidence = requiredEvidence(taskID: fixture.task.id, attemptID: supersededAttemptID)
+
+        let decision = evaluate(fixture, evidence: evidence, approvals: [acceptApproval(for: fixture)])
+
+        XCTAssertEqual(decision, .accepted)
+    }
+
+    /// The newest entry wins by recorded time; equal timestamps fall back to the
+    /// lexicographically greatest id. The rule is total, so the array order never matters.
+    func testSameTimestampEvidenceTieBreakIsDeterministic() {
+        let fixture = completeFixture()
+        let tied = Date(timeIntervalSince1970: 1_700_000_000)
+        let smallID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let largeID = UUID(uuidString: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF")!
+        let testPassed = stepEvidence(
+            "test",
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            fingerprint: currentFingerprint,
+            recordedAt: tied
+        )
+        let buildFailed = stepEvidence(
+            "build",
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            id: largeID,
+            status: .failed,
+            fingerprint: currentFingerprint,
+            recordedAt: tied
+        )
+        let buildPassed = stepEvidence(
+            "build",
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            id: smallID,
+            status: .passed,
+            fingerprint: currentFingerprint,
+            recordedAt: tied
+        )
+
+        for ordered in [[buildPassed, buildFailed], [buildFailed, buildPassed]] {
+            let denied = evaluate(fixture, evidence: [testPassed] + ordered)
+            assertDeniesDone(denied)
+            assertBlocked(denied, contains: .requiredStepNotPassed(name: "build", status: .failed))
+        }
+
+        let laterPassed = stepEvidence(
+            "build",
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            id: largeID,
+            status: .passed,
+            fingerprint: currentFingerprint,
+            recordedAt: tied
+        )
+        let earlierFailed = stepEvidence(
+            "build",
+            taskID: fixture.task.id,
+            attemptID: fixture.attempt.id,
+            id: smallID,
+            status: .failed,
+            fingerprint: currentFingerprint,
+            recordedAt: tied
+        )
+        for ordered in [[earlierFailed, laterPassed], [laterPassed, earlierFailed]] {
+            XCTAssertEqual(evaluate(fixture, evidence: [testPassed] + ordered), .readyForHumanReview)
+        }
+    }
+
     func testAttemptNotCurrentDeniesDone() {
         let fixture = completeFixture()
         let otherAttemptID = UUID()
@@ -222,11 +378,12 @@ final class AcceptanceGateTests: XCTestCase {
             evidence: fixture.evidence,
             findings: [],
             approvals: [acceptApproval(for: fixture)],
-            currentFingerprint: currentFingerprint
+            currentFingerprint: currentFingerprint,
+            requiredSteps: AcceptanceGate.swiftPMRequiredSteps
         )
 
         assertDeniesDone(decision)
-        assertBlocked(decision, contains: .attemptNotCurrent(expected: fixture.attempt.id, actual: otherAttemptID))
+        assertBlocked(decision, contains: .attemptNotCurrent(expected: otherAttemptID, actual: fixture.attempt.id))
     }
 
     func testTaskNotInReviewDeniesDone() {
@@ -373,7 +530,8 @@ final class AcceptanceGateTests: XCTestCase {
         evidence: [VerificationEvidence]? = nil,
         findings: [ReviewFinding] = [],
         approvals: [TaskApproval] = [],
-        currentFingerprint: String? = nil
+        currentFingerprint: String? = nil,
+        requiredSteps: [String] = AcceptanceGate.swiftPMRequiredSteps
     ) -> AcceptanceDecision {
         AcceptanceGate.evaluate(
             task: fixture.task,
@@ -381,20 +539,21 @@ final class AcceptanceGateTests: XCTestCase {
             evidence: evidence ?? fixture.evidence,
             findings: findings,
             approvals: approvals,
-            currentFingerprint: currentFingerprint ?? self.currentFingerprint
+            currentFingerprint: currentFingerprint ?? self.currentFingerprint,
+            requiredSteps: requiredSteps
         )
     }
 
     private func requiredEvidence(
         taskID: UUID,
         attemptID: UUID,
+        steps: [String] = AcceptanceGate.swiftPMRequiredSteps,
         statuses: [String: VerificationEvidenceStatus] = [:],
         fingerprint: String? = nil,
         recipeVersion: Int? = VerificationRecipe.currentVersion,
-        omitting: Set<String> = [],
         details: String = ""
     ) -> [VerificationEvidence] {
-        AcceptanceGate.requiredStepNames.filter { !omitting.contains($0) }.enumerated().map { index, name in
+        steps.enumerated().map { index, name in
             stepEvidence(
                 name,
                 taskID: taskID,
@@ -412,6 +571,7 @@ final class AcceptanceGateTests: XCTestCase {
         _ name: String,
         taskID: UUID,
         attemptID: UUID,
+        id: UUID = UUID(),
         status: VerificationEvidenceStatus = .passed,
         fingerprint: String?,
         recipeVersion: Int? = VerificationRecipe.currentVersion,
@@ -420,6 +580,7 @@ final class AcceptanceGateTests: XCTestCase {
     ) -> VerificationEvidence {
         let exitCode: Int32? = status == .passed ? 0 : (status == .failed ? 1 : nil)
         return VerificationEvidence(
+            id: id,
             taskID: taskID,
             attemptID: attemptID,
             recipeName: "swiftpm:AgenticSidebar",

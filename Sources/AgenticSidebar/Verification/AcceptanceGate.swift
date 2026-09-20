@@ -5,17 +5,21 @@ public enum AcceptanceBlockReason: Sendable, Codable, Equatable {
     /// Completion can only be decided for a task in review.
     case taskNotInReview(status: TaskStatus)
     /// The task does not point at the evaluated attempt.
-    case attemptNotCurrent(expected: UUID, actual: UUID?)
+    case attemptNotCurrent(expected: UUID?, actual: UUID)
     /// The evaluated attempt belongs to a different task.
     case attemptTaskMismatch(expectedTaskID: UUID, actualTaskID: UUID)
     /// No content fingerprint can be verified; nothing may close without one.
     case currentFingerprintUnavailable
+    /// The task records no acceptance criteria; an empty list must never pass vacuously.
+    case noAcceptanceCriteria
     /// Acceptance criteria not marked complete by a human.
     case unmetCriteria(ids: [UUID])
     /// A required verification step has no evidence for this task.
     case missingRequiredStep(name: String)
     /// The latest evidence for a required step did not pass.
     case requiredStepNotPassed(name: String, status: VerificationEvidenceStatus)
+    /// The latest evidence for an optional step reports a failure for this task.
+    case optionalStepFailed(name: String)
     /// Required evidence was produced by a recipe whose semantics are unknown.
     case requiredStepUnknownRecipeVersion(name: String, version: Int?)
     /// Passed evidence records no workspace fingerprint.
@@ -28,6 +32,8 @@ public enum AcceptanceBlockReason: Sendable, Codable, Equatable {
     case acceptanceApprovalAttemptMismatch(expected: UUID, actual: UUID)
     /// An `accept` approval exists but binds different content.
     case acceptanceApprovalFingerprintMismatch(expected: String, actual: String)
+    /// An `accept` approval exists but records no human actor.
+    case acceptanceApprovalMissingActor
 }
 
 /// Outcome of the completion gate; never a bare boolean without reasons.
@@ -42,16 +48,20 @@ public enum AcceptanceDecision: Sendable, Equatable {
 
 /// Deterministic, side-effect-free completion gate.
 ///
-/// Only actual verification evidence can satisfy the required steps: text claiming success
-/// is never read. Evidence counts only when it is bound to this task, passed, was produced
-/// by a known recipe version and was recorded on the current fingerprint. A human `accept`
-/// approval must additionally bind the same attempt and exact content; changed content
-/// revokes it. Only `.accept` authorizes `done`; merge, push and discardWorkspace are
+/// Evidence is content-bound and task-scoped: an entry may satisfy a step when its `taskID`
+/// matches the task and its recorded fingerprint equals the current fingerprint. The attempt
+/// that produced it does not matter, so a superseded attempt's passing run on the current
+/// content still counts. Approvals are attempt-bound: an `accept` approval authorizes exactly
+/// one attempt and exact content, changed content revokes it, and it must record a non-blank
+/// human actor. Only `.accept` authorizes `done`; merge, push and discardWorkspace are
 /// separate future approvals.
 public enum AcceptanceGate {
-    /// Required verification steps produced by the SwiftPM resolver.
-    /// `format` is the lint step; an absent, skipped or failed lint result denies completion.
-    public static let requiredStepNames: [String] = ["build", "test", "format"]
+    /// Required verification steps of the SwiftPM resolver recipe.
+    ///
+    /// `build` and `test` must pass on the current fingerprint. `format` is optional: the
+    /// pinned formatter may be absent, so a missing or skipped lint must not deny completion
+    /// forever; a lint that actually ran and failed still blocks.
+    public static let swiftPMRequiredSteps: [String] = ["build", "test"]
 
     public static func evaluate(
         task: CodingTask,
@@ -59,7 +69,8 @@ public enum AcceptanceGate {
         evidence: [VerificationEvidence],
         findings: [ReviewFinding],
         approvals: [TaskApproval],
-        currentFingerprint: String
+        currentFingerprint: String,
+        requiredSteps: [String]
     ) -> AcceptanceDecision {
         var reasons: [AcceptanceBlockReason] = []
 
@@ -70,12 +81,15 @@ public enum AcceptanceGate {
             reasons.append(.attemptTaskMismatch(expectedTaskID: task.id, actualTaskID: attempt.taskID))
         }
         if task.currentAttemptID != attempt.id {
-            reasons.append(.attemptNotCurrent(expected: attempt.id, actual: task.currentAttemptID))
+            reasons.append(.attemptNotCurrent(expected: task.currentAttemptID, actual: attempt.id))
         }
         if currentFingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             reasons.append(.currentFingerprintUnavailable)
         }
 
+        if task.criteria.isEmpty {
+            reasons.append(.noAcceptanceCriteria)
+        }
         let unmetCriteria = task.criteria.filter { !$0.isCompleted }.map(\.id)
         if !unmetCriteria.isEmpty {
             reasons.append(.unmetCriteria(ids: unmetCriteria))
@@ -89,7 +103,7 @@ public enum AcceptanceGate {
             reasons.append(.openBlockingFindings(ids: blockingFindings))
         }
 
-        for stepName in requiredStepNames {
+        for stepName in requiredSteps {
             let reason = stepReason(
                 name: stepName,
                 taskID: task.id,
@@ -101,12 +115,23 @@ public enum AcceptanceGate {
             }
         }
 
+        for stepName in optionalStepNames(requiredSteps: requiredSteps, taskID: task.id, evidence: evidence) {
+            let entries = evidence.filter { $0.taskID == task.id && $0.stepName == stepName }
+            if entries.sorted(by: evidenceOrder).last?.status == .failed {
+                reasons.append(.optionalStepFailed(name: stepName))
+            }
+        }
+
         if !reasons.isEmpty {
             return .blocked(reasons: reasons)
         }
 
         let acceptApprovals = approvals.filter { $0.taskID == task.id && $0.action == .accept }
-        let matching = acceptApprovals.contains { $0.attemptID == attempt.id && $0.fingerprint == currentFingerprint }
+        let matching = acceptApprovals.contains { approval in
+            approval.attemptID == attempt.id
+                && approval.fingerprint == currentFingerprint
+                && hasHumanActor(approval.actor)
+        }
         if matching {
             return .accepted
         }
@@ -116,6 +141,9 @@ public enum AcceptanceGate {
 
         let approvalReasons = acceptApprovals.flatMap { approval -> [AcceptanceBlockReason] in
             var reasons: [AcceptanceBlockReason] = []
+            if !hasHumanActor(approval.actor) {
+                reasons.append(.acceptanceApprovalMissingActor)
+            }
             if approval.attemptID != attempt.id {
                 reasons.append(.acceptanceApprovalAttemptMismatch(expected: attempt.id, actual: approval.attemptID))
             }
@@ -127,6 +155,27 @@ public enum AcceptanceGate {
             return reasons
         }
         return .blocked(reasons: deduplicated(approvalReasons))
+    }
+
+    /// Step names present in the task's evidence but not listed as required, in stable order.
+    private static func optionalStepNames(
+        requiredSteps: [String],
+        taskID: UUID,
+        evidence: [VerificationEvidence]
+    ) -> [String] {
+        let required = Set(requiredSteps)
+        let names = Set(
+            evidence
+                .filter { $0.taskID == taskID }
+                .compactMap(\.stepName)
+                .filter { !required.contains($0) }
+        )
+        return names.sorted()
+    }
+
+    /// True when the actor is more than blank text; an approval must name a human.
+    private static func hasHumanActor(_ actor: String) -> Bool {
+        !actor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// The blocking reason for one required step, or nil when its latest evidence satisfies it.
@@ -158,7 +207,8 @@ public enum AcceptanceGate {
         return nil
     }
 
-    /// Deterministic ordering: oldest first by recorded time, identity as the tie-break.
+    /// Deterministic ordering: oldest first by recorded time; when timestamps tie, the
+    /// lexicographically greatest id wins as the latest entry, so array order never matters.
     private static func evidenceOrder(_ lhs: VerificationEvidence, _ rhs: VerificationEvidence) -> Bool {
         if lhs.recordedAt != rhs.recordedAt {
             return lhs.recordedAt < rhs.recordedAt

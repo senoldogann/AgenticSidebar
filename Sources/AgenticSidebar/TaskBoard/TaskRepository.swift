@@ -4,12 +4,15 @@ import Foundation
 public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
     case taskNotFound(UUID)
     case findingNotFound(UUID)
+    case findingAlreadyDismissed(findingID: UUID)
     case staleVersion(taskID: UUID, expected: Int, actual: Int)
     case activeAttemptConflict(taskID: UUID, existingAttemptID: UUID)
     case repositoryLeaseConflict(repositoryPath: String, heldByTaskID: UUID)
     case attemptNotActive(taskID: UUID, attemptID: UUID)
     case nonMonotonicGeneration(taskID: UUID, minimumExclusive: Int, actual: Int)
     case taskNotClaimable(taskID: UUID, status: TaskStatus)
+    case invalidApprovalActor(approvalID: UUID)
+    case duplicateRecord(String)
     case foreignKeyViolation(String)
     case storeCorrupt(String)
     case readOnly(String)
@@ -21,6 +24,8 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
             return "Task not found: \(id)"
         case .findingNotFound(let id):
             return "Review finding not found: \(id)"
+        case .findingAlreadyDismissed(let findingID):
+            return "Review finding \(findingID) is already dismissed"
         case .staleVersion(let id, let expected, let actual):
             return "Task \(id) version conflict: expected \(expected), actual \(actual)"
         case .activeAttemptConflict(let taskID, let existingAttemptID):
@@ -33,6 +38,10 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
             return "Attempt generation for task \(taskID) must exceed \(minimumExclusive), got \(actual)"
         case .taskNotClaimable(let taskID, let status):
             return "Task \(taskID) cannot claim an attempt from status \(status.rawValue)"
+        case .invalidApprovalActor(let approvalID):
+            return "Approval \(approvalID) must record a non-blank human actor"
+        case .duplicateRecord(let message):
+            return "Duplicate record: \(message)"
         case .foreignKeyViolation(let message):
             return "Foreign key constraint violation: \(message)"
         case .storeCorrupt(let message):
