@@ -220,11 +220,11 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** `VerificationRecipe` has version, trusted source, ordered `VerificationStep(executable, arguments, relativeWorkingDirectory, timeoutSeconds, required)`; `VerificationResolver.resolve(repository:) async throws -> VerificationRecipe` reads known project CI/script metadata and requires explicit approval for any non-standard execution; `VerificationRunner.verify(recipe:workspace:) async -> [VerificationEvidence]` records exitCode, timedOut, clipped redacted output and exact workspace fingerprint. CLI invocation is argv-only.
 
-- [ ] Step 1: RED recipe tests for this repository's exact build/test plus optional-if-version-matched `swift-format 604.0.0`, unknown project, invalid executable/path escape and required missing tool. Recipes never silently infer unsafe commands from file extension.
-- [ ] Step 2: RED runner tests for build failure preventing dependent test execution, test nonzero, missing required lint, cancellation/timeout and fingerprint changing between steps.
-- [ ] Step 3: Run both focused filters and record RED.
-- [ ] Step 4: Implement trusted recipe resolution, bounded process output, deadline enforcement and evidence fingerprint checks. Record skipped/unavailable explicitly. Real host tests must use a disposable authorized worktree.
-- [ ] Step 5: GREEN filters, full `swift test`, then fresh build/test/lint in exact approved workspace. Never report success based on a tail pipeline exit code alone.
+- [x] Step 1: RED recipe tests for this repository's exact build/test plus optional-if-version-matched `swift-format 604.0.0`, unknown project, invalid executable/path escape and required missing tool. Recipes never silently infer unsafe commands from file extension.
+- [x] Step 2: RED runner tests for build failure preventing dependent test execution, test nonzero, missing required lint, cancellation/timeout and fingerprint changing between steps.
+- [x] Step 3: Run both focused filters and record RED.
+- [x] Step 4: Implement trusted recipe resolution, bounded process output, deadline enforcement and evidence fingerprint checks. Record skipped/unavailable explicitly. Real host tests must use a disposable authorized worktree.
+- [x] Step 5: GREEN filters, full `swift test`, then fresh build/test/lint in exact approved workspace. Never report success based on a tail pipeline exit code alone.
 
 **Gate:** only actual command exit codes and correct revision yield verification PASS.
 
