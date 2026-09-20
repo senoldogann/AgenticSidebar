@@ -22,6 +22,7 @@ enum CodingTaskServiceError: LocalizedError, Equatable, Sendable {
     case transitionRejected(TaskTransitionError)
     case persistence(TaskRepositoryError)
     case schedulerRejected(reason: String)
+    case unexpected(String)
 
     var errorDescription: String? {
         switch self {
@@ -58,6 +59,8 @@ enum CodingTaskServiceError: LocalizedError, Equatable, Sendable {
             return "Task store rejected the operation: \(error.localizedDescription)"
         case .schedulerRejected(let reason):
             return "Scheduler rejected the operation: \(reason)"
+        case .unexpected(let message):
+            return "Unexpected task service failure: \(message)"
         }
     }
 }
@@ -322,16 +325,21 @@ actor CodingTaskService {
         }
     }
 
-    /// Resumes a paused or stopped task by re-arming it; the scheduler has no non-destructive resume.
+    /// Resumes a user-suspended task by re-arming it; the scheduler has no non-destructive resume.
     ///
-    /// Resume replaces the suspended attempt with a fresh generation, so the caller must name the
-    /// attempt it saw. A mismatch is a typed stale refusal, never a silent cancellation.
+    /// Only a `paused` or `stopped` block is resumable: a system block such as
+    /// `.uncertainExecution` needs reconciliation, never a silent relaunch. Resume replaces the
+    /// suspended attempt with a fresh generation, so the caller must name the attempt it saw;
+    /// a mismatch is a typed stale refusal, never a silent cancellation.
     @discardableResult
     func resume(taskID: UUID, expectedVersion: Int, expectedAttemptID: UUID?) async throws -> TaskScheduleEntry {
         try await withExclusiveTaskAction(taskID: taskID) {
             let task = try await self.requireTask(taskID)
             try Self.requireVersion(task: task, expectedVersion: expectedVersion)
             guard task.status == .blocked else {
+                throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
+            }
+            guard TaskScheduler.isUserSuspension(task.blockReason) else {
                 throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
             }
             let active = try await self.activeAttempt(taskID: taskID)
@@ -342,14 +350,28 @@ actor CodingTaskService {
                     actualAttemptID: active?.id
                 )
             }
-            return try await self.mapped { try await self.scheduler.retry(taskID: taskID) }
+            return try await self.mapped {
+                try await self.scheduler.retry(
+                    taskID: taskID,
+                    expectedAttemptID: expectedAttemptID,
+                    expectedGeneration: active?.generation
+                )
+            }
         }
     }
 
-    /// Stops the task the caller saw; the expected attempt may be nil only when none is current.
-    func stop(taskID: UUID, expectedAttemptID: UUID?) async throws {
+    /// Stops the running task the caller saw, fenced by version and active attempt.
+    ///
+    /// The stop is only legal while the task is still running: a task that advanced to
+    /// review behind the caller's back must be refused with a typed stale/not-available
+    /// error instead of being cancelled into `blocked(custom("stopped"))`.
+    func stop(taskID: UUID, expectedVersion: Int, expectedAttemptID: UUID?) async throws {
         try await withExclusiveTaskAction(taskID: taskID) {
             let task = try await self.requireTask(taskID)
+            try Self.requireVersion(task: task, expectedVersion: expectedVersion)
+            guard task.status == .running else {
+                throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
+            }
             guard task.currentAttemptID == expectedAttemptID else {
                 throw CodingTaskServiceError.staleAttempt(
                     taskID: taskID,
@@ -385,7 +407,13 @@ actor CodingTaskService {
                     actualAttemptID: active?.id
                 )
             }
-            return try await self.mapped { try await self.scheduler.retry(taskID: taskID) }
+            return try await self.mapped {
+                try await self.scheduler.retry(
+                    taskID: taskID,
+                    expectedAttemptID: expectedActiveAttemptID,
+                    expectedGeneration: expectedActiveGeneration
+                )
+            }
         }
     }
 
@@ -435,7 +463,18 @@ actor CodingTaskService {
                 throw CodingTaskServiceError.acceptanceDenied(taskID: taskID, reasons: reasons)
             }
 
-            let approval = try await self.matchingOrRecordedApproval(for: context, actor: trimmedActor)
+            let existingApproval = Self.matchingApproval(for: context, actor: trimmedActor)
+            let approval =
+                existingApproval
+                ?? TaskApproval(
+                    id: UUID(),
+                    taskID: context.task.id,
+                    attemptID: context.attempt.id,
+                    fingerprint: context.currentFingerprint,
+                    actor: trimmedActor,
+                    timestamp: clock.now(),
+                    action: .accept
+                )
             let evidenceIDs = context.evidence
                 .filter { entry in
                     entry.taskID == task.id
@@ -443,7 +482,7 @@ actor CodingTaskService {
                         && entry.workspaceFingerprint == context.currentFingerprint
                 }
                 .map(\.id)
-            return try await self.mapped {
+            let accepted = try await self.mapped {
                 try await self.repository.transition(
                     taskID: taskID,
                     expectedVersion: expectedVersion,
@@ -456,6 +495,12 @@ actor CodingTaskService {
                     )
                 )
             }
+            // Persist the approval only after the version-fenced transition committed, so a
+            // rejected transition can never leave an orphan approval that authorizes later work.
+            if existingApproval == nil {
+                try await self.mapped { try await self.repository.recordApproval(approval) }
+            }
+            return accepted
         }
     }
 
@@ -507,31 +552,21 @@ actor CodingTaskService {
         )
     }
 
-    /// Returns an approval that already authorizes this exact attempt and content, or records one.
-    private func matchingOrRecordedApproval(for context: AcceptanceContext, actor: String) async throws -> TaskApproval {
-        let existing = context.approvals.first { approval in
+    /// Returns an approval that already authorizes this exact attempt, content and actor,
+    /// or nil when a fresh actor-bound approval must be constructed.
+    ///
+    /// A same-content approval from another actor is not reused: acceptance must record the
+    /// human who actually accepted this content.
+    private static func matchingApproval(for context: AcceptanceContext, actor: String) -> TaskApproval? {
+        context.approvals.first { approval in
             approval.authorizes(
                 action: .accept,
                 taskID: context.task.id,
                 attemptID: context.attempt.id,
                 fingerprint: context.currentFingerprint
             )
-                && !approval.actor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && approval.actor.trimmingCharacters(in: .whitespacesAndNewlines) == actor
         }
-        if let existing {
-            return existing
-        }
-        let approval = TaskApproval(
-            id: UUID(),
-            taskID: context.task.id,
-            attemptID: context.attempt.id,
-            fingerprint: context.currentFingerprint,
-            actor: actor,
-            timestamp: clock.now(),
-            action: .accept
-        )
-        try await mapped { try await self.repository.recordApproval(approval) }
-        return approval
     }
 
     // MARK: - Guards and mapping
@@ -565,7 +600,7 @@ actor CodingTaskService {
         }
     }
 
-    private static func mapError(_ error: Error) -> CodingTaskServiceError {
+    static func mapError(_ error: Error) -> CodingTaskServiceError {
         if let serviceError = error as? CodingTaskServiceError {
             return serviceError
         }
@@ -598,9 +633,11 @@ actor CodingTaskService {
                 return .budgetExhausted(taskID: taskID, reason: "tool-call budget exhausted (\(used)/\(maximum))")
             case .invalidCompletionOutcome(let outcome):
                 return .schedulerRejected(reason: "invalid completion outcome \(outcome.rawValue)")
+            case .staleAttempt(let taskID, let expectedAttemptID, _, let actualAttemptID, _):
+                return .staleAttempt(taskID: taskID, expectedAttemptID: expectedAttemptID, actualAttemptID: actualAttemptID)
             }
         }
-        return .schedulerRejected(reason: String(describing: error))
+        return .unexpected(String(describing: error))
     }
 
     private static func requireVersion(task: CodingTask, expectedVersion: Int) throws {

@@ -274,6 +274,254 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertEqual(store.phase, .loaded)
     }
 
+    func testConcurrentStartsAcrossTasksClaimOnceAndDeferTheOther() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let first = try await seedTask(harness: harness, projectID: project.id, title: "First", priority: 9, criteria: [])
+        let second = try await seedTask(harness: harness, projectID: project.id, title: "Second", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        let gate = AsyncGate()
+        await harness.repository.gateTaskReads(gate)
+        let firstAction = Task { await store.start(taskID: first.id) }
+        let secondAction = Task { await store.start(taskID: second.id) }
+        await gate.waitUntilEntered(count: 2)
+        await gate.release()
+
+        let results = await [firstAction.value, secondAction.value]
+        XCTAssertEqual(results.filter { $0 == .applied }.count, 1, "Exactly one start may hold the repository lease")
+        let refusals = results.compactMap { result -> TaskBoardRefusal? in
+            guard case .refused(let refusal) = result else { return nil }
+            return refusal
+        }
+        XCTAssertEqual(refusals.count, 1)
+        XCTAssertEqual(refusals.first?.kind, .deferred)
+        XCTAssertTrue(refusals.first?.message.contains("repositoryBusy") == true)
+
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.claimAttempts, 1)
+        XCTAssertFalse(store.isActionInFlight(for: first.id))
+        XCTAssertFalse(store.isActionInFlight(for: second.id))
+
+        let snapshot = try await service.snapshot(projectID: project.id)
+        XCTAssertEqual(snapshot.tasks.filter { $0.status == .running }.count, 1)
+        XCTAssertEqual(snapshot.activeAttempts.count, 1)
+    }
+
+    func testDeferredStartRefusalUsesDedicatedDeferredKind() async throws {
+        let harness = try ServiceTestHarness(workspace: .notOwned(reason: "no manifest"))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Deferred", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        let result = await store.start(taskID: task.id)
+        guard case .refused(let refusal) = result else {
+            XCTFail("A deferred start must be refused, got \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .deferred)
+        XCTAssertTrue(refusal.message.contains("workspaceNotOwned"))
+    }
+
+    func testRepositoryBusyDeferredRefusalUsesDedicatedDeferredKind() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Busy repo", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        await harness.repository.failNextRepositoryLease(
+            with: .repositoryLeaseConflict(
+                repositoryPath: TaskBoardServiceFixtures.ownedWorkspace.repositoryPath,
+                heldByTaskID: UUID()
+            )
+        )
+        let result = await store.start(taskID: task.id)
+        guard case .refused(let refusal) = result else {
+            XCTFail("A busy repository must be refused, got \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .deferred)
+        XCTAssertTrue(refusal.message.contains("repositoryBusy"))
+
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.claimAttempts, 0)
+    }
+
+    func testPersistenceSchedulerAndUnexpectedErrorsMapToRejectedKind() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Mapped", priority: 1, criteria: [])
+
+        let persistence = TaskBoardStore.refusal(from: CodingTaskServiceError.persistence(.underlying("db down")))
+        XCTAssertEqual(persistence.kind, .rejected)
+        XCTAssertTrue(persistence.message.contains("db down"))
+        let schedulerRejected = TaskBoardStore.refusal(
+            from: CodingTaskServiceError.schedulerRejected(reason: "invalid completion outcome inProgress")
+        )
+        XCTAssertEqual(schedulerRejected.kind, .rejected)
+        let unexpected = TaskBoardStore.refusal(from: CodingTaskServiceError.unexpected("CancellationError()"))
+        XCTAssertEqual(unexpected.kind, .rejected)
+        XCTAssertTrue(unexpected.message.contains("CancellationError()"))
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        await harness.repository.failNextTaskRead(with: TaskRepositoryError.underlying("db down"))
+        let result = await store.start(taskID: task.id)
+        guard case .refused(let refusal) = result else {
+            XCTFail("A persistence failure must be refused, got \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        XCTAssertTrue(refusal.message.contains("db down"))
+    }
+
+    func testRefusalThenSuccessfulActionOnSameTaskClearsInFlight() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Retry after stale", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: 1,
+            action: .markReady,
+            context: TaskTransitionContext(fingerprint: "fixture", actor: "fixture")
+        )
+        let stale = await store.start(taskID: task.id)
+        guard case .refused(let refusal) = stale else {
+            XCTFail("A stale start must be refused, got \(stale)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .stale)
+        XCTAssertFalse(store.isActionInFlight(for: task.id))
+
+        let card = try XCTUnwrap(store.cards.first { $0.id == task.id })
+        XCTAssertEqual(card.status, .ready)
+        XCTAssertEqual(card.version, 2)
+        let result = await store.start(taskID: task.id)
+        XCTAssertEqual(result, .applied)
+        XCTAssertFalse(store.isActionInFlight(for: task.id))
+        XCTAssertEqual(store.cards.first { $0.id == task.id }?.status, .running)
+        XCTAssertTrue(store.actionAvailability(for: task.id).first { $0.action == .stop }?.isEnabled == true)
+    }
+
+    func testStaleStopAfterReviewAdvanceIsRefused() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Stop", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        let startResult = await store.start(taskID: task.id)
+        XCTAssertEqual(startResult, .applied)
+        let running = try XCTUnwrap(store.cards.first { $0.id == task.id })
+        XCTAssertEqual(running.status, .running)
+        let attemptID = try XCTUnwrap(running.currentAttemptID)
+
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: running.version,
+            action: .submitForReview,
+            context: TaskTransitionContext(fingerprint: attemptID.uuidString, actor: "agent", evidenceIDs: [UUID()])
+        )
+
+        let result = await store.stop(taskID: task.id)
+        guard case .refused(let refusal) = result else {
+            XCTFail("A stop of a review task must be refused, got \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .stale)
+        let after = try XCTUnwrap(store.cards.first { $0.id == task.id })
+        XCTAssertEqual(after.status, .review)
+        let history = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.outcome), [.inProgress])
+    }
+
+    func testSelectionChangeDuringRefreshKeepsNewSelection() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let other = try await service.createProject(
+            name: "Other",
+            repositoryPath: "/tmp/agentic-sidebar-service-tests/other-repo",
+            gitIdentity: "dev@example.com",
+            protectedRefs: []
+        )
+        _ = try await seedTask(harness: harness, projectID: project.id, title: "Task", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        XCTAssertFalse(store.cards.isEmpty)
+
+        let gate = AsyncGate()
+        await harness.repository.gateSnapshots(gate)
+        let refresh = Task { await store.refresh() }
+        await gate.waitUntilEntered()
+        store.selectProject(other.id)
+        await gate.release()
+        await refresh.value
+
+        XCTAssertEqual(store.selectedProjectID, other.id)
+        XCTAssertTrue(store.cards.isEmpty)
+        XCTAssertEqual(store.phase, .idle)
+        XCTAssertNil(store.detail)
+        XCTAssertNil(store.selectedTaskID)
+    }
+
+    func testRefreshFailureWhileActionInFlightRecoversAfterAction() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "In flight", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        let gate = AsyncGate()
+        await harness.repository.gateTaskReads(gate)
+        let action = Task { await store.start(taskID: task.id) }
+        await gate.waitUntilEntered()
+        XCTAssertTrue(store.isActionInFlight(for: task.id))
+
+        await harness.repository.failNextSnapshot(with: .underlying("snapshot unavailable"))
+        await store.refresh()
+        guard case .failed(let message) = store.phase else {
+            XCTFail("Expected a failed phase, got \(store.phase)")
+            return
+        }
+        XCTAssertTrue(message.contains("snapshot unavailable"))
+
+        await gate.release()
+        let result = await action.value
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(store.phase, .loaded)
+        XCTAssertFalse(store.isActionInFlight(for: task.id))
+        XCTAssertEqual(store.cards.first { $0.id == task.id }?.status, .running)
+    }
+
     func testRefreshFailureSurfacesInPhaseWithoutCrashingBoard() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()

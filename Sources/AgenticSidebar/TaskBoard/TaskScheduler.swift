@@ -145,6 +145,13 @@ enum TaskSchedulerError: LocalizedError, Equatable, Sendable {
     case toolCallBudgetExhausted(taskID: UUID, used: Int, maximum: Int)
     case retryNotAvailable(taskID: UUID, status: TaskStatus)
     case invalidCompletionOutcome(AttemptOutcome)
+    case staleAttempt(
+        taskID: UUID,
+        expectedAttemptID: UUID?,
+        expectedGeneration: Int?,
+        actualAttemptID: UUID?,
+        actualGeneration: Int?
+    )
 
     var errorDescription: String? {
         switch self {
@@ -162,6 +169,9 @@ enum TaskSchedulerError: LocalizedError, Equatable, Sendable {
             return "Task \(taskID) cannot be retried from status \(status.rawValue)"
         case .invalidCompletionOutcome(let outcome):
             return "Completion outcome \(outcome.rawValue) is not terminal"
+        case .staleAttempt(let taskID, let expectedAttemptID, let expectedGeneration, let actualAttemptID, let actualGeneration):
+            return
+                "Task \(taskID) active attempt changed: expected \(expectedAttemptID?.uuidString ?? "none")/gen \(expectedGeneration.map(String.init) ?? "none"), actual \(actualAttemptID?.uuidString ?? "none")/gen \(actualGeneration.map(String.init) ?? "none")"
         }
     }
 }
@@ -175,6 +185,16 @@ enum TaskSchedulerError: LocalizedError, Equatable, Sendable {
 actor TaskScheduler {
     static let attemptLeaseGraceSeconds: TimeInterval = 300
     static let repositoryLeaseGraceSeconds: TimeInterval = 600
+
+    /// Block reason values that mean a user suspension; only these may be resumed.
+    static let pausedBlockReason = "paused"
+    static let stoppedBlockReason = "stopped"
+
+    /// True when the block reason is a user suspension rather than a system block.
+    static func isUserSuspension(_ reason: TaskBlockReason?) -> Bool {
+        guard case .custom(let value) = reason else { return false }
+        return value == pausedBlockReason || value == stoppedBlockReason
+    }
 
     private struct ActiveAttemptRecord: Sendable {
         let taskID: UUID
@@ -286,7 +306,7 @@ actor TaskScheduler {
             throw TaskSchedulerError.taskNotFound(taskID)
         }
         if task.status == .running {
-            try await block(task, reason: .custom("paused"))
+            try await block(task, reason: .custom(Self.pausedBlockReason))
         }
     }
 
@@ -311,7 +331,7 @@ actor TaskScheduler {
             throw TaskSchedulerError.taskNotFound(taskID)
         }
         if task.status == .ready || task.status == .running || task.status == .review {
-            try await block(task, reason: .custom("stopped"))
+            try await block(task, reason: .custom(Self.stoppedBlockReason))
         }
     }
 
@@ -360,6 +380,36 @@ actor TaskScheduler {
 
         let armedTask = try await armForClaim(taskID: taskID)
         return try await claimEntry(for: armedTask, projectID: armedTask.projectID, history: history)
+    }
+
+    /// Fenced re-arm: the caller's expected attempt identity is revalidated before any
+    /// cancellation, so a stale action can never cancel newer work.
+    ///
+    /// The unfenced `retry(taskID:)` stays for existing callers; every service path that
+    /// replaces an attempt uses this fence.
+    @discardableResult
+    func retry(taskID: UUID, expectedAttemptID: UUID?, expectedGeneration: Int?) async throws -> TaskScheduleEntry {
+        let actual = try await fencedActiveAttempt(taskID: taskID)
+        guard actual?.id == expectedAttemptID, actual?.generation == expectedGeneration else {
+            throw TaskSchedulerError.staleAttempt(
+                taskID: taskID,
+                expectedAttemptID: expectedAttemptID,
+                expectedGeneration: expectedGeneration,
+                actualAttemptID: actual?.id,
+                actualGeneration: actual?.generation
+            )
+        }
+        return try await retry(taskID: taskID)
+    }
+
+    /// Active attempt as this scheduler will cancel it: its owned record first, then any
+    /// dangling in-progress row the repository still reports.
+    private func fencedActiveAttempt(taskID: UUID) async throws -> TaskAttempt? {
+        if let record = activeAttempts[taskID] {
+            return record.attempt
+        }
+        let history = try await repository.attemptHistory(taskID: taskID)
+        return history.first { $0.outcome == .inProgress && $0.endedAt == nil }
     }
 
     /// Validates lease ownership and records the terminal outcome of an attempt.

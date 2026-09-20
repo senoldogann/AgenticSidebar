@@ -67,6 +67,7 @@ struct TaskBoardRefusal: Sendable, Equatable {
     enum Kind: String, Sendable, Equatable {
         case stale
         case unavailable
+        case deferred
         case blocked
         case busy
         case rejected
@@ -169,10 +170,16 @@ final class TaskBoardStore {
             return
         }
         isRefreshing = true
+        defer { finishRefresh() }
         repeat {
             needsReload = false
             await loadSnapshot(projectID: projectID)
         } while needsReload
+    }
+
+    /// Ends one refresh pass and wakes every coalesced waiter; `defer`-owned so no future
+    /// throwing or cancelled path can leak `isRefreshing` or a suspended waiter.
+    private func finishRefresh() {
         isRefreshing = false
         let waiters = refreshWaiters
         refreshWaiters = []
@@ -320,7 +327,7 @@ final class TaskBoardStore {
                 case .unavailable(let unavailability):
                     return .refused(TaskBoardRefusal(kind: .unavailable, message: unavailability.message))
                 case .deferred(let reason):
-                    return .refused(TaskBoardRefusal(kind: .unavailable, message: "Not dispatched: \(reason)"))
+                    return .refused(TaskBoardRefusal(kind: .deferred, message: "Not dispatched: \(reason)"))
                 }
             } catch {
                 return .refused(Self.refusal(from: error))
@@ -360,7 +367,11 @@ final class TaskBoardStore {
     func stop(taskID: UUID) async -> TaskBoardActionResult {
         await perform(.stop, taskID: taskID) { card in
             do {
-                try await self.service.stop(taskID: taskID, expectedAttemptID: card.currentAttemptID)
+                try await self.service.stop(
+                    taskID: taskID,
+                    expectedVersion: card.version,
+                    expectedAttemptID: card.currentAttemptID
+                )
                 return .applied
             } catch {
                 return .refused(Self.refusal(from: error))
@@ -451,7 +462,7 @@ final class TaskBoardStore {
         case .blocked(let reason):
             return .refused(TaskBoardRefusal(kind: .blocked, message: reason.boardDescription))
         case .deferred(let reason):
-            return .refused(TaskBoardRefusal(kind: .unavailable, message: "Not dispatched: \(reason)"))
+            return .refused(TaskBoardRefusal(kind: .deferred, message: "Not dispatched: \(reason)"))
         }
     }
 
@@ -510,8 +521,7 @@ final class TaskBoardStore {
     }
 
     private static func isSuspended(_ reason: TaskBlockReason?) -> Bool {
-        guard case .custom(let value) = reason else { return false }
-        return value == "paused" || value == "stopped"
+        TaskScheduler.isUserSuspension(reason)
     }
 
     // MARK: - Projections
@@ -584,7 +594,7 @@ final class TaskBoardStore {
         return String(describing: error)
     }
 
-    private static func refusal(from error: Error) -> TaskBoardRefusal {
+    static func refusal(from error: Error) -> TaskBoardRefusal {
         guard let serviceError = error as? CodingTaskServiceError else {
             return TaskBoardRefusal(kind: .rejected, message: "Unexpected error: \(error)")
         }
@@ -614,7 +624,7 @@ final class TaskBoardStore {
         case .transitionRejected(let transitionError):
             return TaskBoardRefusal(kind: .rejected, message: String(describing: transitionError))
         case .projectNotFound, .taskNotFound, .invalidProjectInput, .invalidTaskInput, .dependencyRejected,
-            .persistence, .schedulerRejected:
+            .persistence, .schedulerRejected, .unexpected:
             return TaskBoardRefusal(kind: .rejected, message: serviceError.localizedDescription)
         }
     }

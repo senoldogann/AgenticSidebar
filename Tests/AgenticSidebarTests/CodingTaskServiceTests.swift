@@ -87,38 +87,56 @@ struct NoProcesses: TaskProcessOwnershipInspecting {
 
 // MARK: - Async gate
 
-/// Holds one repository call open so a test can observe in-flight state before releasing it.
+/// Holds repository calls open so tests can observe in-flight state before releasing them.
+///
+/// The gate is multi-waiter: every caller that enters before `release()` is parked and every
+/// parked caller is woken by `release()`, so cross-task concurrency tests cannot deadlock on
+/// an overwritten continuation.
 actor AsyncGate {
     private var isReleased = false
-    private var isEntered = false
-    private var releaseContinuation: CheckedContinuation<Void, Never>?
-    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var enteredCount = 0
+    private var releaseContinuations: [CheckedContinuation<Void, Never>] = []
+    private var enteredContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func currentEnteredCount() -> Int {
+        enteredCount
+    }
 
     func enter() async {
-        isEntered = true
-        enteredContinuation?.resume()
-        enteredContinuation = nil
+        enteredCount += 1
+        let waiters = enteredContinuations
+        enteredContinuations = []
+        for waiter in waiters {
+            waiter.resume()
+        }
         if isReleased {
             return
         }
         await withCheckedContinuation { continuation in
-            releaseContinuation = continuation
+            releaseContinuations.append(continuation)
+        }
+    }
+
+    /// Suspends until at least `count` callers have entered the gate.
+    func waitUntilEntered(count: Int) async {
+        while enteredCount < count {
+            await withCheckedContinuation { continuation in
+                enteredContinuations.append(continuation)
+            }
         }
     }
 
     func waitUntilEntered() async {
-        if isEntered {
-            return
-        }
-        await withCheckedContinuation { continuation in
-            enteredContinuation = continuation
-        }
+        await waitUntilEntered(count: 1)
     }
 
     func release() {
         isReleased = true
-        releaseContinuation?.resume()
-        releaseContinuation = nil
+        let waiters = releaseContinuations
+        releaseContinuations = []
+        for waiter in waiters {
+            waiter.resume()
+        }
     }
 }
 
@@ -143,6 +161,9 @@ actor ServiceHookingRepository: CodingTaskRepository {
     private var gatedSnapshots: AsyncGate?
     private var nextClaimAttemptFailure: TaskRepositoryError?
     private var nextSnapshotFailure: TaskRepositoryError?
+    private var nextTransitionFailure: TaskRepositoryError?
+    private var nextTaskReadFailure: Error?
+    private var nextRepositoryLeaseFailure: TaskRepositoryError?
     private var snapshotCount = 0
     private var taskReadCount = 0
     private var createTaskCount = 0
@@ -171,6 +192,18 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func failNextSnapshot(with error: TaskRepositoryError) {
         nextSnapshotFailure = error
+    }
+
+    func failNextTransition(with error: TaskRepositoryError) {
+        nextTransitionFailure = error
+    }
+
+    func failNextTaskRead(with error: Error) {
+        nextTaskReadFailure = error
+    }
+
+    func failNextRepositoryLease(with error: TaskRepositoryError) {
+        nextRepositoryLeaseFailure = error
     }
 
     func mutationCounts() -> RepositoryMutationCounts {
@@ -214,6 +247,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
         if let gate = gatedTaskReads {
             await gate.enter()
         }
+        if let failure = nextTaskReadFailure {
+            nextTaskReadFailure = nil
+            throw failure
+        }
         return try await base.task(id: id)
     }
 
@@ -228,6 +265,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
         context: TaskTransitionContext
     ) async throws -> CodingTask {
         transitionCount += 1
+        if let failure = nextTransitionFailure {
+            nextTransitionFailure = nil
+            throw failure
+        }
         return try await base.transition(taskID: taskID, expectedVersion: expectedVersion, action: action, context: context)
     }
 
@@ -269,6 +310,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
         attemptID: UUID,
         leaseTimeoutSeconds: TimeInterval
     ) async throws {
+        if let failure = nextRepositoryLeaseFailure {
+            nextRepositoryLeaseFailure = nil
+            throw failure
+        }
         try await base.acquireRepositoryLease(
             repositoryPath: repositoryPath,
             taskID: taskID,
@@ -342,6 +387,7 @@ final class ServiceTestHarness {
     let repository: ServiceHookingRepository
     let clock: ServiceTestClock
     let providers: ScriptedProviderRegistry
+    let scheduler: TaskScheduler
     var workspaceResult: TaskWorkspacePreflightResult
     var verifierPassed = true
     var acceptanceEvidence: [VerificationEvidence] = []
@@ -350,22 +396,25 @@ final class ServiceTestHarness {
 
     init(workspace: TaskWorkspacePreflightResult) throws {
         let store = try SQLiteTaskStore.inMemory()
+        let repository = ServiceHookingRepository(base: store)
+        let clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
+        let providers = ScriptedProviderRegistry(result: .eligible(runtimeID: "runtime-1", modelID: "model-1"))
         self.store = store
-        self.repository = ServiceHookingRepository(base: store)
-        self.clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
-        self.providers = ScriptedProviderRegistry(result: .eligible(runtimeID: "runtime-1", modelID: "model-1"))
+        self.repository = repository
+        self.clock = clock
+        self.providers = providers
         self.workspaceResult = workspace
-    }
-
-    func makeService() -> CodingTaskService {
-        let scheduler = TaskScheduler(
+        self.scheduler = TaskScheduler(
             repository: repository,
             providers: providers,
-            workspaces: FixedWorkspacePreflight(result: workspaceResult),
-            verifier: FixedVerifier(passed: verifierPassed),
+            workspaces: FixedWorkspacePreflight(result: workspace),
+            verifier: FixedVerifier(passed: true),
             clock: clock,
             schedulerID: "scheduler-test"
         )
+    }
+
+    func makeService() -> CodingTaskService {
         let recovery = TaskRecovery(
             repository: repository,
             providers: NoProviderSessions(),
@@ -767,6 +816,67 @@ final class CodingTaskServiceTests: XCTestCase {
         XCTAssertEqual(history.map(\.outcome), [.cancelled, .inProgress])
     }
 
+    func testSchedulerFencedRetryRefusesMismatchedActiveAttemptWithoutCancelling() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        let startResult = try await service.start(taskID: task.id, expectedVersion: 1)
+        guard case .claimed(let activeAttemptID, let activeGeneration) = startResult else {
+            XCTFail("Expected a claim, got \(startResult)")
+            return
+        }
+
+        do {
+            _ = try await harness.scheduler.retry(
+                taskID: task.id,
+                expectedAttemptID: UUID(),
+                expectedGeneration: activeGeneration
+            )
+            XCTFail("A mismatched active attempt must be refused inside the scheduler")
+        } catch let error as TaskSchedulerError {
+            guard
+                case .staleAttempt(let taskID, let expected, let expectedGeneration, let actual, let actualGeneration) = error
+            else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+            XCTAssertEqual(taskID, task.id)
+            XCTAssertNotEqual(expected, activeAttemptID)
+            XCTAssertEqual(expectedGeneration, activeGeneration)
+            XCTAssertEqual(actual, activeAttemptID)
+            XCTAssertEqual(actualGeneration, activeGeneration)
+        }
+
+        do {
+            _ = try await harness.scheduler.retry(taskID: task.id, expectedAttemptID: activeAttemptID, expectedGeneration: nil)
+            XCTFail("Omitting the active generation while one exists must be refused inside the scheduler")
+        } catch let error as TaskSchedulerError {
+            guard case .staleAttempt = error else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+        }
+
+        let untouched = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(untouched.map(\.outcome), [.inProgress])
+        XCTAssertEqual(untouched.first?.id, activeAttemptID)
+
+        let retried = try await harness.scheduler.retry(
+            taskID: task.id,
+            expectedAttemptID: activeAttemptID,
+            expectedGeneration: activeGeneration
+        )
+        guard case .claimed(_, let retriedGeneration) = retried.disposition else {
+            XCTFail("Expected a fenced retried claim, got \(retried)")
+            return
+        }
+        XCTAssertEqual(retriedGeneration, activeGeneration + 1)
+        let history = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.outcome), [.cancelled, .inProgress])
+    }
+
     func testBackendClaimRejectionIsNotReportedAsSuccess() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()
@@ -853,6 +963,430 @@ final class CodingTaskServiceTests: XCTestCase {
 
         let counts = await harness.repository.mutationCounts()
         XCTAssertEqual(counts.recordedApprovals, 0)
+    }
+
+    func testStopAfterTaskAdvancedToReviewIsRefusedWithoutMutatingState() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        let startResult = try await service.start(taskID: task.id, expectedVersion: 1)
+        guard case .claimed(let attemptID, _) = startResult else {
+            XCTFail("Expected a claim, got \(startResult)")
+            return
+        }
+        let fetchedRunning = try await harness.store.task(id: task.id)
+        let running = try XCTUnwrap(fetchedRunning)
+        XCTAssertEqual(running.status, .running)
+
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: running.version,
+            action: .submitForReview,
+            context: TaskTransitionContext(fingerprint: attemptID.uuidString, actor: "agent", evidenceIDs: [UUID()])
+        )
+
+        do {
+            try await service.stop(taskID: task.id, expectedVersion: running.version, expectedAttemptID: attemptID)
+            XCTFail("A stop based on a stale running view must be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? CodingTaskServiceError,
+                .staleVersion(taskID: task.id, expected: running.version, actual: running.version + 1)
+            )
+        }
+
+        do {
+            try await service.stop(taskID: task.id, expectedVersion: running.version + 1, expectedAttemptID: attemptID)
+            XCTFail("Stop must not be available for a review task")
+        } catch {
+            XCTAssertEqual(error as? CodingTaskServiceError, .actionNotAvailable(taskID: task.id, status: .review))
+        }
+
+        let fetchedAfter = try await harness.store.task(id: task.id)
+        let after = try XCTUnwrap(fetchedAfter)
+        XCTAssertEqual(after.status, .review)
+        XCTAssertEqual(after.version, running.version + 1)
+        XCTAssertNil(after.blockReason)
+        let history = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.outcome), [.inProgress])
+        XCTAssertEqual(history.first?.id, attemptID)
+    }
+
+    func testPauseSuspendsRunningTaskAndRejectsStaleAttempt() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        let startResult = try await service.start(taskID: task.id, expectedVersion: 1)
+        guard case .claimed(let attemptID, _) = startResult else {
+            XCTFail("Expected a claim, got \(startResult)")
+            return
+        }
+
+        let wrongAttemptID = UUID()
+        do {
+            try await service.pause(taskID: task.id, expectedAttemptID: wrongAttemptID)
+            XCTFail("A mismatched attempt must be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? CodingTaskServiceError,
+                .staleAttempt(taskID: task.id, expectedAttemptID: wrongAttemptID, actualAttemptID: attemptID)
+            )
+        }
+
+        try await service.pause(taskID: task.id, expectedAttemptID: attemptID)
+        let fetched = try await harness.store.task(id: task.id)
+        let paused = try XCTUnwrap(fetched)
+        XCTAssertEqual(paused.status, .blocked)
+        XCTAssertEqual(paused.blockReason, .custom(TaskScheduler.pausedBlockReason))
+        let history = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.outcome), [.inProgress])
+    }
+
+    func testStopCancelsActiveAttemptAndRejectsMismatchedAttempt() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        let startResult = try await service.start(taskID: task.id, expectedVersion: 1)
+        guard case .claimed(let attemptID, _) = startResult else {
+            XCTFail("Expected a claim, got \(startResult)")
+            return
+        }
+        let fetchedRunning = try await harness.store.task(id: task.id)
+        let running = try XCTUnwrap(fetchedRunning)
+
+        let wrongAttemptID = UUID()
+        do {
+            try await service.stop(taskID: task.id, expectedVersion: running.version, expectedAttemptID: wrongAttemptID)
+            XCTFail("A mismatched attempt must be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? CodingTaskServiceError,
+                .staleAttempt(taskID: task.id, expectedAttemptID: wrongAttemptID, actualAttemptID: attemptID)
+            )
+        }
+        let untouched = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(untouched.map(\.outcome), [.inProgress])
+
+        try await service.stop(taskID: task.id, expectedVersion: running.version, expectedAttemptID: attemptID)
+        let fetchedStopped = try await harness.store.task(id: task.id)
+        let stopped = try XCTUnwrap(fetchedStopped)
+        XCTAssertEqual(stopped.status, .blocked)
+        XCTAssertEqual(stopped.blockReason, .custom(TaskScheduler.stoppedBlockReason))
+        let history = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.outcome), [.cancelled])
+    }
+
+    func testResumeReArmsPausedAndStoppedTasks() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        let startResult = try await service.start(taskID: task.id, expectedVersion: 1)
+        guard case .claimed(let firstAttemptID, let firstGeneration) = startResult else {
+            XCTFail("Expected a claim, got \(startResult)")
+            return
+        }
+        try await service.pause(taskID: task.id, expectedAttemptID: firstAttemptID)
+        let fetchedPaused = try await harness.store.task(id: task.id)
+        let paused = try XCTUnwrap(fetchedPaused)
+
+        let resumedEntry = try await service.resume(
+            taskID: task.id,
+            expectedVersion: paused.version,
+            expectedAttemptID: firstAttemptID
+        )
+        guard case .claimed(let resumedAttemptID, let resumedGeneration) = resumedEntry.disposition else {
+            XCTFail("Expected a resumed claim, got \(resumedEntry)")
+            return
+        }
+        XCTAssertEqual(resumedGeneration, firstGeneration + 1)
+        let resumedHistory = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(resumedHistory.map(\.outcome), [.cancelled, .inProgress])
+        XCTAssertEqual(resumedHistory.last?.id, resumedAttemptID)
+
+        let fetchedRunning = try await harness.store.task(id: task.id)
+        let running = try XCTUnwrap(fetchedRunning)
+        XCTAssertEqual(running.status, .running)
+        try await service.stop(taskID: task.id, expectedVersion: running.version, expectedAttemptID: resumedAttemptID)
+        let fetchedStopped = try await harness.store.task(id: task.id)
+        let stopped = try XCTUnwrap(fetchedStopped)
+        XCTAssertEqual(stopped.blockReason, .custom(TaskScheduler.stoppedBlockReason))
+
+        let stoppedEntry = try await service.resume(
+            taskID: task.id,
+            expectedVersion: stopped.version,
+            expectedAttemptID: nil
+        )
+        guard case .claimed = stoppedEntry.disposition else {
+            XCTFail("A stopped task must be resumable, got \(stoppedEntry)")
+            return
+        }
+        let finalHistory = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(finalHistory.map(\.outcome), [.cancelled, .cancelled, .inProgress])
+    }
+
+    func testResumeRefusesSystemBlocksWithoutMutating() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+
+        let blockReasons: [TaskBlockReason] = [
+            .uncertainExecution("agent vanished"),
+            .verificationFailed("build failed"),
+            .custom("attemptBudgetExhausted"),
+        ]
+        for reason in blockReasons {
+            let taskID = UUID()
+            let now = harness.clock.now()
+            let blocked = CodingTask(
+                id: taskID,
+                projectID: project.id,
+                title: "Blocked",
+                objective: "Objective",
+                priority: 1,
+                status: .blocked,
+                stage: .implementation,
+                blockReason: reason,
+                previousStageBeforeBlock: .implementation,
+                version: 1,
+                createdAt: now,
+                updatedAt: now
+            )
+            try await harness.store.createTask(blocked)
+
+            do {
+                _ = try await service.resume(taskID: taskID, expectedVersion: 1, expectedAttemptID: nil)
+                XCTFail("Resume must be refused for block reason \(reason)")
+            } catch {
+                XCTAssertEqual(error as? CodingTaskServiceError, .actionNotAvailable(taskID: taskID, status: .blocked))
+            }
+
+            let fetched = try await harness.store.task(id: taskID)
+            let reloaded = try XCTUnwrap(fetched)
+            XCTAssertEqual(reloaded.status, .blocked)
+            XCTAssertEqual(reloaded.blockReason, reason)
+            XCTAssertEqual(reloaded.version, 1)
+        }
+
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.claimAttempts, 0)
+        XCTAssertEqual(counts.transitions, 0)
+    }
+
+    func testRequestChangesSendsReviewBackToReadyAndRejectsWrongStatusAndBlankInput() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let seeded = try await harness.seedReviewTask(projectID: project.id, criteriaCompleted: false, evidence: [])
+
+        let changed = try await service.requestChanges(
+            taskID: seeded.task.id,
+            expectedVersion: seeded.task.version,
+            actor: "reviewer",
+            feedback: "please fix the build"
+        )
+        XCTAssertEqual(changed.status, .ready)
+        XCTAssertEqual(changed.stage, .plan)
+        XCTAssertEqual(changed.version, seeded.task.version + 1)
+
+        do {
+            _ = try await service.requestChanges(
+                taskID: seeded.task.id,
+                expectedVersion: changed.version,
+                actor: "reviewer",
+                feedback: "again"
+            )
+            XCTFail("Request changes must not be available outside review")
+        } catch {
+            XCTAssertEqual(error as? CodingTaskServiceError, .actionNotAvailable(taskID: seeded.task.id, status: .ready))
+        }
+
+        do {
+            _ = try await service.requestChanges(
+                taskID: seeded.task.id,
+                expectedVersion: changed.version,
+                actor: "reviewer",
+                feedback: "   "
+            )
+            XCTFail("Blank feedback must be rejected")
+        } catch {
+            XCTAssertEqual(error as? CodingTaskServiceError, .invalidTaskInput(field: "feedback", reason: "must not be blank"))
+        }
+    }
+
+    func testAcceptDoesNotReuseApprovalRecordedByAnotherActor() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let projectID = UUID()
+        let seeded = try await harness.seedReviewTask(projectID: projectID, criteriaCompleted: true, evidence: [])
+        harness.acceptanceEvidence = [
+            VerificationEvidence(
+                taskID: seeded.task.id,
+                attemptID: seeded.attempt.id,
+                recipeName: "test-recipe",
+                stepName: "build",
+                status: .passed,
+                detailsRedacted: "redacted",
+                workspaceFingerprint: harness.currentFingerprint,
+                recordedAt: harness.clock.now(),
+                recipeVersion: VerificationRecipe.currentVersion
+            )
+        ]
+        try await harness.store.recordApproval(
+            TaskApproval(
+                taskID: seeded.task.id,
+                attemptID: seeded.attempt.id,
+                fingerprint: harness.currentFingerprint,
+                actor: "someone-else",
+                timestamp: harness.clock.now(),
+                action: .accept
+            )
+        )
+        let service = harness.makeService()
+
+        let accepted = try await service.accept(taskID: seeded.task.id, expectedVersion: seeded.task.version, actor: "reviewer")
+        XCTAssertEqual(accepted.status, .done)
+
+        let approvals = try await harness.store.approvals(taskID: seeded.task.id)
+        XCTAssertEqual(approvals.count, 2)
+        XCTAssertTrue(approvals.contains { $0.actor == "reviewer" && $0.action == .accept && $0.attemptID == seeded.attempt.id })
+        XCTAssertTrue(approvals.contains { $0.actor == "someone-else" })
+    }
+
+    func testFailedAcceptTransitionLeavesNoOrphanApproval() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let projectID = UUID()
+        let seeded = try await harness.seedReviewTask(projectID: projectID, criteriaCompleted: true, evidence: [])
+        harness.acceptanceEvidence = [
+            VerificationEvidence(
+                taskID: seeded.task.id,
+                attemptID: seeded.attempt.id,
+                recipeName: "test-recipe",
+                stepName: "build",
+                status: .passed,
+                detailsRedacted: "redacted",
+                workspaceFingerprint: harness.currentFingerprint,
+                recordedAt: harness.clock.now(),
+                recipeVersion: VerificationRecipe.currentVersion
+            )
+        ]
+        let service = harness.makeService()
+        await harness.repository.failNextTransition(
+            with: .staleVersion(taskID: seeded.task.id, expected: seeded.task.version, actual: seeded.task.version + 1)
+        )
+
+        do {
+            _ = try await service.accept(taskID: seeded.task.id, expectedVersion: seeded.task.version, actor: "reviewer")
+            XCTFail("A rejected transition must not accept the task")
+        } catch {
+            XCTAssertEqual(
+                error as? CodingTaskServiceError,
+                .staleVersion(taskID: seeded.task.id, expected: seeded.task.version, actual: seeded.task.version + 1)
+            )
+        }
+
+        let approvals = try await harness.store.approvals(taskID: seeded.task.id)
+        XCTAssertTrue(approvals.isEmpty)
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.recordedApprovals, 0)
+        let fetched = try await harness.store.task(id: seeded.task.id)
+        let reloaded = try XCTUnwrap(fetched)
+        XCTAssertEqual(reloaded.status, .review)
+        XCTAssertEqual(reloaded.version, seeded.task.version)
+    }
+
+    func testStaleFingerprintAcceptanceRefusalDoesNotRecordApproval() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        harness.requiredSteps = []
+        let projectID = UUID()
+        let seeded = try await harness.seedReviewTask(projectID: projectID, criteriaCompleted: true, evidence: [])
+        try await harness.store.recordApproval(
+            TaskApproval(
+                taskID: seeded.task.id,
+                attemptID: seeded.attempt.id,
+                fingerprint: "fingerprint-0",
+                actor: "reviewer",
+                timestamp: harness.clock.now(),
+                action: .accept
+            )
+        )
+        let service = harness.makeService()
+
+        do {
+            _ = try await service.accept(taskID: seeded.task.id, expectedVersion: seeded.task.version, actor: "reviewer")
+            XCTFail("An approval bound to stale content must not authorize acceptance")
+        } catch let error as CodingTaskServiceError {
+            guard case .acceptanceDenied(let taskID, let reasons) = error else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+            XCTAssertEqual(taskID, seeded.task.id)
+            XCTAssertTrue(
+                reasons.contains(
+                    .acceptanceApprovalFingerprintMismatch(expected: harness.currentFingerprint, actual: "fingerprint-0")
+                )
+            )
+        }
+
+        let approvals = try await harness.store.approvals(taskID: seeded.task.id)
+        XCTAssertEqual(approvals.count, 1)
+        XCTAssertEqual(approvals.first?.fingerprint, "fingerprint-0")
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.recordedApprovals, 0)
+        let fetched = try await harness.store.task(id: seeded.task.id)
+        let reloaded = try XCTUnwrap(fetched)
+        XCTAssertEqual(reloaded.status, .review)
+    }
+
+    func testUnexpectedErrorMapsToUnexpectedServiceError() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        await harness.repository.failNextTaskRead(with: CancellationError())
+        do {
+            _ = try await service.start(taskID: task.id, expectedVersion: 1)
+            XCTFail("An unexpected port error must surface as a typed service error")
+        } catch {
+            XCTAssertEqual(error as? CodingTaskServiceError, .unexpected(String(describing: CancellationError())))
+        }
+
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.claimAttempts, 0)
+        XCTAssertEqual(counts.transitions, 0)
+    }
+
+    func testErrorMappingDistinguishesSchedulerStaleAndUnexpectedErrors() {
+        let taskID = UUID()
+        let expectedAttemptID = UUID()
+        let actualAttemptID = UUID()
+        XCTAssertEqual(
+            CodingTaskService.mapError(
+                TaskSchedulerError.staleAttempt(
+                    taskID: taskID,
+                    expectedAttemptID: expectedAttemptID,
+                    expectedGeneration: 1,
+                    actualAttemptID: actualAttemptID,
+                    actualGeneration: 2
+                )
+            ),
+            .staleAttempt(taskID: taskID, expectedAttemptID: expectedAttemptID, actualAttemptID: actualAttemptID)
+        )
+        XCTAssertEqual(
+            CodingTaskService.mapError(TaskSchedulerError.invalidCompletionOutcome(.inProgress)),
+            .schedulerRejected(reason: "invalid completion outcome inProgress")
+        )
+        XCTAssertEqual(
+            CodingTaskService.mapError(TaskRepositoryError.underlying("db down")),
+            .persistence(.underlying("db down"))
+        )
     }
 
     func testReconcileReturnsReportForProject() async throws {
