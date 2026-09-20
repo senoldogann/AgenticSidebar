@@ -209,7 +209,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(except: [.stop]),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
 
         let expected: [TaskBoardFocusTarget] = [
@@ -330,8 +331,11 @@ final class TaskBoardPresentationTests: XCTestCase {
     func testBoardCardsDefaultToNotLoadedBadgeRatherThanAnyClaim() {
         let card = TaskBoardFixtures.card()
         let presentation = TaskBoardPresenter.card(card, verification: .notLoaded)
-        XCTAssertEqual(presentation.verificationBadge, .notLoaded)
-        XCTAssertNil(presentation.verificationBadge.accessibilityLabel)
+        XCTAssertFalse(
+            presentation.accessibilityLabel.contains("doğrulandı"),
+            "Kanıtsız pano kartı doğrulama iddia etmez"
+        )
+        XCTAssertNil(TaskBoardVerificationBadge.notLoaded.accessibilityLabel)
     }
 
     // MARK: - Action presentation (pure)
@@ -340,7 +344,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         XCTAssertEqual(
             actions.map(\.action),
@@ -353,7 +358,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(reason: "Pano eskidi"),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         for action in actions {
             XCTAssertFalse(action.isEnabled)
@@ -368,7 +374,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(except: [.start]),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         let start = actions.first { $0.action == .start }
         XCTAssertEqual(start?.isEnabled, true)
@@ -380,7 +387,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(except: [.start]),
             isInFlight: true,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         for action in actions {
             XCTAssertFalse(action.isEnabled)
@@ -394,15 +402,14 @@ final class TaskBoardPresentationTests: XCTestCase {
             "kullanılamaz",
             "Yapısal olarak kapalı eylem kendi gerekçesini korur; yalnızca normalde açık olan eylem 'işlem sürüyor' der"
         )
-        XCTAssertEqual(TaskActionBarPresenter.busyMessage(isInFlight: true), TaskActionBarPresenter.busyExplanation)
-        XCTAssertNil(TaskActionBarPresenter.busyMessage(isInFlight: false))
     }
 
     func testBlankActorDisablesReviewDecisionsWithExplanation() {
         let actions = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(except: [.accept, .requestChanges]),
             isInFlight: false,
-            actor: "   "
+            actor: "   ",
+            feedback: "geri bildirim"
         )
         let accept = actions.first { $0.action == .accept }
         let requestChanges = actions.first { $0.action == .requestChanges }
@@ -414,21 +421,20 @@ final class TaskBoardPresentationTests: XCTestCase {
         let named = TaskActionBarPresenter.actions(
             availability: TaskBoardFixtures.disabledEverything(except: [.accept, .requestChanges]),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         XCTAssertTrue(named.first { $0.action == .accept }?.isEnabled == true)
         XCTAssertTrue(named.first { $0.action == .requestChanges }?.isEnabled == true)
     }
 
-    func testFailureMessageIsExplicitAndNilSafe() {
-        XCTAssertNil(TaskActionBarPresenter.failureMessage(nil))
-        let message = TaskActionBarPresenter.failureMessage("Pano okunamadı (db)")
-        XCTAssertTrue(message?.contains("Pano okunamadı (db)") == true)
-        XCTAssertTrue(message?.contains("uygulanmadı") == true)
-    }
-
     func testDisabledActionWithoutAvailabilityIsExplainedNotSilent() {
-        let actions = TaskActionBarPresenter.actions(availability: [], isInFlight: false, actor: "reviewer")
+        let actions = TaskActionBarPresenter.actions(
+            availability: [],
+            isInFlight: false,
+            actor: "reviewer",
+            feedback: "geri bildirim"
+        )
         XCTAssertEqual(actions.count, TaskBoardAction.allCases.count)
         for action in actions {
             XCTAssertFalse(action.isEnabled)
@@ -492,12 +498,14 @@ final class TaskBoardPresentationTests: XCTestCase {
     private func enabledActions(
         store: TaskBoardStore,
         taskID: UUID,
-        actor: String
+        actor: String,
+        feedback: String
     ) -> Set<TaskBoardAction> {
         let actions = TaskActionBarPresenter.actions(
             availability: store.actionAvailability(for: taskID),
             isInFlight: store.isActionInFlight(for: taskID),
-            actor: actor
+            actor: actor,
+            feedback: feedback
         )
         return Set(actions.filter(\.isEnabled).map(\.action))
     }
@@ -509,7 +517,7 @@ final class TaskBoardPresentationTests: XCTestCase {
         let task = try await seedTask(harness: harness, projectID: project.id, title: "Kuyruk", status: .backlog, stage: .analysis)
         let store = await makeLoadedStore(harness: harness, projectID: project.id)
 
-        XCTAssertEqual(enabledActions(store: store, taskID: task.id, actor: "reviewer"), [.start])
+        XCTAssertEqual(enabledActions(store: store, taskID: task.id, actor: "reviewer", feedback: "geri bildirim"), [.start])
     }
 
     func testRunningCardEnablesPauseAndStopOnly() async throws {
@@ -550,7 +558,7 @@ final class TaskBoardPresentationTests: XCTestCase {
         )
         let store = await makeLoadedStore(harness: harness, projectID: project.id)
 
-        XCTAssertEqual(enabledActions(store: store, taskID: taskID, actor: "reviewer"), [.pause, .stop])
+        XCTAssertEqual(enabledActions(store: store, taskID: taskID, actor: "reviewer", feedback: "geri bildirim"), [.pause, .stop])
     }
 
     func testPausedBlockedCardEnablesResumeAndRetryButNotStart() async throws {
@@ -570,7 +578,7 @@ final class TaskBoardPresentationTests: XCTestCase {
 
         // Store sözleşmesi: blocked her görev için retry açık, sürdürme yalnızca kullanıcı
         // askıya almasında açık; start ise yalnızca backlog/ready içindir.
-        XCTAssertEqual(enabledActions(store: store, taskID: task.id, actor: "reviewer"), [.resume, .retry])
+        XCTAssertEqual(enabledActions(store: store, taskID: task.id, actor: "reviewer", feedback: "geri bildirim"), [.resume, .retry])
     }
 
     func testTerminalCardsEnableNothing() async throws {
@@ -581,8 +589,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let cancelled = try await seedTask(harness: harness, projectID: project.id, title: "İptal", status: .cancelled, stage: .analysis)
         let store = await makeLoadedStore(harness: harness, projectID: project.id)
 
-        XCTAssertTrue(enabledActions(store: store, taskID: done.id, actor: "reviewer").isEmpty)
-        XCTAssertTrue(enabledActions(store: store, taskID: cancelled.id, actor: "reviewer").isEmpty)
+        XCTAssertTrue(enabledActions(store: store, taskID: done.id, actor: "reviewer", feedback: "geri bildirim").isEmpty)
+        XCTAssertTrue(enabledActions(store: store, taskID: cancelled.id, actor: "reviewer", feedback: "geri bildirim").isEmpty)
     }
 
     func testReviewCardEnablesRequestChangesAndAcceptOnly() async throws {
@@ -593,7 +601,7 @@ final class TaskBoardPresentationTests: XCTestCase {
         let store = await makeLoadedStore(harness: harness, projectID: project.id)
 
         XCTAssertEqual(
-            enabledActions(store: store, taskID: seeded.task.id, actor: "reviewer"),
+            enabledActions(store: store, taskID: seeded.task.id, actor: "reviewer", feedback: "geri bildirim"),
             [.requestChanges, .accept]
         )
     }
@@ -616,7 +624,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: store.actionAvailability(for: task.id),
             isInFlight: store.isActionInFlight(for: task.id),
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         let start = actions.first { $0.action == .start }
         XCTAssertFalse(start?.isEnabled == true)
@@ -641,7 +650,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: store.actionAvailability(for: seeded.task.id),
             isInFlight: store.isActionInFlight(for: seeded.task.id),
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         let accept = actions.first { $0.action == .accept }
         XCTAssertFalse(accept?.isEnabled == true)
@@ -670,7 +680,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: store.actionAvailability(for: task.id),
             isInFlight: store.isActionInFlight(for: task.id),
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         XCTAssertTrue(actions.allSatisfy { !$0.isEnabled })
         let start = actions.first { $0.action == .start }
@@ -686,8 +697,455 @@ final class TaskBoardPresentationTests: XCTestCase {
         let after = TaskActionBarPresenter.actions(
             availability: store.actionAvailability(for: task.id),
             isInFlight: store.isActionInFlight(for: task.id),
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         XCTAssertTrue(after.contains { $0.action == .pause && $0.isEnabled })
+    }
+
+    // MARK: - Detail presenter
+
+    private func detail(
+        card: TaskBoardCard? = nil,
+        criteria: [CodingAcceptanceCriterion] = [],
+        dependencies: [TaskDependency] = [],
+        attempts: [TaskBoardAttemptSummary] = []
+    ) -> TaskBoardTaskDetail {
+        TaskBoardTaskDetail(
+            card: card ?? TaskBoardFixtures.card(),
+            criteria: criteria,
+            dependencies: dependencies,
+            attempts: attempts
+        )
+    }
+
+    private func criterion(
+        _ taskID: UUID,
+        _ text: String,
+        isCompleted: Bool = false,
+        evidenceID: UUID? = nil
+    ) -> CodingAcceptanceCriterion {
+        CodingAcceptanceCriterion(
+            taskID: taskID,
+            description: text,
+            isCompleted: isCompleted,
+            evidenceID: evidenceID
+        )
+    }
+
+    private func finding(
+        _ taskID: UUID,
+        severity: ReviewFindingSeverity,
+        summary: String
+    ) -> ReviewFinding {
+        ReviewFinding(taskID: taskID, severity: severity, summary: summary)
+    }
+
+    func testCriteriaLabelsNamePendingCompletionAndEvidencePresence() {
+        let taskID = UUID()
+        let rows = TaskDetailPresenter.criteria(
+            detail(criteria: [
+                criterion(taskID, "derleme"),
+                criterion(taskID, "testler", isCompleted: true, evidenceID: UUID()),
+                criterion(taskID, "doküman", isCompleted: true),
+            ])
+        )
+
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows[0].evidenceLabel, "Bekliyor")
+        XCTAssertFalse(rows[0].isCompleted)
+        XCTAssertEqual(rows[1].evidenceLabel, "Kanıt kayıtlı")
+        XCTAssertEqual(rows[2].evidenceLabel, "Kanıt kimliği yok")
+        XCTAssertTrue(rows[2].accessibilityLabel.contains("Kanıt kimliği yok"))
+        XCTAssertTrue(rows[1].accessibilityLabel.contains("Tamamlandı"))
+    }
+
+    func testDependenciesReadSatisfactionOnlyFromBoardCards() {
+        let taskID = UUID()
+        let doneID = UUID()
+        let unknownID = UUID()
+        let dependentID = UUID()
+        let dependency = TaskDependency(
+            projectID: TaskBoardFixtures.projectID,
+            prerequisiteTaskID: doneID,
+            dependentTaskID: taskID
+        )
+        let unknownDependency = TaskDependency(
+            projectID: TaskBoardFixtures.projectID,
+            prerequisiteTaskID: unknownID,
+            dependentTaskID: taskID
+        )
+        let dependentDependency = TaskDependency(
+            projectID: TaskBoardFixtures.projectID,
+            prerequisiteTaskID: taskID,
+            dependentTaskID: dependentID
+        )
+
+        let rows = TaskDetailPresenter.dependencies(
+            detail(
+                card: TaskBoardFixtures.card(id: taskID),
+                dependencies: [dependency, unknownDependency, dependentDependency]
+            ),
+            cards: [
+                TaskBoardFixtures.card(id: doneID, title: "Biten", status: .done),
+                TaskBoardFixtures.card(id: dependentID, title: "Bağımlı görev", status: .backlog),
+            ]
+        )
+
+        XCTAssertEqual(rows.count, 3)
+        let satisfiedRow = rows.first { $0.taskID == doneID }
+        XCTAssertEqual(satisfiedRow?.direction, .prerequisite)
+        XCTAssertEqual(satisfiedRow?.title, "Biten")
+        XCTAssertEqual(satisfiedRow?.isSatisfied, true)
+        XCTAssertTrue(satisfiedRow?.accessibilityLabel.contains("Tamamlandı") == true)
+
+        let unknownRow = rows.first { $0.taskID == unknownID }
+        XCTAssertNil(unknownRow?.isSatisfied, "Panoda olmayan önkoşulun tatmini bilinmez, uydurulmaz")
+        XCTAssertTrue(unknownRow?.accessibilityLabel.contains("Önkoşul") == true)
+
+        let dependentRow = rows.first { $0.taskID == dependentID }
+        XCTAssertEqual(dependentRow?.direction, .dependent)
+        XCTAssertNil(dependentRow?.isSatisfied, "Yalnızca önkoşulun tatmini panodan okunur")
+        XCTAssertTrue(dependentRow?.accessibilityLabel.contains("Bağımlı") == true)
+    }
+
+    func testProviderCapabilityNoticeAppearsOnlyWhenStartIsRefused() {
+        let older = TaskBoardAttemptSummary(
+            id: UUID(),
+            attemptSequence: 1,
+            generation: 1,
+            role: .developer,
+            providerID: "runtime-1",
+            modelID: "model-1",
+            outcome: .succeeded,
+            startedAt: TaskBoardFixtures.fixedDate,
+            endedAt: TaskBoardFixtures.fixedDate,
+            durationSeconds: 10,
+            toolCallCount: 3
+        )
+        let latest = TaskBoardAttemptSummary(
+            id: UUID(),
+            attemptSequence: 2,
+            generation: 1,
+            role: .reviewer,
+            providerID: "runtime-2",
+            modelID: "model-2",
+            outcome: .failed,
+            startedAt: TaskBoardFixtures.fixedDate,
+            endedAt: TaskBoardFixtures.fixedDate,
+            durationSeconds: 20,
+            toolCallCount: 4
+        )
+        let refusal = TaskBoardFixtures.availability(.start, isEnabled: false, disabledReason: "çalışma ortamı yok")
+        let backlog = TaskBoardFixtures.card(status: .backlog)
+
+        let capability = TaskDetailPresenter.providerCapability(
+            card: backlog,
+            attempts: [older, latest],
+            startAvailability: refusal
+        )
+        XCTAssertEqual(capability.providerLabel, "runtime-2")
+        XCTAssertEqual(capability.modelLabel, "model-2")
+        XCTAssertEqual(capability.notice, "çalışma ortamı yok")
+        XCTAssertTrue(capability.accessibilityLabel.contains("çalışma ortamı yok"))
+
+        let running = TaskDetailPresenter.providerCapability(
+            card: TaskBoardFixtures.card(status: .running),
+            attempts: [],
+            startAvailability: refusal
+        )
+        XCTAssertEqual(running.providerLabel, "Kayıtlı sağlayıcı yok")
+        XCTAssertEqual(running.modelLabel, "—")
+        XCTAssertNil(running.notice, "Başlatma dışındaki durumlarda yetenek uyarısı gösterilmez")
+
+        let enabled = TaskBoardFixtures.availability(.start, isEnabled: true, disabledReason: nil)
+        XCTAssertNil(
+            TaskDetailPresenter.providerCapability(card: backlog, attempts: [], startAvailability: enabled).notice
+        )
+    }
+
+    func testApprovalScopeBindsAttemptVersionAndExplainsDisabledState() {
+        let attemptID = UUID()
+        let card = TaskBoardFixtures.card(status: .review, version: 4)
+        let enabled = TaskDetailPresenter.approval(
+            card: card,
+            attemptID: attemptID,
+            availability: TaskBoardFixtures.availability(.accept, isEnabled: true, disabledReason: nil)
+        )
+        XCTAssertTrue(enabled.isEnabled)
+        XCTAssertNil(enabled.disabledReason)
+        XCTAssertTrue(enabled.scopeDescription.contains("sürümü 4"))
+        XCTAssertTrue(enabled.scopeDescription.contains(attemptID.uuidString.prefix(8)))
+        XCTAssertTrue(enabled.accessibilityLabel.contains("insan aktör"))
+
+        let missingAttempt = TaskDetailPresenter.approval(card: card, attemptID: nil, availability: nil)
+        XCTAssertEqual(missingAttempt.scopeDescription, "Onaylanacak aktif deneme yok")
+        XCTAssertFalse(missingAttempt.isEnabled)
+        XCTAssertTrue(missingAttempt.disabledReason?.isEmpty == false)
+        XCTAssertTrue(missingAttempt.accessibilityLabel.contains("Devre dışı"))
+
+        let refused = TaskDetailPresenter.approval(
+            card: card,
+            attemptID: attemptID,
+            availability: TaskBoardFixtures.availability(.accept, isEnabled: false, disabledReason: "ölçütler eksik")
+        )
+        XCTAssertEqual(refused.disabledReason, "ölçütler eksik")
+        XCTAssertTrue(refused.accessibilityLabel.contains("ölçütler eksik"))
+    }
+
+    func testEvidenceSummaryNamesWorkspaceRowsAndUnwiredDiff() {
+        let card = TaskBoardFixtures.card(status: .review)
+        let workspaceID = UUID()
+        let summary = TaskDetailPresenter.evidenceSummary(
+            card: card,
+            evidence: [
+                evidence(taskID: card.id, attemptID: UUID(), status: .passed, fingerprint: "fp")
+            ],
+            currentFingerprint: "fp",
+            workspaceID: workspaceID,
+            diffSummary: nil
+        )
+
+        XCTAssertTrue(summary.isWired)
+        XCTAssertEqual(summary.rows.count, 1)
+        XCTAssertTrue(summary.worktreeLabel.contains(workspaceID.uuidString.prefix(8)))
+        XCTAssertEqual(summary.diffNotice, "Diff özeti bu sürümde bağlı değil", "Bağlanmayan diff açıkça söylenir")
+        XCTAssertTrue(summary.accessibilityLabel.contains("1 kanıt kaydı"))
+
+        let unwired = TaskDetailPresenter.evidenceSummary(
+            card: card,
+            evidence: nil,
+            currentFingerprint: nil,
+            workspaceID: nil,
+            diffSummary: "12 dosya değişti"
+        )
+        XCTAssertFalse(unwired.isWired)
+        XCTAssertTrue(unwired.rows.isEmpty)
+        XCTAssertEqual(unwired.worktreeLabel, "Çalışma alanı kaydı yok")
+        XCTAssertEqual(unwired.diffNotice, "12 dosya değişti")
+    }
+
+    // MARK: - Findings gating
+
+    func testDismissedBlockingFindingIsListedButNeverCountsAsBlocking() throws {
+        let taskID = UUID()
+        let open = finding(taskID, severity: .critical, summary: "açık kritik")
+        let dismissed = try finding(taskID, severity: .critical, summary: "kapatılmış kritik")
+            .dismissed(by: "reviewer", reason: "kabul edildi", at: TaskBoardFixtures.fixedDate)
+
+        let presentation = TaskDetailPresenter.findings([open, dismissed])
+
+        XCTAssertTrue(presentation.isWired)
+        XCTAssertEqual(presentation.rows.count, 2, "Kapatılan bulgu listeden düşmez")
+        XCTAssertEqual(presentation.blockingCount, 1)
+        XCTAssertTrue(presentation.accessibilityLabel.contains("1 tanesi kabulü engelliyor"))
+
+        let dismissedRow = presentation.rows.first { $0.id == dismissed.id }
+        XCTAssertEqual(dismissedRow?.statusLabel, "Kapatıldı")
+        XCTAssertFalse(dismissedRow?.blocksAcceptance == true)
+        XCTAssertFalse(dismissedRow?.accessibilityLabel.contains("engelliyor") == true)
+
+        let openRow = presentation.rows.first { $0.id == open.id }
+        XCTAssertTrue(openRow?.blocksAcceptance == true)
+        XCTAssertTrue(openRow?.accessibilityLabel.contains("Kabulü engelliyor") == true)
+        XCTAssertEqual(presentation.rows.first?.id, open.id, "Engelleyen bulgu üstte sıralanır")
+    }
+
+    func testOpenFindingsBelowBlockingSeverityAreListedWithoutBlocking() {
+        let taskID = UUID()
+        let presentation = TaskDetailPresenter.findings([
+            finding(taskID, severity: .low, summary: "düşük"),
+            finding(taskID, severity: .medium, summary: "orta"),
+            finding(taskID, severity: .high, summary: "yüksek"),
+        ])
+
+        XCTAssertEqual(presentation.rows.count, 3)
+        XCTAssertEqual(presentation.blockingCount, 1, "Yalnızca yüksek ve kritik engeller; bu listede tek yüksek var")
+        XCTAssertTrue(presentation.accessibilityLabel.contains("1 tanesi kabulü engelliyor"))
+        XCTAssertFalse(presentation.rows.first { $0.summary == "düşük" }?.blocksAcceptance == true)
+    }
+
+    func testUnwiredFindingsAreExplicitRatherThanEmpty() {
+        let presentation = TaskDetailPresenter.findings(nil)
+
+        XCTAssertFalse(presentation.isWired)
+        XCTAssertTrue(presentation.rows.isEmpty)
+        XCTAssertEqual(presentation.blockingCount, 0)
+        XCTAssertTrue(presentation.accessibilityLabel.contains("bağlı değil"))
+    }
+
+    // MARK: - Verification badge tones
+
+    func testBadgeToneIsGreenOnlyForVerified() {
+        XCTAssertEqual(TaskBoardVerificationBadge.verified.tone, .positive, "Yeşil yalnızca doğrulanmış kanıta aittir")
+        XCTAssertEqual(TaskBoardVerificationBadge.notWired.tone, .neutral)
+        XCTAssertEqual(TaskBoardVerificationBadge.missing.tone, .neutral)
+        XCTAssertEqual(TaskBoardVerificationBadge.notLoaded.tone, .neutral)
+        XCTAssertEqual(TaskBoardVerificationBadge.stale(reason: "fp eski").tone, .warning)
+        XCTAssertEqual(TaskBoardVerificationBadge.failed(reason: "exit 1").tone, .negative)
+    }
+
+    func testEvidenceRowsCarryFailureStaleAndSkippedTones() {
+        let attemptID = UUID()
+        let card = TaskBoardFixtures.card(status: .blocked, blockReason: .verificationFailed("exit 1"))
+        let summary = TaskDetailPresenter.evidenceSummary(
+            card: card,
+            evidence: [
+                evidence(
+                    taskID: card.id,
+                    attemptID: attemptID,
+                    status: .failed,
+                    fingerprint: "fp",
+                    blockedBy: "derleme kırıldı",
+                    step: "build"
+                ),
+                evidence(taskID: card.id, attemptID: attemptID, status: .passed, fingerprint: "fp-old", step: "lint"),
+                evidence(taskID: card.id, attemptID: attemptID, status: .skipped, fingerprint: nil, step: "e2e"),
+            ],
+            currentFingerprint: "fp-new",
+            workspaceID: nil,
+            diffSummary: nil
+        )
+
+        XCTAssertEqual(summary.rows.count, 3)
+        let failedRow = summary.rows.first { $0.stepLabel.contains("build") }
+        XCTAssertEqual(failedRow?.tone, .negative, "Başarısız kanıt satırı kırmızı tonda olmalı")
+        XCTAssertEqual(failedRow?.statusLabel, "Başarısız")
+        XCTAssertTrue(failedRow?.accessibilityLabel.contains("derleme kırıldı") == true)
+
+        let staleRow = summary.rows.first { $0.stepLabel.contains("lint") }
+        XCTAssertEqual(staleRow?.tone, .warning)
+        XCTAssertTrue(staleRow?.isStale == true)
+
+        let skippedRow = summary.rows.first { $0.stepLabel.contains("e2e") }
+        XCTAssertEqual(skippedRow?.tone, .neutral)
+
+        XCTAssertEqual(summary.badge.tone, .negative, "Başarısız kanıt rozeti de kırmızı tonda olmalı")
+    }
+
+    // MARK: - Detail pane states
+
+    func testDetailPaneStateDistinguishesIdleLoadingFailureAndLoaded() {
+        let taskID = UUID()
+        let loadedDetail = detail(card: TaskBoardFixtures.card(id: taskID))
+
+        XCTAssertEqual(TaskDetailPresenter.paneState(selectedTaskID: nil, detail: nil, lastFailure: "db"), .idle)
+        XCTAssertEqual(
+            TaskDetailPresenter.paneState(selectedTaskID: taskID, detail: nil, lastFailure: nil),
+            .loading(taskID: taskID)
+        )
+        XCTAssertEqual(
+            TaskDetailPresenter.paneState(selectedTaskID: taskID, detail: nil, lastFailure: "Görev okunamadı (db)"),
+            .failed(taskID: taskID, message: "Görev okunamadı (db)")
+        )
+        XCTAssertEqual(
+            TaskDetailPresenter.paneState(selectedTaskID: taskID, detail: loadedDetail, lastFailure: "db"),
+            .loaded,
+            "Yüklü detay son hatayı gölgeler"
+        )
+    }
+
+    func testDetailPaneIdentityIsStablePerTaskAndDistinctAcrossTasks() {
+        let first = UUID()
+        let second = UUID()
+
+        XCTAssertEqual(TaskDetailPresenter.paneIdentity(for: first), TaskDetailPresenter.paneIdentity(for: first))
+        XCTAssertNotEqual(
+            TaskDetailPresenter.paneIdentity(for: first),
+            TaskDetailPresenter.paneIdentity(for: second),
+            "Görev değişince bölme kimliği değişir ve yerel form durumu sıfırlanır"
+        )
+    }
+
+    // MARK: - Action refusal surfacing
+
+    func testRefusalMessageIsNilWhenAppliedAndNamesTheRefusal() {
+        XCTAssertNil(TaskActionBarPresenter.refusalMessage(.applied))
+
+        let refusal = TaskBoardRefusal(kind: .stale, message: "This task changed since the board loaded")
+        let message = TaskActionBarPresenter.refusalMessage(.refused(refusal))
+        XCTAssertTrue(message?.contains("uygulanmadı") == true)
+        XCTAssertTrue(message?.contains("This task changed since the board loaded") == true)
+    }
+
+    // MARK: - Feedback gate
+
+    func testBlankFeedbackDisablesRequestChangesWithItsOwnReason() {
+        let availability = TaskBoardFixtures.disabledEverything(except: [.accept, .requestChanges])
+        let blank = TaskActionBarPresenter.actions(
+            availability: availability,
+            isInFlight: false,
+            actor: "reviewer",
+            feedback: "   "
+        )
+
+        let requestChanges = blank.first { $0.action == .requestChanges }
+        XCTAssertFalse(requestChanges?.isEnabled == true)
+        XCTAssertTrue(requestChanges?.disabledReason?.contains("geri bildirim") == true)
+        XCTAssertTrue(requestChanges?.accessibilityLabel.contains("geri bildirim") == true)
+        XCTAssertTrue(blank.first { $0.action == .accept }?.isEnabled == true, "Geri bildirim kapısı accept'i bağlamaz")
+
+        let named = TaskActionBarPresenter.actions(
+            availability: availability,
+            isInFlight: false,
+            actor: "reviewer",
+            feedback: "şu alanı düzelt"
+        )
+        XCTAssertTrue(named.first { $0.action == .requestChanges }?.isEnabled == true)
+    }
+
+    // MARK: - Primary / overflow split
+
+    func testPrimaryAndOverflowSetsPartitionEveryActionInCanonicalOrder() {
+        XCTAssertEqual(TaskActionBarPresenter.primaryActions, [.start, .pause, .resume, .stop, .accept])
+        XCTAssertEqual(TaskActionBarPresenter.secondaryActions, [.retry, .requestChanges])
+        XCTAssertTrue(
+            Set(TaskActionBarPresenter.primaryActions)
+                .isDisjoint(with: Set(TaskActionBarPresenter.secondaryActions))
+        )
+        XCTAssertEqual(
+            Set(TaskActionBarPresenter.primaryActions).union(TaskActionBarPresenter.secondaryActions),
+            Set(TaskBoardAction.allCases),
+            "Her eylem tam olarak bir yuvada görünür"
+        )
+        for subset in [TaskActionBarPresenter.primaryActions, TaskActionBarPresenter.secondaryActions] {
+            XCTAssertEqual(
+                subset,
+                TaskActionBarPresenter.displayOrder.filter { subset.contains($0) },
+                "Alt kümeler kanonik sunum sırasını korur"
+            )
+        }
+
+        let actions = TaskActionBarPresenter.actions(
+            availability: TaskBoardFixtures.disabledEverything(except: [.retry, .requestChanges]),
+            isInFlight: false,
+            actor: "reviewer",
+            feedback: "geri bildirim metni"
+        )
+        XCTAssertEqual(
+            TaskActionBarPresenter.primary(actions).map(\.action),
+            [.start, .pause, .resume, .stop, .accept]
+        )
+        XCTAssertEqual(TaskActionBarPresenter.overflow(actions).map(\.action), [.retry, .requestChanges])
+    }
+
+    // MARK: - Board injection point
+
+    func testBoardViewCarriesInspectorInputWithoutEditingItsBody() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let store = TaskBoardStore(service: harness.makeService())
+        let wired = TaskBoardInspectorInput(
+            evidence: [],
+            currentFingerprint: "fp-current",
+            findings: [],
+            workspaceID: UUID(),
+            diffSummary: "12 dosya değişti"
+        )
+
+        let wiredView = TaskBoardView(store: store, preset: AppThemes.allPresets[0], isDark: false, inspectorInput: wired)
+        XCTAssertEqual(wiredView.inspectorInput, wired)
+
+        let unwiredView = TaskBoardView(store: store, preset: AppThemes.allPresets[0], isDark: false)
+        XCTAssertEqual(unwiredView.inspectorInput, .unwired, "Varsayılan init açıkça unwired sözleşmesini taşır")
     }
 }

@@ -26,13 +26,14 @@ struct TaskBoardDependencyPresentation: Identifiable, Equatable {
     let accessibilityLabel: String
 }
 
-/// Doğrulama kanıtı satırı; eski parmak izi stale olarak işaretlenir.
+/// Doğrulama kanıtı satırı; eski parmak izi stale olarak işaretlenir, tonu başarıyı yalanlamaz.
 struct TaskBoardEvidenceRow: Identifiable, Equatable {
     let id: UUID
     let stepLabel: String
     let statusLabel: String
     let fingerprintLabel: String?
     let isStale: Bool
+    let tone: TaskBoardBadgeTone
     let blockedBy: String?
     let accessibilityLabel: String
 }
@@ -98,8 +99,37 @@ struct TaskBoardInspectorInput: Equatable {
     )
 }
 
+/// Detay bölmesinin görünümden bağımsız durumu; yutulan yükleme hatası "seçim yok" gibi görünmez.
+enum TaskBoardDetailPaneState: Equatable {
+    case idle
+    case loading(taskID: UUID)
+    case failed(taskID: UUID, message: String)
+    case loaded
+}
+
+/// Detay bölmesi kimliği; görev değişince yerel form durumu sıfırlanır.
+struct TaskBoardDetailPaneIdentity: Equatable, Hashable {
+    let taskID: UUID
+}
+
 /// Detay denetçisinin saf sunum fonksiyonları.
 enum TaskDetailPresenter {
+
+    /// Seçim, yükleme, hata ve yüklü durumlarını ayırır; hata mesajı kaybolmaz.
+    static func paneState(
+        selectedTaskID: UUID?,
+        detail: TaskBoardTaskDetail?,
+        lastFailure: String?
+    ) -> TaskBoardDetailPaneState {
+        if detail != nil { return .loaded }
+        guard let selectedTaskID else { return .idle }
+        guard let lastFailure else { return .loading(taskID: selectedTaskID) }
+        return .failed(taskID: selectedTaskID, message: lastFailure)
+    }
+
+    static func paneIdentity(for taskID: UUID) -> TaskBoardDetailPaneIdentity {
+        TaskBoardDetailPaneIdentity(taskID: taskID)
+    }
 
     static func criteria(_ detail: TaskBoardTaskDetail) -> [TaskBoardCriterionPresentation] {
         detail.criteria.map { criterion in
@@ -201,14 +231,15 @@ enum TaskDetailPresenter {
             .map { finding in
                 let severityLabel = severityText(finding.severity)
                 let statusLabel = finding.isOpen ? "Açık" : "Kapatıldı"
+                let blocksAcceptance = finding.isOpen && finding.severity.blocksAcceptance
                 var label = "\(severityLabel) önem, \(statusLabel): \(finding.summary)"
-                if finding.severity.blocksAcceptance { label += ". Kabulü engelliyor" }
+                if blocksAcceptance { label += ". Kabulü engelliyor" }
                 return TaskBoardFindingRow(
                     id: finding.id,
                     severityLabel: severityLabel,
                     statusLabel: statusLabel,
                     summary: finding.summary,
-                    blocksAcceptance: finding.severity.blocksAcceptance,
+                    blocksAcceptance: blocksAcceptance,
                     accessibilityLabel: label
                 )
             }
@@ -321,12 +352,20 @@ enum TaskDetailPresenter {
         if isStale { accessibilityLabel += ". Güncel içerikle eşleşmiyor" }
         if let blockedBy = entry.blockedBy { accessibilityLabel += ". Engel: \(blockedBy)" }
 
+        let tone: TaskBoardBadgeTone
+        switch entry.status {
+        case .passed: tone = isStale ? .warning : .positive
+        case .failed: tone = .negative
+        case .skipped: tone = .neutral
+        }
+
         return TaskBoardEvidenceRow(
             id: entry.id,
             stepLabel: stepLabel,
             statusLabel: statusLabel,
             fingerprintLabel: fingerprintLabel,
             isStale: isStale,
+            tone: tone,
             blockedBy: entry.blockedBy,
             accessibilityLabel: accessibilityLabel
         )
@@ -360,52 +399,27 @@ struct TaskDetailView: View {
 
     private var detail: TaskBoardTaskDetail? { store.detail }
 
+    private var paneState: TaskBoardDetailPaneState {
+        TaskDetailPresenter.paneState(
+            selectedTaskID: store.selectedTaskID,
+            detail: store.detail,
+            lastFailure: store.lastFailure
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            if let detail {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 14) {
-                        headerSection(detail)
-
-                        if !detail.criteria.isEmpty {
-                            criteriaSection(detail)
-                        }
-                        if !detail.dependencies.isEmpty {
-                            dependenciesSection(detail)
-                        }
-                        providerSection(detail)
-                        evidenceSection(detail)
-                        findingsSection(detail)
-                        TaskActivityView(
-                            attempts: detail.attempts,
-                            lastFailure: store.lastFailure,
-                            isActionInFlight: store.isActionInFlight(for: detail.card.id),
-                            preset: preset,
-                            isDark: isDark
-                        )
-                        approvalSection(detail)
-                    }
-                    .padding(12)
+            switch paneState {
+            case .loaded:
+                if let detail {
+                    loadedPane(detail)
                 }
-
-                Divider().opacity(0.35)
-
-                actorField
-
-                TaskActionBar(
-                    store: store,
-                    taskID: detail.card.id,
-                    actor: actor,
-                    feedback: feedback,
-                    preset: preset,
-                    isDark: isDark
-                )
-            } else {
-                Text("Görev seçilmedi")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityLabel("Görev seçilmedi")
+            case .idle:
+                paneMessage(title: "Görev seçilmedi", systemImage: "sidebar.left")
+            case .loading:
+                paneMessage(title: "Görev yükleniyor…", systemImage: "clock")
+            case .failed(let taskID, let message):
+                failurePane(taskID: taskID, message: message)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -414,6 +428,95 @@ struct TaskDetailView: View {
             Rectangle()
                 .fill((isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.6))
                 .frame(width: 1)
+        }
+    }
+
+    private func loadedPane(_ detail: TaskBoardTaskDetail) -> some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    headerSection(detail)
+
+                    if !detail.criteria.isEmpty {
+                        criteriaSection(detail)
+                    }
+                    if !detail.dependencies.isEmpty {
+                        dependenciesSection(detail)
+                    }
+                    providerSection(detail)
+                    evidenceSection(detail)
+                    findingsSection(detail)
+                    TaskActivityView(
+                        attempts: detail.attempts,
+                        isActionInFlight: store.isActionInFlight(for: detail.card.id),
+                        preset: preset,
+                        isDark: isDark
+                    )
+                    approvalSection(detail)
+                }
+                .padding(12)
+            }
+
+            Divider().opacity(0.35)
+
+            actorField
+
+            TaskActionBar(
+                store: store,
+                taskID: detail.card.id,
+                actor: actor,
+                feedback: feedback,
+                preset: preset,
+                isDark: isDark
+            )
+        }
+    }
+
+    private func paneMessage(title: String, systemImage: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 18, weight: .light))
+                .foregroundStyle(.tertiary)
+            Text(title)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(title)
+    }
+
+    private func failurePane(taskID: UUID, message: String) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 18))
+                .foregroundStyle(.orange)
+            Text("Görev yüklenemedi")
+                .font(.system(size: 12, weight: .semibold))
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Yeniden dene") {
+                retry(taskID: taskID)
+            }
+            .buttonStyle(.plain)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(.orange)
+            .pointingHandCursor()
+            .accessibilityLabel("Görevi yeniden yükle")
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Görev yüklenemedi: \(message)")
+    }
+
+    private func retry(taskID: UUID) {
+        Task {
+            await store.selectTask(nil)
+            await store.selectTask(taskID)
         }
     }
 
@@ -535,7 +638,7 @@ struct TaskDetailView: View {
                     if let badgeLabel = summary.badge.label {
                         Text(badgeLabel)
                             .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(summary.badge.isStale ? Color.orange : Color.green)
+                            .foregroundStyle(toneColor(summary.badge.tone))
                     }
                     Spacer(minLength: 0)
                 }
@@ -548,9 +651,9 @@ struct TaskDetailView: View {
 
                 ForEach(summary.rows) { row in
                     HStack(alignment: .top, spacing: 6) {
-                        Image(systemName: row.isStale ? "clock.badge.exclamationmark" : "checkmark.seal")
+                        Image(systemName: evidenceIcon(row.tone))
                             .font(.system(size: 10.5))
-                            .foregroundStyle(row.isStale ? Color.orange : Color.secondary)
+                            .foregroundStyle(toneColor(row.tone))
                         VStack(alignment: .leading, spacing: 1) {
                             Text("\(row.stepLabel) — \(row.statusLabel)")
                                 .font(.system(size: 11))
@@ -678,5 +781,24 @@ struct TaskDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
+    }
+
+    /// Rozet ve kanıt satırı renkleri sunum tonundan türetilir; görünüm kendi kararını vermez.
+    private func toneColor(_ tone: TaskBoardBadgeTone) -> Color {
+        switch tone {
+        case .positive: .green
+        case .neutral: .secondary
+        case .warning: .orange
+        case .negative: .red
+        }
+    }
+
+    private func evidenceIcon(_ tone: TaskBoardBadgeTone) -> String {
+        switch tone {
+        case .positive: "checkmark.seal.fill"
+        case .neutral: "minus.circle"
+        case .warning: "clock.badge.exclamationmark"
+        case .negative: "xmark.octagon.fill"
+        }
     }
 }

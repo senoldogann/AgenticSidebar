@@ -78,11 +78,12 @@ enum TaskActivityPresenter {
 
 // MARK: - Etkinlik görünümü
 
-/// Deneme geçmişi ve son hata; sahte ilerleme çubuğu çizmez, yalnızca kaydı gösterir.
+/// Deneme geçmişi; sahte ilerleme çubuğu çizmez, yalnızca kaydı gösterir.
+/// Yükleme hataları seçimle taşınmaması için burada değil, pano/detay hata
+/// yüzeylerinde gösterilir.
 @MainActor
 struct TaskActivityView: View {
     let attempts: [TaskBoardAttemptSummary]
-    let lastFailure: String?
     let isActionInFlight: Bool
     let preset: AppThemePreset
     let isDark: Bool
@@ -107,14 +108,6 @@ struct TaskActivityView: View {
                         .foregroundStyle(.secondary)
                         .accessibilityLabel(TaskActionBarPresenter.busyExplanation)
                 }
-            }
-
-            if let lastFailure {
-                Label(lastFailure, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel("Son hata: \(lastFailure)")
             }
 
             if rows.isEmpty {

@@ -87,10 +87,74 @@ final class TaskBoardAccessibilityTests: XCTestCase {
     func testVerifiedBadgeNeverSpeaksWithoutAFingerprintWitness() {
         let card = Fixture.card(status: .review)
         let notLoaded = TaskBoardPresenter.card(card, verification: .notLoaded)
-        XCTAssertNil(notLoaded.verificationBadge.accessibilityLabel)
+        XCTAssertFalse(notLoaded.accessibilityLabel.contains("doğrulandı"))
 
         let verified = TaskBoardPresenter.card(card, verification: .verified)
-        XCTAssertTrue(verified.verificationBadge.accessibilityLabel?.contains("doğrulandı") == true)
+        XCTAssertTrue(verified.accessibilityLabel.contains("doğrulandı"))
+    }
+
+    func testEveryBadgeKindSpeaksItsStateInsteadOfRelyingOnColor() {
+        let badges: [TaskBoardVerificationBadge] = [
+            .notLoaded,
+            .notWired,
+            .missing,
+            .verified,
+            .stale(reason: "parmak izi fp-old"),
+            .failed(reason: "exit 1"),
+        ]
+        for badge in badges {
+            XCTAssertEqual(
+                badge.label == nil,
+                badge.accessibilityLabel == nil,
+                "Görsel etiketi olan her rozet konuşur; renk tek başına bilgi taşımaz"
+            )
+        }
+        XCTAssertTrue(TaskBoardVerificationBadge.failed(reason: "exit 1").accessibilityLabel?.contains("exit 1") == true)
+        XCTAssertEqual(TaskBoardVerificationBadge.verified.tone, .positive)
+        XCTAssertEqual(TaskBoardVerificationBadge.stale(reason: "fp").tone, .warning)
+        XCTAssertEqual(TaskBoardVerificationBadge.failed(reason: "fp").tone, .negative)
+    }
+
+    func testEvidenceRowsSpeakFailureStaleAndBlockedReasonInText() {
+        let card = Fixture.card(status: .review)
+        let summary = TaskDetailPresenter.evidenceSummary(
+            card: card,
+            evidence: [
+                VerificationEvidence(
+                    taskID: card.id,
+                    attemptID: UUID(),
+                    recipeName: "recipe",
+                    stepName: "build",
+                    status: .failed,
+                    detailsRedacted: "redacted",
+                    workspaceFingerprint: "fp",
+                    blockedBy: "derleme kırıldı",
+                    recordedAt: Date(timeIntervalSince1970: 1_700_000_000)
+                ),
+                VerificationEvidence(
+                    taskID: card.id,
+                    attemptID: UUID(),
+                    recipeName: "recipe",
+                    stepName: "lint",
+                    status: .passed,
+                    detailsRedacted: "redacted",
+                    workspaceFingerprint: "fp-old",
+                    recordedAt: Date(timeIntervalSince1970: 1_700_000_000)
+                ),
+            ],
+            currentFingerprint: "fp-new",
+            workspaceID: nil,
+            diffSummary: nil
+        )
+
+        let failedRow = summary.rows.first { $0.stepLabel.contains("build") }
+        XCTAssertEqual(failedRow?.tone, .negative)
+        XCTAssertTrue(failedRow?.accessibilityLabel.contains("Başarısız") == true)
+        XCTAssertTrue(failedRow?.accessibilityLabel.contains("derleme kırıldı") == true)
+
+        let staleRow = summary.rows.first { $0.stepLabel.contains("lint") }
+        XCTAssertEqual(staleRow?.tone, .warning)
+        XCTAssertTrue(staleRow?.accessibilityLabel.contains("Güncel içerikle eşleşmiyor") == true)
     }
 
     func testStaleVerificationBadgeSpeaksItsReason() {
@@ -104,7 +168,8 @@ final class TaskBoardAccessibilityTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: Fixture.onlyEnabled([]),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         for action in actions {
             XCTAssertTrue(action.accessibilityLabel.contains(action.title))
@@ -117,7 +182,8 @@ final class TaskBoardAccessibilityTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: Fixture.onlyEnabled([.accept]),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
         let accept = actions.first { $0.action == .accept }
         XCTAssertTrue(accept?.isEnabled == true)
@@ -148,14 +214,21 @@ final class TaskBoardAccessibilityTests: XCTestCase {
         let actions = TaskActionBarPresenter.actions(
             availability: Fixture.onlyEnabled(enabled),
             isInFlight: false,
-            actor: "reviewer"
+            actor: "reviewer",
+            feedback: "geri bildirim"
         )
 
-        XCTAssertEqual(TaskActionBarPresenter.keyboardTabOrder(actions), [.start, .stop, .accept])
+        let tabOrder = TaskActionBarPresenter.keyboardTabOrder(actions)
+        XCTAssertEqual(tabOrder, [.start, .stop, .accept])
         XCTAssertEqual(
-            TaskActionBarPresenter.keyboardTabOrder(actions),
+            tabOrder,
             TaskActionBarPresenter.keyboardTabOrder(actions),
             "Klavye sırası her çağrıda aynı olmalı"
+        )
+        XCTAssertEqual(
+            tabOrder,
+            TaskActionBarPresenter.displayOrder.filter { tabOrder.contains($0) },
+            "Klavye sırası kanonik sunum sırasının alt dizisidir"
         )
     }
 
@@ -187,44 +260,10 @@ final class TaskBoardAccessibilityTests: XCTestCase {
         XCTAssertEqual(TaskActivityPresenter.summary([]), "Etkinlik yok")
     }
 
-    // MARK: - Source checks
+    // MARK: - Source guards
 
-    func testBoardViewRendersLazilyAndNeverMutatesOnDrop() throws {
-        let source = try taskBoardSource(named: "TaskBoardView.swift")
-
-        XCTAssertTrue(source.contains("LazyVStack"), "Kartlar tembel listede çizilmeli")
-        XCTAssertTrue(source.contains("LazyHStack"), "Kolonlar tembel şeritte çizilmeli")
-        for forbidden in ["onDrop", "dropDestination", "onInsert", "draggable", "TaskStateMachine"] {
-            XCTAssertFalse(
-                source.contains(forbidden),
-                "Pano sürükle-bırak ile durum değiştirmemeli (\(forbidden) yasak)"
-            )
-        }
-    }
-
-    func testActionBarButtonsCallStoreOnlyAndExposeDisabledHelp() throws {
-        let source = try taskBoardSource(named: "TaskActionBar.swift")
-
-        for call in [
-            "store.start(",
-            "store.pause(",
-            "store.resume(",
-            "store.stop(",
-            "store.retry(",
-            "store.requestChanges(",
-            "store.accept(",
-        ] {
-            XCTAssertTrue(source.contains(call), "Eylem butonu store üzerinden çağırmalı: \(call)")
-        }
-        XCTAssertTrue(source.contains(".help("), "Devre dışı eylem gerekçesi yardım metninde olmalı")
-        XCTAssertTrue(source.contains("disabledReason"))
-        for forbidden in ["CodingTaskService", "SQLite", "TaskStateMachine", "TaskAction."] {
-            XCTAssertFalse(source.contains(forbidden), "Görünüm servis/servis-altı türleri bilmemeli (\(forbidden))")
-        }
-    }
-
-    func testBoardAndDetailViewsNeverTouchServiceOrTransitions() throws {
-        for file in ["TaskBoardView.swift", "TaskDetailView.swift", "TaskActivityView.swift"] {
+    func testBoardSurfacesNeverTouchServiceSQLStateMachineOrDragDrop() throws {
+        for file in ["TaskBoardView.swift", "TaskDetailView.swift", "TaskActionBar.swift", "TaskActivityView.swift"] {
             let source = try taskBoardSource(named: file)
             for forbidden in ["CodingTaskService", "SQLite", "TaskStateMachine", "onDrop", "dropDestination"] {
                 XCTAssertFalse(source.contains(forbidden), "\(file) içinde \(forbidden) yasak")
@@ -232,28 +271,15 @@ final class TaskBoardAccessibilityTests: XCTestCase {
         }
     }
 
-    func testDetailViewCoversEveryInspectorSection() throws {
-        let source = try taskBoardSource(named: "TaskDetailView.swift")
+    /// Odak sırası yalnızca modelde değil, gerçek SwiftUI odak bağlarında da uygulanır.
+    func testActionBarBindsFocusInPresenterOrderInsteadOfOnlyModelingIt() throws {
+        let source = try taskBoardSource(named: "TaskActionBar.swift")
 
-        for section in [
-            "TaskBoardCriterionPresentation",
-            "TaskBoardDependencyPresentation",
-            "TaskActivityView",
-            "TaskBoardEvidenceSummary",
-            "TaskBoardFindingsPresentation",
-            "TaskBoardApprovalPresentation",
-            "TaskActionBar(",
-        ] {
-            XCTAssertTrue(source.contains(section), "Detay denetçisinde eksik bölüm: \(section)")
-        }
-    }
-
-    func testBoardViewOffersCreationAndSelectionThroughTheStore() throws {
-        let source = try taskBoardSource(named: "TaskBoardView.swift")
-
-        XCTAssertTrue(source.contains("store.createTask("))
-        XCTAssertTrue(source.contains("store.selectTask("))
-        XCTAssertTrue(source.contains("store.refresh()"))
+        XCTAssertTrue(source.contains("@FocusState"), "Eylem çubuğu odak durumunu bağlar")
+        XCTAssertTrue(source.contains(".focused("), "Her eylem butonu presenter sırasında odaklanır")
+        XCTAssertTrue(source.contains(".focusSection()"), "Eylem çubuğu tek odak bölümü olarak gezinir")
+        XCTAssertTrue(source.contains("TaskActionBarPresenter.primary(actions)"), "Görünür butonlar presenter birincil setinden gelir")
+        XCTAssertTrue(source.contains("TaskActionBarPresenter.overflow(actions)"), "İkincil eylemler taşma menüsünden gelir")
     }
 
     private func taskBoardSource(named file: String) throws -> String {

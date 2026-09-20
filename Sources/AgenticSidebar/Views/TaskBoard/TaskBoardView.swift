@@ -151,6 +151,14 @@ struct TaskBoardDropFeedback: Equatable {
     let mutatesStatus: Bool
 }
 
+/// Rozet tonu; görünüm rengi bu tondan türetir, yeşil yalnızca kanıtlanmış doğrulamaya aittir.
+enum TaskBoardBadgeTone: Equatable {
+    case positive
+    case neutral
+    case warning
+    case negative
+}
+
 /// Doğrulama rozeti; her durum adıyla konuşur, renk tek başına anlam taşımaz.
 enum TaskBoardVerificationBadge: Equatable {
     case notLoaded
@@ -159,6 +167,16 @@ enum TaskBoardVerificationBadge: Equatable {
     case verified
     case failed(reason: String)
     case stale(reason: String)
+
+    /// Renk kararı sunum katmanında verilir; başarısız/engelli asla yeşil yanmaz.
+    var tone: TaskBoardBadgeTone {
+        switch self {
+        case .verified: .positive
+        case .notLoaded, .notWired, .missing: .neutral
+        case .stale: .warning
+        case .failed: .negative
+        }
+    }
 
     var label: String? {
         switch self {
@@ -197,7 +215,6 @@ struct TaskBoardCardPresentation: Equatable {
     let criteriaLabel: String
     let dependencyLabel: String?
     let blockReasonText: String?
-    let verificationBadge: TaskBoardVerificationBadge
     let accessibilityLabel: String
 }
 
@@ -323,7 +340,6 @@ enum TaskBoardPresenter {
             criteriaLabel: criteriaLabel,
             dependencyLabel: dependencyLabel,
             blockReasonText: blockReasonText,
-            verificationBadge: verification,
             accessibilityLabel: accessibilityLabel
         )
     }
@@ -366,16 +382,36 @@ enum TaskBoardPresenter {
 ///
 /// Tüm eylemler yalnızca `TaskBoardStore` üzerinden gider; görünüm servis, SQL
 /// veya sağlayıcı türü bilmez. Kartlar tembel listelerde çizilir ve hiçbir
-/// sürükle-bırak durum mutasyonu bağlanmaz.
+/// sürükle-bırak durum mutasyonu bağlanmaz. Denetçi girdisi dışarıdan enjekte
+/// edilir; gövdeye dokunmadan kanıt, bulgu ve diff bağlanabilir.
 @MainActor
 struct TaskBoardView: View {
     let store: TaskBoardStore
     let preset: AppThemePreset
     let isDark: Bool
+    let inspectorInput: TaskBoardInspectorInput
 
     @State private var showsBlockedOnly = false
     @State private var showsCancelledHistory = false
     @State private var showsCreationSheet = false
+    @FocusState private var focusedCardID: UUID?
+
+    /// Denetçi kaynağı bağlanmayan çağrılar açıkça `unwired` sözleşmesini kullanır.
+    init(store: TaskBoardStore, preset: AppThemePreset, isDark: Bool) {
+        self.init(store: store, preset: preset, isDark: isDark, inspectorInput: .unwired)
+    }
+
+    init(
+        store: TaskBoardStore,
+        preset: AppThemePreset,
+        isDark: Bool,
+        inspectorInput: TaskBoardInspectorInput
+    ) {
+        self.store = store
+        self.preset = preset
+        self.isDark = isDark
+        self.inspectorInput = inspectorInput
+    }
 
     private var loadState: TaskBoardLoadState {
         switch store.phase {
@@ -394,9 +430,10 @@ struct TaskBoardView: View {
         HStack(spacing: 0) {
             boardColumn
 
-            if store.selectedTaskID != nil {
+            if let selectedTaskID = store.selectedTaskID {
                 Divider().opacity(0.4)
-                TaskDetailView(store: store, preset: preset, isDark: isDark, input: .unwired)
+                TaskDetailView(store: store, preset: preset, isDark: isDark, input: inspectorInput)
+                    .id(TaskDetailPresenter.paneIdentity(for: selectedTaskID))
                     .frame(minWidth: 320, idealWidth: 380, maxWidth: 460)
             }
         }
@@ -594,6 +631,7 @@ struct TaskBoardView: View {
             isSelected: card.id == store.selectedTaskID,
             preset: preset,
             isDark: isDark,
+            focusedCardID: $focusedCardID,
             onSelect: {
                 Task { await store.selectTask(card.id) }
             }
@@ -653,6 +691,7 @@ private struct TaskBoardCardView: View {
     let isSelected: Bool
     let preset: AppThemePreset
     let isDark: Bool
+    @FocusState.Binding var focusedCardID: UUID?
     let onSelect: () -> Void
 
     private var presentation: TaskBoardCardPresentation {
@@ -720,6 +759,7 @@ private struct TaskBoardCardView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+        .focused($focusedCardID, equals: card.id)
     }
 
     private var statusChip: some View {

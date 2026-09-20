@@ -20,19 +20,30 @@ struct TaskBoardActionPresentation: Identifiable, Equatable {
 /// Eylem çubuğunun saf sunum fonksiyonları.
 enum TaskActionBarPresenter {
 
-    /// Kanonik eylem sırası; klavye sekme sırası da bu sırayı izler.
+    /// Kanonik eylem sırasının tek kaynağı. Görünür birincil butonlar ve taşma
+    /// menüsü bu sıradan türetilir; klavye odak sırası `keyboardTabOrder` ile
+    /// aynı sırayı izler.
     static let displayOrder: [TaskBoardAction] = [
         .start, .pause, .resume, .stop, .retry, .requestChanges, .accept,
     ]
 
+    /// Çubukta her zaman görünen birincil eylemler; kanonik sıranın alt dizisi.
+    static let primaryActions: [TaskBoardAction] = [.start, .pause, .resume, .stop, .accept]
+
+    /// Taşma menüsünde toplanan ikincil eylemler; kanonik sıranın alt dizisi.
+    static let secondaryActions: [TaskBoardAction] = [.retry, .requestChanges]
+
     static let busyExplanation = "Bu görev için bir işlem sürüyor; sonuç gelene kadar bekleyin."
+    static let missingFeedbackReason = "Değişiklik isteği için geri bildirim gerekli"
 
     static func actions(
         availability: [TaskBoardActionAvailability],
         isInFlight: Bool,
-        actor: String
+        actor: String,
+        feedback: String
     ) -> [TaskBoardActionPresentation] {
         let trimmedActor = actor.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedFeedback = feedback.trimmingCharacters(in: .whitespacesAndNewlines)
         return displayOrder.map { action in
             let base = availability.first { $0.action == action }
             var isEnabled = base?.isEnabled ?? false
@@ -44,6 +55,9 @@ enum TaskActionBarPresenter {
             } else if isEnabled, requiresHumanActor(action), trimmedActor.isEmpty {
                 isEnabled = false
                 disabledReason = humanActorReason(action)
+            } else if isEnabled, requiresFeedback(action), trimmedFeedback.isEmpty {
+                isEnabled = false
+                disabledReason = missingFeedbackReason
             }
 
             let title = title(for: action)
@@ -72,17 +86,27 @@ enum TaskActionBarPresenter {
         actions.filter(\.isEnabled).map(\.action)
     }
 
-    static func busyMessage(isInFlight: Bool) -> String? {
-        isInFlight ? busyExplanation : nil
+    /// Birincil butonlar kanonik sırayı korur; taşma menüsü kalanları taşır.
+    static func primary(_ actions: [TaskBoardActionPresentation]) -> [TaskBoardActionPresentation] {
+        actions.filter { primaryActions.contains($0.action) }
     }
 
-    static func failureMessage(_ lastFailure: String?) -> String? {
-        guard let lastFailure else { return nil }
-        return "Son işlem uygulanmadı: \(lastFailure)"
+    static func overflow(_ actions: [TaskBoardActionPresentation]) -> [TaskBoardActionPresentation] {
+        actions.filter { secondaryActions.contains($0.action) }
+    }
+
+    /// Başarısız bir eylem sonucunu sesli/görsel gerekçeye çevirir; başarı sessizdir.
+    static func refusalMessage(_ result: TaskBoardActionResult) -> String? {
+        guard case .refused(let refusal) = result else { return nil }
+        return "İşlem uygulanmadı (\(refusal.kind.rawValue)): \(refusal.message)"
     }
 
     private static func requiresHumanActor(_ action: TaskBoardAction) -> Bool {
         action == .accept || action == .requestChanges
+    }
+
+    private static func requiresFeedback(_ action: TaskBoardAction) -> Bool {
+        action == .requestChanges
     }
 
     private static func humanActorReason(_ action: TaskBoardAction) -> String {
@@ -134,27 +158,42 @@ struct TaskActionBar: View {
     let preset: AppThemePreset
     let isDark: Bool
 
+    @FocusState private var focusedAction: TaskBoardAction?
+    @State private var lastRefusalMessage: String?
+
     private var actions: [TaskBoardActionPresentation] {
         TaskActionBarPresenter.actions(
             availability: store.actionAvailability(for: taskID),
             isInFlight: store.isActionInFlight(for: taskID),
-            actor: actor
+            actor: actor,
+            feedback: feedback
         )
+    }
+
+    private var primaryActions: [TaskBoardActionPresentation] {
+        TaskActionBarPresenter.primary(actions)
+    }
+
+    private var overflowActions: [TaskBoardActionPresentation] {
+        TaskActionBarPresenter.overflow(actions)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let message = TaskActionBarPresenter.failureMessage(store.lastFailure) {
-                Label(message, systemImage: "exclamationmark.triangle.fill")
+            if let lastRefusalMessage {
+                Label(lastRefusalMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel(message)
+                    .accessibilityLabel(lastRefusalMessage)
             }
 
             HStack(spacing: 6) {
-                ForEach(actions) { action in
+                ForEach(primaryActions) { action in
                     button(action)
+                }
+                if !overflowActions.isEmpty {
+                    overflowMenu
                 }
                 Spacer(minLength: 0)
                 if store.isActionInFlight(for: taskID) {
@@ -164,9 +203,38 @@ struct TaskActionBar: View {
                         .accessibilityLabel("Bu görev için işlem sürüyor")
                 }
             }
+            .focusSection()
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
+    }
+
+    private var overflowMenu: some View {
+        Menu {
+            ForEach(overflowActions) { action in
+                Button {
+                    perform(action.action)
+                } label: {
+                    Label(action.title, systemImage: action.systemImage)
+                }
+                .disabled(!action.isEnabled)
+                .help(action.disabledReason ?? action.title)
+                .accessibilityLabel(action.accessibilityLabel)
+                .accessibilityHint(action.accessibilityHint ?? "")
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.system(size: 11, weight: .semibold))
+                .frame(height: 22)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .foregroundStyle(overflowActions.contains(where: \.isEnabled) ? Color.primary : Color.secondary)
+        .help("Diğer eylemler")
+        .accessibilityLabel("Diğer eylemler")
     }
 
     private func button(_ action: TaskBoardActionPresentation) -> some View {
@@ -194,6 +262,7 @@ struct TaskActionBar: View {
         .help(action.disabledReason ?? action.title)
         .accessibilityLabel(action.accessibilityLabel)
         .accessibilityHint(action.accessibilityHint ?? "")
+        .focused($focusedAction, equals: action.action)
     }
 
     private func foreground(for action: TaskBoardActionPresentation) -> Color {
@@ -212,22 +281,24 @@ struct TaskActionBar: View {
 
     private func perform(_ action: TaskBoardAction) {
         Task {
+            let result: TaskBoardActionResult
             switch action {
             case .start:
-                _ = await store.start(taskID: taskID)
+                result = await store.start(taskID: taskID)
             case .pause:
-                _ = await store.pause(taskID: taskID)
+                result = await store.pause(taskID: taskID)
             case .resume:
-                _ = await store.resume(taskID: taskID)
+                result = await store.resume(taskID: taskID)
             case .stop:
-                _ = await store.stop(taskID: taskID)
+                result = await store.stop(taskID: taskID)
             case .retry:
-                _ = await store.retry(taskID: taskID)
+                result = await store.retry(taskID: taskID)
             case .requestChanges:
-                _ = await store.requestChanges(taskID: taskID, actor: actor, feedback: feedback)
+                result = await store.requestChanges(taskID: taskID, actor: actor, feedback: feedback)
             case .accept:
-                _ = await store.accept(taskID: taskID, actor: actor)
+                result = await store.accept(taskID: taskID, actor: actor)
             }
+            lastRefusalMessage = TaskActionBarPresenter.refusalMessage(result)
         }
     }
 }
