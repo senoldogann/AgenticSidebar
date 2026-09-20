@@ -262,6 +262,125 @@ public struct TaskApproval: Sendable, Identifiable, Codable, Equatable {
         self.timestamp = timestamp
         self.action = action
     }
+
+    /// True when this approval authorizes exactly the given action on the given task,
+    /// attempt and content fingerprint; any other content revokes its validity.
+    public func authorizes(action: ApprovalAction, taskID: UUID, attemptID: UUID, fingerprint: String) -> Bool {
+        self.action == action
+            && self.taskID == taskID
+            && self.attemptID == attemptID
+            && self.fingerprint == fingerprint
+    }
+}
+
+/// Severity of a review finding.
+public enum ReviewFindingSeverity: String, Sendable, Codable, Equatable, CaseIterable {
+    case low
+    case medium
+    case high
+    case critical
+
+    /// The blocking band: an open finding at or above this severity denies completion.
+    public var blocksAcceptance: Bool {
+        self == .high || self == .critical
+    }
+}
+
+/// Lifecycle status of a review finding.
+public enum ReviewFindingStatus: String, Sendable, Codable, Equatable {
+    case open
+    case dismissed
+}
+
+/// Errors raised when a finding dismissal lacks the human record it must carry.
+public enum ReviewFindingError: Error, Sendable, Equatable {
+    case missingDismissalActor(findingID: UUID)
+    case missingDismissalReason(findingID: UUID)
+}
+
+/// Review finding raised against a task attempt.
+///
+/// A finding only leaves the open state through an explicit dismissal that records a
+/// non-empty human actor and reason. A persisted row that claims `dismissed` without both
+/// fields is treated as open by every consumer: dismissal can never happen implicitly.
+/// `attemptID` identifies the reviewed attempt; nil means the finding is task-scoped.
+public struct ReviewFinding: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public let taskID: UUID
+    public let attemptID: UUID?
+    public let severity: ReviewFindingSeverity
+    public let summary: String
+    public let status: ReviewFindingStatus
+    public let dismissalActor: String?
+    public let dismissalReason: String?
+    public let dismissedAt: Date?
+    public let createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        taskID: UUID,
+        attemptID: UUID? = nil,
+        severity: ReviewFindingSeverity,
+        summary: String,
+        status: ReviewFindingStatus = .open,
+        dismissalActor: String? = nil,
+        dismissalReason: String? = nil,
+        dismissedAt: Date? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.taskID = taskID
+        self.attemptID = attemptID
+        self.severity = severity
+        self.summary = summary
+        self.status = status
+        self.dismissalActor = dismissalActor
+        self.dismissalReason = dismissalReason
+        self.dismissedAt = dismissedAt
+        self.createdAt = createdAt
+    }
+
+    /// True only when the dismissal recorded a non-empty human actor and reason.
+    public var isDismissed: Bool {
+        status == .dismissed && Self.hasHumanText(dismissalActor) && Self.hasHumanText(dismissalReason)
+    }
+
+    /// True while the finding still denies completion; an invalid dismissal never counts.
+    public var isOpen: Bool { !isDismissed }
+
+    /// Returns a dismissed copy, refusing to record a dismissal without actor and reason.
+    public func dismissed(by actor: String, reason: String, at date: Date) throws -> ReviewFinding {
+        let trimmedActor = actor.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedActor.isEmpty else {
+            throw ReviewFindingError.missingDismissalActor(findingID: id)
+        }
+        let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedReason.isEmpty else {
+            throw ReviewFindingError.missingDismissalReason(findingID: id)
+        }
+        return ReviewFinding(
+            id: id,
+            taskID: taskID,
+            attemptID: attemptID,
+            severity: severity,
+            summary: summary,
+            status: .dismissed,
+            dismissalActor: trimmedActor,
+            dismissalReason: trimmedReason,
+            dismissedAt: date,
+            createdAt: createdAt
+        )
+    }
+
+    /// Whether the finding applies to the given attempt; task-scoped findings apply to all.
+    public func applies(toAttempt attemptID: UUID) -> Bool {
+        self.attemptID == nil || self.attemptID == attemptID
+    }
+
+    private static func hasHumanText(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 /// Disposition of one verification step.

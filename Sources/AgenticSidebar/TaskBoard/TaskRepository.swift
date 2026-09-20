@@ -3,6 +3,7 @@ import Foundation
 /// Errors produced by repository persistence and optimistic concurrency controls.
 public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
     case taskNotFound(UUID)
+    case findingNotFound(UUID)
     case staleVersion(taskID: UUID, expected: Int, actual: Int)
     case activeAttemptConflict(taskID: UUID, existingAttemptID: UUID)
     case repositoryLeaseConflict(repositoryPath: String, heldByTaskID: UUID)
@@ -18,6 +19,8 @@ public enum TaskRepositoryError: LocalizedError, Equatable, Sendable {
         switch self {
         case .taskNotFound(let id):
             return "Task not found: \(id)"
+        case .findingNotFound(let id):
+            return "Review finding not found: \(id)"
         case .staleVersion(let id, let expected, let actual):
             return "Task \(id) version conflict: expected \(expected), actual \(actual)"
         case .activeAttemptConflict(let taskID, let existingAttemptID):
@@ -150,6 +153,16 @@ public protocol CodingTaskRepository: Sendable {
     ) async throws
     func appendEvent(_ event: CodingTaskEvent) async throws
     func recordEvidence(_ evidence: VerificationEvidence) async throws
+    func recordFinding(_ finding: ReviewFinding) async throws
+    func findings(taskID: UUID) async throws -> [ReviewFinding]
+    func dismissFinding(
+        findingID: UUID,
+        actor: String,
+        reason: String,
+        at date: Date
+    ) async throws -> ReviewFinding
+    func recordApproval(_ approval: TaskApproval) async throws
+    func approvals(taskID: UUID) async throws -> [TaskApproval]
     func saveAgentProfile(_ profile: AgentProfile) async throws
     func loadAgentProfile(id: UUID) async throws -> AgentProfile?
 }

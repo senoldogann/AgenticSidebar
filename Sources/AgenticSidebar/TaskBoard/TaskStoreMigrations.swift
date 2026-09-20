@@ -26,6 +26,7 @@ public enum TaskStoreMigrations {
         repositoryLeaseAttemptBinding,
         verificationEvidenceDetails,
         verificationEvidenceRecipeVersion,
+        reviewFindingsAndApprovals,
     ]
 
     private static let initialSchema = TaskStoreMigration(version: 1, name: "InitialSchema_v1") { db in
@@ -257,6 +258,46 @@ public enum TaskStoreMigrations {
     ) { db in
         try execute(
             "ALTER TABLE verification_evidence ADD COLUMN recipe_version INTEGER;",
+            on: db
+        )
+    }
+
+    /// Schema v6: review findings and scoped approvals become first-class persisted rows.
+    /// Both tables are new, so existing tasks, evidence and attempts keep every row.
+    /// A finding dismissal is only trusted when the row records a non-empty human actor
+    /// and reason; the schema stores that record but never manufactures it.
+    private static let reviewFindingsAndApprovals = TaskStoreMigration(
+        version: 6,
+        name: "ReviewFindingsAndApprovals_v6"
+    ) { db in
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_findings (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                attempt_id TEXT,
+                severity TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                dismissal_actor TEXT,
+                dismissal_reason TEXT,
+                dismissed_at REAL,
+                created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS task_approvals (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                attempt_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                timestamp REAL NOT NULL,
+                action TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_findings_task ON review_findings(task_id);
+            CREATE INDEX IF NOT EXISTS idx_approvals_task ON task_approvals(task_id);
+            """,
             on: db
         )
     }

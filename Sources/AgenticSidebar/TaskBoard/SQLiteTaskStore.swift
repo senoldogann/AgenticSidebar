@@ -507,6 +507,117 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
     }
 
+    /// Persists one review finding. A row that claims a dismissal without a human actor and
+    /// reason is stored as-is; consumers must treat such a row as open.
+    public func recordFinding(_ finding: ReviewFinding) async throws {
+        try queue.sync {
+            try checkOpen()
+            try executeTransaction {
+                let sql = """
+                    INSERT INTO review_findings (
+                        id, task_id, attempt_id, severity, summary, status,
+                        dismissal_actor, dismissal_reason, dismissed_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, finding.id.uuidString)
+                bindText(stmt, 2, finding.taskID.uuidString)
+                if let attemptID = finding.attemptID {
+                    bindText(stmt, 3, attemptID.uuidString)
+                } else {
+                    sqlite3_bind_null(stmt, 3)
+                }
+                bindText(stmt, 4, finding.severity.rawValue)
+                bindText(stmt, 5, finding.summary)
+                bindText(stmt, 6, finding.status.rawValue)
+                bindOptionalText(stmt, 7, finding.dismissalActor)
+                bindOptionalText(stmt, 8, finding.dismissalReason)
+                if let dismissedAt = finding.dismissedAt {
+                    sqlite3_bind_double(stmt, 9, dismissedAt.timeIntervalSince1970)
+                } else {
+                    sqlite3_bind_null(stmt, 9)
+                }
+                sqlite3_bind_double(stmt, 10, finding.createdAt.timeIntervalSince1970)
+                try stepDone(stmt)
+            }
+        }
+    }
+
+    /// Loads every finding for a task, oldest first.
+    public func findings(taskID: UUID) async throws -> [ReviewFinding] {
+        try queue.sync {
+            try checkOpen()
+            return try loadFindings(taskID: taskID)
+        }
+    }
+
+    /// Applies an explicit human dismissal, refusing to record one without actor and reason.
+    public func dismissFinding(
+        findingID: UUID,
+        actor: String,
+        reason: String,
+        at date: Date
+    ) async throws -> ReviewFinding {
+        try queue.sync {
+            try checkOpen()
+            return try executeTransaction {
+                guard let finding = try loadFinding(id: findingID) else {
+                    throw TaskRepositoryError.findingNotFound(findingID)
+                }
+                let dismissed = try finding.dismissed(by: actor, reason: reason, at: date)
+                let sql = """
+                    UPDATE review_findings SET
+                        status = ?, dismissal_actor = ?, dismissal_reason = ?, dismissed_at = ?
+                    WHERE id = ?;
+                    """
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, dismissed.status.rawValue)
+                bindOptionalText(stmt, 2, dismissed.dismissalActor)
+                bindOptionalText(stmt, 3, dismissed.dismissalReason)
+                sqlite3_bind_double(stmt, 4, date.timeIntervalSince1970)
+                bindText(stmt, 5, findingID.uuidString)
+                try stepDone(stmt)
+                return dismissed
+            }
+        }
+    }
+
+    /// Persists one scoped approval record.
+    public func recordApproval(_ approval: TaskApproval) async throws {
+        try queue.sync {
+            try checkOpen()
+            try executeTransaction {
+                let sql = """
+                    INSERT INTO task_approvals (id, task_id, attempt_id, fingerprint, actor, timestamp, action)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, approval.id.uuidString)
+                bindText(stmt, 2, approval.taskID.uuidString)
+                bindText(stmt, 3, approval.attemptID.uuidString)
+                bindText(stmt, 4, approval.fingerprint)
+                bindText(stmt, 5, approval.actor)
+                sqlite3_bind_double(stmt, 6, approval.timestamp.timeIntervalSince1970)
+                bindText(stmt, 7, approval.action.rawValue)
+                try stepDone(stmt)
+            }
+        }
+    }
+
+    /// Loads every approval for a task, oldest first.
+    public func approvals(taskID: UUID) async throws -> [TaskApproval] {
+        try queue.sync {
+            try checkOpen()
+            return try loadApprovals(taskID: taskID)
+        }
+    }
+
     private func loadEvidence(stmt: OpaquePointer?) -> VerificationEvidence? {
         guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText) else { return nil }
         guard let recipeName = optionalText(stmt, 3) else { return nil }
@@ -537,6 +648,117 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
     private func optionalText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
         guard let text = sqlite3_column_text(stmt, index) else { return nil }
         return String(cString: text)
+    }
+
+    private func loadFinding(id: UUID) throws -> ReviewFinding? {
+        let sql = """
+            SELECT id, task_id, attempt_id, severity, summary, status,
+                   dismissal_actor, dismissal_reason, dismissed_at, created_at
+            FROM review_findings
+            WHERE id = ?;
+            """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, id.uuidString)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        return try parseFinding(from: stmt!)
+    }
+
+    private func loadFindings(taskID: UUID) throws -> [ReviewFinding] {
+        let sql = """
+            SELECT id, task_id, attempt_id, severity, summary, status,
+                   dismissal_actor, dismissal_reason, dismissed_at, created_at
+            FROM review_findings
+            WHERE task_id = ?
+            ORDER BY created_at ASC, id ASC;
+            """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, taskID.uuidString)
+        var findings: [ReviewFinding] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            findings.append(try parseFinding(from: stmt!))
+        }
+        return findings
+    }
+
+    private func parseFinding(from stmt: OpaquePointer) throws -> ReviewFinding {
+        guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText),
+            let taskIDText = optionalText(stmt, 1), let taskID = UUID(uuidString: taskIDText)
+        else {
+            throw TaskRepositoryError.storeCorrupt("Review finding row has an invalid identity")
+        }
+        let attemptID = optionalText(stmt, 2).flatMap(UUID.init(uuidString:))
+        guard let severityText = optionalText(stmt, 3), let severity = ReviewFindingSeverity(rawValue: severityText) else {
+            throw TaskRepositoryError.storeCorrupt("Review finding \(id) has an invalid severity")
+        }
+        guard let summary = optionalText(stmt, 4) else {
+            throw TaskRepositoryError.storeCorrupt("Review finding \(id) has no summary")
+        }
+        guard let statusText = optionalText(stmt, 5), let status = ReviewFindingStatus(rawValue: statusText) else {
+            throw TaskRepositoryError.storeCorrupt("Review finding \(id) has an invalid status")
+        }
+        let dismissedAt: Date? =
+            sqlite3_column_type(stmt, 8) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(stmt, 8))
+        return ReviewFinding(
+            id: id,
+            taskID: taskID,
+            attemptID: attemptID,
+            severity: severity,
+            summary: summary,
+            status: status,
+            dismissalActor: optionalText(stmt, 6),
+            dismissalReason: optionalText(stmt, 7),
+            dismissedAt: dismissedAt,
+            createdAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 9))
+        )
+    }
+
+    private func loadApprovals(taskID: UUID) throws -> [TaskApproval] {
+        let sql = """
+            SELECT id, task_id, attempt_id, fingerprint, actor, timestamp, action
+            FROM task_approvals
+            WHERE task_id = ?
+            ORDER BY timestamp ASC, id ASC;
+            """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, taskID.uuidString)
+        var approvals: [TaskApproval] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText),
+                let storedTaskIDText = optionalText(stmt, 1), let storedTaskID = UUID(uuidString: storedTaskIDText),
+                let attemptIDText = optionalText(stmt, 2), let attemptID = UUID(uuidString: attemptIDText),
+                let fingerprint = optionalText(stmt, 3),
+                let actor = optionalText(stmt, 4),
+                let actionText = optionalText(stmt, 6), let action = ApprovalAction(rawValue: actionText)
+            else {
+                throw TaskRepositoryError.storeCorrupt("Approval row for task \(taskID) is unreadable")
+            }
+            approvals.append(
+                TaskApproval(
+                    id: id,
+                    taskID: storedTaskID,
+                    attemptID: attemptID,
+                    fingerprint: fingerprint,
+                    actor: actor,
+                    timestamp: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5)),
+                    action: action
+                )
+            )
+        }
+        return approvals
+    }
+
+    private func bindOptionalText(_ stmt: OpaquePointer?, _ index: Int32, _ text: String?) {
+        if let text {
+            bindText(stmt, index, text)
+        } else {
+            sqlite3_bind_null(stmt, index)
+        }
     }
 
     public func saveAgentProfile(_ profile: AgentProfile) async throws {

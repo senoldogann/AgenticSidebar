@@ -861,6 +861,26 @@ final class TaskSchedulerTests: XCTestCase {
             try await base.recordEvidence(evidence)
         }
 
+        func recordFinding(_ finding: ReviewFinding) async throws {
+            try await base.recordFinding(finding)
+        }
+
+        func findings(taskID: UUID) async throws -> [ReviewFinding] {
+            try await base.findings(taskID: taskID)
+        }
+
+        func dismissFinding(findingID: UUID, actor: String, reason: String, at date: Date) async throws -> ReviewFinding {
+            try await base.dismissFinding(findingID: findingID, actor: actor, reason: reason, at: date)
+        }
+
+        func recordApproval(_ approval: TaskApproval) async throws {
+            try await base.recordApproval(approval)
+        }
+
+        func approvals(taskID: UUID) async throws -> [TaskApproval] {
+            try await base.approvals(taskID: taskID)
+        }
+
         func saveAgentProfile(_ profile: AgentProfile) async throws {
             try await base.saveAgentProfile(profile)
         }
