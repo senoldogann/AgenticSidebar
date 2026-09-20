@@ -125,6 +125,15 @@ final class TaskBoardStore {
     private(set) var lastFailure: String?
     private(set) var isCreatingTask = false
     private(set) var isAddingDependency = false
+    private(set) var isCreatingProject = false
+
+    /// Yeni proje kaydı tamamlandığında çağrılır; kompozisyon bu köprüyle
+    /// süreç ömürlü proje kayıt defterini besler ve kaydı hemen uzlaştırır.
+    /// Açılış uzlaştırması ve kapanış yalnızca kayıt defterindeki projeleri
+    /// kapsar. `async`tir çünkü kayıt sonrası uzlaştırma turu, kayıt dönmeden
+    /// önce tamamlanmalıdır; aksi hâlde `createProject` başarı döndürdüğünde
+    /// proje henüz bilinmiyor olabilirdi.
+    var onProjectRegistered: (@MainActor (UUID) async -> Void)?
 
     init(service: CodingTaskService) {
         self.service = service
@@ -259,6 +268,47 @@ final class TaskBoardStore {
                 return TaskBoardActionAvailability(action: action, isEnabled: false, disabledReason: refusal.message)
             }
             return Self.baseAvailability(for: action, card: card)
+        }
+    }
+
+    // MARK: - Project registration
+
+    /// Pano için proje kaydeder, kaydı seçer ve panoyu yükler.
+    ///
+    /// Kayıt servise devredilir; servisin doğrulama hataları (boş ad gibi)
+    /// diğer eylemlerle aynı `TaskBoardRefusal` kanalıyla yüzeye çıkar.
+    /// Klasör denetimi en iyi çabadır: var olmayan ya da Git işareti
+    /// taşımayan bir klasör servise hiç gönderilmez; asıl depo sahipliği
+    /// denetimi talep anındaki çalışma alanı ön kontrolüne aittir. Proje
+    /// listesi bu sürümde süreç ömürlüdür (bkz. kompozisyon kayıt defteri).
+    func createProject(name: String, repositoryURL: URL) async -> TaskBoardActionResult {
+        guard !isCreatingProject else {
+            return .refused(TaskBoardRefusal(kind: .busy, message: "A project registration is already in flight"))
+        }
+        isCreatingProject = true
+        defer { isCreatingProject = false }
+
+        if let message = Self.repositoryFolderValidationMessage(for: repositoryURL) {
+            lastFailure = message
+            return .refused(TaskBoardRefusal(kind: .rejected, message: message))
+        }
+
+        do {
+            let project = try await service.createProject(
+                name: name,
+                repositoryPath: repositoryURL.path,
+                gitIdentity: Self.defaultGitIdentity,
+                protectedRefs: []
+            )
+            selectProject(project.id)
+            lastFailure = nil
+            await onProjectRegistered?(project.id)
+            await refresh()
+            return .applied
+        } catch {
+            let refusal = Self.refusal(from: error)
+            lastFailure = refusal.message
+            return .refused(refusal)
         }
     }
 
@@ -587,6 +637,35 @@ final class TaskBoardStore {
             durationSeconds: attempt.durationSeconds,
             toolCallCount: attempt.toolCallCount
         )
+    }
+
+    // MARK: - Project validation
+
+    /// Klasör denetimi en iyi çabadır ve servis çağrısından önce koşar:
+    /// var olmayan bir klasör ya da `.git` girdisi taşımayan bir klasör için
+    /// kayıt reddedilir. Çalışma kopyalarında (worktree) `.git` bir dosya da
+    /// olabileceğinden yalnızca varlığına bakılır; gerçek depo sahipliği
+    /// denetimi talep anındaki çalışma alanı ön kontrolüne aittir.
+    private static func repositoryFolderValidationMessage(for repositoryURL: URL) -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: repositoryURL.path, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        else {
+            return "Seçilen klasör bulunamadı: \(repositoryURL.path)"
+        }
+        let gitMarker = repositoryURL.appendingPathComponent(".git")
+        guard FileManager.default.fileExists(atPath: gitMarker.path) else {
+            return "Seçilen klasör bir Git deposu değil: \(repositoryURL.path)"
+        }
+        return nil
+    }
+
+    /// Form Git kimliği sormaz; süreç kullanıcısından türetilen sabit bir
+    /// kimlik yeterlidir çünkü bu sürümde kimlik yalnızca proje kaydında
+    /// taşınır ve hiçbir Git yazımında kullanılmaz.
+    private static var defaultGitIdentity: String {
+        let userName = NSUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        return userName.isEmpty ? "agentic-sidebar" : "\(userName)@agentic-sidebar"
     }
 
     // MARK: - Error mapping

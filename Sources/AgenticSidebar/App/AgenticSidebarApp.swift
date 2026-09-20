@@ -31,6 +31,9 @@ struct AgenticSidebarApp: App {
     @State private var splitStore = SplitLayoutStore()
     /// Görev panosunun ana aktör projeksiyonu; `nil` ise pano bağlanmamıştır.
     @State private var taskBoardStore: TaskBoardStore?
+    /// Panonun süreç ömürlü kompozisyonu; açılış uzlaştırması ve kapanış
+    /// sırasında kayıt defterine erişmek için burada tutulur.
+    @State private var taskBoardComposition: TaskBoardComposition?
 
     /// HUD'un gördüğü bilgisayar adımları: odaklı bölmenin oturumu. Dört akış
     /// üst üste bindirilmez; odaksız bölme başlığındaki meşgul noktasıyla yetinir.
@@ -223,6 +226,7 @@ struct AgenticSidebarApp: App {
 
         _settingsStore = State(initialValue: initialSettingsStore)
         _taskBoardStore = State(initialValue: taskBoardComposition?.store)
+        _taskBoardComposition = State(initialValue: taskBoardComposition)
         _sessionService = State(initialValue: initialSessionService)
         _composerPrefs = State(initialValue: initialComposerPrefs)
         _clipboardMonitor = State(initialValue: initialClipboardMonitor)
@@ -358,6 +362,11 @@ struct AgenticSidebarApp: App {
             // Yetenek keşfi yalnızca burada yapılır; `RootChatView` de çağırdığında
             // her açılışta iki kez /provider ve /models isteği gidiyordu.
             .task {
+                // Açılış uzlaştırması: bilinen her proje için kurtarma, ilk
+                // zamanlayıcı turu istenmeden önce koşar. Kayıt defteri süreç
+                // ömürlüdür; taze süreçte boş olduğundan bu tur bilinçli bir
+                // no-op'tur ama çağrı yeri sözleşmenin parçasıdır.
+                _ = await taskBoardComposition?.reconcileKnownProjects()
                 // Snap Context bağlantısı: kısayol AppDelegate'de hazırdır,
                 // koordinatör atanır atanmaz `didSet` üzerinden kendini kaydeder.
                 if appDelegate.snapCoordinator == nil {
@@ -429,6 +438,33 @@ final class TaskBoardComposition {
     let recovery: TaskRecovery
     let repository: SQLiteTaskStore
 
+    /// Bu süreçte tanınan projeler. Açılış uzlaştırması ve kapanış yalnızca bu
+    /// kümeyi kapsar; hiçbir proje tahmin edilmez. Kayıt defteri süreç
+    /// ömürlüdür (kalıcı proje listesi henüz yoktur) ve yalnızca
+    /// `register(projectID:)` ile ya da pano kayıt köprüsüyle beslenir.
+    private(set) var knownProjectIDs: Set<UUID> = []
+
+    /// Canlı koşu gönderimi bu sürümde kablolanmaz: zamanlayıcının sağlayıcıya
+    /// koşu gönderen bir çağrısı yoktur. `DisabledLiveDispatchSessions` ve
+    /// `DisabledLiveDispatchProcesses` portları yalnızca bu ön koşul sürdüğü
+    /// sürece doğrudur; gönderim yeteneği eklenirse bayrak `true` yapılmalı ve
+    /// portlar önce gerçek oturum/süreç sahipliğini yansıtmalıdır, yoksa
+    /// kurtarma koşan bir denemeyi serbest bırakır.
+    static let liveDispatchCapabilityPresent = false
+
+    /// `DisabledLiveDispatch*` portlarının ön koşulunu hata ayıklamada
+    /// doğrular; gönderim yeteneği eklenip portlar değiştirilmezse burada
+    /// durulur.
+    static func assertLiveDispatchPrecondition() {
+        #if DEBUG
+            if liveDispatchCapabilityPresent {
+                assertionFailure(
+                    "DisabledLiveDispatchSessions/Processes are only valid while live dispatch is not wired; replace them before enabling dispatch"
+                )
+            }
+        #endif
+    }
+
     init(
         store: TaskBoardStore,
         service: CodingTaskService,
@@ -441,6 +477,13 @@ final class TaskBoardComposition {
         self.scheduler = scheduler
         self.recovery = recovery
         self.repository = repository
+        // Kayıt köprüsü: yeni proje önce kayıt defterine girer, sonra hemen
+        // uzlaştırılır. Taze bir projede uzlaştırma boş bir turdur ama çağrı
+        // yeri sözleşmenin parçasıdır: kalıcı proje listesi geldiğinde eski
+        // çökme artıkları kayıt anında kapanır.
+        store.onProjectRegistered = { [weak self] projectID in
+            await self?.registerAndReconcile(projectID: projectID)
+        }
     }
 
     /// Enjekte edilen portlarla tam yığını kurar.
@@ -494,25 +537,72 @@ final class TaskBoardComposition {
         )
     }
 
-    /// Açılış uzlaştırması; zamanlayıcı herhangi bir tur işlemeden önce koşar.
+    /// Tek bir projenin kurtarma turu; zamanlayıcı herhangi bir tur işlemeden
+    /// önce koşar.
     func reconcile(projectID: UUID) async -> RecoveryReport {
         await service.reconcile(projectID: projectID)
     }
 
-    /// Bu sürecin sahiplendiği koşan denemeleri iptal eder ve mağazayı boşaltır.
+    /// Bu süreçte bilinen projeleri kayıt defterine ekler. Uzlaştırma ve
+    /// kapanış yalnızca bu kümeyi kapsar.
+    func register(projectID: UUID) {
+        knownProjectIDs.insert(projectID)
+    }
+
+    /// Yeni kaydedilen projeyi kayıt defterine ekler ve hemen uzlaştırır.
     ///
-    /// Yalnızca panonun gösterdiği projedeki `running` görevler durdurulur;
-    /// başka hiçbir süreç sinyalle hedeflenmez ve OpenCode sunucu yaşam
-    /// döngüsü uygulama temsilcisinde kalır.
+    /// Kayıt akışından sonra çağrılır; taze bir projede tur boştur ama çağrı
+    /// yeri sözleşmenin parçasıdır: kalıcı proje listesi geldiğinde eski
+    /// çökme artıkları kayıt anında kapanır.
+    @discardableResult
+    func registerAndReconcile(projectID: UUID) async -> RecoveryReport {
+        register(projectID: projectID)
+        return await service.reconcile(projectID: projectID)
+    }
+
+    /// Açılış uzlaştırması: bilinen her proje için `reconcile` çağırır.
+    ///
+    /// Taze bir süreçte kayıt defteri boştur, bu yüzden tur bilinçli bir
+    /// no-op'tur; çağrı yeri yine de zorunludur çünkü uzlaştırma herhangi bir
+    /// zamanlayıcı turu istenmeden önce koşmalıdır. Projeler sıralı işlenir ve
+    /// bir projenin hatası (`RecoveryReport.failure`) diğerlerini atlamaz.
+    func reconcileKnownProjects() async -> [RecoveryReport] {
+        var reports: [RecoveryReport] = []
+        for projectID in knownProjectIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            reports.append(await service.reconcile(projectID: projectID))
+        }
+        return reports
+    }
+
+    /// Bu sürecin bildiği tüm projelerdeki koşan görevleri durdurur ve
+    /// mağazayı boşaltır.
+    ///
+    /// Kapsam kayıt defteridir, panonun seçimi değil: yalnızca panoda görünen
+    /// projeyi durdurmak diğer projelerde sahipsiz koşan denemeler bırakırdı.
+    /// Her başarısızlık AppLog'a yazılır ve kalan projeler işlenmeye devam
+    /// edilir; hiçbir hata sessizce yutulmaz. Başka hiçbir süreç sinyalle
+    /// hedeflenmez ve OpenCode sunucu yaşam döngüsü uygulama temsilcisinde
+    /// kalır.
     func shutdown() async {
-        if let projectID = store.selectedProjectID,
-            let snapshot = try? await service.snapshot(projectID: projectID)
-        {
-            for task in snapshot.tasks where task.status == .running {
-                try? await service.stop(
-                    taskID: task.id,
-                    expectedVersion: task.version,
-                    expectedAttemptID: task.currentAttemptID
+        for projectID in knownProjectIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+            do {
+                let snapshot = try await service.snapshot(projectID: projectID)
+                for task in snapshot.tasks where task.status == .running {
+                    do {
+                        try await service.stop(
+                            taskID: task.id,
+                            expectedVersion: task.version,
+                            expectedAttemptID: task.currentAttemptID
+                        )
+                    } catch {
+                        AppLog.lifecycle.error(
+                            "Shutdown could not stop running task \(task.id.uuidString, privacy: .public) in project \(projectID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        )
+                    }
+                }
+            } catch {
+                AppLog.lifecycle.error(
+                    "Shutdown could not read project \(projectID.uuidString, privacy: .public): \(error.localizedDescription, privacy: .public)"
                 )
             }
         }
@@ -532,6 +622,7 @@ extension TaskBoardComposition {
         permissionApprovalCenter: PermissionApprovalCenter,
         sessionConfiguration: @escaping @MainActor @Sendable () -> SessionConfiguration?
     ) -> TaskBoardComposition? {
+        assertLiveDispatchPrecondition()
         guard let applicationSupportDirectory else { return nil }
         let boardDirectory = applicationSupportDirectory.appendingPathComponent(
             AppIdentity.name,
@@ -638,9 +729,9 @@ extension TaskBoardComposition {
             ),
             workspacePreflight: preflight,
             provisioning: provisioning,
-            recoveryProviders: NoLiveTaskProviderSessions(),
+            recoveryProviders: DisabledLiveDispatchSessions(),
             recoveryWorkspaces: recoveryWorkspaces,
-            recoveryProcesses: NoLiveTaskProcesses(),
+            recoveryProcesses: DisabledLiveDispatchProcesses(),
             verifier: verifier,
             acceptanceEvidence: evidenceLedger,
             clock: SystemTaskSchedulerClock(),
@@ -718,16 +809,28 @@ private struct LiveTaskProviderRegistry: TaskProviderRegistryPort {
     }
 }
 
-/// Koşu gönderimi bağlı olmadığından hiçbir sağlayıcı oturumu kalıcı bir
+/// Canlı yazma gönderimi bağlı olmadığından hiçbir sağlayıcı oturumu kalıcı bir
 /// denemeye bağlı olamaz; kurtarma bu gerçeği `.stopped` olarak görür.
-private struct NoLiveTaskProviderSessions: TaskProviderSessionInspecting {
+///
+/// Ön koşul: bu yanıt yalnızca canlı gönderim kablolanmadığı sürece doğrudur.
+/// Gerçek koşular sahiplenilmeye başlanırsa `.stopped` yalan olur ve kurtarma
+/// koşan bir denemeyi serbest bırakır; gönderim eklenirken bu port gerçek
+/// oturum sahipliği denetimiyle değiştirilmelidir (bkz.
+/// `TaskBoardComposition.liveDispatchCapabilityPresent`).
+private struct DisabledLiveDispatchSessions: TaskProviderSessionInspecting {
     func providerStatus(for attempt: TaskAttempt) async -> TaskProviderSessionStatus {
         .stopped
     }
 }
 
 /// Hiçbir görev süreci başlatılmadığından sahipli süreç yoktur.
-private struct NoLiveTaskProcesses: TaskProcessOwnershipInspecting {
+///
+/// Ön koşul: bu yanıt yalnızca canlı gönderim kablolanmadığı sürece doğrudur;
+/// gönderim eklenirse `.absent` yalan olur ve kurtarma koşan bir denemeyi
+/// serbest bırakır. Gönderim eklenirken bu port gerçek süreç sahipliği
+/// denetimiyle değiştirilmelidir (bkz.
+/// `TaskBoardComposition.liveDispatchCapabilityPresent`).
+private struct DisabledLiveDispatchProcesses: TaskProcessOwnershipInspecting {
     func processStatus(for attempt: TaskAttempt) async -> TaskProcessOwnershipStatus {
         .absent
     }

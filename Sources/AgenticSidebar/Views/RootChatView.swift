@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct RootChatView: View {
@@ -27,6 +28,10 @@ struct RootChatView: View {
     /// Pano ayrı bir sayfada açılır: sohbet yüzeyi ve besteci durumu
     /// yerinde kalır, pano kendi seçimini sayfa kapanınca korur.
     @State private var showsTaskBoard = false
+    /// "Proje ekle" satırının form durumu; kayıt başarıyla dönünce temizlenir.
+    @State private var projectRegistrationName = ""
+    @State private var projectRegistrationFolder: URL?
+    @State private var projectRegistrationMessage: String?
 
     @Environment(\.colorScheme) private var systemColorScheme
 
@@ -135,6 +140,10 @@ struct RootChatView: View {
 
                 Divider().opacity(0.35)
 
+                projectRegistrationRow(store: taskBoardStore)
+
+                Divider().opacity(0.35)
+
                 HStack(spacing: 6) {
                     Image(systemName: "pause.circle")
                         .font(.system(size: 11, weight: .semibold))
@@ -150,6 +159,97 @@ struct RootChatView: View {
             .background(currentTheme.background(isDark: isDarkMode))
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Görev panosu, canlı yazma devre dışı")
+        }
+    }
+
+    /// "Proje ekle" satırı: ad alanı, yalnızca klasör seçen bir seçici ve kayıt
+    /// düğmesi. Kayıt servise `store.createProject` ile devredilir; red
+    /// mesajları satırın altında görünür ve düğme kayıt sürerken kapanır.
+    @ViewBuilder
+    private func projectRegistrationRow(store: TaskBoardStore) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Yeni proje")
+                    .font(.system(size: 11, weight: .semibold))
+                TextField("Proje adı", text: $projectRegistrationName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 200)
+                    .accessibilityLabel("Proje adı")
+                Button("Klasör seç…") {
+                    presentProjectFolderPicker()
+                }
+                .controlSize(.small)
+                .help("Proje kök klasörünü seç")
+                Text(projectRegistrationFolder?.path ?? "Klasör seçilmedi")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(projectRegistrationFolder?.path ?? "Klasör seçilmedi")
+                Spacer(minLength: 0)
+                Button("Proje ekle") {
+                    submitProjectRegistration(store: store)
+                }
+                .controlSize(.small)
+                .disabled(
+                    !TaskBoardProjectRegistrationPresenter.submitEnabled(
+                        name: projectRegistrationName,
+                        repositoryURL: projectRegistrationFolder,
+                        isSubmitting: store.isCreatingProject
+                    )
+                )
+                .help("Seçilen klasörü Git deposu olarak panoya kaydet")
+            }
+            if let projectRegistrationMessage {
+                Text(projectRegistrationMessage)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Proje kaydı reddedildi: \(projectRegistrationMessage)")
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    /// Klasör seçici yalnızca dizin kabul eder; seçim sonrası ad alanı klasör
+    /// adından türetilir ve önceki hata mesajı temizlenir.
+    private func presentProjectFolderPicker() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Seç"
+        panel.message = "Projenin Git deposu klasörünü seçin"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        projectRegistrationFolder = url
+        projectRegistrationName = TaskBoardProjectRegistrationPresenter.suggestedName(for: url)
+        projectRegistrationMessage = nil
+    }
+
+    /// Kayıt düğmesi: servis reddi mesajı satırda gösterilir; başarıda form
+    /// temizlenir ve pano seçilen projeye geçer (mağaza bunu kendisi yapar).
+    private func submitProjectRegistration(store: TaskBoardStore) {
+        guard let folder = projectRegistrationFolder,
+            TaskBoardProjectRegistrationPresenter.submitEnabled(
+                name: projectRegistrationName,
+                repositoryURL: projectRegistrationFolder,
+                isSubmitting: store.isCreatingProject
+            )
+        else {
+            return
+        }
+        let name = projectRegistrationName
+        Task {
+            let result = await store.createProject(name: name, repositoryURL: folder)
+            switch result {
+            case .applied:
+                projectRegistrationName = ""
+                projectRegistrationFolder = nil
+                projectRegistrationMessage = nil
+            case .refused(let refusal):
+                projectRegistrationMessage = refusal.message
+            }
         }
     }
 
@@ -571,5 +671,25 @@ struct RootChatView: View {
         case .gridColumn: "Drag to resize the left and right panes"
         case .gridRow: "Drag to resize the top and bottom panes"
         }
+    }
+}
+
+// MARK: - Proje kaydı sunumu
+
+/// "Proje ekle" satırının saf sunum mantığı: düğme etkinliği ve klasörden
+/// türetilen varsayılan ad. SwiftUI gövdesinden bağımsız olduğundan doğrudan
+/// sınanabilir; servis doğrulaması burada tekrarlanmaz.
+enum TaskBoardProjectRegistrationPresenter {
+    /// Kayıt düğmesi yalnızca boş olmayan ad, seçilmiş klasör ve sürmeyen bir
+    /// kayıt varken etkindir.
+    static func submitEnabled(name: String, repositoryURL: URL?, isSubmitting: Bool) -> Bool {
+        guard !isSubmitting, repositoryURL != nil else { return false }
+        return !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Seçilen klasörün adı; kök gibi adsız bir yol için "Proje" döner.
+    static func suggestedName(for repositoryURL: URL) -> String {
+        let name = repositoryURL.lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || name == "/" ? "Proje" : name
     }
 }

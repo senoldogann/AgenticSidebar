@@ -439,7 +439,244 @@ final class MultiAgentCodingIntegrationTests: XCTestCase {
         await second.repository.close()
     }
 
+    // MARK: - Step 3: açılış uzlaştırması
+
+    @MainActor
+    func testLaunchReconciliationCoversKnownProjectsAndBlocksCrashOrphan() async throws {
+        let root = try makeTemporaryRoot(name: "launch-reconciliation")
+        let dbURL = root.appendingPathComponent("taskboard.sqlite")
+
+        let first = try await IntegrationHarness.make(root: root, dbURL: dbURL)
+        // Proje panonun kayıt yoluyla açılır: kompozisyon kayıt defteri bu
+        // süreçte projeyi böyle tanır. Klasör denetimi en iyi çabadır;
+        // fixture deposuna Git işareti konur.
+        let repositoryURL = URL(fileURLWithPath: first.provisioning.repositoryPath, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: repositoryURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let registration = await first.composition.store.createProject(
+            name: "Launch",
+            repositoryURL: repositoryURL
+        )
+        XCTAssertEqual(registration, .applied)
+        let projectID = try XCTUnwrap(first.composition.store.selectedProjectID)
+        XCTAssertEqual(
+            first.composition.knownProjectIDs,
+            [projectID],
+            "Registration must feed the process-lifetime registry through the store callback"
+        )
+
+        let taskID = UUID()
+        let now = first.clock.now()
+        try await first.repository.createTask(
+            CodingTask(
+                id: taskID,
+                projectID: projectID,
+                title: "Launch crash task",
+                objective: "Survive a crash and get reconciled at launch",
+                priority: 1,
+                status: .ready,
+                stage: .plan,
+                version: 1,
+                criteria: [],
+                createdAt: now,
+                updatedAt: now
+            )
+        )
+
+        let startResult = try await first.composition.service.start(taskID: taskID, expectedVersion: 1)
+        guard case .claimed(let attemptID, let generation) = startResult else {
+            XCTFail("Expected a claimed attempt, got \(startResult)")
+            return
+        }
+        let claimedAttempts = try await first.repository.attemptHistory(taskID: taskID)
+        let attempt = try XCTUnwrap(claimedAttempts.first)
+        let workspaceID = try XCTUnwrap(attempt.workspaceID)
+        let foundRecord = await first.provisioning.record(for: workspaceID)
+        let workspaceRecord = try XCTUnwrap(foundRecord)
+
+        let runtime = FakeOpenCodeRuntime()
+        let configuration = SessionConfiguration(
+            providerID: ProviderID("opencode-fake"),
+            modelID: ProviderModelID("fake-model"),
+            variantID: nil
+        )
+        let run = try await runtime.start(
+            request: CodingAgentExecutionRequest(
+                taskID: taskID,
+                attemptID: attemptID,
+                generation: generation,
+                role: .developer,
+                configuration: configuration,
+                objective: "Survive a crash and get reconciled at launch",
+                acceptanceCriteria: [],
+                workspacePath: workspaceRecord.workspacePath,
+                stage: .implementation
+            )
+        )
+        for await _ in run.events {}
+        // Sağlayıcı düzenlemeyi bildirdi; süreç kanıt yazılmadan ölür.
+        let editURL = URL(fileURLWithPath: workspaceRecord.workspacePath).appendingPathComponent("edit.txt")
+        let editContent = Data("launch reconciliation provider edit\n".utf8)
+        try editContent.write(to: editURL)
+        await first.repository.close()
+
+        // Taze süreç: kayıt defteri süreç ömürlüdür ve boş başlar, bu yüzden
+        // uzlaştırma turu bilinçli olarak boştur. Proje listesi henüz kalıcı
+        // olmadığından bilinen proje açıkça kaydedilir (takip işi).
+        let relaunch = try await IntegrationHarness.make(root: root, dbURL: dbURL)
+        let emptyReports = await relaunch.composition.reconcileKnownProjects()
+        XCTAssertTrue(emptyReports.isEmpty, "A fresh process must not guess projects it does not know")
+
+        relaunch.composition.register(projectID: projectID)
+        let reports = await relaunch.composition.reconcileKnownProjects()
+        XCTAssertEqual(reports.count, 1)
+        let report = try XCTUnwrap(reports.first)
+        XCTAssertEqual(report.projectID, projectID)
+        XCTAssertNil(report.failure)
+        let entry = try XCTUnwrap(report.entry(for: taskID))
+        XCTAssertEqual(
+            entry.disposition,
+            .reconciledAndReleased(
+                attemptID: attemptID,
+                generation: generation,
+                repositoryPath: relaunch.provisioning.repositoryPath
+            )
+        )
+
+        let fetchedBlocked = try await relaunch.repository.task(id: taskID)
+        let blocked = try XCTUnwrap(fetchedBlocked)
+        XCTAssertEqual(blocked.status, .blocked)
+        guard case .uncertainExecution = blocked.blockReason else {
+            XCTFail("Launch reconciliation must block for uncertain execution, got \(String(describing: blocked.blockReason))")
+            return
+        }
+        let recoveredHistory = try await relaunch.repository.attemptHistory(taskID: taskID)
+        XCTAssertEqual(recoveredHistory.map(\.outcome), [.cancelled])
+        XCTAssertEqual(recoveredHistory.count, 1)
+
+        // Kopya yazma yok: engellenen görev ne zamanlayıcıdan ne start'tan
+        // yeniden talep edilebilir; sağlayıcı düzenlemesi yerinde kalır.
+        let scheduleAfterRecovery = try await relaunch.composition.scheduler.schedule(projectID: projectID)
+        XCTAssertTrue(scheduleAfterRecovery.claimedTaskIDs.isEmpty)
+        do {
+            _ = try await relaunch.composition.service.start(taskID: taskID, expectedVersion: blocked.version)
+            XCTFail("A blocked uncertain task must not be restarted by start")
+        } catch let error as CodingTaskServiceError {
+            XCTAssertEqual(error, .actionNotAvailable(taskID: taskID, status: .blocked))
+        }
+        let recoveryCreateCount = await relaunch.provisioning.createCallCount
+        XCTAssertEqual(recoveryCreateCount, 0)
+        XCTAssertEqual(try Data(contentsOf: editURL), editContent)
+        await relaunch.repository.close()
+    }
+
+    // MARK: - Step 4: kapanış kapsamı
+
+    @MainActor
+    func testShutdownStopsRunningTasksInEveryKnownProject() async throws {
+        let root = try makeTemporaryRoot(name: "shutdown-coverage")
+        let dbURL = root.appendingPathComponent("taskboard.sqlite")
+        let harness = try await IntegrationHarness.make(root: root, dbURL: dbURL)
+
+        let selectedProject = try await harness.composition.service.createProject(
+            name: "Selected",
+            repositoryPath: harness.provisioning.repositoryPath,
+            gitIdentity: "integration@agentic-sidebar.local",
+            protectedRefs: ["main"]
+        )
+        let otherProject = try await harness.composition.service.createProject(
+            name: "Other",
+            repositoryPath: harness.provisioning.repositoryPath,
+            gitIdentity: "integration@agentic-sidebar.local",
+            protectedRefs: ["main"]
+        )
+        harness.composition.register(projectID: selectedProject.id)
+        harness.composition.register(projectID: otherProject.id)
+        harness.composition.store.selectProject(selectedProject.id)
+
+        let selectedTask = try await seedReadyTask(
+            in: harness,
+            projectID: selectedProject.id,
+            title: "Selected project task"
+        )
+        let otherTask = try await seedReadyTask(
+            in: harness,
+            projectID: otherProject.id,
+            title: "Other project task"
+        )
+        let selectedStart = try await harness.composition.service.start(
+            taskID: selectedTask.id,
+            expectedVersion: selectedTask.version
+        )
+        guard case .claimed = selectedStart else {
+            XCTFail("Expected a claimed attempt for the selected project, got \(selectedStart)")
+            return
+        }
+        // İki proje aynı üst depoyu paylaştığından ikinci canlı talep depo
+        // kirası yüzünden ertelenir. Kapanış kapsamı canlı talep akışına değil
+        // kalıcı `running` durumuna baktığı için diğer projenin koşan denemesi
+        // doğrudan mağaza üzerinden tohumlanır.
+        let otherAttempt = TaskAttempt(
+            taskID: otherTask.id,
+            attemptSequence: 1,
+            role: .developer,
+            providerID: "integration-fake",
+            modelID: "fake-model",
+            workspaceID: UUID(),
+            leaseOwner: "shutdown-fixture",
+            leaseToken: "shutdown-fixture-token",
+            leaseExpiry: Date().addingTimeInterval(300)
+        )
+        _ = try await harness.repository.claimAttempt(
+            taskID: otherTask.id,
+            expectedVersion: otherTask.version,
+            attempt: otherAttempt
+        )
+
+        await harness.composition.shutdown()
+
+        let reopened = try SQLiteTaskStore.open(at: dbURL)
+        let selectedAfter = try await reopened.task(id: selectedTask.id)
+        XCTAssertEqual(selectedAfter?.status, .blocked)
+        XCTAssertEqual(selectedAfter?.blockReason, .custom(TaskScheduler.stoppedBlockReason))
+        let otherAfter = try await reopened.task(id: otherTask.id)
+        XCTAssertEqual(otherAfter?.status, .blocked)
+        XCTAssertEqual(
+            otherAfter?.blockReason,
+            .custom(TaskScheduler.stoppedBlockReason),
+            "Shutdown must stop running tasks in every known project, not only the selected one"
+        )
+        await reopened.close()
+    }
+
     // MARK: - Fixture
+
+    @MainActor
+    private func seedReadyTask(
+        in harness: IntegrationHarness,
+        projectID: UUID,
+        title: String
+    ) async throws -> CodingTask {
+        let taskID = UUID()
+        let now = harness.clock.now()
+        let task = CodingTask(
+            id: taskID,
+            projectID: projectID,
+            title: title,
+            objective: "Objective for \(title)",
+            priority: 1,
+            status: .ready,
+            stage: .plan,
+            version: 1,
+            criteria: [],
+            createdAt: now,
+            updatedAt: now
+        )
+        try await harness.repository.createTask(task)
+        return task
+    }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(

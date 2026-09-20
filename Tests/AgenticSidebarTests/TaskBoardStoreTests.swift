@@ -562,4 +562,148 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertTrue(message.contains("snapshot unavailable"))
         XCTAssertEqual(store.lastFailure, message)
     }
+
+    // MARK: - Proje kaydı
+
+    /// En iyi çaba klasör denetiminden geçen geçici bir Git deposu klasörü:
+    /// dizin ve içinde bir `.git` girdisi.
+    private func makeRepositoryFolder(name: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-sidebar-store-\(name)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: url.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    func testCreateProjectForwardsToServiceAndSelectsLoadedBoard() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let repositoryURL = try makeRepositoryFolder(name: "forwarding")
+        let store = TaskBoardStore(service: service)
+        var registeredProjectIDs: [UUID] = []
+        store.onProjectRegistered = { registeredProjectIDs.append($0) }
+
+        let result = await store.createProject(name: "Board Project", repositoryURL: repositoryURL)
+
+        XCTAssertEqual(result, .applied)
+        let projectID = try XCTUnwrap(store.selectedProjectID)
+        let project = await service.project(id: projectID)
+        XCTAssertEqual(project?.name, "Board Project")
+        XCTAssertEqual(project?.repositoryPath, repositoryURL.path)
+        XCTAssertFalse(project?.gitIdentity.isEmpty ?? true)
+        XCTAssertEqual(store.phase, .loaded)
+        XCTAssertTrue(store.cards.isEmpty)
+        XCTAssertNil(store.lastFailure)
+        XCTAssertFalse(store.isCreatingProject)
+        XCTAssertEqual(
+            registeredProjectIDs,
+            [projectID],
+            "A successful registration must notify the composition registry exactly once"
+        )
+    }
+
+    func testCreateProjectRefusesMissingFolderWithoutCallingService() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let store = TaskBoardStore(service: service)
+        var registeredProjectIDs: [UUID] = []
+        store.onProjectRegistered = { registeredProjectIDs.append($0) }
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-sidebar-missing-\(UUID().uuidString)",
+            isDirectory: true
+        )
+
+        let result = await store.createProject(name: "Missing", repositoryURL: missing)
+
+        guard case .refused(let refusal) = result else {
+            XCTFail("A missing folder must be refused, got \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        XCTAssertTrue(refusal.message.contains("bulunamadı"))
+        XCTAssertEqual(store.lastFailure, refusal.message)
+        XCTAssertNil(store.selectedProjectID)
+        XCTAssertEqual(store.phase, .idle)
+        XCTAssertTrue(registeredProjectIDs.isEmpty, "A refused registration must never reach the registry")
+    }
+
+    func testCreateProjectRefusesBlankNameAndNonRepositoryFolder() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let store = TaskBoardStore(service: service)
+
+        // Boş ad servise gider; servis doğrulaması reddi aynı kanaldan yüzeye
+        // çıkar ve seçim değişmez.
+        let repositoryURL = try makeRepositoryFolder(name: "blank-name")
+        let blank = await store.createProject(name: "   ", repositoryURL: repositoryURL)
+        guard case .refused(let blankRefusal) = blank else {
+            XCTFail("A blank name must be refused, got \(blank)")
+            return
+        }
+        XCTAssertEqual(blankRefusal.kind, .rejected)
+        XCTAssertTrue(blankRefusal.message.contains("name"))
+        XCTAssertEqual(store.lastFailure, blankRefusal.message)
+        XCTAssertNil(store.selectedProjectID)
+        XCTAssertEqual(store.phase, .idle)
+
+        // Git işareti taşımayan klasör servise hiç gönderilmez: en iyi çaba
+        // klasör denetimi kullanıcıya formda geri bildirim verir.
+        let plainFolder = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-sidebar-non-repository-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: plainFolder, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: plainFolder) }
+        let nonRepository = await store.createProject(name: "Not a repository", repositoryURL: plainFolder)
+        guard case .refused(let folderRefusal) = nonRepository else {
+            XCTFail("A non-repository folder must be refused, got \(nonRepository)")
+            return
+        }
+        XCTAssertEqual(folderRefusal.kind, .rejected)
+        XCTAssertTrue(folderRefusal.message.contains("Git"))
+        XCTAssertEqual(store.lastFailure, folderRefusal.message)
+        XCTAssertNil(store.selectedProjectID)
+    }
+
+    func testProjectRegistrationPresenterDisablesSubmitUntilReady() {
+        let repositoryURL = URL(fileURLWithPath: "/tmp/agentic-sidebar-board-project")
+
+        XCTAssertFalse(
+            TaskBoardProjectRegistrationPresenter.submitEnabled(
+                name: "   ",
+                repositoryURL: repositoryURL,
+                isSubmitting: false
+            )
+        )
+        XCTAssertFalse(
+            TaskBoardProjectRegistrationPresenter.submitEnabled(
+                name: "Board",
+                repositoryURL: nil,
+                isSubmitting: false
+            )
+        )
+        XCTAssertFalse(
+            TaskBoardProjectRegistrationPresenter.submitEnabled(
+                name: "Board",
+                repositoryURL: repositoryURL,
+                isSubmitting: true
+            )
+        )
+        XCTAssertTrue(
+            TaskBoardProjectRegistrationPresenter.submitEnabled(
+                name: "Board",
+                repositoryURL: repositoryURL,
+                isSubmitting: false
+            )
+        )
+        XCTAssertEqual(
+            TaskBoardProjectRegistrationPresenter.suggestedName(for: repositoryURL),
+            "agentic-sidebar-board-project"
+        )
+    }
 }
