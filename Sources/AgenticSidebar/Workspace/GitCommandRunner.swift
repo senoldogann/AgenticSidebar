@@ -201,8 +201,8 @@ final class GitCommandRunner: Sendable {
     }
 }
 
-/// Thread-safe, byte-bounded pipe drain.
-private final class BoundedOutputCollector: @unchecked Sendable {
+/// Thread-safe, byte-bounded pipe drain shared with the verification runner.
+final class BoundedOutputCollector: @unchecked Sendable {
     private let limit: Int
     private let lock = NSLock()
     private var data = Data()

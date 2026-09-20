@@ -24,6 +24,7 @@ public enum TaskStoreMigrations {
         initialSchema,
         attemptNullableUsage,
         repositoryLeaseAttemptBinding,
+        verificationEvidenceDetails,
     ]
 
     private static let initialSchema = TaskStoreMigration(version: 1, name: "InitialSchema_v1") { db in
@@ -199,6 +200,48 @@ public enum TaskStoreMigrations {
             );
 
             DELETE FROM repository_leases WHERE attempt_id IS NULL;
+            """,
+            on: db
+        )
+    }
+
+    /// Schema v4: verification evidence records step identity, status, exit code,
+    /// timeout, workspace fingerprint and blocker, and may be standalone (no task yet).
+    private static let verificationEvidenceDetails = TaskStoreMigration(
+        version: 4,
+        name: "VerificationEvidenceDetails_v4"
+    ) { db in
+        try execute(
+            """
+            CREATE TABLE verification_evidence_v4 (
+                id TEXT PRIMARY KEY,
+                task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+                attempt_id TEXT,
+                recipe_name TEXT NOT NULL,
+                step_name TEXT,
+                status TEXT NOT NULL,
+                passed INTEGER NOT NULL,
+                exit_code INTEGER,
+                timed_out INTEGER NOT NULL,
+                details_redacted TEXT NOT NULL,
+                workspace_fingerprint TEXT,
+                blocked_by TEXT,
+                recorded_at REAL NOT NULL
+            );
+
+            INSERT INTO verification_evidence_v4 (
+                id, task_id, attempt_id, recipe_name, step_name, status, passed,
+                exit_code, timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at
+            )
+            SELECT
+                id, task_id, attempt_id, recipe_name, NULL,
+                CASE WHEN passed = 1 THEN 'passed' ELSE 'failed' END,
+                passed, NULL, 0, details_redacted, NULL, NULL, recorded_at
+            FROM verification_evidence;
+
+            DROP TABLE verification_evidence;
+            ALTER TABLE verification_evidence_v4 RENAME TO verification_evidence;
+            CREATE INDEX IF NOT EXISTS idx_evidence_task ON verification_evidence(task_id);
             """,
             on: db
         )

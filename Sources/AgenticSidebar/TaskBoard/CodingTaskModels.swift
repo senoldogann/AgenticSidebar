@@ -264,6 +264,93 @@ public struct TaskApproval: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
+/// Disposition of one verification step.
+public enum VerificationEvidenceStatus: String, Sendable, Codable, Equatable {
+    /// The command ran, exited zero and the workspace revision did not change.
+    case passed
+    /// The command ran and failed, timed out, was cancelled, or could not run at all.
+    case failed
+    /// The step did not run: an earlier required step failed, the caller cancelled, the
+    /// workspace revision changed between steps, or the step is explicitly unavailable.
+    case skipped
+}
+
+/// Redacted verification evidence for one recipe step.
+///
+/// `taskID`/`attemptID` are optional so the verification runner can record standalone
+/// evidence before a task attaches it. `passed` is derived from `status`: only an actual
+/// zero exit code on an unchanged workspace revision may report a pass.
+public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
+    public let id: UUID
+    public let taskID: UUID?
+    public let attemptID: UUID?
+    public let recipeName: String
+    public let stepName: String?
+    public let status: VerificationEvidenceStatus
+    public let exitCode: Int32?
+    public let timedOut: Bool
+    public let detailsRedacted: String
+    public let workspaceFingerprint: String?
+    public let blockedBy: String?
+    public let recordedAt: Date
+
+    public var passed: Bool { status == .passed }
+
+    /// Task-scoped evidence without step detail; kept for callers that only record pass/fail.
+    public init(
+        id: UUID = UUID(),
+        taskID: UUID,
+        attemptID: UUID,
+        recipeName: String,
+        passed: Bool,
+        detailsRedacted: String,
+        recordedAt: Date = Date()
+    ) {
+        self.init(
+            id: id,
+            taskID: taskID,
+            attemptID: attemptID,
+            recipeName: recipeName,
+            stepName: nil,
+            status: passed ? .passed : .failed,
+            exitCode: nil,
+            timedOut: false,
+            detailsRedacted: detailsRedacted,
+            workspaceFingerprint: nil,
+            blockedBy: nil,
+            recordedAt: recordedAt
+        )
+    }
+
+    public init(
+        id: UUID = UUID(),
+        taskID: UUID? = nil,
+        attemptID: UUID? = nil,
+        recipeName: String,
+        stepName: String? = nil,
+        status: VerificationEvidenceStatus,
+        exitCode: Int32? = nil,
+        timedOut: Bool = false,
+        detailsRedacted: String,
+        workspaceFingerprint: String? = nil,
+        blockedBy: String? = nil,
+        recordedAt: Date = Date()
+    ) {
+        self.id = id
+        self.taskID = taskID
+        self.attemptID = attemptID
+        self.recipeName = recipeName
+        self.stepName = stepName
+        self.status = status
+        self.exitCode = exitCode
+        self.timedOut = timedOut
+        self.detailsRedacted = detailsRedacted
+        self.workspaceFingerprint = workspaceFingerprint
+        self.blockedBy = blockedBy
+        self.recordedAt = recordedAt
+    }
+}
+
 /// Immutable coding task entity.
 public struct CodingTask: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID

@@ -111,35 +111,6 @@ public struct CodingTaskEvent: Sendable, Identifiable, Codable, Equatable {
     }
 }
 
-/// Redacted verification evidence linked to an acceptance criterion.
-public struct VerificationEvidence: Sendable, Identifiable, Codable, Equatable {
-    public let id: UUID
-    public let taskID: UUID
-    public let attemptID: UUID
-    public let recipeName: String
-    public let passed: Bool
-    public let detailsRedacted: String
-    public let recordedAt: Date
-
-    public init(
-        id: UUID = UUID(),
-        taskID: UUID,
-        attemptID: UUID,
-        recipeName: String,
-        passed: Bool,
-        detailsRedacted: String,
-        recordedAt: Date = Date()
-    ) {
-        self.id = id
-        self.taskID = taskID
-        self.attemptID = attemptID
-        self.recipeName = recipeName
-        self.passed = passed
-        self.detailsRedacted = detailsRedacted
-        self.recordedAt = recordedAt
-    }
-}
-
 /// Protocol defining transactional persistence operations for coding tasks and attempts.
 public protocol CodingTaskRepository: Sendable {
     func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot

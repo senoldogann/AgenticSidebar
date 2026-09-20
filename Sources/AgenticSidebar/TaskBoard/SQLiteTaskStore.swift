@@ -429,22 +429,104 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             try checkOpen()
             try executeTransaction {
                 let sql = """
-                    INSERT INTO verification_evidence (id, task_id, attempt_id, recipe_name, passed, details_redacted, recorded_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    INSERT INTO verification_evidence (
+                        id, task_id, attempt_id, recipe_name, step_name, status, passed,
+                        exit_code, timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
                 try prepare(sql, &stmt)
                 bindText(stmt, 1, evidence.id.uuidString)
-                bindText(stmt, 2, evidence.taskID.uuidString)
-                bindText(stmt, 3, evidence.attemptID.uuidString)
+                if let taskID = evidence.taskID {
+                    bindText(stmt, 2, taskID.uuidString)
+                } else {
+                    sqlite3_bind_null(stmt, 2)
+                }
+                if let attemptID = evidence.attemptID {
+                    bindText(stmt, 3, attemptID.uuidString)
+                } else {
+                    sqlite3_bind_null(stmt, 3)
+                }
                 bindText(stmt, 4, evidence.recipeName)
-                sqlite3_bind_int(stmt, 5, evidence.passed ? 1 : 0)
-                bindText(stmt, 6, evidence.detailsRedacted)
-                sqlite3_bind_double(stmt, 7, evidence.recordedAt.timeIntervalSince1970)
+                if let stepName = evidence.stepName {
+                    bindText(stmt, 5, stepName)
+                } else {
+                    sqlite3_bind_null(stmt, 5)
+                }
+                bindText(stmt, 6, evidence.status.rawValue)
+                sqlite3_bind_int(stmt, 7, evidence.passed ? 1 : 0)
+                if let exitCode = evidence.exitCode {
+                    sqlite3_bind_int(stmt, 8, exitCode)
+                } else {
+                    sqlite3_bind_null(stmt, 8)
+                }
+                sqlite3_bind_int(stmt, 9, evidence.timedOut ? 1 : 0)
+                bindText(stmt, 10, evidence.detailsRedacted)
+                if let fingerprint = evidence.workspaceFingerprint {
+                    bindText(stmt, 11, fingerprint)
+                } else {
+                    sqlite3_bind_null(stmt, 11)
+                }
+                if let blockedBy = evidence.blockedBy {
+                    bindText(stmt, 12, blockedBy)
+                } else {
+                    sqlite3_bind_null(stmt, 12)
+                }
+                sqlite3_bind_double(stmt, 13, evidence.recordedAt.timeIntervalSince1970)
                 try stepDone(stmt)
             }
         }
+    }
+
+    /// Loads one evidence entry by identity; nil when no such entry exists.
+    public func evidence(id: UUID) async throws -> VerificationEvidence? {
+        try queue.sync {
+            try checkOpen()
+            let sql = """
+                SELECT
+                    id, task_id, attempt_id, recipe_name, step_name, status, exit_code,
+                    timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at
+                FROM verification_evidence
+                WHERE id = ?;
+                """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            try prepare(sql, &stmt)
+            bindText(stmt, 1, id.uuidString)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+            return loadEvidence(stmt: stmt)
+        }
+    }
+
+    private func loadEvidence(stmt: OpaquePointer?) -> VerificationEvidence? {
+        guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText) else { return nil }
+        guard let recipeName = optionalText(stmt, 3) else { return nil }
+        guard let statusText = optionalText(stmt, 5), let status = VerificationEvidenceStatus(rawValue: statusText) else {
+            return nil
+        }
+        guard let details = optionalText(stmt, 8) else { return nil }
+        let exitCode: Int32? = sqlite3_column_type(stmt, 6) == SQLITE_NULL ? nil : sqlite3_column_int(stmt, 6)
+        return VerificationEvidence(
+            id: id,
+            taskID: optionalText(stmt, 1).flatMap(UUID.init(uuidString:)),
+            attemptID: optionalText(stmt, 2).flatMap(UUID.init(uuidString:)),
+            recipeName: recipeName,
+            stepName: optionalText(stmt, 4),
+            status: status,
+            exitCode: exitCode,
+            timedOut: sqlite3_column_int(stmt, 7) != 0,
+            detailsRedacted: details,
+            workspaceFingerprint: optionalText(stmt, 9),
+            blockedBy: optionalText(stmt, 10),
+            recordedAt: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 11))
+        )
+    }
+
+    private func optionalText(_ stmt: OpaquePointer?, _ index: Int32) -> String? {
+        guard let text = sqlite3_column_text(stmt, index) else { return nil }
+        return String(cString: text)
     }
 
     public func saveAgentProfile(_ profile: AgentProfile) async throws {
