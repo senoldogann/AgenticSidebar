@@ -28,6 +28,8 @@ struct VerificationRunID: Sendable, Hashable {
 enum VerificationRunnerError: LocalizedError, Equatable, Sendable {
     /// A second run was requested while another run is in flight.
     case runAlreadyInFlight(activeRunID: VerificationRunID)
+    /// The same run identity is already executing; a run may execute exactly once.
+    case runAlreadyExecuting(runID: VerificationRunID)
     /// The runner does not understand the recipe version and must never guess at it.
     case unsupportedRecipeVersion(recipe: String, version: Int, supported: Int)
     /// The run identity does not match any in-flight run.
@@ -37,6 +39,8 @@ enum VerificationRunnerError: LocalizedError, Equatable, Sendable {
         switch self {
         case .runAlreadyInFlight(let activeRunID):
             return "VERIFICATION_RUN_IN_FLIGHT: run \(activeRunID.rawValue.uuidString) is already in flight"
+        case .runAlreadyExecuting(let runID):
+            return "VERIFICATION_RUN_ALREADY_EXECUTING: run \(runID.rawValue.uuidString) is already executing"
         case .unsupportedRecipeVersion(let recipe, let version, let supported):
             return
                 "VERIFICATION_UNSUPPORTED_RECIPE_VERSION: recipe \(recipe) version \(version) is not understood (supported: \(supported))"
@@ -61,14 +65,19 @@ private struct VerificationStepOutcome: Sendable {
 enum VerificationOutputRedactor {
     /// Masks credential-shaped values before any output is persisted.
     ///
-    /// Scheme-aware rules run first: a `Bearer` token is masked as a whole before the
-    /// key/value rule sees the line, and the key/value rule refuses to swallow the
-    /// scheme word itself, so `Authorization: Bearer <token>` can never leave the token
-    /// unmasked behind a redacted scheme.
+    /// Scheme-aware rules run first: a `Basic` or `Bearer` token is masked as a whole
+    /// before the key/value rule sees the line, and the key/value rule refuses to swallow
+    /// a scheme word itself, so `Authorization: Bearer <token>` and
+    /// `{"authorization": "Basic <token>"}` can never leave the token unmasked behind a
+    /// redacted scheme. The key/value rule tolerates quotes around the key and the value
+    /// so JSON bodies (`{"token": "…"}`, `{"api_key": "…"}`) are masked as well.
     static func redact(_ text: String) -> String {
         let patterns: [(pattern: String, template: String)] = [
-            (#"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"#, "$1<redacted>"),
-            (#"(?i)((?:api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*)(?!bearer\b)\S+"#, "$1<redacted>"),
+            (#"(?i)((?:basic|bearer)\s+)[A-Za-z0-9._~+/=-]{4,}"#, "$1<redacted>"),
+            (
+                #"(?i)("?(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passwd|authorization)"?\s*[:=]\s*["']?)(?!["']?(?:basic|bearer)\b)\S+"#,
+                "$1<redacted>"
+            ),
             (#"AKIA[0-9A-Z]{16}"#, "<redacted>"),
             (#"gh[pousr]_[A-Za-z0-9]{20,}"#, "<redacted>"),
         ]
@@ -94,9 +103,11 @@ enum VerificationOutputRedactor {
 /// returns its identity; a second concurrent registration is refused with
 /// `VerificationRunnerError.runAlreadyInFlight` instead of being queued, so two
 /// verifications on one workspace can never interleave steps or corrupt each other's
-/// fingerprint checks. Cancellation is scoped to a single run identity
-/// (`cancel(runID:)`): it never touches another run, and it is never a sticky flag that
-/// poisons future runs.
+/// fingerprint checks. A registered identity executes exactly once: a concurrent second
+/// `run` for the same identity is refused with `VerificationRunnerError.runAlreadyExecuting`.
+/// Cancellation is scoped to a single run identity (`cancel(runID:)`): it never touches
+/// another run, it releases an identity that never started, and it is never a sticky flag
+/// that poisons future runs.
 ///
 /// Execution is ordered and argv-only: there is no shell anywhere in this type. Every
 /// step gets a wall-clock deadline and a bounded, redacted output budget. A required
@@ -109,8 +120,8 @@ enum VerificationOutputRedactor {
 actor VerificationRunner {
     private static let pollInterval: TimeInterval = 0.05
     private static let fingerprintTimeout: TimeInterval = 10
-    /// Largest single untracked file whose bytes are folded into the fingerprint digest.
-    private static let untrackedFileDigestLimit = 1_048_576
+    /// Chunk size used while streaming an untracked file through SHA-256.
+    private static let untrackedFileChunkBytes = 1_048_576
 
     private let maxOutputBytes: Int
     private let maxDetailsCharacters: Int
@@ -125,6 +136,7 @@ actor VerificationRunner {
         let recipe: VerificationRecipe
         let workspace: URL
         let cancellation: VerificationCancellationFlag
+        var isExecuting: Bool
     }
 
     init(
@@ -163,16 +175,26 @@ actor VerificationRunner {
             id: runID,
             recipe: recipe,
             workspace: workspace,
-            cancellation: VerificationCancellationFlag()
+            cancellation: VerificationCancellationFlag(),
+            isExecuting: false
         )
         return runID
     }
 
     /// Executes a registered run to completion and deregisters it.
+    ///
+    /// The registration is marked executing in the same actor-isolated stretch that
+    /// checks it, before the first `await`, so a concurrent second `run` of the same
+    /// identity is refused with `.runAlreadyExecuting` instead of executing the recipe
+    /// twice. A refused call never returns evidence and never touches the active run.
     func run(_ runID: VerificationRunID) async throws -> [VerificationEvidence] {
         guard let activeRun, activeRun.id == runID else {
             throw VerificationRunnerError.unknownRun(runID: runID)
         }
+        guard !activeRun.isExecuting else {
+            throw VerificationRunnerError.runAlreadyExecuting(runID: runID)
+        }
+        self.activeRun?.isExecuting = true
         defer {
             if self.activeRun?.id == runID {
                 self.activeRun = nil
@@ -191,12 +213,19 @@ actor VerificationRunner {
         return try await run(runID)
     }
 
-    /// Requests cancellation of exactly one in-flight run.
+    /// Requests cancellation of exactly one run.
     ///
-    /// A run that already finished, or an identity this runner never minted, is a no-op:
-    /// cancellation can never leak into another run.
+    /// An executing run gets its flag set and is deregistered when `run` returns. A run
+    /// that was registered but never started is deregistered here, so a token that will
+    /// never execute cannot occupy the single-flight slot forever. A run that already
+    /// finished, or an identity this runner never minted, is a no-op: cancellation can
+    /// never leak into another run.
     func cancel(runID: VerificationRunID) {
         guard let activeRun, activeRun.id == runID else { return }
+        guard activeRun.isExecuting else {
+            self.activeRun = nil
+            return
+        }
         activeRun.cancellation.cancel()
     }
 
@@ -523,13 +552,15 @@ actor VerificationRunner {
     ///    renamed, conflicted and untracked non-ignored paths. Ignored files never appear,
     ///    so ignored build artifacts do not change the fingerprint.
     /// 3. `git diff HEAD --no-ext-diff --binary` for the tracked working-tree change.
-    /// 4. For every untracked non-ignored file: its path plus `sha256=<digest>;bytes=<size>;
-    ///    capped=<bool>` of the file's bytes, read up to `untrackedFileDigestLimit` bytes.
-    ///    Changing the content of an untracked file therefore changes the fingerprint.
+    /// 4. For every untracked non-ignored file: its path plus `sha256=<digest>;bytes=<size>`
+    ///    over the file's full byte stream, read in bounded chunks. Changing any byte of an
+    ///    untracked file, including its tail, therefore changes the fingerprint.
     ///
     /// When a git invocation is refused, exits nonzero or reports clipped output, or when
-    /// an untracked file listed by status cannot be read, the fingerprint is unavailable:
-    /// a truncated or partial revision must fail closed instead of hashing partial state.
+    /// an untracked file listed by status cannot be read end to end — an open failure, a
+    /// read error mid-stream, or a size that changed while reading — the fingerprint is
+    /// unavailable: a truncated or partial revision must fail closed instead of hashing
+    /// partial state.
     private func workspaceFingerprint(of workspace: URL) -> String? {
         guard FileManager.default.fileExists(atPath: workspace.path) else { return nil }
         guard let head = runGit(["rev-parse", "HEAD"], in: workspace),
@@ -585,7 +616,13 @@ actor VerificationRunner {
         return paths
     }
 
-    /// `sha256` of an untracked file's bytes, capped per file, plus its total size.
+    /// `sha256` of an untracked file's full byte stream, plus its total size.
+    ///
+    /// The file is streamed in bounded chunks, so an arbitrarily large untracked file
+    /// neither loads into memory nor hides a tail change behind a prefix digest. A read
+    /// error, a short read or a size that changed while reading makes the digest nil,
+    /// and an unavailable digest makes the whole fingerprint nil: the runner fails closed
+    /// instead of verifying a revision it cannot confirm.
     private func untrackedFileDigest(in workspace: URL, relativePath: String) -> String? {
         let fileURL = workspace.appendingPathComponent(relativePath)
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
@@ -596,15 +633,20 @@ actor VerificationRunner {
 
         var hasher = SHA256()
         var readBytes: Int64 = 0
-        let limit = Int64(Self.untrackedFileDigestLimit)
-        while readBytes < limit {
-            let remaining = Int(min(limit - readBytes, 1_048_576))
-            guard let chunk = try? handle.read(upToCount: remaining), !chunk.isEmpty else { break }
+        while true {
+            let chunk: Data?
+            do {
+                chunk = try handle.read(upToCount: Self.untrackedFileChunkBytes)
+            } catch {
+                return nil
+            }
+            guard let chunk, !chunk.isEmpty else { break }
             hasher.update(data: chunk)
             readBytes += Int64(chunk.count)
         }
+        guard readBytes == size else { return nil }
         let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        return "sha256=\(digest);bytes=\(size);capped=\(size > readBytes)"
+        return "sha256=\(digest);bytes=\(size)"
     }
 
     private func runGit(_ arguments: [String], in directory: URL) -> GitCommandResult? {

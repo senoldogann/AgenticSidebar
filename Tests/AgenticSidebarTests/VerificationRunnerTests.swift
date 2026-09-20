@@ -264,7 +264,12 @@ final class VerificationRunnerTests: XCTestCase {
     func testSecondRunWhileOneIsInFlightIsRefusedWithoutEvidence() async throws {
         let workspace = try makeWorkspace(name: "single-flight")
         let runner = makeRunner()
-        let hangRecipe = recipe(steps: [step("hang", "/usr/bin/tail", ["-f", "/dev/null"], timeout: 30)])
+        let hangRecipe = recipe(
+            steps: [
+                step("hang", "/usr/bin/tail", ["-f", "/dev/null"], timeout: 30),
+                step("dependent", "/usr/bin/touch", ["ran-dependent"]),
+            ]
+        )
         let activeRunID = try await runner.beginRun(recipe: hangRecipe, workspace: workspace)
 
         do {
@@ -278,11 +283,81 @@ final class VerificationRunnerTests: XCTestCase {
             XCTAssertEqual(reportedRunID, activeRunID)
         }
 
+        let box = EvidenceBox()
+        let finished = DispatchSemaphore(value: 0)
+        Task {
+            box.store((try? await runner.run(activeRunID)) ?? [])
+            finished.signal()
+        }
+        try await Task.sleep(for: .milliseconds(500))
         await runner.cancel(runID: activeRunID)
-        let evidence = try await runner.run(activeRunID)
-        XCTAssertEqual(evidence.map(\.stepName), ["hang"])
+        XCTAssertEqual(finished.wait(timeout: .now() + 15), .success)
+        let evidence = try XCTUnwrap(box.evidence)
+        XCTAssertEqual(evidence.map(\.stepName), ["hang", "dependent"])
         XCTAssertFalse(evidence[0].passed, "a refused concurrent run must never yield a pass")
-        XCTAssertEqual(evidence[0].blockedBy, "cancellation")
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("cancel"), evidence[0].detailsRedacted)
+        XCTAssertEqual(evidence[1].status, .skipped)
+        XCTAssertEqual(evidence[1].blockedBy, "cancellation")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workspace.appendingPathComponent("ran-dependent").path))
+    }
+
+    func testConcurrentRunOfSameRunIDExecutesExactlyOnce() async throws {
+        let workspace = try makeWorkspace(name: "single-execution")
+        let runner = makeRunner()
+        let started = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-verification-started-\(UUID().uuidString)"
+        )
+        let gate = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-verification-gate-\(UUID().uuidString)"
+        )
+        let marker = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-verification-marker-\(UUID().uuidString)"
+        )
+        addTeardownBlock {
+            for url in [started, gate, marker] { try? FileManager.default.removeItem(at: url) }
+        }
+        let script =
+            "echo started >> \(started.path); while [ ! -f \(gate.path) ]; do sleep 0.02; done; echo executed >> \(marker.path)"
+        let runID = try await runner.beginRun(
+            recipe: recipe(steps: [step("append", "/bin/sh", ["-c", script], timeout: 30)]),
+            workspace: workspace
+        )
+
+        let box = EvidenceBox()
+        let finished = DispatchSemaphore(value: 0)
+        Task {
+            box.store((try? await runner.run(runID)) ?? [])
+            finished.signal()
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while !FileManager.default.fileExists(atPath: started.path), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: started.path),
+            "the first run must reach its step before the second call is attempted"
+        )
+
+        do {
+            _ = try await runner.run(runID)
+            XCTFail("a concurrent second run of the same identity must be refused, never executed twice")
+        } catch {
+            guard case VerificationRunnerError.runAlreadyExecuting(let reportedRunID) = error else {
+                XCTFail("expected runAlreadyExecuting, got \(error)")
+                return
+            }
+            XCTAssertEqual(reportedRunID, runID)
+        }
+
+        try Data().write(to: gate)
+        XCTAssertEqual(finished.wait(timeout: .now() + 15), .success)
+        let evidence = try XCTUnwrap(box.evidence)
+        XCTAssertEqual(evidence.count, 1)
+        XCTAssertEqual(evidence[0].status, .passed)
+        let executed = (try? String(contentsOf: marker, encoding: .utf8)) ?? ""
+        let lines = executed.split(separator: "\n").filter { !$0.isEmpty }
+        XCTAssertEqual(lines.count, 1, "the run body must execute exactly once, saw: \(lines)")
     }
 
     func testCancellingRunDoesNotPoisonFutureRuns() async throws {
@@ -320,6 +395,35 @@ final class VerificationRunnerTests: XCTestCase {
 
         let evidence = try await runner.run(runID)
         XCTAssertEqual(evidence[0].status, .passed)
+    }
+
+    func testCancelOfRegisteredRunReleasesTokenForFutureRun() async throws {
+        let workspace = try makeWorkspace(name: "cancel-registered")
+        let runner = makeRunner()
+        let registered = try await runner.beginRun(
+            recipe: recipe(steps: [step("never", "/usr/bin/true")]),
+            workspace: workspace
+        )
+
+        await runner.cancel(runID: registered)
+
+        do {
+            _ = try await runner.run(registered)
+            XCTFail("a cancelled run that never started must be deregistered, never executed")
+        } catch {
+            guard case VerificationRunnerError.unknownRun(let reportedRunID) = error else {
+                XCTFail("expected unknownRun, got \(error)")
+                return
+            }
+            XCTAssertEqual(reportedRunID, registered)
+        }
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+        XCTAssertEqual(evidence[0].status, .passed)
+        XCTAssertTrue(evidence[0].passed, "a never-run token cancelled before execution must not brick the runner")
     }
 
     func testRunnerRecordsRecipeVersionOnEveryEntry() async throws {
@@ -474,6 +578,51 @@ final class VerificationRunnerTests: XCTestCase {
         XCTAssertTrue(evidence[0].detailsRedacted.contains("<redacted>"), evidence[0].detailsRedacted)
     }
 
+    func testRedactorMasksBasicSchemeWithoutSpaceAfterColon() {
+        let token = "dXNlcjpwYXNzd29yZA=="
+        let redacted = VerificationOutputRedactor.redact("Authorization:Basic \(token)")
+
+        XCTAssertFalse(redacted.contains(token), redacted)
+        XCTAssertTrue(redacted.contains("Basic <redacted>"), redacted)
+    }
+
+    func testRedactorMasksBasicSchemeWithSpace() {
+        let token = "dXNlcjpwYXNzd29yZA=="
+        let redacted = VerificationOutputRedactor.redact("Authorization: Basic \(token)")
+
+        XCTAssertFalse(redacted.contains(token), redacted)
+        XCTAssertTrue(redacted.contains("Basic <redacted>"), redacted)
+    }
+
+    func testRedactorMasksQuotedJSONAuthorizationBasic() {
+        let token = "dXNlcjpwYXNzd29yZA=="
+        let redacted = VerificationOutputRedactor.redact(#"{"authorization": "Basic \#(token)"}"#)
+
+        XCTAssertFalse(redacted.contains(token), redacted)
+        XCTAssertTrue(redacted.contains("Basic <redacted>"), redacted)
+    }
+
+    func testRedactorMasksQuotedJSONToken() {
+        let redacted = VerificationOutputRedactor.redact(#"{"token": "supersecrettoken123"}"#)
+
+        XCTAssertFalse(redacted.contains("supersecrettoken123"), redacted)
+        XCTAssertTrue(redacted.contains("<redacted>"), redacted)
+    }
+
+    func testRedactorMasksQuotedJSONApiKey() {
+        let redacted = VerificationOutputRedactor.redact(#"{"api_key": "ABCDEF1234567890"}"#)
+
+        XCTAssertFalse(redacted.contains("ABCDEF1234567890"), redacted)
+        XCTAssertTrue(redacted.contains("<redacted>"), redacted)
+    }
+
+    func testRedactorMasksShortBearerToken() {
+        let redacted = VerificationOutputRedactor.redact("Bearer abc123")
+
+        XCTAssertFalse(redacted.contains("abc123"), redacted)
+        XCTAssertTrue(redacted.contains("Bearer <redacted>"), redacted)
+    }
+
     func testPostFinalDriftMarksFinalPassedStepAsFailed() async throws {
         let workspace = try makeWorkspace(name: "post-final-drift")
         let runner = makeRunner()
@@ -506,6 +655,49 @@ final class VerificationRunnerTests: XCTestCase {
         XCTAssertEqual(evidence[2].status, .skipped)
         XCTAssertEqual(evidence[2].blockedBy, "workspaceFingerprint")
         XCTAssertFalse(evidence[2].passed)
+    }
+
+    func testUntrackedTailDriftPastFormerDigestCapPreventsPass() async throws {
+        let workspace = try makeWorkspace(name: "untracked-tail-drift")
+        let bigFile = workspace.appendingPathComponent("big-untracked.bin")
+        try Data(repeating: 0x61, count: 1_500_000).write(to: bigFile)
+        let runner = makeRunner()
+        let first = step("first", "/usr/bin/true")
+        let mutate = step(
+            "mutate",
+            "/bin/dd",
+            ["if=/dev/zero", "of=big-untracked.bin", "bs=1", "seek=1400000", "count=1", "conv=notrunc"]
+        )
+        let after = step("after", "/usr/bin/true")
+
+        let evidence = try await runner.verify(recipe: recipe(steps: [first, mutate, after]), workspace: workspace)
+
+        XCTAssertEqual(evidence[0].status, .passed)
+        XCTAssertEqual(evidence[1].status, .failed, "a tail change past the former digest cap cannot report a pass")
+        XCTAssertTrue(evidence[1].detailsRedacted.contains("fingerprint"), evidence[1].detailsRedacted)
+        XCTAssertEqual(evidence[2].status, .skipped)
+        XCTAssertEqual(evidence[2].blockedBy, "workspaceFingerprint")
+        XCTAssertFalse(evidence[2].passed)
+    }
+
+    func testUnreadableUntrackedEntryFailsClosed() async throws {
+        let workspace = try makeWorkspace(name: "unreadable-untracked")
+        let dangling = workspace.appendingPathComponent("dangling-entry")
+        try FileManager.default.createSymbolicLink(
+            at: dangling,
+            withDestinationURL: URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)")
+        )
+        let runner = makeRunner()
+
+        let evidence = try await runner.verify(
+            recipe: recipe(steps: [step("build", "/usr/bin/true")]),
+            workspace: workspace
+        )
+
+        XCTAssertEqual(evidence[0].status, .failed)
+        XCTAssertNil(evidence[0].workspaceFingerprint)
+        XCTAssertFalse(evidence[0].passed, "an unreadable untracked entry must never yield a pass")
+        XCTAssertTrue(evidence[0].detailsRedacted.contains("fingerprint"), evidence[0].detailsRedacted)
     }
 
     func testRunnerMarksTruncatedOutputInDetails() async throws {
