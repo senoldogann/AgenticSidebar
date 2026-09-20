@@ -234,10 +234,10 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** `AcceptanceGate.evaluate(task:attempt:evidence:findings:approvals:currentFingerprint:) -> AcceptanceDecision` returns `.readyForHumanReview` or `.blocked(reasons)` or `.accepted`; there is no completion boolean missing reasons. `TaskApproval` binds action, task ID, attempt ID, exact content fingerprint, actor and timestamp; changed content revokes validity. `accept` is the only MVP action allowed to move to `done`; merge/push/discard workspaces are separate future approvals.
 
-- [ ] Step 1: RED matrix: failed build, failed tests, stale fingerprint, absent required lint, open high finding, unset criterion, missing user acceptance, wrong attempt approval, and changed file after approval each deny done.
-- [ ] Step 2: Run `swift test --filter AcceptanceGateTests` and `swift test --filter TaskApprovalTests`; verify relevant RED.
-- [ ] Step 3: Implement exact fingerprint/evidence and human criterion gates; a model statement 'all tests passed' is merely text, not evidence. Dismissal of a finding must record human actor and reason; cannot happen implicitly.
-- [ ] Step 4: GREEN filters and full `swift test`; verify a passing complete fixture reaches done only after matching acceptance.
+- [x] Step 1: RED matrix: failed build, failed tests, stale fingerprint, absent required lint, open high finding, unset criterion, missing user acceptance, wrong attempt approval, and changed file after approval each deny done.
+- [x] Step 2: Run `swift test --filter AcceptanceGateTests` and `swift test --filter TaskApprovalTests`; verify relevant RED.
+- [x] Step 3: Implement exact fingerprint/evidence and human criterion gates; a model statement 'all tests passed' is merely text, not evidence. Dismissal of a finding must record human actor and reason; cannot happen implicitly.
+- [x] Step 4: GREEN filters and full `swift test`; verify a passing complete fixture reaches done only after matching acceptance.
 
 **Gate:** no stale or fabricated evidence can close a task.
 
