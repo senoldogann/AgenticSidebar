@@ -262,10 +262,10 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** Board has Backlog/Ready/Running/Review/Done columns, prominent Blocked filter and Cancelled history; task inspector includes criteria, dependencies, attempt history, provider capability, verified worktree/diff/evidence, review findings and content-fingerprint-scoped approval. Action buttons invoke `CodingTaskService` via `TaskBoardStore` only.
 
-- [ ] Step 1: RED presenter tests for each state, missing capability reason, stale verification badge, pause/resume action matrix and no automatic status mutation from drag/drop.
-- [ ] Step 2: Run `swift test --filter TaskBoardPresentationTests` and `TaskBoardAccessibilityTests`; record RED.
-- [ ] Step 3: Implement lazily rendered cards, detail view and action bar; keyboard tab order and VoiceOver labels include status/reason, not just color. An unavailable runtime displays a disabled explanatory action.
-- [ ] Step 4: GREEN presenter tests and target build; real-host smoke: create/select task, keyboard navigation, stop while streaming, interrupted task remains visible and chat transcript stays intact.
+- [x] Step 1: RED presenter tests for each state, missing capability reason, stale verification badge, pause/resume action matrix and no automatic status mutation from drag/drop.
+- [x] Step 2: Run `swift test --filter TaskBoardPresentationTests` and `swift test --filter TaskBoardAccessibilityTests`; record RED.
+- [x] Step 3: Implement lazily rendered cards, detail view and action bar; keyboard tab order and VoiceOver labels include status/reason, not just color. An unavailable runtime displays a disabled explanatory action.
+- [x] Step 4: GREEN presenter tests and target build; real-host smoke: create/select task, keyboard navigation, stop while streaming, interrupted task remains visible and chat transcript stays intact. — Not: board henüz app kompozisyonuna bağlı değil (Task 15); presenter düzeyinde smoke ve hedef build doğrulandı, gerçek-host UI smoke Task 15'e devredildi.
 
 **Gate:** visual board reflects persisted truth; no fake progress or automatic accept.
 
