@@ -249,10 +249,10 @@ The new directories are package-source folders, not extra SwiftPM targets. File 
 
 **Interfaces:** `CodingTaskService` exposes project/task creation, dependency changes, start/pause/resume/stop/retry, review and acceptance through injected scheduler/repository; `@MainActor @Observable TaskBoardStore` exposes immutable card/detail projections, loading/error state and action availability, never raw SQL or concrete OpenCode types.
 
-- [ ] Step 1: RED tests for create/reload, stale user action, unavailable runtime, concurrent action de-duplication, backend rejection not optimistically shown as successful and switching board selection without cancelling chat.
-- [ ] Step 2: Run focused tests and capture RED.
-- [ ] Step 3: Implement service and main-actor projection with bounded event coalescing, explicit result/throw handling, task-local spinner and no auto-execution on view appear.
-- [ ] Step 4: GREEN, full `swift test` and target build with warnings as errors.
+- [x] Step 1: RED tests for create/reload, stale user action, unavailable runtime, concurrent action de-duplication, backend rejection not optimistically shown as successful and switching board selection without cancelling chat.
+- [x] Step 2: Run focused tests and capture RED.
+- [x] Step 3: Implement service and main-actor projection with bounded event coalescing, explicit result/throw handling, task-local spinner and no auto-execution on view appear.
+- [x] Step 4: GREEN, full `swift test` and target build with warnings as errors.
 
 **Gate:** board UI talks only to the service, not to providers, Git or SQLite directly.
 
