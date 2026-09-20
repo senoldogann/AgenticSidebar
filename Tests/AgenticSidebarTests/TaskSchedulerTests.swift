@@ -1644,6 +1644,57 @@ final class TaskSchedulerTests: XCTestCase {
         }
     }
 
+    /// Provider registry that parks every candidate call on an injected gate once armed.
+    ///
+    /// Fixture creation claims through this registry, so gating stays disarmed until a
+    /// race test arms it immediately before the dispatch under test.
+    private actor ArmedDispatchTestRegistry: TaskProviderRegistryPort {
+        private let gate: AsyncGate
+        private let result: TaskProviderCandidate
+        private var isArmed = false
+
+        init(gate: AsyncGate, result: TaskProviderCandidate) {
+            self.gate = gate
+            self.result = result
+        }
+
+        func arm() {
+            isArmed = true
+        }
+
+        func candidate(for task: CodingTask, stage: TaskStage) async -> TaskProviderCandidate {
+            if isArmed {
+                await gate.enter()
+            }
+            return result
+        }
+    }
+
+    /// Running port whose `start` parks on an injected gate before handing back its session.
+    private final class GatedStartTaskRunningPort: TaskRunningPort, @unchecked Sendable {
+        private let session: DispatchTestSession
+        private let gate: AsyncGate
+        private let starts = Mutex(0)
+
+        init(session: DispatchTestSession, gate: AsyncGate) {
+            self.session = session
+            self.gate = gate
+        }
+
+        func start(
+            _ request: TaskRunRequest,
+            approvalResolver: @escaping TaskRunApprovalResolver
+        ) async throws -> TaskRunSession {
+            starts.withLock { $0 += 1 }
+            await gate.enter()
+            return session
+        }
+
+        var startCount: Int {
+            starts.withLock { $0 }
+        }
+    }
+
     private actor DispatchTestRegistry: TaskProviderRegistryPort {
         private var results: [TaskProviderCandidate]
 
@@ -2571,5 +2622,267 @@ final class TaskSchedulerTests: XCTestCase {
         XCTAssertEqual(storedA?.blockReason, .custom("stopped"))
         let storedB = try await store.task(id: taskB.id)
         XCTAssertEqual(storedB?.status, .review)
+    }
+
+    // MARK: - Live dispatch reentrancy races
+
+    /// Polls until the condition holds, failing the test if the deadline passes.
+    private func waitUntil(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () async -> Bool
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Timed out waiting for \(description)", file: file, line: line)
+    }
+
+    func testStopDuringDispatchGatesPreventsRunStart() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let gate = AsyncGate()
+        let registry = ArmedDispatchTestRegistry(
+            gate: gate,
+            result: .eligible(runtimeID: "runtime", modelID: "model")
+        )
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: registry,
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-stop-gates")
+        let taskID = fixture.task.id
+        let attemptID = fixture.attemptID
+        let generation = fixture.generation
+        let fingerprint = "fingerprint-stop-gates"
+        try await recordExecuteApproval(store: store, taskID: taskID, attemptID: attemptID, fingerprint: fingerprint)
+        port.bind(session, to: attemptID)
+        await registry.arm()
+
+        async let firstDispatch = dispatchTestOutcome(
+            scheduler,
+            taskID: taskID,
+            attemptID: attemptID,
+            generation: generation,
+            fingerprint: fingerprint
+        )
+        await gate.waitUntilEntered()
+
+        try await scheduler.stop(taskID: taskID)
+        await gate.release()
+        session.finish()
+
+        let outcome = await firstDispatch
+        XCTAssertEqual(port.startCount, 0, "A dispatch retired by stop must never start a runtime")
+        guard case .refusal(let refusal) = outcome else {
+            XCTFail("Expected a typed refusal after stop landed inside the gates, got \(outcome)")
+            return
+        }
+        XCTAssertEqual(
+            refusal,
+            .staleAttempt(
+                taskID: taskID,
+                expectedAttemptID: attemptID,
+                expectedGeneration: generation,
+                actualAttemptID: nil,
+                actualGeneration: nil
+            )
+        )
+
+        // A leaked early reservation would refuse this probe as already-active before
+        // the identity guard can report the stop-cleared attempt.
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: taskID,
+            attemptID: attemptID,
+            generation: generation,
+            fingerprint: fingerprint,
+            expected: .staleAttempt(
+                taskID: taskID,
+                expectedAttemptID: attemptID,
+                expectedGeneration: generation,
+                actualAttemptID: nil,
+                actualGeneration: nil
+            )
+        )
+    }
+
+    func testConcurrentDuplicateDispatchDuringGatesStartsExactlyOneRun() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let gate = AsyncGate()
+        let registry = ArmedDispatchTestRegistry(
+            gate: gate,
+            result: .eligible(runtimeID: "runtime", modelID: "model")
+        )
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: registry,
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-duplicate-gates")
+        let taskID = fixture.task.id
+        let attemptID = fixture.attemptID
+        let generation = fixture.generation
+        let fingerprint = "fingerprint-duplicate-gates"
+        try await recordExecuteApproval(store: store, taskID: taskID, attemptID: attemptID, fingerprint: fingerprint)
+        port.bind(session, to: attemptID)
+        await registry.arm()
+
+        async let firstDispatch = dispatchTestOutcome(
+            scheduler,
+            taskID: taskID,
+            attemptID: attemptID,
+            generation: generation,
+            fingerprint: fingerprint
+        )
+        await gate.waitUntilEntered()
+
+        let secondOutcome = DispatchTestOutcomeBox()
+        let secondTask = Task {
+            let outcome = await dispatchTestOutcome(
+                scheduler,
+                taskID: taskID,
+                attemptID: attemptID,
+                generation: generation,
+                fingerprint: fingerprint
+            )
+            await secondOutcome.set(outcome)
+        }
+
+        // Fixed: the duplicate loses the reservation race before the gate. Broken: both
+        // park in the gate, so wait for the second entry before letting either proceed.
+        await waitUntil("the duplicate to settle or join the provider gate") {
+            if await secondOutcome.outcome != nil {
+                return true
+            }
+            return await gate.currentEnteredCount() >= 2
+        }
+        await gate.release()
+        try await waitForDispatchStart(port, count: 1)
+
+        try await scheduler.stop(taskID: taskID)
+        session.finish()
+
+        let firstResult = await firstDispatch
+        _ = await secondTask.value
+        let secondResult = await secondOutcome.outcome
+
+        XCTAssertEqual(port.startCount, 1, "Two interleaved dispatches must start exactly one runtime")
+        guard let secondResult else {
+            XCTFail("The duplicate dispatch never settled")
+            return
+        }
+        guard case .refusal(let refusal) = secondResult else {
+            XCTFail("The duplicate dispatch must be refused with a typed refusal, got \(secondResult)")
+            return
+        }
+        XCTAssertEqual(refusal, .dispatchAlreadyActive(taskID: taskID))
+        XCTAssertEqual(session.cancelCount, 1, "Stop must cancel the one started run exactly once")
+        guard case .report(let firstReport) = firstResult else {
+            XCTFail("The first dispatch must settle once stopped, got \(firstResult)")
+            return
+        }
+        XCTAssertEqual(firstReport.completion.disposition, .stale)
+    }
+
+    func testStopDuringRuntimeStartInFlightCancelsJustStartedRun() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let gate = AsyncGate()
+        let session = DispatchTestSession()
+        let port = GatedStartTaskRunningPort(session: session, gate: gate)
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-start-in-flight")
+        let taskID = fixture.task.id
+        let attemptID = fixture.attemptID
+        let generation = fixture.generation
+        let fingerprint = "fingerprint-start-in-flight"
+        try await recordExecuteApproval(store: store, taskID: taskID, attemptID: attemptID, fingerprint: fingerprint)
+
+        async let dispatchCall = dispatchTestOutcome(
+            scheduler,
+            taskID: taskID,
+            attemptID: attemptID,
+            generation: generation,
+            fingerprint: fingerprint
+        )
+        await gate.waitUntilEntered()
+
+        try await scheduler.stop(taskID: taskID)
+        await gate.release()
+
+        let outcome = await dispatchCall
+        XCTAssertEqual(port.startCount, 1)
+        XCTAssertEqual(session.cancelCount, 1, "A run whose reservation was retired during start must be cancelled")
+        guard case .report(let report) = outcome else {
+            XCTFail("The dispatch must settle as stale after its run was cancelled, got \(outcome)")
+            return
+        }
+        XCTAssertEqual(report.completion.disposition, .stale)
+        let stored = try await store.task(id: taskID)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("stopped"))
+    }
+}
+
+// MARK: - Live dispatch race observation
+
+/// One dispatch outcome kept as a value so race tests can interleave tasks without
+/// awaiting a call that may still be parked inside the scheduler.
+private enum DispatchTestOutcome: Sendable {
+    case report(TaskRunDispatchReport)
+    case refusal(TaskDispatchRefusal)
+    case otherFailure(String)
+}
+
+/// Actor box for one asynchronously observed dispatch outcome.
+private actor DispatchTestOutcomeBox {
+    private(set) var outcome: DispatchTestOutcome?
+
+    func set(_ outcome: DispatchTestOutcome) {
+        self.outcome = outcome
+    }
+}
+
+/// Awaits one dispatch and keeps its typed refusal instead of throwing it.
+private func dispatchTestOutcome(
+    _ scheduler: TaskScheduler,
+    taskID: UUID,
+    attemptID: UUID,
+    generation: Int,
+    fingerprint: String
+) async -> DispatchTestOutcome {
+    do {
+        return .report(
+            try await scheduler.dispatch(
+                taskID: taskID,
+                attemptID: attemptID,
+                generation: generation,
+                fingerprint: fingerprint
+            )
+        )
+    } catch let refusal as TaskDispatchRefusal {
+        return .refusal(refusal)
+    } catch {
+        return .otherFailure(String(describing: error))
     }
 }

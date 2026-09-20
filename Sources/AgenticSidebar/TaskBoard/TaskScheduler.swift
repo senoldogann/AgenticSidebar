@@ -399,6 +399,15 @@ actor TaskScheduler {
                 actualGeneration: activeAttempts[taskID]?.attempt.generation
             )
         }
+
+        // Reserve the single-flight slot before the first suspension point: a concurrent
+        // duplicate dispatch loses here instead of overwriting this run token, and
+        // stop/pause/retry can retire exactly this reservation while the gates below await.
+        // Every exit path clears the reservation through the defer.
+        let runID = UUID()
+        activeRuns[taskID] = ActiveRunRecord(runID: runID, session: nil)
+        defer { clearRunIfOwned(taskID: taskID, runID: runID) }
+
         guard let task = try await repository.task(id: taskID) else {
             throw TaskSchedulerError.taskNotFound(taskID)
         }
@@ -460,6 +469,21 @@ actor TaskScheduler {
             )
         }
 
+        // Re-validate after every gate await: stop/pause/retry may have retired this
+        // reservation, replaced the attempt, suspended the task or blocked it while the
+        // gates were in flight. The post-start runID check below stays as the last resort
+        // for a retirement while the port is starting.
+        guard let liveTask = try await repository.task(id: taskID) else {
+            throw TaskSchedulerError.taskNotFound(taskID)
+        }
+        try requireDispatchReservation(
+            taskID: taskID,
+            attemptID: attemptID,
+            generation: generation,
+            runID: runID,
+            task: liveTask
+        )
+
         let request = TaskRunRequest(
             task: task,
             attempt: record.attempt,
@@ -476,10 +500,9 @@ actor TaskScheduler {
             )
         }
 
-        let runID = UUID()
-        activeRuns[taskID] = ActiveRunRecord(runID: runID, session: nil)
-        defer { clearRunIfOwned(taskID: taskID, runID: runID) }
-
+        // Between the revalidation above and the start call there is no suspension
+        // point, so only a retirement that lands while `start` itself is in flight can
+        // still race; the post-start runID check below is the last resort for that case.
         let session: any TaskRunSession
         do {
             session = try await dispatchPort.start(request, approvalResolver: resolver)
@@ -569,6 +592,46 @@ actor TaskScheduler {
     private func clearRunIfOwned(taskID: UUID, runID: UUID) {
         guard activeRuns[taskID]?.runID == runID else { return }
         activeRuns[taskID] = nil
+    }
+
+    /// Fails closed unless the dispatch reservation still owns the exact attempt.
+    ///
+    /// Stop/pause/retry may retire the run token, replace the attempt, suspend the task
+    /// or block it while the dispatch gates are in flight, so the exact reservation, the
+    /// exact attempt identity, the suspension sets and the live task status must all
+    /// still agree before a runtime may start.
+    private func requireDispatchReservation(
+        taskID: UUID,
+        attemptID: UUID,
+        generation: Int,
+        runID: UUID,
+        task: CodingTask
+    ) throws {
+        guard activeRuns[taskID]?.runID == runID else {
+            throw TaskDispatchRefusal.staleAttempt(
+                taskID: taskID,
+                expectedAttemptID: attemptID,
+                expectedGeneration: generation,
+                actualAttemptID: activeAttempts[taskID]?.attempt.id,
+                actualGeneration: activeAttempts[taskID]?.attempt.generation
+            )
+        }
+        guard
+            let liveRecord = activeAttempts[taskID],
+            liveRecord.attempt.id == attemptID,
+            liveRecord.attempt.generation == generation
+        else {
+            throw TaskDispatchRefusal.staleAttempt(
+                taskID: taskID,
+                expectedAttemptID: attemptID,
+                expectedGeneration: generation,
+                actualAttemptID: activeAttempts[taskID]?.attempt.id,
+                actualGeneration: activeAttempts[taskID]?.attempt.generation
+            )
+        }
+        guard !pausedTaskIDs.contains(taskID), !stoppedTaskIDs.contains(taskID), task.status == .running else {
+            throw TaskDispatchRefusal.taskNotRunning(taskID: taskID, status: task.status)
+        }
     }
 
     /// Splits the adapter's comma-joined `patterns` parameter back into entries.
