@@ -18,11 +18,18 @@ final class ServiceTestClock: TaskSchedulerClock, @unchecked Sendable {
         defer { lock.unlock() }
         return current
     }
+
+    func advance(by interval: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        current = current.addingTimeInterval(interval)
+    }
 }
 
 actor ScriptedProviderRegistry: TaskProviderRegistryPort {
     private var result: TaskProviderCandidate
     private var gatedCandidates: AsyncGate?
+    private var gatedCandidatesFromCall = 1
     private(set) var callCount = 0
 
     init(result: TaskProviderCandidate) {
@@ -34,16 +41,144 @@ actor ScriptedProviderRegistry: TaskProviderRegistryPort {
     }
 
     func gateCandidates(_ gate: AsyncGate) {
+        gateCandidates(gate, fromCall: 1)
+    }
+
+    /// Talepten sonraki uygunluk sorularını kapıya alır; ilk çağrı (talep öncesi)
+    /// serbest kalır, böylece gönderim anındaki ret deterministik olur.
+    func gateCandidates(_ gate: AsyncGate, fromCall: Int) {
         gatedCandidates = gate
+        gatedCandidatesFromCall = fromCall
     }
 
     func candidate(for task: CodingTask, stage: TaskStage) async -> TaskProviderCandidate {
         callCount += 1
-        if let gate = gatedCandidates {
+        if let gate = gatedCandidates, callCount >= gatedCandidatesFromCall {
             await gate.enter()
         }
         return result
     }
+}
+
+/// Sıralı sahiplik yanıtları: talep anı ile gönderim anı farklı sonuç görebilsin.
+actor ScriptedWorkspacePreflight: TaskWorkspacePreflightPort {
+    private var results: [TaskWorkspacePreflightResult]
+    private(set) var callCount = 0
+
+    init(results: [TaskWorkspacePreflightResult]) {
+        self.results = results
+    }
+
+    func preflight(projectID: UUID, taskID: UUID) async -> TaskWorkspacePreflightResult {
+        callCount += 1
+        guard !results.isEmpty else {
+            return .unavailable(reason: "script exhausted after \(callCount) calls")
+        }
+        if results.count == 1 {
+            return results[0]
+        }
+        return results.removeFirst()
+    }
+}
+
+/// Parmak izi sorgusunu kapıya alan sahte artık `FixedExecutionFingerprints`
+/// üzerinden `gate` ile kurulur; ek bir türe gerek yoktur.
+
+/// Kapanış bariyeri testi için gönderim portu: olay akışını test serbest
+/// bırakana kadar açık tutar, böylece gönderim görevi uçuşta kalır.
+actor HoldingDispatchPort: TaskRunningPort {
+    private struct HeldRun {
+        let taskID: UUID
+        let attemptID: UUID
+        let generation: Int
+        let continuation: AsyncStream<CodingAgentEvent>.Continuation
+    }
+
+    private(set) var startCount = 0
+    private(set) var cancelCount = 0
+    private var heldRuns: [UUID: HeldRun] = [:]
+
+    func start(
+        _ request: TaskRunRequest,
+        approvalResolver: @escaping TaskRunApprovalResolver
+    ) async throws -> TaskRunSession {
+        startCount += 1
+        let (stream, continuation) = AsyncStream<CodingAgentEvent>.makeStream()
+        continuation.yield(
+            CodingAgentEvent(
+                taskID: request.task.id,
+                attemptID: request.attempt.id,
+                generation: request.attempt.generation,
+                kind: .started
+            )
+        )
+        heldRuns[request.attempt.id] = HeldRun(
+            taskID: request.task.id,
+            attemptID: request.attempt.id,
+            generation: request.attempt.generation,
+            continuation: continuation
+        )
+        return HoldingRunSession(events: stream) { [weak self] in
+            await self?.recordCancel(attemptID: request.attempt.id)
+        }
+    }
+
+    private func recordCancel(attemptID: UUID) {
+        cancelCount += 1
+    }
+
+    /// Açık akışları terminal iptal olayıyla kapatır: gönderim görevi ancak
+    /// bundan sonra bitebilir.
+    func finishAll() {
+        for held in heldRuns.values {
+            held.continuation.yield(
+                CodingAgentEvent(
+                    taskID: held.taskID,
+                    attemptID: held.attemptID,
+                    generation: held.generation,
+                    kind: .interrupted("held dispatch released")
+                )
+            )
+            held.continuation.finish()
+        }
+        heldRuns = [:]
+    }
+}
+
+struct HoldingRunSession: TaskRunSession {
+    let events: AsyncStream<CodingAgentEvent>
+    let cancelHandler: @Sendable () async -> Void
+
+    func cancel() async {
+        await cancelHandler()
+    }
+}
+
+/// Provizyonu devrede tutan basit sahte: talep edilen çalışma alanı kaydını
+/// olduğu gibi teslim eder, gönderim kapısının gördüğü kimlikle birebir aynıdır.
+struct FixedProvisioning: TaskWorkspaceProvisioningPort {
+    let workspace: TaskWorkspaceDescriptor
+
+    func resolveBase(for task: CodingTask) async throws -> WorkspaceBase {
+        WorkspaceBase(commitSHA: "test-base")
+    }
+
+    func create(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord {
+        WorkspaceRecord(
+            workspaceID: workspace.workspaceID,
+            projectID: task.projectID,
+            taskID: task.id,
+            attemptID: attempt.id,
+            repositoryPath: workspace.repositoryPath,
+            workspacePath: workspace.workspacePath,
+            commonDirIdentity: "test-common-dir",
+            baseSHA: base.commitSHA,
+            nonce: UUID().uuidString,
+            createdAt: Date(timeIntervalSince1970: 0)
+        )
+    }
+
+    func discardUnclaimed(workspaceID: UUID, attemptID: UUID) async throws {}
 }
 
 struct FixedWorkspacePreflight: TaskWorkspacePreflightPort {
@@ -78,13 +213,22 @@ struct FixedAcceptanceEvidence: TaskAcceptanceEvidenceProviding {
 struct FixedExecutionFingerprints: TaskExecutionFingerprintProviding {
     let fingerprint: String
     let failure: Error?
+    let gate: AsyncGate?
 
     init(fingerprint: String, failure: Error? = nil) {
+        self.init(fingerprint: fingerprint, failure: failure, gate: nil)
+    }
+
+    init(fingerprint: String, failure: Error?, gate: AsyncGate?) {
         self.fingerprint = fingerprint
         self.failure = failure
+        self.gate = gate
     }
 
     func executionFingerprint(projectID: UUID, taskID: UUID) async throws -> String {
+        if let gate {
+            await gate.enter()
+        }
         if let failure {
             throw failure
         }
@@ -99,9 +243,22 @@ actor ServiceScriptedDispatchPort: TaskRunningPort {
     private(set) var requests: [TaskRunRequest] = []
     private var hangingContinuations: [UUID: AsyncStream<CodingAgentEvent>.Continuation] = [:]
     private let hangAfterStart: Bool
+    private var startGate: AsyncGate?
+    private var startFailure: Error?
 
     init(hangAfterStart: Bool = false) {
         self.hangAfterStart = hangAfterStart
+    }
+
+    /// `start` çağrısını kapıya alır: gönderim, çalıştırıcı başlamadan bekletilir.
+    func gateStart(_ gate: AsyncGate) {
+        startGate = gate
+    }
+
+    /// Bir sonraki `start` çağrısını verilen hatayla düşürür; zamanlayıcı bunu
+    /// `runtimeStartFailed` reddine çevirir.
+    func failNextStart(with error: Error) {
+        startFailure = error
     }
 
     func start(
@@ -110,6 +267,13 @@ actor ServiceScriptedDispatchPort: TaskRunningPort {
     ) async throws -> TaskRunSession {
         startCount += 1
         requests.append(request)
+        if let gate = startGate {
+            await gate.enter()
+        }
+        if let failure = startFailure {
+            startFailure = nil
+            throw failure
+        }
         let (stream, continuation) = AsyncStream<CodingAgentEvent>.makeStream()
         continuation.yield(
             CodingAgentEvent(
@@ -148,6 +312,15 @@ actor ServiceScriptedDispatchPort: TaskRunningPort {
             )
         )
         continuation.finish()
+    }
+
+    /// Asılı kalan koşuların akışını kapatır (test temizliği): gönderim döngüsü
+    /// terminal durumla biter, süreçte askıda görev kalmaz.
+    func finishHangingRuns() {
+        for continuation in hangingContinuations.values {
+            continuation.finish()
+        }
+        hangingContinuations = [:]
     }
 }
 
@@ -258,6 +431,7 @@ actor ServiceHookingRepository: CodingTaskRepository {
     private var nextTaskReadFailure: Error?
     private var nextAttemptHistoryFailure: Error?
     private var nextRepositoryLeaseFailure: TaskRepositoryError?
+    private var nextRecordApprovalFailure: TaskRepositoryError?
     private var snapshotCount = 0
     private var taskReadCount = 0
     private var createTaskCount = 0
@@ -302,6 +476,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func failNextRepositoryLease(with error: TaskRepositoryError) {
         nextRepositoryLeaseFailure = error
+    }
+
+    func failNextRecordApproval(with error: TaskRepositoryError) {
+        nextRecordApprovalFailure = error
     }
 
     func mutationCounts() -> RepositoryMutationCounts {
@@ -470,6 +648,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func recordApproval(_ approval: TaskApproval) async throws {
         recordApprovalCount += 1
+        if let failure = nextRecordApprovalFailure {
+            nextRecordApprovalFailure = nil
+            throw failure
+        }
         try await base.recordApproval(approval)
     }
 
@@ -549,7 +731,7 @@ final class ServiceTestHarness {
                 evidence: acceptanceEvidence,
                 currentFingerprint: currentFingerprint
             ),
-            executionFingerprints: FixedExecutionFingerprints(fingerprint: currentFingerprint),
+            executionFingerprints: FixedExecutionFingerprints(fingerprint: currentFingerprint, failure: nil, gate: nil),
             clock: clock,
             requiredSteps: requiredSteps,
             liveDispatchAvailable: false
@@ -1614,18 +1796,25 @@ final class CodingTaskServiceTests: XCTestCase {
 
     private func makeDispatchService(
         port: ServiceScriptedDispatchPort,
+        providers: ScriptedProviderRegistry,
+        workspaces: any TaskWorkspacePreflightPort,
+        clock: ServiceTestClock,
         fingerprint: String,
-        fingerprintFailure: Error?
-    ) async throws -> (store: SQLiteTaskStore, scheduler: TaskScheduler, service: CodingTaskService, project: CodingProject) {
+        fingerprintFailure: Error?,
+        fingerprintGate: AsyncGate?
+    ) async throws -> (
+        store: SQLiteTaskStore,
+        repository: ServiceHookingRepository,
+        scheduler: TaskScheduler,
+        service: CodingTaskService,
+        project: CodingProject
+    ) {
         let store = try SQLiteTaskStore.inMemory()
         let repository = ServiceHookingRepository(base: store)
-        let clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
-        let providers = ScriptedProviderRegistry(result: .eligible(runtimeID: "runtime-1", modelID: "model-1"))
-        let workspace = TaskBoardServiceFixtures.ownedWorkspace
         let scheduler = TaskScheduler(
             repository: repository,
             providers: providers,
-            workspaces: FixedWorkspacePreflight(result: .owned(workspace)),
+            workspaces: workspaces,
             verifier: FixedVerifier(passed: true),
             clock: clock,
             schedulerID: "scheduler-dispatch-service",
@@ -1648,7 +1837,8 @@ final class CodingTaskServiceTests: XCTestCase {
             acceptanceEvidence: FixedAcceptanceEvidence(evidence: [], currentFingerprint: fingerprint),
             executionFingerprints: FixedExecutionFingerprints(
                 fingerprint: fingerprint,
-                failure: fingerprintFailure
+                failure: fingerprintFailure,
+                gate: fingerprintGate
             ),
             clock: clock,
             requiredSteps: [],
@@ -1656,16 +1846,32 @@ final class CodingTaskServiceTests: XCTestCase {
         )
         let project = try await service.createProject(
             name: "Dispatch",
-            repositoryPath: workspace.repositoryPath,
+            repositoryPath: TaskBoardServiceFixtures.ownedWorkspace.repositoryPath,
             gitIdentity: "dev@example.com",
             protectedRefs: ["main"]
         )
-        return (store, scheduler, service, project)
+        return (store, repository, scheduler, service, project)
+    }
+
+    private func makeEligibleProviders() -> ScriptedProviderRegistry {
+        ScriptedProviderRegistry(result: .eligible(runtimeID: "runtime-1", modelID: "model-1"))
+    }
+
+    private func makeOwnedPreflight() -> FixedWorkspacePreflight {
+        FixedWorkspacePreflight(result: .owned(TaskBoardServiceFixtures.ownedWorkspace))
     }
 
     func testStartRunRequiresAHumanActorBeforeAnyClaim() async throws {
         let port = ServiceScriptedDispatchPort()
-        let fixture = try await makeDispatchService(port: port, fingerprint: "fingerprint-live", fingerprintFailure: nil)
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
         _ = try await fixture.service.createTask(
             projectID: fixture.project.id,
             title: "Live",
@@ -1706,7 +1912,15 @@ final class CodingTaskServiceTests: XCTestCase {
 
     func testStartRunRecordsExecuteApprovalBoundToAttemptAndFingerprint() async throws {
         let port = ServiceScriptedDispatchPort()
-        let fixture = try await makeDispatchService(port: port, fingerprint: "fingerprint-live", fingerprintFailure: nil)
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
         _ = try await fixture.service.createTask(
             projectID: fixture.project.id,
             title: "Live",
@@ -1758,11 +1972,15 @@ final class CodingTaskServiceTests: XCTestCase {
         let port = ServiceScriptedDispatchPort()
         let fixture = try await makeDispatchService(
             port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
             fingerprint: "unused",
             fingerprintFailure: TaskExecutionFingerprintError.fingerprintUnavailable(
                 taskID: UUID(),
                 workspacePath: "/tmp/workspace"
-            )
+            ),
+            fingerprintGate: nil
         )
         _ = try await fixture.service.createTask(
             projectID: fixture.project.id,
@@ -1795,6 +2013,391 @@ final class CodingTaskServiceTests: XCTestCase {
         let reloaded = try await fixture.store.task(id: fingerprintTask.id)
         XCTAssertEqual(reloaded?.status, .blocked)
         XCTAssertEqual(reloaded?.blockReason, .custom(TaskScheduler.stoppedBlockReason))
+    }
+
+    // MARK: - Talep sonrası gönderim redleri (fenced geri çekme)
+
+    /// Talep alındıktan sonra gönderim reddedilirse deneme `.running` olarak
+    /// asılı kalamaz: tam kimliğiyle emekliye ayrılır ve görev bloke olur.
+    private func assertClaimRetired(
+        taskID: UUID,
+        store: SQLiteTaskStore,
+        port: ServiceScriptedDispatchPort,
+        expectedStartCount: Int
+    ) async throws {
+        let history = try await store.attemptHistory(taskID: taskID)
+        XCTAssertEqual(
+            history.map(\.outcome),
+            [.cancelled],
+            "The refused claim must end cancelled instead of stranding in progress"
+        )
+        let reloaded = try await store.task(id: taskID)
+        XCTAssertEqual(reloaded?.status, .blocked)
+        XCTAssertEqual(reloaded?.blockReason, .custom(TaskScheduler.stoppedBlockReason))
+        let startCount = await port.startCount
+        XCTAssertEqual(startCount, expectedStartCount, "Only the expected runtime starts may occur")
+    }
+
+    func testDispatchWorkspaceNotOwnedRefusalRetiresTheClaim() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let owned = TaskBoardServiceFixtures.ownedWorkspace
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: ScriptedWorkspacePreflight(results: [
+                .owned(owned),
+                .notOwned(reason: "workspace disappeared"),
+            ]),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+
+        let result = try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com")
+        guard case .claimed = result else {
+            return XCTFail("Expected a claim, got \(result)")
+        }
+        await fixture.service.awaitDispatchedRuns()
+        try await assertClaimRetired(taskID: task.id, store: fixture.store, port: port, expectedStartCount: 0)
+    }
+
+    func testDispatchWorkspaceIdentityMismatchRefusalRetiresTheClaim() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let owned = TaskBoardServiceFixtures.ownedWorkspace
+        let foreignWorkspace = TaskWorkspaceDescriptor(
+            workspaceID: UUID(),
+            workspacePath: owned.workspacePath,
+            repositoryPath: owned.repositoryPath
+        )
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: ScriptedWorkspacePreflight(results: [
+                .owned(owned),
+                .owned(foreignWorkspace),
+            ]),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+
+        let result = try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com")
+        guard case .claimed = result else {
+            return XCTFail("Expected a claim, got \(result)")
+        }
+        await fixture.service.awaitDispatchedRuns()
+        try await assertClaimRetired(taskID: task.id, store: fixture.store, port: port, expectedStartCount: 0)
+    }
+
+    func testDispatchProviderNotEligibleRefusalRetiresTheClaim() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let providers = makeEligibleProviders()
+        let gate = AsyncGate()
+        await providers.gateCandidates(gate, fromCall: 3)
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: providers,
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+
+        let result = try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com")
+        guard case .claimed = result else {
+            return XCTFail("Expected a claim, got \(result)")
+        }
+        await gate.waitUntilEntered()
+        await providers.setResult(.unsupported(missingCapabilities: ["tools"]))
+        await gate.release()
+        await fixture.service.awaitDispatchedRuns()
+        try await assertClaimRetired(taskID: task.id, store: fixture.store, port: port, expectedStartCount: 0)
+    }
+
+    func testDispatchBudgetRefusalRetiresTheClaim() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let providers = makeEligibleProviders()
+        let gate = AsyncGate()
+        await providers.gateCandidates(gate, fromCall: 3)
+        let clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: providers,
+            workspaces: makeOwnedPreflight(),
+            clock: clock,
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+
+        let result = try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com")
+        guard case .claimed = result else {
+            return XCTFail("Expected a claim, got \(result)")
+        }
+        await gate.waitUntilEntered()
+        clock.advance(by: TimeInterval(task.budget.maxTaskDurationSeconds + 60))
+        await gate.release()
+        await fixture.service.awaitDispatchedRuns()
+        try await assertClaimRetired(taskID: task.id, store: fixture.store, port: port, expectedStartCount: 0)
+    }
+
+    /// Koşu yuvasını başka bir gönderim tutarken gelen `dispatchAlreadyActive`
+    /// reddi de denemeyi emekliye ayırır; gönderim çağrısı başlamış olsa bile
+    /// görev asılı kalmaz.
+    func testDispatchAlreadyActiveRefusalRetiresTheClaim() async throws {
+        let port = ServiceScriptedDispatchPort(hangAfterStart: true)
+        let fingerprintGate = AsyncGate()
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: fingerprintGate
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+
+        let start = Task { try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com") }
+        await fingerprintGate.waitUntilEntered()
+
+        // Talep alındı; aynı deneme için koşu yuvasını yabancı bir gönderim tutuyor.
+        let claimedHistory = try await fixture.store.attemptHistory(taskID: task.id)
+        let claimed = try XCTUnwrap(claimedHistory.first)
+        try await fixture.store.recordApproval(
+            TaskApproval(
+                id: UUID(),
+                taskID: task.id,
+                attemptID: claimed.id,
+                fingerprint: "fingerprint-live",
+                actor: "foreign@example.com",
+                timestamp: TaskBoardServiceFixtures.startDate,
+                action: .executeRecipe
+            )
+        )
+        let occupyingRun = Task {
+            _ = try? await fixture.scheduler.dispatch(
+                taskID: task.id,
+                attemptID: claimed.id,
+                generation: claimed.generation,
+                fingerprint: "fingerprint-live"
+            )
+        }
+        try await waitForDispatchStart(port, count: 1)
+
+        await fingerprintGate.release()
+        guard case .claimed = try await start.value else {
+            return XCTFail("Expected the fenced startRun to still claim its attempt")
+        }
+        await fixture.service.awaitDispatchedRuns()
+        try await assertClaimRetired(taskID: task.id, store: fixture.store, port: port, expectedStartCount: 1)
+        // Temizlik: yabancı gönderimi kapat, askıda görev bırakma.
+        await port.finishHangingRuns()
+        await occupyingRun.value
+    }
+
+    /// Bayat bir çalıştırıcı-başlatma hatası, kendisinden sonra talep edilmiş
+    /// daha yeni bir denemeyi asla iptal etmemeli: geri çekme kimlikle çitlenir.
+    func testStaleRuntimeStartFailureDoesNotCancelANewerAttempt() async throws {
+        struct DispatchStartFailure: Error {}
+
+        let port = ServiceScriptedDispatchPort()
+        let startGate = AsyncGate()
+        await port.gateStart(startGate)
+        await port.failNextStart(with: DispatchStartFailure())
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+
+        let first = try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com")
+        guard case .claimed(let firstAttemptID, let firstGeneration) = first else {
+            return XCTFail("Expected the first claim, got \(first)")
+        }
+        await startGate.waitUntilEntered()
+
+        let second = try await fixture.service.retry(
+            taskID: task.id,
+            expectedActiveAttemptID: firstAttemptID,
+            expectedActiveGeneration: firstGeneration
+        )
+        guard case .claimed(let secondAttemptID, _) = second.disposition else {
+            return XCTFail("Expected a newer claim, got \(second)")
+        }
+
+        await startGate.release()
+        await fixture.service.awaitDispatchedRuns()
+
+        let history = try await fixture.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.id), [firstAttemptID, secondAttemptID])
+        XCTAssertEqual(history.map(\.outcome), [.cancelled, .inProgress])
+        let reloaded = try await fixture.store.task(id: task.id)
+        XCTAssertEqual(reloaded?.status, .running, "The stale runtime-start failure must not stop the newer attempt")
+        XCTAssertEqual(reloaded?.currentAttemptID, secondAttemptID)
+        let startCount = await port.startCount
+        XCTAssertEqual(startCount, 1, "The runtime start was attempted exactly once")
+    }
+
+    /// Onay kaydı düşerse talep edilmiş deneme yine de tam kimliğiyle geri
+    /// çekilir; hata çağırana açıkça döner.
+    func testStartRunRetiresTheClaimWhenApprovalCannotBeRecorded() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil
+        )
+        let task = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+        await fixture.repository.failNextRecordApproval(with: .underlying("disk full"))
+
+        do {
+            _ = try await fixture.service.startRun(taskID: task.id, expectedVersion: task.version, actor: "human@example.com")
+            XCTFail("A failed approval record must refuse the run")
+        } catch let error as CodingTaskServiceError {
+            XCTAssertEqual(error, .persistence(.underlying("disk full")))
+        }
+        try await assertClaimRetired(taskID: task.id, store: fixture.store, port: port, expectedStartCount: 0)
+    }
+
+    /// Kapanış bariyeri: uçuştaki gönderim görevi bitmeden mağaza kapanmaz.
+    ///
+    /// Gönderim portu olay akışını test serbest bırakana kadar açık tutar;
+    /// `shutdown` bu sırada mağazayı kapatırsa okuma `readOnly("Store is closed")`
+    /// ile düşerdi. Bariyer çalışırken mağaza açık kalır, akış kapatılınca
+    /// `shutdown` tamamlanır ve mağaza kapanır.
+    @MainActor
+    func testShutdownAwaitsInFlightDispatchBeforeClosingTheStore() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
+        let workspace = TaskBoardServiceFixtures.ownedWorkspace
+        let port = HoldingDispatchPort()
+        let composition = TaskBoardComposition.make(
+            repository: store,
+            providers: makeEligibleProviders(),
+            workspacePreflight: FixedWorkspacePreflight(result: .owned(workspace)),
+            provisioning: FixedProvisioning(workspace: workspace),
+            dispatchPort: port,
+            recoveryProviders: NoProviderSessions(),
+            recoveryWorkspaces: NoWorkspaceOwnership(),
+            recoveryProcesses: NoProcesses(),
+            verifier: FixedVerifier(passed: true),
+            acceptanceEvidence: FixedAcceptanceEvidence(evidence: [], currentFingerprint: "fingerprint-live"),
+            executionFingerprints: FixedExecutionFingerprints(fingerprint: "fingerprint-live", failure: nil, gate: nil),
+            clock: clock,
+            schedulerID: "scheduler-shutdown-barrier",
+            recoveryID: "recovery-shutdown-barrier",
+            requiredSteps: []
+        )
+        let project = try await composition.service.createProject(
+            name: "Shutdown",
+            repositoryPath: workspace.repositoryPath,
+            gitIdentity: "dev@example.com",
+            protectedRefs: ["main"]
+        )
+        composition.register(projectID: project.id)
+        let task = try await composition.service.createTask(
+            projectID: project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+        let result = try await composition.service.startRun(
+            taskID: task.id,
+            expectedVersion: task.version,
+            actor: "human@example.com"
+        )
+        guard case .claimed = result else {
+            return XCTFail("Expected a claim, got \(result)")
+        }
+        try await waitUntilMainActor { await port.startCount >= 1 }
+
+        let shutdown = Task { await composition.shutdown() }
+        try await waitUntilMainActor { await port.cancelCount >= 1 }
+        try await Task.sleep(for: .milliseconds(250))
+
+        // Bariyer olmasaydı `shutdown` bu noktada mağazayı çoktan kapatmış olurdu.
+        var storeOpenWhileRunIsHeld = false
+        do {
+            _ = try await store.task(id: task.id)
+            storeOpenWhileRunIsHeld = true
+        } catch {
+            storeOpenWhileRunIsHeld = false
+        }
+        XCTAssertTrue(
+            storeOpenWhileRunIsHeld,
+            "shutdown must await the in-flight dispatch task before closing the store"
+        )
+
+        await port.finishAll()
+        await shutdown.value
+
+        var storeClosedAfterShutdown = false
+        do {
+            _ = try await store.task(id: task.id)
+        } catch {
+            storeClosedAfterShutdown = true
+        }
+        XCTAssertTrue(storeClosedAfterShutdown, "shutdown must close the store once the barrier completes")
     }
 
     // MARK: - Kabul ölçütü tamamlama
@@ -1928,6 +2531,19 @@ final class CodingTaskServiceTests: XCTestCase {
     }
 
     private func waitUntil(timeout: TimeInterval = 5, _ condition: @escaping () async -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Condition was not met before timeout")
+    }
+
+    /// MainActor testleri için bekçi: koşul kapanışı da MainActor'a izole kalır.
+    @MainActor
+    private func waitUntilMainActor(timeout: TimeInterval = 5, _ condition: @escaping @MainActor () async -> Bool) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if await condition() {

@@ -3,6 +3,42 @@ import XCTest
 
 @testable import AgenticSidebar
 
+/// E2E ön koşul eksikliği: yalnızca gerçekten eksik ortam bu hatayla temsil
+/// edilir (OpenCode ikilisi yok, sunucu ayağa kalkmadı, sağlayıcı/model
+/// yetkilendirmesi yok, geçici mağaza açılamadı). Gönderim reddi ya da akış
+/// ihlali bu tiple asla temsil edilmez.
+struct E2EPreconditionFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+/// Gerçek koşu sırasında oluşan başarısızlık: atlanmaz, test başarısız olur.
+struct E2EFlowFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+/// E2E hatasının dürüst sonucu: ortam eksikliği atlanır, her akış hatası testi
+/// başarısız kılar. Sınıflandırma saf tutulur; gerçek E2E koşusu olmadan
+/// birim testiyle sabitlenebilir.
+enum E2EFailureDisposition: Equatable, Sendable {
+    case skip(reason: String)
+    case fail(reason: String)
+}
+
+enum E2EFailureClassifier {
+    /// Tip sözleşmesi belirleyicidir: akış hatası her zaman başarısızlıktır,
+    /// ön koşul hatası atlanır, tip dışı her hata başarısızlıktır. Böylece bir
+    /// gönderim reddi ya da düzenleme üretmeyen koşu asla `XCTSkip`'e dönüşemez.
+    static func disposition(for error: Error) -> E2EFailureDisposition {
+        if let flowFailure = error as? E2EFlowFailure {
+            return .fail(reason: flowFailure.description)
+        }
+        if let preconditionFailure = error as? E2EPreconditionFailure {
+            return .skip(reason: preconditionFailure.description)
+        }
+        return .fail(reason: String(describing: error))
+    }
+}
+
 /// Gerçek OpenCode E2E koşusu; varsayılan olarak kapalıdır.
 ///
 /// `RUN_OPENCODE_E2E=1` verilmedikçe atlanır. Koşu, kullanıcının kendi kopyasına
@@ -11,16 +47,6 @@ import XCTest
 /// sunucusu). Ön koşullardan biri (ikili, sağlayıcı/model yetkilendirmesi, sunucu
 /// başlangıcı) yoksa test bunu gerekçesiyle atlar; başarı asla taklit edilmez.
 final class OpenCodeLiveEndToEndTests: XCTestCase {
-
-    /// Ön koşul eksikliği: test atlanır ve gerekçe dürüstçe raporlanır.
-    private struct E2EPreconditionFailure: Error, CustomStringConvertible {
-        let description: String
-    }
-
-    /// Gerçek koşu sırasında oluşan başarısızlık: atlanmaz, test başarısız olur.
-    private struct E2EFlowFailure: Error, CustomStringConvertible {
-        let description: String
-    }
 
     private struct E2EStack {
         let composition: TaskBoardComposition
@@ -142,23 +168,76 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
 
             try await runHappyPath(stack: stack, candidates: candidates, worktreeURL: worktreeURL)
             try await exerciseCancellation(stack: stack)
-        } catch let failure as E2EPreconditionFailure {
-            // Ön koşul eksikliği başarı sayılmaz; durum açıkça raporlanır.
-            print("E2E result: prerequisite-blocked (\(failure.description))")
-            await serverManager.stop()
-            throw XCTSkip("OpenCode E2E prerequisite failed: \(failure.description)")
         } catch {
-            print("E2E result: failed (\(error))")
+            // Dürüst sonuç: yalnızca gerçekten eksik ortam atlanır; gönderim
+            // reddi, düzenleme/terminal üretmeyen koşu ve tüm adayların gerçek
+            // denemeden sonra düşmesi testi başarısız kılar.
+            let disposition = E2EFailureClassifier.disposition(for: error)
+            switch disposition {
+            case .skip(let reason):
+                print("E2E result: prerequisite-blocked (\(reason))")
+            case .fail(let reason):
+                print("E2E result: failed (\(reason))")
+            }
             if let stack {
                 await cleanup(stack: stack)
             } else {
                 await serverManager.stop()
             }
-            throw error
+            switch disposition {
+            case .skip(let reason):
+                throw XCTSkip("OpenCode E2E prerequisite failed: \(reason)")
+            case .fail(let reason):
+                XCTFail("OpenCode E2E flow failed: \(reason)")
+                return
+            }
         }
 
         if let stack {
             await cleanup(stack: stack)
+        }
+    }
+
+    // MARK: - Sınıflandırma sözleşmesi
+
+    /// Gerçek koşu olmadan sabitlenen sözleşme: yalnızca ön koşul (ortam
+    /// eksikliği) atlanır; gönderim reddi, akış hatası ve tip dışı her hata
+    /// testi başarısız kılar.
+    func testFailureClassifierSkipsOnlyMissingEnvironmentAndFailsFlowProblems() {
+        XCTAssertEqual(
+            E2EFailureClassifier.disposition(
+                for: E2EPreconditionFailure(description: "opencode executable resolution is missing")
+            ),
+            .skip(reason: "opencode executable resolution is missing")
+        )
+        XCTAssertEqual(
+            E2EFailureClassifier.disposition(
+                for: E2EPreconditionFailure(description: "no authenticated provider/model is available")
+            ),
+            .skip(reason: "no authenticated provider/model is available")
+        )
+        XCTAssertEqual(
+            E2EFailureClassifier.disposition(
+                for: E2EFlowFailure(description: "startRun did not claim an attempt: deferred(activeAttempt)")
+            ),
+            .fail(reason: "startRun did not claim an attempt: deferred(activeAttempt)")
+        )
+        XCTAssertEqual(
+            E2EFailureClassifier.disposition(
+                for: E2EFlowFailure(description: "no discovered model completed the real flow; attempts: model=a")
+            ),
+            .fail(reason: "no discovered model completed the real flow; attempts: model=a")
+        )
+        guard
+            case .fail(let refusalReason) = E2EFailureClassifier.disposition(
+                for: TaskDispatchRefusal.budgetExhausted(taskID: UUID(), reason: "timeBudgetExhausted")
+            )
+        else {
+            return XCTFail("A dispatch refusal must never be classified as a skip")
+        }
+        XCTAssertTrue(refusalReason.contains("timeBudgetExhausted"))
+        guard case .fail = E2EFailureClassifier.disposition(for: NSError(domain: "e2e", code: 1)) else {
+            return XCTFail("An untyped failure must never be classified as a skip")
         }
     }
 
@@ -196,7 +275,7 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
                 actor: "e2e-human"
             )
             guard case .claimed(let attemptID, _) = startResult else {
-                throw E2EPreconditionFailure(description: "startRun did not claim an attempt: \(startResult)")
+                throw E2EFlowFailure(description: "startRun did not claim an attempt: \(startResult)")
             }
             print(
                 "E2E dispatch: model=\(candidate.id.rawValue) task=\(task.id.uuidString) attempt=\(attemptID.uuidString) started"
@@ -239,7 +318,7 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
             candidateFailures.append(reason)
             print("E2E candidate failed, trying next: \(reason)")
         }
-        throw E2EPreconditionFailure(
+        throw E2EFlowFailure(
             description: "no discovered model completed the real flow; attempts: " + candidateFailures.joined(separator: " || ")
         )
     }
@@ -371,7 +450,7 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
             actor: "e2e-human"
         )
         guard case .claimed(let attemptID, _) = startResult else {
-            throw E2EPreconditionFailure(description: "cancellation run did not claim an attempt: \(startResult)")
+            throw E2EFlowFailure(description: "cancellation run did not claim an attempt: \(startResult)")
         }
         let startedBefore = await stack.counter.count(named: "started")
         try await waitUntil(timeout: 120) {

@@ -609,6 +609,11 @@ final class TaskBoardComposition {
                 )
             }
         }
+        // Bariyer mağaza kapanışından önce gelir: uçuştaki gönderim görevi
+        // kapalı mağazaya yazamaz. Sıra kasıtlıdır — önce koşan denemeler
+        // durdurulur, sonra gönderim görevleri beklenir, en son mağaza kapanır.
+        // OpenCode sunucu yaşam döngüsü bu yola dahil değildir.
+        await service.awaitDispatchedRuns()
         await repository.close()
     }
 }

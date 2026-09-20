@@ -362,11 +362,12 @@ actor CodingTaskService {
     /// Sıra: sağlayıcı uygunluğu → deneme talebi (çalışma alanı bu adımda doğar) →
     /// güncel içerik parmak izi → insan `executeRecipe` onayı → gönderim. Parmak
     /// izi alınamazsa onay uydurulmaz; talep edilmiş deneme geri çekilir ve açık
-    /// bir hata döner. Gönderim, eylem dönmeden önce arka planda başlar; koşunun
-    /// sonucu panoya bir sonraki yenilemede yansır ve `stop` onu iptal eder.
+    /// bir hata döner. Gönderim, dışlama kilidi bırakıldıktan sonra arka planda
+    /// başlar; koşunun sonucu panoya bir sonraki yenilemede yansır ve `stop` onu
+    /// iptal eder.
     @discardableResult
     func startRun(taskID: UUID, expectedVersion: Int, actor: String) async throws -> CodingTaskStartResult {
-        try await withExclusiveTaskAction(taskID: taskID) {
+        let outcome = try await withExclusiveTaskAction(taskID: taskID) { () async throws -> StartRunOutcome in
             guard self.liveDispatchAvailable else {
                 throw CodingTaskServiceError.liveDispatchUnavailable(taskID: taskID)
             }
@@ -377,15 +378,15 @@ actor CodingTaskService {
                 throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
             }
             guard task.currentAttemptID == nil else {
-                return .deferred(reason: "activeAttempt")
+                return .resolved(.deferred(reason: "activeAttempt"))
             }
 
             let stage: TaskStage = task.status == .backlog ? .plan : task.stage
             switch await self.providers.candidate(for: task, stage: stage) {
             case .unsupported(let missingCapabilities):
-                return .unavailable(.unsupported(missingCapabilities: missingCapabilities))
+                return .resolved(.unavailable(.unsupported(missingCapabilities: missingCapabilities)))
             case .unavailable(let reason):
-                return .unavailable(.providerUnavailable(reason: reason))
+                return .resolved(.unavailable(.providerUnavailable(reason: reason)))
             case .eligible:
                 break
             }
@@ -394,7 +395,7 @@ actor CodingTaskService {
                 try await self.scheduler.retry(taskID: taskID, expectedAttemptID: nil, expectedGeneration: nil)
             }
             guard case .claimed(let attemptID, let generation) = entry.disposition else {
-                return Self.startResult(from: entry)
+                return .resolved(Self.startResult(from: entry))
             }
 
             let fingerprint: String
@@ -405,8 +406,8 @@ actor CodingTaskService {
                 )
             } catch {
                 // Onaysız koşu başlamaz; talep edilmiş deneme arkada kalmasın diye
-                // açıkça durdurulur ve hata olduğu gibi yüzeye çıkar.
-                try? await self.mapped { try await self.scheduler.stop(taskID: taskID) }
+                // tam kimliğiyle geri çekilir ve hata olduğu gibi yüzeye çıkar.
+                await self.retireClaimedAttemptIfCurrent(taskID: taskID, attemptID: attemptID, generation: generation)
                 throw CodingTaskServiceError.executionFingerprintUnavailable(
                     taskID: taskID,
                     reason: String(describing: error)
@@ -422,19 +423,90 @@ actor CodingTaskService {
                 timestamp: self.clock.now(),
                 action: .executeRecipe
             )
-            try await self.mapped { try await self.repository.recordApproval(approval) }
+            do {
+                try await self.mapped { try await self.repository.recordApproval(approval) }
+            } catch {
+                // Onay kaydı düşerse talep edilmiş deneme `.running` olarak asılı
+                // kalamaz: tam kimliğiyle geri çekilir ve hata yüzeye çıkar.
+                await self.retireClaimedAttemptIfCurrent(taskID: taskID, attemptID: attemptID, generation: generation)
+                throw error
+            }
+            return .dispatch(attemptID: attemptID, generation: generation, fingerprint: fingerprint)
+        }
+
+        switch outcome {
+        case .resolved(let result):
+            return result
+        case .dispatch(let attemptID, let generation, let fingerprint):
+            // Gönderim dışlama kilidinin dışında başlar: arka plan hatasının
+            // fenced geri çekmesi kilit yüzünden reddedilmez.
             await self.dispatch(attempt: attemptID, generation: generation, fingerprint: fingerprint, taskID: taskID)
             return .claimed(attemptID: attemptID, generation: generation)
+        }
+    }
+
+    /// `startRun` eyleminin dışlama kilidi içindeki sonucu.
+    private enum StartRunOutcome {
+        case resolved(CodingTaskStartResult)
+        case dispatch(attemptID: UUID, generation: Int, fingerprint: String)
+    }
+
+    /// Gönderim reddinde veya onay kaydı hatasında, yalnızca hâlâ geçerli olan
+    /// talep edilmiş denemeyi geri çeker; bayat bir hata yeni bir denemeyi asla
+    /// durduramaz.
+    ///
+    /// Dışlama kilidi, kimlik kontrolü ile durdurma arasına başka bir servis
+    /// eyleminin girmesini engeller; kimlik uyuşmuyorsa hiçbir şey durdurulmaz.
+    private func retireClaimedAttempt(taskID: UUID, attemptID: UUID, generation: Int, reason: String) async {
+        do {
+            try await withExclusiveTaskAction(taskID: taskID) {
+                await self.retireClaimedAttemptIfCurrent(taskID: taskID, attemptID: attemptID, generation: generation)
+            }
+        } catch {
+            AppLog.lifecycle.error(
+                "Could not retire claim of task \(taskID.uuidString, privacy: .public) attempt \(attemptID.uuidString, privacy: .public) after dispatch refusal (\(reason, privacy: .public)): \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
+    /// Çağıran dışlamayı zaten tutuyorsa kullanılan iç geri çekme.
+    ///
+    /// Deneme kimliği ve nesli eşleşmiyorsa hiçbir şey durdurulmaz; eşleşiyorsa
+    /// `scheduler.stop` o anda aktif olan bu denemeyi emekliye ayırır.
+    private func retireClaimedAttemptIfCurrent(taskID: UUID, attemptID: UUID, generation: Int) async {
+        do {
+            guard
+                let active = try await self.activeAttempt(taskID: taskID),
+                active.id == attemptID,
+                active.generation == generation
+            else {
+                AppLog.lifecycle.info(
+                    "Skipped retiring claim of task \(taskID.uuidString, privacy: .public): attempt \(attemptID.uuidString, privacy: .public)/gen \(generation) is no longer current"
+                )
+                return
+            }
+            try await self.mapped { try await self.scheduler.stop(taskID: taskID) }
+        } catch {
+            AppLog.lifecycle.error(
+                "Retiring claim of task \(taskID.uuidString, privacy: .public) attempt \(attemptID.uuidString, privacy: .public) failed: \(String(describing: error), privacy: .public)"
+            )
         }
     }
 
     /// Gönderimi sahipli bir arka plan görevinde sürer; sonuç panoyu yeniden
     /// yükleyerek görünür olur. Başlatma kapıları (onay, sahiplik, kimlik,
     /// bütçe) zamanlayıcının içindedir; burada yalnızca yaşam döngüsü tutulur.
+    ///
+    /// Her gönderim hatası (çalıştırıcı başlayamadı, sahiplik/kimlik reddi,
+    /// sağlayıcı uygun değil, bütçe tükendi, koşu zaten aktif) loglanır ve
+    /// talep edilmiş deneme yalnızca kimliği hâlâ geçerliyse fenced bir geri
+    /// çekmeyle emekliye ayrılır; bayat bir hata daha yeni bir denemeyi
+    /// durduramaz.
     private func dispatch(attempt attemptID: UUID, generation: Int, fingerprint: String, taskID: UUID) async {
-        let handle = Task { [scheduler] in
+        let handle = Task { [weak self] in
+            guard let self else { return }
             do {
-                _ = try await scheduler.dispatch(
+                _ = try await self.scheduler.dispatch(
                     taskID: taskID,
                     attemptID: attemptID,
                     generation: generation,
@@ -444,12 +516,12 @@ actor CodingTaskService {
                 AppLog.lifecycle.error(
                     "Live dispatch for task \(taskID.uuidString, privacy: .public) attempt \(attemptID.uuidString, privacy: .public) failed: \(String(describing: error), privacy: .public)"
                 )
-                // Yalnızca çalıştırıcı hiç başlayamadıysa deneme geri çekilir:
-                // kimlik/bütçe redleri denemenin başka bir yolla emekliye
-                // ayrıldığını gösterir ve yeni bir denemeyi durdurmak yanlış olur.
-                if case TaskDispatchRefusal.runtimeStartFailed = error {
-                    try? await scheduler.stop(taskID: taskID)
-                }
+                await self.retireClaimedAttempt(
+                    taskID: taskID,
+                    attemptID: attemptID,
+                    generation: generation,
+                    reason: String(describing: error)
+                )
             }
         }
         dispatchedRuns[taskID] = handle
