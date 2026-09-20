@@ -191,6 +191,12 @@ actor TaskRecovery {
     /// workspace or proved process owns it. Anything else is blocked for uncertain execution
     /// and surfaced for an explicit human choice.
     ///
+    /// Launch-phase precondition (plan revision 2026-09-19, user-approved): this pass must
+    /// run at launch, before the scheduler processes any turn, and is never invoked
+    /// concurrently with live attempts. The heal path cannot distinguish a queued-but-unclaimed
+    /// attempt from a stranded one, so racing it against a scheduler turn could settle work
+    /// that is only between workspace creation and its claim.
+    ///
     /// Passes are single-flight: while one pass is suspended at a port, a concurrent call
     /// does not interleave with it and instead returns a deterministic busy report whose
     /// per-task dispositions are `noAction` and whose failure names the busy state.

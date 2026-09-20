@@ -522,6 +522,27 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertEqual(store.cards.first { $0.id == task.id }?.status, .running)
     }
 
+    func testSelectingNewTaskClearsPreviousDetailLoadFailure() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let first = try await seedTask(harness: harness, projectID: project.id, title: "First", priority: 9, criteria: [])
+        let second = try await seedTask(harness: harness, projectID: project.id, title: "Second", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        await harness.repository.failNextAttemptHistory(with: .underlying("history unavailable"))
+        await store.selectTask(first.id)
+        XCTAssertEqual(store.selectedTaskID, first.id)
+        XCTAssertNotNil(store.lastFailure)
+
+        await store.selectTask(second.id)
+        XCTAssertEqual(store.selectedTaskID, second.id)
+        XCTAssertNil(store.lastFailure, "A previous task's load failure must not leak onto the newly selected task")
+    }
+
     func testRefreshFailureSurfacesInPhaseWithoutCrashingBoard() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()

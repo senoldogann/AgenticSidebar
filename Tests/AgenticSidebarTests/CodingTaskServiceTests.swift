@@ -22,6 +22,7 @@ final class ServiceTestClock: TaskSchedulerClock, @unchecked Sendable {
 
 actor ScriptedProviderRegistry: TaskProviderRegistryPort {
     private var result: TaskProviderCandidate
+    private var gatedCandidates: AsyncGate?
     private(set) var callCount = 0
 
     init(result: TaskProviderCandidate) {
@@ -32,8 +33,15 @@ actor ScriptedProviderRegistry: TaskProviderRegistryPort {
         self.result = result
     }
 
+    func gateCandidates(_ gate: AsyncGate) {
+        gatedCandidates = gate
+    }
+
     func candidate(for task: CodingTask, stage: TaskStage) async -> TaskProviderCandidate {
         callCount += 1
+        if let gate = gatedCandidates {
+            await gate.enter()
+        }
         return result
     }
 }
@@ -163,6 +171,7 @@ actor ServiceHookingRepository: CodingTaskRepository {
     private var nextSnapshotFailure: TaskRepositoryError?
     private var nextTransitionFailure: TaskRepositoryError?
     private var nextTaskReadFailure: Error?
+    private var nextAttemptHistoryFailure: Error?
     private var nextRepositoryLeaseFailure: TaskRepositoryError?
     private var snapshotCount = 0
     private var taskReadCount = 0
@@ -200,6 +209,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func failNextTaskRead(with error: Error) {
         nextTaskReadFailure = error
+    }
+
+    func failNextAttemptHistory(with error: TaskRepositoryError) {
+        nextAttemptHistoryFailure = error
     }
 
     func failNextRepositoryLease(with error: TaskRepositoryError) {
@@ -255,7 +268,11 @@ actor ServiceHookingRepository: CodingTaskRepository {
     }
 
     func attemptHistory(taskID: UUID) async throws -> [TaskAttempt] {
-        try await base.attemptHistory(taskID: taskID)
+        if let failure = nextAttemptHistoryFailure {
+            nextAttemptHistoryFailure = nil
+            throw failure
+        }
+        return try await base.attemptHistory(taskID: taskID)
     }
 
     func transition(
@@ -410,7 +427,8 @@ final class ServiceTestHarness {
             workspaces: FixedWorkspacePreflight(result: workspace),
             verifier: FixedVerifier(passed: true),
             clock: clock,
-            schedulerID: "scheduler-test"
+            schedulerID: "scheduler-test",
+            provisioning: nil
         )
     }
 
@@ -877,6 +895,59 @@ final class CodingTaskServiceTests: XCTestCase {
         XCTAssertEqual(history.map(\.outcome), [.cancelled, .inProgress])
     }
 
+    /// A concurrent claim that lands after `start` read the task must never be cancelled:
+    /// the fenced no-active-attempt expectation refuses with a typed stale error instead.
+    func testStartDoesNotCancelAttemptClaimedAfterGuard() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: 1,
+            action: .markReady,
+            context: TaskTransitionContext(fingerprint: "agent", actor: "agent")
+        )
+
+        let gate = AsyncGate()
+        await harness.providers.gateCandidates(gate)
+        let start = Task { try await service.start(taskID: task.id, expectedVersion: 2) }
+        await gate.waitUntilEntered()
+
+        let foreignAttemptID = UUID()
+        let foreignAttempt = TaskAttempt(
+            id: foreignAttemptID,
+            taskID: task.id,
+            attemptSequence: 1,
+            role: .developer,
+            providerID: "runtime-1",
+            modelID: "model-1",
+            generation: 1,
+            startedAt: harness.clock.now()
+        )
+        _ = try await harness.store.claimAttempt(taskID: task.id, expectedVersion: 2, attempt: foreignAttempt)
+
+        await gate.release()
+        do {
+            _ = try await start.value
+            XCTFail("A start that lost the race to another claim must be refused")
+        } catch let error as CodingTaskServiceError {
+            guard case .staleAttempt(let taskID, let expected, let actual) = error else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+            XCTAssertEqual(taskID, task.id)
+            XCTAssertNil(expected)
+            XCTAssertEqual(actual, foreignAttemptID)
+        }
+
+        let history = try await harness.store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.map(\.outcome), [.inProgress], "The concurrent claim must survive the stale start")
+        XCTAssertEqual(history.first?.id, foreignAttemptID)
+        let reloaded = try await harness.store.task(id: task.id)
+        XCTAssertEqual(reloaded?.currentAttemptID, foreignAttemptID)
+    }
+
     func testBackendClaimRejectionIsNotReportedAsSuccess() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()
@@ -1257,6 +1328,43 @@ final class CodingTaskServiceTests: XCTestCase {
         XCTAssertEqual(approvals.count, 2)
         XCTAssertTrue(approvals.contains { $0.actor == "reviewer" && $0.action == .accept && $0.attemptID == seeded.attempt.id })
         XCTAssertTrue(approvals.contains { $0.actor == "someone-else" })
+    }
+
+    func testAcceptReusesExistingSameActorApprovalWithoutDuplicateRow() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let projectID = UUID()
+        let seeded = try await harness.seedReviewTask(projectID: projectID, criteriaCompleted: true, evidence: [])
+        harness.acceptanceEvidence = [
+            VerificationEvidence(
+                taskID: seeded.task.id,
+                attemptID: seeded.attempt.id,
+                recipeName: "test-recipe",
+                stepName: "build",
+                status: .passed,
+                detailsRedacted: "redacted",
+                workspaceFingerprint: harness.currentFingerprint,
+                recordedAt: harness.clock.now(),
+                recipeVersion: VerificationRecipe.currentVersion
+            )
+        ]
+        let existing = TaskApproval(
+            taskID: seeded.task.id,
+            attemptID: seeded.attempt.id,
+            fingerprint: harness.currentFingerprint,
+            actor: "reviewer",
+            timestamp: harness.clock.now(),
+            action: .accept
+        )
+        try await harness.store.recordApproval(existing)
+        let service = harness.makeService()
+
+        let accepted = try await service.accept(taskID: seeded.task.id, expectedVersion: seeded.task.version, actor: "reviewer")
+        XCTAssertEqual(accepted.status, .done)
+
+        let approvals = try await harness.store.approvals(taskID: seeded.task.id)
+        XCTAssertEqual(approvals, [existing], "A reused approval must not be persisted twice")
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.recordedApprovals, 0, "The accept path records its approval inside the transition")
     }
 
     func testFailedAcceptTransitionLeavesNoOrphanApproval() async throws {

@@ -995,7 +995,8 @@ final class TaskRecoveryTests: XCTestCase {
             workspaces: RecoveryTestWorkspacePreflight(descriptor: descriptor),
             verifier: RecoveryTestVerifier(),
             clock: clock,
-            schedulerID: "recovery-late-callback"
+            schedulerID: "recovery-late-callback",
+            provisioning: nil
         )
         let lateCompletion = try await scheduler.attemptDidComplete(
             taskID: task.id,
@@ -1081,7 +1082,8 @@ final class TaskRecoveryTests: XCTestCase {
             workspaces: RecoveryTestWorkspacePreflight(descriptor: descriptor),
             verifier: RecoveryTestVerifier(),
             clock: clock,
-            schedulerID: "recovery-launch"
+            schedulerID: "recovery-launch",
+            provisioning: nil
         )
         let scheduleReport = try await scheduler.schedule(projectID: projectID)
         XCTAssertTrue(scheduleReport.claimedTaskIDs.isEmpty, "Recovery must never dispatch a replacement attempt")

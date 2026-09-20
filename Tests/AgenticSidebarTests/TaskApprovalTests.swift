@@ -354,12 +354,163 @@ final class TaskApprovalTests: XCTestCase {
         await store.close()
     }
 
+    // MARK: - Atomic acceptance persistence
+
+    func testAcceptTransitionPersistsApprovalAtomicallyWithTaskState() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let seeded = try await seedAcceptableReviewTask(in: store)
+        let approval = TaskApproval(
+            taskID: seeded.task.id,
+            attemptID: seeded.attemptID,
+            fingerprint: "verified-fingerprint",
+            actor: "reviewer",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_100),
+            action: .accept
+        )
+
+        let accepted = try await store.transition(
+            taskID: seeded.task.id,
+            expectedVersion: seeded.task.version,
+            action: .accept,
+            context: TaskTransitionContext(
+                fingerprint: "verified-fingerprint",
+                actor: "reviewer",
+                evidenceIDs: [UUID()],
+                humanApproval: approval
+            )
+        )
+
+        XCTAssertEqual(accepted.status, .done)
+        let approvals = try await store.approvals(taskID: seeded.task.id)
+        XCTAssertEqual(approvals, [approval], "The accept transition must record the actor-correct approval exactly once")
+        let reloaded = try await store.task(id: seeded.task.id)
+        XCTAssertEqual(reloaded?.status, .done)
+        XCTAssertEqual(reloaded?.version, seeded.task.version + 1)
+        await store.close()
+    }
+
+    func testFailedAcceptTransitionLeavesNoApprovalRow() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let seeded = try await seedAcceptableReviewTask(in: store)
+        let approval = TaskApproval(
+            taskID: seeded.task.id,
+            attemptID: seeded.attemptID,
+            fingerprint: "stale-fingerprint",
+            actor: "reviewer",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_100),
+            action: .accept
+        )
+
+        do {
+            _ = try await store.transition(
+                taskID: seeded.task.id,
+                expectedVersion: seeded.task.version,
+                action: .accept,
+                context: TaskTransitionContext(
+                    fingerprint: "verified-fingerprint",
+                    actor: "reviewer",
+                    evidenceIDs: [UUID()],
+                    humanApproval: approval
+                )
+            )
+            XCTFail("A fingerprint-mismatched approval must not accept the task")
+        } catch let error as TaskTransitionError {
+            XCTAssertEqual(
+                error,
+                .fingerprintMismatch(expected: "verified-fingerprint", actual: "stale-fingerprint")
+            )
+        }
+
+        let approvals = try await store.approvals(taskID: seeded.task.id)
+        XCTAssertTrue(approvals.isEmpty, "A rolled-back transition must leave no approval row")
+        let reloaded = try await store.task(id: seeded.task.id)
+        XCTAssertEqual(reloaded?.status, .review)
+        XCTAssertEqual(reloaded?.version, seeded.task.version)
+        await store.close()
+    }
+
+    func testStaleVersionAcceptTransitionLeavesNoApprovalRow() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let seeded = try await seedAcceptableReviewTask(in: store)
+        let approval = TaskApproval(
+            taskID: seeded.task.id,
+            attemptID: seeded.attemptID,
+            fingerprint: "verified-fingerprint",
+            actor: "reviewer",
+            timestamp: Date(timeIntervalSince1970: 1_700_000_100),
+            action: .accept
+        )
+
+        do {
+            _ = try await store.transition(
+                taskID: seeded.task.id,
+                expectedVersion: seeded.task.version + 1,
+                action: .accept,
+                context: TaskTransitionContext(
+                    fingerprint: "verified-fingerprint",
+                    actor: "reviewer",
+                    evidenceIDs: [UUID()],
+                    humanApproval: approval
+                )
+            )
+            XCTFail("A stale version must be refused")
+        } catch let error as TaskRepositoryError {
+            guard case .staleVersion = error else {
+                XCTFail("unexpected error \(error)")
+                return
+            }
+        }
+
+        let approvals = try await store.approvals(taskID: seeded.task.id)
+        XCTAssertTrue(approvals.isEmpty)
+        await store.close()
+    }
+
     // MARK: - Helpers
 
     private func createTask(in store: SQLiteTaskStore, id: UUID) async throws {
         try await store.createTask(
             CodingTask(id: id, projectID: UUID(), title: "Review task", objective: "Reach review acceptance")
         )
+    }
+
+    /// Seeds a running task whose single criterion is met and whose attempt is submitted for review.
+    private func seedAcceptableReviewTask(in store: SQLiteTaskStore) async throws -> (task: CodingTask, attemptID: UUID) {
+        let taskID = UUID()
+        let attemptID = UUID()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let task = CodingTask(
+            id: taskID,
+            projectID: UUID(),
+            title: "Acceptable task",
+            objective: "Reach review with completed criteria",
+            status: .running,
+            stage: .implementation,
+            version: 1,
+            criteria: [CodingAcceptanceCriterion(taskID: taskID, description: "done", isCompleted: true)],
+            currentAttemptID: attemptID,
+            createdAt: now,
+            updatedAt: now
+        )
+        try await store.createTask(task)
+        let attempt = TaskAttempt(
+            id: attemptID,
+            taskID: taskID,
+            attemptSequence: 1,
+            role: .developer,
+            providerID: "fixture-runtime",
+            modelID: "fixture-model",
+            generation: 1,
+            startedAt: now
+        )
+        _ = try await store.claimAttempt(taskID: taskID, expectedVersion: 1, attempt: attempt)
+        let submitted = try await store.transition(
+            taskID: taskID,
+            expectedVersion: 2,
+            action: .submitForReview,
+            context: TaskTransitionContext(fingerprint: attemptID.uuidString, actor: "agent", evidenceIDs: [UUID()])
+        )
+        return (submitted, attemptID)
     }
 
     private func withRawDatabase(at url: URL, _ body: (OpaquePointer) throws -> Void) throws {

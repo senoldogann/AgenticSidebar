@@ -227,6 +227,8 @@ enum WorkspaceInspection: Sendable, Equatable {
 /// concrete actor to finish an attempt.
 protocol WorkspaceManaging: Sendable {
     func preflight(project: CodingProject, task: CodingTask) async -> WorkspacePreflight
+    /// Resolves the immutable repository HEAD commit a fresh workspace is based on.
+    func resolveBase(task: CodingTask) async throws -> WorkspaceBase
     func createOwnedWorkspace(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord
     func inspect(workspaceID: UUID) async -> WorkspaceInspection
     /// Releases the live holding of a finished attempt; a mismatched attempt is a no-op.
@@ -313,6 +315,54 @@ struct GitWorkspaceSchedulerAdapter: TaskWorkspacePreflightPort {
             return .unavailable(reason: "\(error.code): \(error.localizedDescription)")
         case .unavailable(let reason):
             return .unavailable(reason: reason)
+        }
+    }
+}
+
+/// Backs the scheduler's `TaskWorkspaceProvisioningPort` with a `WorkspaceManaging` implementation.
+///
+/// `create` maps directly to `createOwnedWorkspace`, so every manager guard (clean source,
+/// writable branch, authorized root, exact identity) still applies unchanged, and
+/// `resolveBase` maps to the manager's validated HEAD resolution.
+///
+/// `discardUnclaimed` is guard-safe by construction: the creating attempt's live holding is
+/// released first (a mismatched attempt is a no-op release, so a workspace held by another
+/// attempt stays visibly active), then the idle workspace is retired with an internally
+/// issued `discardWorkspace` approval bound to the exact task, the exact attempt and the
+/// workspace base SHA. A workspace that is already unknown is treated as discarded; a
+/// rejected manifest is surfaced instead of silently ignored. No manager guard is relaxed
+/// and the approval is never reused across attempts.
+struct GitWorkspaceSchedulerProvisioningAdapter: TaskWorkspaceProvisioningPort {
+    let manager: any WorkspaceManaging
+    let approvalActor: String
+
+    func resolveBase(for task: CodingTask) async throws -> WorkspaceBase {
+        try await manager.resolveBase(task: task)
+    }
+
+    func create(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord {
+        try await manager.createOwnedWorkspace(task: task, attempt: attempt, base: base)
+    }
+
+    func discardUnclaimed(workspaceID: UUID, attemptID: UUID) async throws {
+        await manager.releaseOwnedWorkspace(workspaceID: workspaceID, attemptID: attemptID)
+        switch await manager.inspect(workspaceID: workspaceID) {
+        case .unknown:
+            // The workspace is already gone; there is nothing left to retire.
+            return
+        case .rejected(let error):
+            throw error
+        case .present(let report):
+            let approval = TaskApproval(
+                id: UUID(),
+                taskID: report.record.taskID,
+                attemptID: attemptID,
+                fingerprint: report.record.baseSHA,
+                actor: approvalActor,
+                timestamp: Date(),
+                action: .discardWorkspace
+            )
+            try await manager.retire(workspaceID: workspaceID, approval: approval)
         }
     }
 }

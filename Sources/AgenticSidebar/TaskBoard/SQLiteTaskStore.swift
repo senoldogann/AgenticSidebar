@@ -238,6 +238,13 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
                 let updated = try TaskStateMachine.transition(existing, action: action, context: context)
                 try updateTask(updated)
+                // The acceptance transition is the only place a human accept approval is
+                // validated; persisting it in the same transaction makes the approval and
+                // the task state commit or roll back together, so no rejected transition
+                // can leave an orphan approval that authorizes later work.
+                if case .accept = action, let approval = context.humanApproval {
+                    try insertApprovalIfAbsent(approval)
+                }
                 return updated
             }
         }
@@ -601,23 +608,48 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 throw TaskRepositoryError.invalidApprovalActor(approvalID: approval.id)
             }
             try executeTransaction {
-                let sql = """
-                    INSERT INTO task_approvals (id, task_id, attempt_id, fingerprint, actor, timestamp, action)
-                    VALUES (?, ?, ?, ?, ?, ?, ?);
-                    """
-                var stmt: OpaquePointer?
-                defer { sqlite3_finalize(stmt) }
-                try prepare(sql, &stmt)
-                bindText(stmt, 1, approval.id.uuidString)
-                bindText(stmt, 2, approval.taskID.uuidString)
-                bindText(stmt, 3, approval.attemptID.uuidString)
-                bindText(stmt, 4, approval.fingerprint)
-                bindText(stmt, 5, approval.actor)
-                sqlite3_bind_double(stmt, 6, approval.timestamp.timeIntervalSince1970)
-                bindText(stmt, 7, approval.action.rawValue)
-                try stepDone(stmt)
+                try insertApproval(approval)
             }
         }
+    }
+
+    /// Inserts an approval row inside the caller's transaction unless its identity is already
+    /// recorded, so an approval that already authorized this exact content is never duplicated.
+    ///
+    /// The human-actor invariant is enforced here as well as in `recordApproval`: an accept
+    /// transition must not be able to persist an approval that names no human.
+    private func insertApprovalIfAbsent(_ approval: TaskApproval) throws {
+        let actor = approval.actor.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !actor.isEmpty else {
+            throw TaskRepositoryError.invalidApprovalActor(approvalID: approval.id)
+        }
+        let existsSql = "SELECT 1 FROM task_approvals WHERE id = ? LIMIT 1;"
+        var existsStmt: OpaquePointer?
+        defer { sqlite3_finalize(existsStmt) }
+        try prepare(existsSql, &existsStmt)
+        bindText(existsStmt, 1, approval.id.uuidString)
+        if sqlite3_step(existsStmt) == SQLITE_ROW {
+            return
+        }
+        try insertApproval(approval)
+    }
+
+    private func insertApproval(_ approval: TaskApproval) throws {
+        let sql = """
+            INSERT INTO task_approvals (id, task_id, attempt_id, fingerprint, actor, timestamp, action)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+            """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, approval.id.uuidString)
+        bindText(stmt, 2, approval.taskID.uuidString)
+        bindText(stmt, 3, approval.attemptID.uuidString)
+        bindText(stmt, 4, approval.fingerprint)
+        bindText(stmt, 5, approval.actor)
+        sqlite3_bind_double(stmt, 6, approval.timestamp.timeIntervalSince1970)
+        bindText(stmt, 7, approval.action.rawValue)
+        try stepDone(stmt)
     }
 
     /// Loads every approval for a task, oldest first.

@@ -31,6 +31,26 @@ protocol TaskWorkspacePreflightPort: Sendable {
     func preflight(projectID: UUID, taskID: UUID) async -> TaskWorkspacePreflightResult
 }
 
+/// Port that provisions the owned workspace an attempt is claimed against.
+///
+/// The workspace must exist and be bound *before* the attempt row is claimed: `create`
+/// runs with the already-minted attempt identity, and the record it returns is what the
+/// claim binds. `discardUnclaimed` removes a workspace whose attempt never claimed,
+/// strictly by the exact `(workspaceID, attemptID)` identity pair that created it.
+///
+/// `resolveBase` keeps the base commit explicit instead of guessed: the scheduler never
+/// resolves a moving reference itself, and only a full commit object name may reach `create`.
+protocol TaskWorkspaceProvisioningPort: Sendable {
+    /// Resolves the immutable base commit a fresh workspace for this task is created from.
+    func resolveBase(for task: CodingTask) async throws -> WorkspaceBase
+
+    /// Creates the owned workspace for the exact attempt identity.
+    func create(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord
+
+    /// Discards a created workspace whose attempt never claimed, by exact identity only.
+    func discardUnclaimed(workspaceID: UUID, attemptID: UUID) async throws
+}
+
 /// Runtime candidate selected for a task stage.
 enum TaskProviderCandidate: Sendable, Equatable {
     case eligible(runtimeID: String, modelID: String)
@@ -180,8 +200,10 @@ enum TaskSchedulerError: LocalizedError, Equatable, Sendable {
 ///
 /// The scheduler owns one active writing attempt per repository, enforces
 /// attempt/time/tool-call budgets and keeps missing usage unknown. It performs
-/// repository bookkeeping only; live execution stays inert until the workspace
-/// preflight port returns an owned workspace.
+/// repository bookkeeping only; an attempt is only claimed against an owned
+/// workspace — created for the minted attempt identity through the provisioning
+/// port before the claim, or already owned per the preflight port when no
+/// provisioner is injected.
 actor TaskScheduler {
     static let attemptLeaseGraceSeconds: TimeInterval = 300
     static let repositoryLeaseGraceSeconds: TimeInterval = 600
@@ -227,6 +249,13 @@ actor TaskScheduler {
     private let clock: TaskSchedulerClock
     private let schedulerID: String
 
+    /// Optional workspace-before-claim provisioner.
+    ///
+    /// When present, the claim path creates the owned workspace for the minted attempt
+    /// identity first and binds its `workspaceID` into the claim; when absent, the
+    /// scheduler keeps the preflight-only behavior for already-owned workspaces.
+    private let provisioning: (any TaskWorkspaceProvisioningPort)?
+
     private var activeAttempts: [UUID: ActiveAttemptRecord] = [:]
     private var pausedTaskIDs: Set<UUID> = []
     private var stoppedTaskIDs: Set<UUID> = []
@@ -237,7 +266,8 @@ actor TaskScheduler {
         workspaces: TaskWorkspacePreflightPort,
         verifier: TaskVerifying,
         clock: TaskSchedulerClock,
-        schedulerID: String
+        schedulerID: String,
+        provisioning: (any TaskWorkspaceProvisioningPort)?
     ) {
         self.repository = repository
         self.providers = providers
@@ -245,6 +275,7 @@ actor TaskScheduler {
         self.verifier = verifier
         self.clock = clock
         self.schedulerID = schedulerID
+        self.provisioning = provisioning
     }
 
     /// Lease currently owned by this scheduler instance for a task.
@@ -623,6 +654,15 @@ actor TaskScheduler {
             return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "providerUnavailable:\(reason)"))
 
         case .eligible(let runtimeID, let modelID):
+            if let provisioning {
+                return try await provisionedClaimEntry(
+                    for: task,
+                    runtimeID: runtimeID,
+                    modelID: modelID,
+                    history: history,
+                    provisioning: provisioning
+                )
+            }
             let preflight = await workspaces.preflight(projectID: projectID, taskID: task.id)
             guard case .owned(let workspace) = preflight else {
                 return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "workspaceNotOwned"))
@@ -663,6 +703,88 @@ actor TaskScheduler {
         }
     }
 
+    /// Workspace-before-claim path used when a provisioning port is injected.
+    ///
+    /// Order: mint attempt identity → resolve the immutable base → create the owned
+    /// workspace for that exact identity → acquire the repository lease → claim the
+    /// attempt bound to the created `workspaceID`. Any failure after creation discards
+    /// the workspace by exact identity, so a rejected lease, a rejected claim or a
+    /// thrown repository failure never leaves an orphan workspace behind. Claim
+    /// failures are reported deferred; a discard failure is raised because leaving an
+    /// orphan would be worse than a visibly failed schedule pass.
+    private func provisionedClaimEntry(
+        for task: CodingTask,
+        runtimeID: String,
+        modelID: String,
+        history: [TaskAttempt],
+        provisioning: any TaskWorkspaceProvisioningPort
+    ) async throws -> TaskScheduleEntry {
+        let identity = makePendingIdentity(for: task, history: history)
+        let record: WorkspaceRecord
+        do {
+            let base = try await provisioning.resolveBase(for: task)
+            let provisionalAttempt = makeAttempt(
+                task: task,
+                runtimeID: runtimeID,
+                modelID: modelID,
+                history: history,
+                identity: identity,
+                workspaceID: nil
+            )
+            record = try await provisioning.create(task: task, attempt: provisionalAttempt, base: base)
+        } catch {
+            return TaskScheduleEntry(
+                taskID: task.id,
+                disposition: .deferred(reason: "workspaceProvisioningFailed:\(error.localizedDescription)")
+            )
+        }
+        let workspace = TaskWorkspaceDescriptor(
+            workspaceID: record.workspaceID,
+            workspacePath: record.workspacePath,
+            repositoryPath: record.repositoryPath
+        )
+
+        do {
+            try await repository.acquireRepositoryLease(
+                repositoryPath: workspace.repositoryPath,
+                taskID: task.id,
+                attemptID: identity.attemptID,
+                leaseTimeoutSeconds: TimeInterval(task.budget.maxTaskDurationSeconds) + Self.repositoryLeaseGraceSeconds
+            )
+        } catch {
+            try await provisioning.discardUnclaimed(workspaceID: workspace.workspaceID, attemptID: identity.attemptID)
+            if let repositoryError = error as? TaskRepositoryError, Self.isContention(repositoryError) {
+                return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "repositoryBusy"))
+            }
+            throw error
+        }
+
+        do {
+            let attempt = try await claimAttempt(
+                task: task,
+                workspace: workspace,
+                runtimeID: runtimeID,
+                modelID: modelID,
+                history: history,
+                identity: identity
+            )
+            return TaskScheduleEntry(
+                taskID: task.id,
+                disposition: .claimed(attemptID: attempt.id, generation: attempt.generation)
+            )
+        } catch {
+            await releaseLease(for: workspace.repositoryPath, taskID: task.id, attemptID: identity.attemptID)
+            try await provisioning.discardUnclaimed(workspaceID: workspace.workspaceID, attemptID: identity.attemptID)
+            if let repositoryError = error as? TaskRepositoryError, Self.isContention(repositoryError) {
+                return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "claimRejected"))
+            }
+            return TaskScheduleEntry(
+                taskID: task.id,
+                disposition: .deferred(reason: "claimFailed:\(error.localizedDescription)")
+            )
+        }
+    }
+
     private func makePendingIdentity(for task: CodingTask, history: [TaskAttempt]) -> PendingAttemptIdentity {
         let attemptID = UUID()
         let generation = (history.map(\.generation).max() ?? 0) + 1
@@ -692,23 +814,13 @@ actor TaskScheduler {
         history: [TaskAttempt],
         identity: PendingAttemptIdentity
     ) async throws -> TaskAttempt {
-        let attempt = TaskAttempt(
-            id: identity.attemptID,
-            taskID: task.id,
-            attemptSequence: history.count + 1,
-            role: Self.role(for: task.stage),
-            providerID: runtimeID,
+        let attempt = makeAttempt(
+            task: task,
+            runtimeID: runtimeID,
             modelID: modelID,
-            workspaceID: workspace.workspaceID,
-            generation: identity.generation,
-            leaseOwner: schedulerID,
-            leaseToken: identity.ownerNonce,
-            leaseExpiry: identity.lease.expiration,
-            startedAt: identity.startedAt,
-            endedAt: nil,
-            outcome: .inProgress,
-            toolCallCount: nil,
-            durationSeconds: nil
+            history: history,
+            identity: identity,
+            workspaceID: workspace.workspaceID
         )
         let claimed = try await repository.claimAttempt(taskID: task.id, expectedVersion: task.version, attempt: attempt)
         activeAttempts[task.id] = ActiveAttemptRecord(
@@ -720,6 +832,39 @@ actor TaskScheduler {
             startedAt: identity.startedAt
         )
         return claimed
+    }
+
+    /// Builds the attempt row for a minted identity.
+    ///
+    /// The provisioning path passes `workspaceID: nil` for the pre-claim provisional
+    /// attempt (the workspace does not exist yet); the claimed attempt always carries
+    /// the exact workspace identity the claim is bound to.
+    private func makeAttempt(
+        task: CodingTask,
+        runtimeID: String,
+        modelID: String,
+        history: [TaskAttempt],
+        identity: PendingAttemptIdentity,
+        workspaceID: UUID?
+    ) -> TaskAttempt {
+        TaskAttempt(
+            id: identity.attemptID,
+            taskID: task.id,
+            attemptSequence: history.count + 1,
+            role: Self.role(for: task.stage),
+            providerID: runtimeID,
+            modelID: modelID,
+            workspaceID: workspaceID,
+            generation: identity.generation,
+            leaseOwner: schedulerID,
+            leaseToken: identity.ownerNonce,
+            leaseExpiry: identity.lease.expiration,
+            startedAt: identity.startedAt,
+            endedAt: nil,
+            outcome: .inProgress,
+            toolCallCount: nil,
+            durationSeconds: nil
+        )
     }
 
     // MARK: - Task lifecycle helpers

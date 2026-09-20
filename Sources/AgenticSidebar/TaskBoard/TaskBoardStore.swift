@@ -145,11 +145,15 @@ final class TaskBoardStore {
     }
 
     /// Selects a task and loads its attempt history; an in-flight action keeps running.
+    ///
+    /// The previous selection's failure is cleared so an old detail-load error can never
+    /// appear as if it belonged to the newly selected task.
     func selectTask(_ taskID: UUID?) async {
         guard selectedTaskID != taskID else { return }
         selectedTaskID = taskID
         detail = nil
         selectedTaskAttempts = []
+        lastFailure = nil
         guard let taskID else { return }
         await loadDetail(taskID: taskID)
     }

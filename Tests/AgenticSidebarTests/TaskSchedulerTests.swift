@@ -109,7 +109,8 @@ final class TaskSchedulerTests: XCTestCase {
             workspaces: TestWorkspacePreflight(isOwned: workspaceOwned, sharedRepositoryPath: sharedRepositoryPath),
             verifier: TestVerifier(passed: verifierPassed),
             clock: clock,
-            schedulerID: schedulerID
+            schedulerID: schedulerID,
+            provisioning: nil
         )
     }
 
@@ -232,6 +233,279 @@ final class TaskSchedulerTests: XCTestCase {
         XCTAssertTrue(history.isEmpty)
         let stored = try await store.task(id: task.id)
         XCTAssertEqual(stored?.status, .ready)
+    }
+
+    // MARK: - Workspace-before-claim provisioning
+
+    private actor SchedulerEventLog {
+        private var events: [String] = []
+
+        func append(_ event: String) {
+            events.append(event)
+        }
+
+        func snapshot() -> [String] {
+            events
+        }
+    }
+
+    private struct TestWorkspaceProvisioning: TaskWorkspaceProvisioningPort {
+        let log: SchedulerEventLog
+        let workspaceID: UUID
+        let baseSHA: String
+        let repositoryPath: String
+        let createRefusal: WorkspaceGuardError?
+
+        func resolveBase(for task: CodingTask) async throws -> WorkspaceBase {
+            await log.append("resolveBase")
+            return WorkspaceBase(commitSHA: baseSHA)
+        }
+
+        func create(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord {
+            await log.append("create:\(attempt.id.uuidString):\(base.commitSHA)")
+            if let createRefusal {
+                throw createRefusal
+            }
+            return WorkspaceRecord(
+                workspaceID: workspaceID,
+                projectID: task.projectID,
+                taskID: task.id,
+                attemptID: attempt.id,
+                repositoryPath: repositoryPath,
+                workspacePath: repositoryPath + "/workspace-\(workspaceID.uuidString)",
+                commonDirIdentity: repositoryPath + "/.git",
+                baseSHA: base.commitSHA,
+                nonce: UUID().uuidString,
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+            )
+        }
+
+        func discardUnclaimed(workspaceID: UUID, attemptID: UUID) async throws {
+            await log.append("discard:\(workspaceID.uuidString):\(attemptID.uuidString)")
+        }
+    }
+
+    private func makeProvisioningScheduler(
+        store: SQLiteTaskStore,
+        repository: CodingTaskRepository,
+        clock: TestTaskSchedulerClock,
+        providers: TaskProviderCandidate,
+        provisioning: TestWorkspaceProvisioning,
+        verifierPassed: Bool,
+        schedulerID: String
+    ) -> TaskScheduler {
+        TaskScheduler(
+            repository: repository,
+            providers: TestProviderRegistry(result: providers),
+            workspaces: TestWorkspacePreflight(isOwned: false, sharedRepositoryPath: nil),
+            verifier: TestVerifier(passed: verifierPassed),
+            clock: clock,
+            schedulerID: schedulerID,
+            provisioning: provisioning
+        )
+    }
+
+    func testScheduleProvisionsWorkspaceBeforeClaimAndBindsWorkspaceID() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/agentic-sidebar-scheduler-tests/provisioned-repo"
+        let workspaceID = UUID()
+        let baseSHA = String(repeating: "a", count: 40)
+        let log = SchedulerEventLog()
+        let provisioning = TestWorkspaceProvisioning(
+            log: log,
+            workspaceID: workspaceID,
+            baseSHA: baseSHA,
+            repositoryPath: repositoryPath,
+            createRefusal: nil
+        )
+        let repository = HookingTaskRepository(base: store)
+        await repository.setClaimObserver { await log.append("claim") }
+        let scheduler = makeProvisioningScheduler(
+            store: store,
+            repository: repository,
+            clock: clock,
+            providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            provisioning: provisioning,
+            verifierPassed: true,
+            schedulerID: "scheduler-provisioning"
+        )
+        let task = makeTask(projectID: projectID, title: "Provisioned Task", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimed = try XCTUnwrap(claim(in: report, taskID: task.id))
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(
+            history.first?.workspaceID,
+            workspaceID,
+            "The claimed attempt must be bound to the workspace created for its exact identity"
+        )
+        XCTAssertEqual(history.first?.id, claimed.attemptID)
+
+        let events = await log.snapshot()
+        XCTAssertEqual(
+            events,
+            ["resolveBase", "create:\(claimed.attemptID.uuidString):\(baseSHA)", "claim"],
+            "The owned workspace must be created before the attempt is claimed"
+        )
+    }
+
+    func testClaimRejectionDiscardsProvisionedWorkspaceAndReleasesLease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/agentic-sidebar-scheduler-tests/discarded-repo"
+        let workspaceID = UUID()
+        let log = SchedulerEventLog()
+        let provisioning = TestWorkspaceProvisioning(
+            log: log,
+            workspaceID: workspaceID,
+            baseSHA: String(repeating: "b", count: 40),
+            repositoryPath: repositoryPath,
+            createRefusal: nil
+        )
+        let repository = HookingTaskRepository(base: store)
+        let task = makeTask(projectID: projectID, title: "Rejected Claim", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+        await repository.setClaimAttemptError(
+            .activeAttemptConflict(taskID: task.id, existingAttemptID: UUID())
+        )
+        let scheduler = makeProvisioningScheduler(
+            store: store,
+            repository: repository,
+            clock: clock,
+            providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            provisioning: provisioning,
+            verifierPassed: true,
+            schedulerID: "scheduler-claim-rejected"
+        )
+
+        let report = try await scheduler.schedule(projectID: projectID)
+
+        XCTAssertEqual(try entry(in: report, taskID: task.id).disposition, .deferred(reason: "claimRejected"))
+        let events = await log.snapshot()
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events[0], "resolveBase")
+        XCTAssertTrue(events[1].hasPrefix("create:"))
+        let createAttemptID = events[1].split(separator: ":")[1]
+        XCTAssertTrue(
+            events[2].hasPrefix("discard:\(workspaceID.uuidString):"),
+            "The unclaimed workspace must be discarded by exact identity, got \(events[2])"
+        )
+        XCTAssertEqual(events[2].split(separator: ":")[2], createAttemptID)
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertTrue(history.isEmpty, "A rejected claim must not persist an attempt")
+        let snapshot = try await store.snapshot(projectID: projectID)
+        XCTAssertTrue(snapshot.activeAttempts.isEmpty)
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .ready)
+
+        let replacementAttemptID = UUID()
+        try await store.acquireRepositoryLease(
+            repositoryPath: repositoryPath, taskID: UUID(), attemptID: replacementAttemptID, leaseTimeoutSeconds: 60)
+        try await store.releaseRepositoryLease(
+            repositoryPath: repositoryPath, taskID: UUID(), attemptID: replacementAttemptID)
+    }
+
+    func testNonContentionClaimFailureDiscardsProvisionedWorkspaceWithoutDispatch() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/agentic-sidebar-scheduler-tests/failed-claim-repo"
+        let workspaceID = UUID()
+        let log = SchedulerEventLog()
+        let provisioning = TestWorkspaceProvisioning(
+            log: log,
+            workspaceID: workspaceID,
+            baseSHA: String(repeating: "c", count: 40),
+            repositoryPath: repositoryPath,
+            createRefusal: nil
+        )
+        let repository = HookingTaskRepository(base: store)
+        let task = makeTask(projectID: projectID, title: "Failing Claim", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+        await repository.setClaimAttemptError(.underlying("injected claim failure"))
+        let scheduler = makeProvisioningScheduler(
+            store: store,
+            repository: repository,
+            clock: clock,
+            providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            provisioning: provisioning,
+            verifierPassed: true,
+            schedulerID: "scheduler-claim-failed"
+        )
+
+        let report = try await scheduler.schedule(projectID: projectID)
+
+        guard case .deferred(let reason) = try entry(in: report, taskID: task.id).disposition else {
+            XCTFail("A failed claim must be reported deferred, never as a dispatch")
+            return
+        }
+        XCTAssertTrue(reason.hasPrefix("claimFailed"), "Unexpected reason \(reason)")
+        XCTAssertTrue(reason.contains("injected claim failure"))
+        let events = await log.snapshot()
+        XCTAssertTrue(events.last?.hasPrefix("discard:\(workspaceID.uuidString):") == true)
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertTrue(history.isEmpty)
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .ready)
+    }
+
+    func testProvisioningRefusalDefersWithoutClaimOrLease() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let repositoryPath = "/tmp/agentic-sidebar-scheduler-tests/refused-provisioning-repo"
+        let log = SchedulerEventLog()
+        let provisioning = TestWorkspaceProvisioning(
+            log: log,
+            workspaceID: UUID(),
+            baseSHA: String(repeating: "d", count: 40),
+            repositoryPath: repositoryPath,
+            createRefusal: .worktreeDirty(path: repositoryPath, status: " M tracked.txt")
+        )
+        let repository = HookingTaskRepository(base: store)
+        let task = makeTask(projectID: projectID, title: "Refused Workspace", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+        let scheduler = makeProvisioningScheduler(
+            store: store,
+            repository: repository,
+            clock: clock,
+            providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            provisioning: provisioning,
+            verifierPassed: true,
+            schedulerID: "scheduler-provisioning-refused"
+        )
+
+        let report = try await scheduler.schedule(projectID: projectID)
+
+        guard case .deferred(let reason) = try entry(in: report, taskID: task.id).disposition else {
+            XCTFail("A refused provisioning pass must defer the task")
+            return
+        }
+        XCTAssertTrue(reason.hasPrefix("workspaceProvisioningFailed"), "Unexpected reason \(reason)")
+        XCTAssertTrue(reason.contains("WORKTREE_DIRTY"))
+        let events = await log.snapshot()
+        XCTAssertEqual(events.count, 2)
+        XCTAssertEqual(events.first, "resolveBase")
+        XCTAssertTrue(events.last?.hasPrefix("create:") == true)
+        XCTAssertFalse(events.contains { $0.hasPrefix("discard:") }, "Nothing was created, so nothing may be discarded")
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertTrue(history.isEmpty)
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.status, .ready)
+
+        let replacementAttemptID = UUID()
+        try await store.acquireRepositoryLease(
+            repositoryPath: repositoryPath, taskID: UUID(), attemptID: replacementAttemptID, leaseTimeoutSeconds: 60)
+        try await store.releaseRepositoryLease(
+            repositoryPath: repositoryPath, taskID: UUID(), attemptID: replacementAttemptID)
     }
 
     // MARK: - Writer exclusivity
@@ -704,6 +978,44 @@ final class TaskSchedulerTests: XCTestCase {
         XCTAssertEqual(stored?.status, .running)
     }
 
+    /// `nil` expectations mean "no active attempt is expected": a concurrent claim that
+    /// landed first must never be cancelled by a stale start request.
+    func testFencedRetryWithNilExpectationsRefusesWhenAttemptWasClaimed() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let scheduler = makeScheduler(
+            store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            workspaceOwned: true, sharedRepositoryPath: nil, verifierPassed: true, schedulerID: "scheduler-nil-fence")
+        let task = makeTask(projectID: projectID, title: "Fenced Start", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimed = try XCTUnwrap(claim(in: report, taskID: task.id))
+
+        do {
+            _ = try await scheduler.retry(taskID: task.id, expectedAttemptID: nil, expectedGeneration: nil)
+            XCTFail("A nil-expectation retry must refuse while an active attempt exists")
+        } catch let error as TaskSchedulerError {
+            XCTAssertEqual(
+                error,
+                .staleAttempt(
+                    taskID: task.id,
+                    expectedAttemptID: nil,
+                    expectedGeneration: nil,
+                    actualAttemptID: claimed.attemptID,
+                    actualGeneration: claimed.generation
+                )
+            )
+        }
+
+        let history = try await store.attemptHistory(taskID: task.id)
+        XCTAssertEqual(history.count, 1)
+        XCTAssertEqual(history.first?.outcome, .inProgress, "The fenced refusal must not cancel the claimed attempt")
+        let stored = try await store.task(id: task.id)
+        XCTAssertEqual(stored?.currentAttemptID, claimed.attemptID)
+    }
+
     // MARK: - Verification
 
     func testSuccessfulCompletionRecordsEvidenceAndSubmitsForReview() async throws {
@@ -746,9 +1058,14 @@ final class TaskSchedulerTests: XCTestCase {
         private var evidenceWrites: Int = 0
         private var forcedRepositoryLeaseTimeout: TimeInterval?
         private var releaseRepositoryLeaseError: TaskRepositoryError?
+        private var claimObserver: (@Sendable () async -> Void)?
 
         init(base: CodingTaskRepository) {
             self.base = base
+        }
+
+        func setClaimObserver(_ observer: (@Sendable () async -> Void)?) {
+            claimObserver = observer
         }
 
         func setEndAttemptDelay(_ delay: Duration?) {
@@ -801,6 +1118,7 @@ final class TaskSchedulerTests: XCTestCase {
         }
 
         func claimAttempt(taskID: UUID, expectedVersion: Int, attempt: TaskAttempt) async throws -> TaskAttempt {
+            await claimObserver?()
             let injected = claimAttemptError
             claimAttemptError = nil
             if let injected {
@@ -966,7 +1284,8 @@ final class TaskSchedulerTests: XCTestCase {
             workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: sharedPath),
             verifier: TestVerifier(passed: true),
             clock: clock,
-            schedulerID: "scheduler-reentrancy"
+            schedulerID: "scheduler-reentrancy",
+            provisioning: nil
         )
 
         let report = try await scheduler.schedule(projectID: projectID)
@@ -1025,7 +1344,8 @@ final class TaskSchedulerTests: XCTestCase {
             workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: sharedPath),
             verifier: TestVerifier(passed: true),
             clock: clock,
-            schedulerID: "scheduler-claim-failure"
+            schedulerID: "scheduler-claim-failure",
+            provisioning: nil
         )
 
         do {
@@ -1078,7 +1398,8 @@ final class TaskSchedulerTests: XCTestCase {
             workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: nil),
             verifier: TestVerifier(passed: false),
             clock: clock,
-            schedulerID: "scheduler-verifier-failure"
+            schedulerID: "scheduler-verifier-failure",
+            provisioning: nil
         )
         let task = makeTask(projectID: projectID, title: "Failing Verification", priority: 1, status: .ready, createdAt: startDate)
         try await store.createTask(task)
@@ -1165,7 +1486,8 @@ final class TaskSchedulerTests: XCTestCase {
             workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: sharedPath),
             verifier: TestVerifier(passed: true),
             clock: clock,
-            schedulerID: "scheduler-swallowed-release"
+            schedulerID: "scheduler-swallowed-release",
+            provisioning: nil
         )
 
         let report = try await scheduler.schedule(projectID: projectID)

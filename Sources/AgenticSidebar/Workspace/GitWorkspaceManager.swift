@@ -100,6 +100,24 @@ actor GitWorkspaceManager: WorkspaceManaging {
         }
     }
 
+    /// Resolves the immutable base commit for a task's next owned workspace.
+    ///
+    /// The repository HEAD is normalized to a full commit object name and re-verified
+    /// through `rev-parse --verify <sha>^{commit}`, so a branch, a tag or a symbolic
+    /// reference can never leak into a manifest as the recorded base.
+    func resolveBase(task: CodingTask) async throws -> WorkspaceBase {
+        guard let project = await projects.resolveProject(id: task.projectID) else {
+            throw WorkspaceGuardError.projectNotFound(projectID: task.projectID)
+        }
+        try validateProjectIdentity(project: project, task: task)
+        let repositoryURL = URL(fileURLWithPath: project.repositoryPath)
+        let head = try runGit(["rev-parse", "HEAD"], in: repositoryURL)
+            .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commitSHA = try normalizedCommitSHA(head)
+        try verifyCommitExists(commitSHA, repositoryURL: repositoryURL)
+        return WorkspaceBase(commitSHA: commitSHA)
+    }
+
     func createOwnedWorkspace(task: CodingTask, attempt: TaskAttempt, base: WorkspaceBase) async throws -> WorkspaceRecord {
         guard let project = await projects.resolveProject(id: task.projectID) else {
             throw WorkspaceGuardError.projectNotFound(projectID: task.projectID)

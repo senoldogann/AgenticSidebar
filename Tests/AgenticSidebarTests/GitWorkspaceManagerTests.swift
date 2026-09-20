@@ -1353,6 +1353,91 @@ final class GitWorkspaceManagerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: record.workspacePath))
     }
 
+    func testSchedulerProvisioningAdapterResolvesHeadAndCreatesOwnedWorkspace() async throws {
+        let fixture = try makeCleanFixture(name: "provisioning-adapter")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let adapter = GitWorkspaceSchedulerProvisioningAdapter(manager: manager, approvalActor: "scheduler-provisioning")
+
+        let base = try await adapter.resolveBase(for: task)
+        XCTAssertEqual(base.commitSHA, fixture.baseSHA)
+
+        let record = try await adapter.create(task: task, attempt: attempt, base: base)
+        XCTAssertEqual(record.projectID, project.id)
+        XCTAssertEqual(record.taskID, task.id)
+        XCTAssertEqual(record.attemptID, attempt.id)
+        XCTAssertEqual(record.baseSHA, fixture.baseSHA)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: record.workspacePath))
+
+        guard case .present(let report) = await manager.inspect(workspaceID: record.workspaceID) else {
+            XCTFail("expected the freshly created workspace to be present")
+            return
+        }
+        XCTAssertEqual(report.holder, .active(attemptID: attempt.id))
+    }
+
+    func testSchedulerProvisioningAdapterDiscardUnclaimedRetiresWorkspaceWithoutOrphan() async throws {
+        let fixture = try makeCleanFixture(name: "provisioning-discard")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let adapter = GitWorkspaceSchedulerProvisioningAdapter(manager: manager, approvalActor: "scheduler-provisioning")
+        let record = try await adapter.create(
+            task: task, attempt: attempt, base: WorkspaceBase(commitSHA: fixture.baseSHA))
+
+        try await adapter.discardUnclaimed(workspaceID: record.workspaceID, attemptID: attempt.id)
+
+        let inspection = await manager.inspect(workspaceID: record.workspaceID)
+        XCTAssertEqual(inspection, .unknown(workspaceID: record.workspaceID))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: record.workspacePath))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: manifestFile(
+                    fixture: fixture, projectID: project.id, taskID: task.id, workspaceID: record.workspaceID
+                ).path
+            ),
+            "No manifest may survive an unclaimed workspace discard"
+        )
+        guard case .notOwned = await manager.preflight(project: project, task: task) else {
+            XCTFail("the task must be back to notOwned after the unclaimed workspace is discarded")
+            return
+        }
+    }
+
+    func testSchedulerProvisioningAdapterDiscardUnclaimedRefusesMismatchedAttempt() async throws {
+        let fixture = try makeCleanFixture(name: "provisioning-discard-mismatch")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let adapter = GitWorkspaceSchedulerProvisioningAdapter(manager: manager, approvalActor: "scheduler-provisioning")
+        let record = try await adapter.create(
+            task: task, attempt: attempt, base: WorkspaceBase(commitSHA: fixture.baseSHA))
+
+        do {
+            try await adapter.discardUnclaimed(workspaceID: record.workspaceID, attemptID: UUID())
+            XCTFail("A discard bound to another attempt must be refused")
+        } catch let error as WorkspaceGuardError {
+            guard case .approvalRejected = error else {
+                XCTFail("unexpected guard error \(error)")
+                return
+            }
+        }
+
+        guard case .present(let report) = await manager.inspect(workspaceID: record.workspaceID) else {
+            XCTFail("the guarded refusal must keep the workspace")
+            return
+        }
+        XCTAssertEqual(report.holder, .active(attemptID: attempt.id))
+
+        try await adapter.discardUnclaimed(workspaceID: record.workspaceID, attemptID: attempt.id)
+        let finalInspection = await manager.inspect(workspaceID: record.workspaceID)
+        XCTAssertEqual(finalInspection, .unknown(workspaceID: record.workspaceID))
+    }
+
     func testRecoveryAdapterMapsIdleWorkspaceToNotActivelyOwned() async throws {
         let fixture = try makeCleanFixture(name: "recovery-idle")
         let project = makeProject(fixture: fixture)

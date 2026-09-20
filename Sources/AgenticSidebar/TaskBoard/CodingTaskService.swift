@@ -281,6 +281,8 @@ actor CodingTaskService {
     /// An unsupported or unavailable runtime is refused before any scheduler call, so no claim,
     /// lease or transition is written for work this machine cannot run. Workspace readiness is
     /// surfaced exactly as the scheduler reports it (for example `.deferred(reason:)`).
+    /// The re-arm is fenced with "no active attempt expected": an attempt claimed concurrently
+    /// between the guard above and the scheduler call is refused as typed stale, never cancelled.
     func start(taskID: UUID, expectedVersion: Int) async throws -> CodingTaskStartResult {
         try await withExclusiveTaskAction(taskID: taskID) {
             let task = try await self.requireTask(taskID)
@@ -302,7 +304,9 @@ actor CodingTaskService {
                 break
             }
 
-            let entry = try await self.mapped { try await self.scheduler.retry(taskID: taskID) }
+            let entry = try await self.mapped {
+                try await self.scheduler.retry(taskID: taskID, expectedAttemptID: nil, expectedGeneration: nil)
+            }
             return Self.startResult(from: entry)
         }
     }
@@ -449,6 +453,10 @@ actor CodingTaskService {
     }
 
     /// Accepts a task only when the completion gate passes; the approval binds actor, attempt and content.
+    ///
+    /// The approval travels inside the version-fenced transition context: `SQLiteTaskStore`
+    /// persists the task state and the approval row in one transaction, so a rejected
+    /// transition can never leave an orphan approval that authorizes later work.
     func accept(taskID: UUID, expectedVersion: Int, actor: String) async throws -> CodingTask {
         try await withExclusiveTaskAction(taskID: taskID) {
             let trimmedActor = try Self.requireHumanText(actor, field: "actor")
@@ -482,7 +490,7 @@ actor CodingTaskService {
                         && entry.workspaceFingerprint == context.currentFingerprint
                 }
                 .map(\.id)
-            let accepted = try await self.mapped {
+            return try await self.mapped {
                 try await self.repository.transition(
                     taskID: taskID,
                     expectedVersion: expectedVersion,
@@ -495,12 +503,6 @@ actor CodingTaskService {
                     )
                 )
             }
-            // Persist the approval only after the version-fenced transition committed, so a
-            // rejected transition can never leave an orphan approval that authorizes later work.
-            if existingApproval == nil {
-                try await self.mapped { try await self.repository.recordApproval(approval) }
-            }
-            return accepted
         }
     }
 
