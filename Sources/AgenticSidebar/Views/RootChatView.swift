@@ -16,12 +16,17 @@ struct RootChatView: View {
     let collapseStore: TimelineCollapseStore
     /// Yan yana sohbet düzeni; ikincil bölme sabitlenmiş oturumu tutar.
     let splitStore: SplitLayoutStore
+    /// Görev panosunun ana aktör projeksiyonu; `nil` ise pano hiç takılmaz.
+    let taskBoardStore: TaskBoardStore?
     let onApplyGlobalShortcut: @MainActor (GlobalShortcutSpec) -> Void
 
     /// Ayraç sürüklenirken oranın başlangıç değeri (aynı anda tek sürükleme).
     @State private var splitDragBase: Double?
     /// Sürüklenen sohbetin üzerinde durduğu yuva; halka yalnız orada çizilir.
     @State private var dropTargetedSlot: PaneSlot?
+    /// Pano ayrı bir sayfada açılır: sohbet yüzeyi ve besteci durumu
+    /// yerinde kalır, pano kendi seçimini sayfa kapanınca korur.
+    @State private var showsTaskBoard = false
 
     @Environment(\.colorScheme) private var systemColorScheme
 
@@ -113,6 +118,39 @@ struct RootChatView: View {
             syncVisibleSessions(activeID: sessionService.activeSessionID)
         }
         .textSelection(.enabled)
+        // Pano ayrı bir sayfada açılır: sohbet, besteci ve `/goal` yüzeylerine
+        // dokunulmaz; pano yalnızca enjekte edilen mağazadan konuşur.
+        .sheet(isPresented: $showsTaskBoard) {
+            taskBoardSheet
+        }
+    }
+
+    /// Görev panosu sayfası: canlı yazma devre dışı ibaresi panonun altında
+    /// durur; başlatma yalnızca defter kaydı üretir, sağlayıcıya yazma gitmez.
+    @ViewBuilder
+    private var taskBoardSheet: some View {
+        if let taskBoardStore {
+            VStack(spacing: 0) {
+                TaskBoardView(store: taskBoardStore, preset: currentTheme, isDark: isDarkMode)
+
+                Divider().opacity(0.35)
+
+                HStack(spacing: 6) {
+                    Image(systemName: "pause.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Canlı yazma devre dışı: pano kaydı tutulur, sağlayıcıya yazma gönderilmez.")
+                        .font(.system(size: 11))
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .frame(minWidth: 760, minHeight: 520)
+            .background(currentTheme.background(isDark: isDarkMode))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Görev panosu, canlı yazma devre dışı")
+        }
     }
 
     private func syncVisibleSessions(activeID: UUID) {
@@ -189,6 +227,17 @@ struct RootChatView: View {
                     }
                     .help("Open a terminal in this conversation's side panel")
                     .accessibilityLabel("Open terminal")
+                }
+            }
+            if taskBoardStore != nil {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showsTaskBoard = true
+                    } label: {
+                        Image(systemName: "checklist")
+                    }
+                    .help("Görev panosunu aç")
+                    .accessibilityLabel("Görev panosunu aç")
                 }
             }
             ToolbarItem(placement: .primaryAction) {
