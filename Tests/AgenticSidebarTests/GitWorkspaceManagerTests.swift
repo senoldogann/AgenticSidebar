@@ -1650,6 +1650,86 @@ final class GitWorkspaceManagerTests: XCTestCase {
         XCTAssertEqual(stray.exitCode, 1, "timed-out descendant left running: \(stray.stdout)")
     }
 
+    func testGitCommandRunnerSuccessPathDrainIsBoundedWhenDescendantHoldsPipes() throws {
+        let fixture = try makeCleanFixture(name: "runner-descendant-success")
+        let directory = fixture.root
+        let runner = GitCommandRunner(
+            executableDirectory: URL(fileURLWithPath: "/usr/bin"),
+            maxOutputBytes: 262_144
+        )
+        // The direct child exits 0 immediately; a forked descendant inherits the
+        // stdout/stderr pipes, ignores SIGTERM and sleeps far beyond the call. The
+        // runner must still return within its bounded deadline and leave nothing behind.
+        let interpreter: String
+        let scriptFlag: String
+        let script: String
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/ruby") {
+            interpreter = "ruby"
+            scriptFlag = "-e"
+            script = "Signal.trap(\"TERM\", \"IGNORE\"); if Process.fork.nil? then sleep 300 else exit 0 end"
+        } else if FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") {
+            interpreter = "python3"
+            scriptFlag = "-c"
+            script =
+                "import os,signal,time,sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); pid=os.fork(); sys.exit(0) if pid else time.sleep(300)"
+        } else {
+            XCTFail("no validated interpreter under /usr/bin; cannot exercise the descendant stall")
+            return
+        }
+        let marker = "agenticsidebar-success-descendant-\(UUID().uuidString)"
+        addTeardownBlock {
+            let pkill = Process()
+            pkill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            // The descendant ignores SIGTERM by construction, so the teardown must escalate.
+            pkill.arguments = ["-9", "-f", marker]
+            pkill.standardOutput = FileHandle.nullDevice
+            pkill.standardError = FileHandle.nullDevice
+            try? pkill.run()
+            pkill.waitUntilExit()
+        }
+
+        let outcome = RunnerOutcomeBox()
+        let finished = DispatchSemaphore(value: 0)
+        let started = Date()
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let result = try runner.run(
+                    executable: interpreter,
+                    arguments: [scriptFlag, script, marker],
+                    directory: directory,
+                    timeout: 30
+                )
+                outcome.store(.success(result))
+            } catch {
+                outcome.store(.failure(error))
+            }
+            finished.signal()
+        }
+
+        // The runner is synchronous, so the test bounds it from the outside: on an
+        // unbounded success-path drain this fails on the deadline instead of hanging.
+        let deadline: DispatchTime = .now() + 15
+        XCTAssertEqual(
+            finished.wait(timeout: deadline),
+            .success,
+            "run() must return within its bounded deadline instead of stalling on the success-path drain"
+        )
+        guard let stored = outcome.result, case .success(let result) = stored else {
+            XCTFail("expected the successful invocation to return a result")
+            return
+        }
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 10, "success-path drain must be bounded")
+
+        var stray = try runTool("pgrep", ["-f", marker], in: fixture.root)
+        let cleanupDeadline = Date().addingTimeInterval(3)
+        while stray.exitCode == 0, Date() < cleanupDeadline {
+            usleep(100_000)
+            stray = try runTool("pgrep", ["-f", marker], in: fixture.root)
+        }
+        XCTAssertEqual(stray.exitCode, 1, "pipe-holding descendant left running: \(stray.stdout)")
+    }
+
     // MARK: - Real-host smoke
 
     func testRealHostManagedWorktreeSmokeLeavesNoOrphans() async throws {

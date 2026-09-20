@@ -36,13 +36,15 @@ enum GitCommandRunnerError: LocalizedError, Equatable, Sendable {
 ///
 /// Every invocation carries a wall-clock deadline (`defaultTimeout` unless the caller
 /// overrides it). A process that overruns is terminated (SIGTERM to the process group,
-/// then SIGKILL to the whole group after a short grace period), the direct child is
-/// always reaped, and the final pipe drain is bounded as well, so a descendant that
-/// inherited the pipes and survived the group kill cannot stall `run()` past that extra
-/// grace. The call then throws the typed `WorkspaceGuardError.gitTimedOut`, so a hung
-/// tool can never block the workspace actor forever. The runner only bounds its own
-/// wait: it does not hunt down a process that escaped its process group (for example
-/// via `setsid`).
+/// then SIGKILL to the whole group after a short grace period) and the call throws the
+/// typed `WorkspaceGuardError.gitTimedOut`, so a hung tool can never block the workspace
+/// actor forever. The direct child is always reaped and the final pipe drain is bounded
+/// on both the timeout and the success path: when a descendant that inherited the pipes
+/// still holds them past the drain grace, the runner closes the pipes and — when the
+/// direct child led its own process group — SIGKILLs that group, so a pipe-holding
+/// descendant can neither stall `run()` nor survive a completed command. The runner only
+/// bounds its own wait: it does not hunt down a process that escaped its process group
+/// (for example via `setsid`).
 final class GitCommandRunner: Sendable {
     static let defaultTimeout: TimeInterval = 30
     private static let terminationGrace: TimeInterval = 2
@@ -120,6 +122,10 @@ final class GitCommandRunner: Sendable {
             throw GitCommandRunnerError.launchFailed(executable: executable, reason: "\(error)")
         }
 
+        // Recorded once, while the child is alive: the group identity is what lets the
+        // success path reach a pipe-holding descendant after the leader has exited.
+        let childLeadsProcessGroup = getpgid(process.processIdentifier) == process.processIdentifier
+
         if exitSemaphore.wait(timeout: .now() + timeout) == .timedOut {
             terminateProcess(process, exitSemaphore: exitSemaphore)
             // The drain is bounded so a descendant that inherited the pipes and survived
@@ -135,8 +141,15 @@ final class GitCommandRunner: Sendable {
             throw WorkspaceGuardError.gitTimedOut(executable: executable, arguments: arguments, timeout: timeout)
         }
 
-        drainGroup.wait()
         process.waitUntilExit()
+        // A successful command can still leave a forked descendant holding the inherited
+        // pipes. The same drain grace bounds this path; on expiry the pipes are closed and
+        // the descendant's process group is killed so nothing is left behind.
+        if drainGroup.wait(timeout: .now() + Self.drainGrace) == .timedOut {
+            try? stdoutHandle.close()
+            try? stderrHandle.close()
+            killPipeHoldingDescendants(process, childLeadsProcessGroup: childLeadsProcessGroup)
+        }
 
         let stdout = stdoutCollector.snapshot()
         let stderr = stderrCollector.snapshot()
@@ -167,6 +180,20 @@ final class GitCommandRunner: Sendable {
             }
             _ = exitSemaphore.wait(timeout: .now() + Self.terminationGrace)
         }
+    }
+
+    /// Kills the process group of a child that already exited but left a descendant
+    /// holding the inherited stdout/stderr pipes.
+    ///
+    /// The direct child was reaped, so `getpgid` can no longer confirm the group; the
+    /// recorded leader identity plus a `killpg` probe decide whether the group still
+    /// exists. A descendant that ignored SIGTERM during the timeout path is reached the
+    /// same way: SIGKILL to the whole group.
+    private func killPipeHoldingDescendants(_ process: Process, childLeadsProcessGroup: Bool) {
+        guard childLeadsProcessGroup else { return }
+        let pid = process.processIdentifier
+        guard pid > 0, killpg(pid, 0) == 0 else { return }
+        killpg(pid, SIGKILL)
     }
 
     private static func isValidExecutableName(_ name: String) -> Bool {
