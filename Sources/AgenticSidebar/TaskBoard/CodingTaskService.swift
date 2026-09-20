@@ -18,6 +18,9 @@ enum CodingTaskServiceError: LocalizedError, Equatable, Sendable {
     case budgetExhausted(taskID: UUID, reason: String)
     case acceptanceDenied(taskID: UUID, reasons: [AcceptanceBlockReason])
     case acceptanceInputUnavailable(taskID: UUID, reason: String)
+    case liveDispatchUnavailable(taskID: UUID)
+    case executionFingerprintUnavailable(taskID: UUID, reason: String)
+    case criterionNotFound(taskID: UUID, criterionID: UUID)
     case dependencyRejected(projectID: UUID, reason: String)
     case transitionRejected(TaskTransitionError)
     case persistence(TaskRepositoryError)
@@ -51,6 +54,12 @@ enum CodingTaskServiceError: LocalizedError, Equatable, Sendable {
             return "Task \(taskID) cannot be accepted: \(reasons.count) blocking gate reason(s)"
         case .acceptanceInputUnavailable(let taskID, let reason):
             return "Acceptance inputs for task \(taskID) are unavailable: \(reason)"
+        case .liveDispatchUnavailable(let taskID):
+            return "Task \(taskID) cannot start a live run: no running port is wired in this composition"
+        case .executionFingerprintUnavailable(let taskID, let reason):
+            return "Task \(taskID) cannot start a live run: no current workspace fingerprint is available (\(reason))"
+        case .criterionNotFound(let taskID, let criterionID):
+            return "Task \(taskID) has no acceptance criterion \(criterionID.uuidString)"
         case .dependencyRejected(let projectID, let reason):
             return "Dependency for project \(projectID) rejected: \(reason)"
         case .transitionRejected(let error):
@@ -105,6 +114,31 @@ protocol TaskAcceptanceEvidenceProviding: Sendable {
     func acceptanceEvidence(taskID: UUID) async throws -> TaskAcceptanceEvidence
 }
 
+/// Supplies the content fingerprint a human `executeRecipe` approval binds to.
+///
+/// The fingerprint is read from the attempt's owned workspace at start time, so the
+/// approval authorizes running the agent against the exact revision the human saw
+/// when they pressed start. An unavailable fingerprint refuses the start instead of
+/// fabricating a value; the claimed attempt is retired so no naked run stays behind.
+protocol TaskExecutionFingerprintProviding: Sendable {
+    func executionFingerprint(projectID: UUID, taskID: UUID) async throws -> String
+}
+
+/// Typed failures of an execution fingerprint lookup.
+enum TaskExecutionFingerprintError: LocalizedError, Equatable, Sendable {
+    case workspaceNotOwned(taskID: UUID, reason: String)
+    case fingerprintUnavailable(taskID: UUID, workspacePath: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .workspaceNotOwned(let taskID, let reason):
+            return "Task \(taskID) has no owned workspace to fingerprint: \(reason)"
+        case .fingerprintUnavailable(let taskID, let workspacePath):
+            return "The owned workspace of task \(taskID) could not be fingerprinted at \(workspacePath)"
+        }
+    }
+}
+
 /// App-facing task service: the only surface the board UI is allowed to mutate through.
 ///
 /// Every mutating call is single-flight per task, takes the caller's expected version or
@@ -116,8 +150,16 @@ actor CodingTaskService {
     private let recovery: TaskRecovery
     private let providers: TaskProviderRegistryPort
     private let acceptanceEvidence: TaskAcceptanceEvidenceProviding
+    private let executionFingerprints: any TaskExecutionFingerprintProviding
     private let clock: TaskSchedulerClock
     private let requiredSteps: [String]
+
+    /// Gönderim yeteneğinin bu kompozisyonda gerçekten bağlı olup olmadığı.
+    ///
+    /// `false` iken canlı koşu başlatma isteği talebi hiç doğurmadan reddedilir;
+    /// `true` iken başlatma yalnızca zamanlayıcının kendi kapılarından geçerse
+    /// koşu doğurur.
+    private let liveDispatchAvailable: Bool
 
     /// Process-lifetime project registry. Persistence arrives with the project repository port
     /// in the composition task; nothing here writes SQL or guesses Git state.
@@ -132,16 +174,20 @@ actor CodingTaskService {
         recovery: TaskRecovery,
         providers: TaskProviderRegistryPort,
         acceptanceEvidence: TaskAcceptanceEvidenceProviding,
+        executionFingerprints: any TaskExecutionFingerprintProviding,
         clock: TaskSchedulerClock,
-        requiredSteps: [String]
+        requiredSteps: [String],
+        liveDispatchAvailable: Bool
     ) {
         self.repository = repository
         self.scheduler = scheduler
         self.recovery = recovery
         self.providers = providers
         self.acceptanceEvidence = acceptanceEvidence
+        self.executionFingerprints = executionFingerprints
         self.clock = clock
         self.requiredSteps = requiredSteps
+        self.liveDispatchAvailable = liveDispatchAvailable
     }
 
     // MARK: - Projects and tasks
@@ -308,6 +354,142 @@ actor CodingTaskService {
                 try await self.scheduler.retry(taskID: taskID, expectedAttemptID: nil, expectedGeneration: nil)
             }
             return Self.startResult(from: entry)
+        }
+    }
+
+    /// İnsan onayıyla canlı koşu başlatır: talep, parmak izi ve koşu tek eylemde.
+    ///
+    /// Sıra: sağlayıcı uygunluğu → deneme talebi (çalışma alanı bu adımda doğar) →
+    /// güncel içerik parmak izi → insan `executeRecipe` onayı → gönderim. Parmak
+    /// izi alınamazsa onay uydurulmaz; talep edilmiş deneme geri çekilir ve açık
+    /// bir hata döner. Gönderim, eylem dönmeden önce arka planda başlar; koşunun
+    /// sonucu panoya bir sonraki yenilemede yansır ve `stop` onu iptal eder.
+    @discardableResult
+    func startRun(taskID: UUID, expectedVersion: Int, actor: String) async throws -> CodingTaskStartResult {
+        try await withExclusiveTaskAction(taskID: taskID) {
+            guard self.liveDispatchAvailable else {
+                throw CodingTaskServiceError.liveDispatchUnavailable(taskID: taskID)
+            }
+            let trimmedActor = try Self.requireHumanText(actor, field: "actor")
+            let task = try await self.requireTask(taskID)
+            try Self.requireVersion(task: task, expectedVersion: expectedVersion)
+            guard task.status == .backlog || task.status == .ready else {
+                throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
+            }
+            guard task.currentAttemptID == nil else {
+                return .deferred(reason: "activeAttempt")
+            }
+
+            let stage: TaskStage = task.status == .backlog ? .plan : task.stage
+            switch await self.providers.candidate(for: task, stage: stage) {
+            case .unsupported(let missingCapabilities):
+                return .unavailable(.unsupported(missingCapabilities: missingCapabilities))
+            case .unavailable(let reason):
+                return .unavailable(.providerUnavailable(reason: reason))
+            case .eligible:
+                break
+            }
+
+            let entry = try await self.mapped {
+                try await self.scheduler.retry(taskID: taskID, expectedAttemptID: nil, expectedGeneration: nil)
+            }
+            guard case .claimed(let attemptID, let generation) = entry.disposition else {
+                return Self.startResult(from: entry)
+            }
+
+            let fingerprint: String
+            do {
+                fingerprint = try await self.executionFingerprints.executionFingerprint(
+                    projectID: task.projectID,
+                    taskID: taskID
+                )
+            } catch {
+                // Onaysız koşu başlamaz; talep edilmiş deneme arkada kalmasın diye
+                // açıkça durdurulur ve hata olduğu gibi yüzeye çıkar.
+                try? await self.mapped { try await self.scheduler.stop(taskID: taskID) }
+                throw CodingTaskServiceError.executionFingerprintUnavailable(
+                    taskID: taskID,
+                    reason: String(describing: error)
+                )
+            }
+
+            let approval = TaskApproval(
+                id: UUID(),
+                taskID: taskID,
+                attemptID: attemptID,
+                fingerprint: fingerprint,
+                actor: trimmedActor,
+                timestamp: self.clock.now(),
+                action: .executeRecipe
+            )
+            try await self.mapped { try await self.repository.recordApproval(approval) }
+            await self.dispatch(attempt: attemptID, generation: generation, fingerprint: fingerprint, taskID: taskID)
+            return .claimed(attemptID: attemptID, generation: generation)
+        }
+    }
+
+    /// Gönderimi sahipli bir arka plan görevinde sürer; sonuç panoyu yeniden
+    /// yükleyerek görünür olur. Başlatma kapıları (onay, sahiplik, kimlik,
+    /// bütçe) zamanlayıcının içindedir; burada yalnızca yaşam döngüsü tutulur.
+    private func dispatch(attempt attemptID: UUID, generation: Int, fingerprint: String, taskID: UUID) async {
+        let handle = Task { [scheduler] in
+            do {
+                _ = try await scheduler.dispatch(
+                    taskID: taskID,
+                    attemptID: attemptID,
+                    generation: generation,
+                    fingerprint: fingerprint
+                )
+            } catch {
+                AppLog.lifecycle.error(
+                    "Live dispatch for task \(taskID.uuidString, privacy: .public) attempt \(attemptID.uuidString, privacy: .public) failed: \(String(describing: error), privacy: .public)"
+                )
+                // Yalnızca çalıştırıcı hiç başlayamadıysa deneme geri çekilir:
+                // kimlik/bütçe redleri denemenin başka bir yolla emekliye
+                // ayrıldığını gösterir ve yeni bir denemeyi durdurmak yanlış olur.
+                if case TaskDispatchRefusal.runtimeStartFailed = error {
+                    try? await scheduler.stop(taskID: taskID)
+                }
+            }
+        }
+        dispatchedRuns[taskID] = handle
+    }
+
+    /// Bekleyen koşu görevleri; kapanış ve durdurma bu tutamağı bekler.
+    private var dispatchedRuns: [UUID: Task<Void, Never>] = [:]
+
+    /// Bu süreçte başlatılmış koşu görevlerinin bitmesini bekler (kapanış yolu).
+    func awaitDispatchedRuns() async {
+        let handles = dispatchedRuns.values
+        for handle in handles {
+            _ = await handle.value
+        }
+    }
+
+    /// İnsan bir kabul ölçütünü tamamlandı ya da geri aldı olarak işaretler.
+    ///
+    /// Sürüm çiti çağıranın gördüğü kart sürümüdür; bayat işaretleme sessizce
+    /// uygulanmaz. Ölçüt bulunamazsa açık bir `criterionNotFound` hatası döner.
+    @discardableResult
+    func setCriterionCompletion(
+        taskID: UUID,
+        criterionID: UUID,
+        isCompleted: Bool,
+        expectedVersion: Int
+    ) async throws -> CodingTask {
+        try await withExclusiveTaskAction(taskID: taskID) {
+            let task = try await self.requireTask(taskID)
+            guard task.criteria.contains(where: { $0.id == criterionID }) else {
+                throw CodingTaskServiceError.criterionNotFound(taskID: taskID, criterionID: criterionID)
+            }
+            return try await self.mapped {
+                try await self.repository.setCriterionCompletion(
+                    taskID: taskID,
+                    criterionID: criterionID,
+                    isCompleted: isCompleted,
+                    expectedVersion: expectedVersion
+                )
+            }
         }
     }
 

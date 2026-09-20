@@ -75,6 +75,91 @@ struct FixedAcceptanceEvidence: TaskAcceptanceEvidenceProviding {
     }
 }
 
+struct FixedExecutionFingerprints: TaskExecutionFingerprintProviding {
+    let fingerprint: String
+    let failure: Error?
+
+    init(fingerprint: String, failure: Error? = nil) {
+        self.fingerprint = fingerprint
+        self.failure = failure
+    }
+
+    func executionFingerprint(projectID: UUID, taskID: UUID) async throws -> String {
+        if let failure {
+            throw failure
+        }
+        return fingerprint
+    }
+}
+
+/// Canlı gönderim portu sahtesi: kaç kez başlatıldığını ve hangi isteğin
+/// geldiğini kaydeder; terminal olayları senaryoya göre yayar.
+actor ServiceScriptedDispatchPort: TaskRunningPort {
+    private(set) var startCount = 0
+    private(set) var requests: [TaskRunRequest] = []
+    private var hangingContinuations: [UUID: AsyncStream<CodingAgentEvent>.Continuation] = [:]
+    private let hangAfterStart: Bool
+
+    init(hangAfterStart: Bool = false) {
+        self.hangAfterStart = hangAfterStart
+    }
+
+    func start(
+        _ request: TaskRunRequest,
+        approvalResolver: @escaping TaskRunApprovalResolver
+    ) async throws -> TaskRunSession {
+        startCount += 1
+        requests.append(request)
+        let (stream, continuation) = AsyncStream<CodingAgentEvent>.makeStream()
+        continuation.yield(
+            CodingAgentEvent(
+                taskID: request.task.id,
+                attemptID: request.attempt.id,
+                generation: request.attempt.generation,
+                kind: .started
+            )
+        )
+        if hangAfterStart {
+            hangingContinuations[request.attempt.id] = continuation
+        } else {
+            continuation.yield(
+                CodingAgentEvent(
+                    taskID: request.task.id,
+                    attemptID: request.attempt.id,
+                    generation: request.attempt.generation,
+                    kind: .terminalSuccess
+                )
+            )
+            continuation.finish()
+        }
+        return TestScriptedRunSession(events: stream) { [weak self] in
+            await self?.cancel(attemptID: request.attempt.id)
+        }
+    }
+
+    private func cancel(attemptID: UUID) {
+        guard let continuation = hangingContinuations.removeValue(forKey: attemptID) else { return }
+        continuation.yield(
+            CodingAgentEvent(
+                taskID: UUID(),
+                attemptID: attemptID,
+                generation: 0,
+                kind: .interrupted("cancelled")
+            )
+        )
+        continuation.finish()
+    }
+}
+
+struct TestScriptedRunSession: TaskRunSession {
+    let events: AsyncStream<CodingAgentEvent>
+    let cancelHandler: @Sendable () async -> Void
+
+    func cancel() async {
+        await cancelHandler()
+    }
+}
+
 struct NoProviderSessions: TaskProviderSessionInspecting {
     func providerStatus(for attempt: TaskAttempt) async -> TaskProviderSessionStatus {
         .stopped
@@ -253,6 +338,20 @@ actor ServiceHookingRepository: CodingTaskRepository {
     func addDependency(_ dependency: TaskDependency) async throws {
         addDependencyCount += 1
         try await base.addDependency(dependency)
+    }
+
+    func setCriterionCompletion(
+        taskID: UUID,
+        criterionID: UUID,
+        isCompleted: Bool,
+        expectedVersion: Int
+    ) async throws -> CodingTask {
+        try await base.setCriterionCompletion(
+            taskID: taskID,
+            criterionID: criterionID,
+            isCompleted: isCompleted,
+            expectedVersion: expectedVersion
+        )
     }
 
     func task(id: UUID) async throws -> CodingTask? {
@@ -450,8 +549,10 @@ final class ServiceTestHarness {
                 evidence: acceptanceEvidence,
                 currentFingerprint: currentFingerprint
             ),
+            executionFingerprints: FixedExecutionFingerprints(fingerprint: currentFingerprint),
             clock: clock,
-            requiredSteps: requiredSteps
+            requiredSteps: requiredSteps,
+            liveDispatchAvailable: false
         )
     }
 
@@ -1507,5 +1608,333 @@ final class CodingTaskServiceTests: XCTestCase {
         XCTAssertNil(report.failure)
         XCTAssertEqual(report.entries.count, 1)
         XCTAssertEqual(report.entries.first?.disposition, .noAction)
+    }
+
+    // MARK: - Canlı koşu gönderimi (executeRecipe onayı)
+
+    private func makeDispatchService(
+        port: ServiceScriptedDispatchPort,
+        fingerprint: String,
+        fingerprintFailure: Error?
+    ) async throws -> (store: SQLiteTaskStore, scheduler: TaskScheduler, service: CodingTaskService, project: CodingProject) {
+        let store = try SQLiteTaskStore.inMemory()
+        let repository = ServiceHookingRepository(base: store)
+        let clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
+        let providers = ScriptedProviderRegistry(result: .eligible(runtimeID: "runtime-1", modelID: "model-1"))
+        let workspace = TaskBoardServiceFixtures.ownedWorkspace
+        let scheduler = TaskScheduler(
+            repository: repository,
+            providers: providers,
+            workspaces: FixedWorkspacePreflight(result: .owned(workspace)),
+            verifier: FixedVerifier(passed: true),
+            clock: clock,
+            schedulerID: "scheduler-dispatch-service",
+            provisioning: nil,
+            dispatchPort: port
+        )
+        let recovery = TaskRecovery(
+            repository: repository,
+            providers: NoProviderSessions(),
+            workspaces: NoWorkspaceOwnership(),
+            processes: NoProcesses(),
+            clock: clock,
+            recoveryID: "recovery-dispatch-service"
+        )
+        let service = CodingTaskService(
+            repository: repository,
+            scheduler: scheduler,
+            recovery: recovery,
+            providers: providers,
+            acceptanceEvidence: FixedAcceptanceEvidence(evidence: [], currentFingerprint: fingerprint),
+            executionFingerprints: FixedExecutionFingerprints(
+                fingerprint: fingerprint,
+                failure: fingerprintFailure
+            ),
+            clock: clock,
+            requiredSteps: [],
+            liveDispatchAvailable: true
+        )
+        let project = try await service.createProject(
+            name: "Dispatch",
+            repositoryPath: workspace.repositoryPath,
+            gitIdentity: "dev@example.com",
+            protectedRefs: ["main"]
+        )
+        return (store, scheduler, service, project)
+    }
+
+    func testStartRunRequiresAHumanActorBeforeAnyClaim() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeDispatchService(port: port, fingerprint: "fingerprint-live", fingerprintFailure: nil)
+        _ = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: ["done"]
+        )
+        let snapshotForActor = try await fixture.service.snapshot(projectID: fixture.project.id)
+        let actorTask = try XCTUnwrap(snapshotForActor.tasks.first)
+
+        do {
+            _ = try await fixture.service.startRun(taskID: actorTask.id, expectedVersion: actorTask.version, actor: "   ")
+            XCTFail("A blank human actor must be refused before any claim")
+        } catch {
+            XCTAssertEqual(error as? CodingTaskServiceError, .invalidTaskInput(field: "actor", reason: "must not be blank"))
+        }
+        let startCount = await port.startCount
+        XCTAssertEqual(startCount, 0)
+        let reloaded = try await fixture.store.task(id: actorTask.id)
+        XCTAssertEqual(reloaded?.status, .backlog)
+    }
+
+    func testStartRunWithoutInjectedPortIsRefusedBeforeClaim() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(projectID: project.id, title: "Task", objective: "Objective", priority: 1, criteria: [])
+
+        do {
+            _ = try await service.startRun(taskID: task.id, expectedVersion: 1, actor: "human@example.com")
+            XCTFail("A composition without a running port must refuse startRun")
+        } catch {
+            XCTAssertEqual(error as? CodingTaskServiceError, .liveDispatchUnavailable(taskID: task.id))
+        }
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.claimAttempts, 0)
+    }
+
+    func testStartRunRecordsExecuteApprovalBoundToAttemptAndFingerprint() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeDispatchService(port: port, fingerprint: "fingerprint-live", fingerprintFailure: nil)
+        _ = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: ["done"]
+        )
+        let snapshotForRun = try await fixture.service.snapshot(projectID: fixture.project.id)
+        let runTask = try XCTUnwrap(snapshotForRun.tasks.first)
+
+        let result = try await fixture.service.startRun(
+            taskID: runTask.id,
+            expectedVersion: runTask.version,
+            actor: "human@example.com"
+        )
+        guard case .claimed(let attemptID, let generation) = result else {
+            return XCTFail("Expected a claim, got \(result)")
+        }
+        try await waitForDispatchStart(port, count: 1)
+
+        let approvals = try await fixture.store.approvals(taskID: runTask.id)
+        XCTAssertEqual(approvals.count, 1)
+        let approval = try XCTUnwrap(approvals.first)
+        XCTAssertEqual(approval.action, .executeRecipe)
+        XCTAssertEqual(approval.actor, "human@example.com")
+        XCTAssertEqual(approval.attemptID, attemptID)
+        XCTAssertEqual(approval.fingerprint, "fingerprint-live")
+        XCTAssertTrue(
+            approval.authorizes(
+                action: .executeRecipe,
+                taskID: runTask.id,
+                attemptID: attemptID,
+                fingerprint: "fingerprint-live"
+            )
+        )
+
+        let capturedRequests = await port.requests
+        let request = try XCTUnwrap(capturedRequests.first)
+        XCTAssertEqual(request.attempt.id, attemptID)
+        XCTAssertEqual(request.attempt.generation, generation)
+        // Koşu terminal olaylarla bittiğinde görev incelemeye ilerler.
+        try await waitUntil {
+            let reloaded = try? await fixture.store.task(id: runTask.id)
+            return reloaded?.status == .review
+        }
+    }
+
+    func testStartRunRefusesWhenFingerprintIsUnavailableAndRetiresTheClaim() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeDispatchService(
+            port: port,
+            fingerprint: "unused",
+            fingerprintFailure: TaskExecutionFingerprintError.fingerprintUnavailable(
+                taskID: UUID(),
+                workspacePath: "/tmp/workspace"
+            )
+        )
+        _ = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: []
+        )
+        let snapshotForFingerprint = try await fixture.service.snapshot(projectID: fixture.project.id)
+        let fingerprintTask = try XCTUnwrap(snapshotForFingerprint.tasks.first)
+
+        do {
+            _ = try await fixture.service.startRun(
+                taskID: fingerprintTask.id,
+                expectedVersion: fingerprintTask.version,
+                actor: "human@example.com"
+            )
+            XCTFail("A missing fingerprint must refuse the run")
+        } catch let error as CodingTaskServiceError {
+            guard case .executionFingerprintUnavailable(let refusedTaskID, _) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(refusedTaskID, fingerprintTask.id)
+        }
+
+        let startCount = await port.startCount
+        XCTAssertEqual(startCount, 0, "No runtime may start without a bound approval")
+        let approvals = try await fixture.store.approvals(taskID: fingerprintTask.id)
+        XCTAssertTrue(approvals.isEmpty, "No approval may be invented when the fingerprint is unavailable")
+        let reloaded = try await fixture.store.task(id: fingerprintTask.id)
+        XCTAssertEqual(reloaded?.status, .blocked)
+        XCTAssertEqual(reloaded?.blockReason, .custom(TaskScheduler.stoppedBlockReason))
+    }
+
+    // MARK: - Kabul ölçütü tamamlama
+
+    func testSetCriterionCompletionMarksAndUnmarksWithVersionFence() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(
+            projectID: project.id,
+            title: "Criteria",
+            objective: "Complete criteria",
+            priority: 1,
+            criteria: ["first", "second"]
+        )
+        let firstCriterion = try XCTUnwrap(task.criteria.first)
+
+        let completed = try await service.setCriterionCompletion(
+            taskID: task.id,
+            criterionID: firstCriterion.id,
+            isCompleted: true,
+            expectedVersion: task.version
+        )
+        XCTAssertEqual(completed.version, task.version + 1)
+        XCTAssertEqual(completed.criteria.first?.isCompleted, true)
+        XCTAssertEqual(completed.criteria.last?.isCompleted, false)
+
+        let uncompleted = try await service.setCriterionCompletion(
+            taskID: task.id,
+            criterionID: firstCriterion.id,
+            isCompleted: false,
+            expectedVersion: completed.version
+        )
+        XCTAssertEqual(uncompleted.criteria.first?.isCompleted, false)
+
+        do {
+            _ = try await service.setCriterionCompletion(
+                taskID: task.id,
+                criterionID: firstCriterion.id,
+                isCompleted: true,
+                expectedVersion: task.version
+            )
+            XCTFail("A stale version must be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? CodingTaskServiceError,
+                .staleVersion(taskID: task.id, expected: task.version, actual: uncompleted.version)
+            )
+        }
+    }
+
+    func testSetCriterionCompletionRejectsUnknownCriterion() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await service.createTask(
+            projectID: project.id,
+            title: "Criteria",
+            objective: "Objective",
+            priority: 1,
+            criteria: ["first"]
+        )
+        let unknownID = UUID()
+
+        do {
+            _ = try await service.setCriterionCompletion(
+                taskID: task.id,
+                criterionID: unknownID,
+                isCompleted: true,
+                expectedVersion: task.version
+            )
+            XCTFail("An unknown criterion must be refused")
+        } catch {
+            XCTAssertEqual(
+                error as? CodingTaskServiceError,
+                .criterionNotFound(taskID: task.id, criterionID: unknownID)
+            )
+        }
+    }
+
+    func testCriterionCompletionUnblocksHumanAcceptance() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let seeded = try await harness.seedReviewTask(
+            projectID: UUID(),
+            criteriaCompleted: false,
+            evidence: []
+        )
+        let evidence = VerificationEvidence(
+            taskID: seeded.task.id,
+            attemptID: seeded.attempt.id,
+            recipeName: "test-recipe",
+            stepName: "build",
+            status: .passed,
+            detailsRedacted: "redacted",
+            workspaceFingerprint: harness.currentFingerprint,
+            recordedAt: harness.clock.now(),
+            recipeVersion: VerificationRecipe.currentVersion
+        )
+        harness.acceptanceEvidence = [evidence]
+        let service = harness.makeService()
+        let criterion = try XCTUnwrap(seeded.task.criteria.first)
+
+        do {
+            _ = try await service.accept(taskID: seeded.task.id, expectedVersion: seeded.task.version, actor: "human@example.com")
+            XCTFail("Acceptance must stay blocked while a criterion is unmet")
+        } catch let error as CodingTaskServiceError {
+            guard case .acceptanceDenied(_, let reasons) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(reasons.contains { if case .unmetCriteria = $0 { return true } else { return false } })
+        }
+
+        let completed = try await service.setCriterionCompletion(
+            taskID: seeded.task.id,
+            criterionID: criterion.id,
+            isCompleted: true,
+            expectedVersion: seeded.task.version
+        )
+        let accepted = try await service.accept(
+            taskID: seeded.task.id,
+            expectedVersion: completed.version,
+            actor: "human@example.com"
+        )
+        XCTAssertEqual(accepted.status, .done)
+    }
+
+    private func waitForDispatchStart(_ port: ServiceScriptedDispatchPort, count: Int) async throws {
+        try await waitUntil {
+            await port.startCount >= count
+        }
+    }
+
+    private func waitUntil(timeout: TimeInterval = 5, _ condition: @escaping () async -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Condition was not met before timeout")
     }
 }

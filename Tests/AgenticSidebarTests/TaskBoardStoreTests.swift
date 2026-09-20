@@ -706,4 +706,129 @@ final class TaskBoardStoreTests: XCTestCase {
             "agentic-sidebar-board-project"
         )
     }
+
+    // MARK: - Kabul ölçütü ve canlı koşu yüzeyleri
+
+    func testCriterionToggleSurfacesThroughTheStoreAndRefreshes() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Criteria", priority: 1, criteria: ["first"])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        await store.selectTask(task.id)
+        let criterion = try XCTUnwrap(store.detail?.criteria.first)
+
+        let result = await store.setCriterionCompletion(
+            taskID: task.id,
+            criterionID: criterion.id,
+            isCompleted: true
+        )
+        XCTAssertEqual(result, .applied)
+        let card = try XCTUnwrap(store.cards.first { $0.id == task.id })
+        XCTAssertEqual(card.criteriaCompleted, 1)
+        XCTAssertEqual(store.detail?.criteria.first?.isCompleted, true)
+    }
+
+    func testStartRunThroughStoreIsRefusedWithoutLiveDispatch() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "No dispatch", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        let result = await store.startRun(taskID: task.id, actor: "human@example.com")
+        guard case .refused(let refusal) = result else {
+            return XCTFail("A composition without live dispatch must refuse startRun, got \(result)")
+        }
+        XCTAssertEqual(refusal.kind, .unavailable)
+        XCTAssertTrue(refusal.message.contains("fingerprint") || refusal.message.contains("dispatch"))
+        let counts = await harness.repository.mutationCounts()
+        XCTAssertEqual(counts.claimAttempts, 0)
+    }
+
+    func testStartRunThroughStoreDispatchesOnceWithApproval() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeLiveDispatchStore(port: port, fingerprint: "store-live-fingerprint")
+        let task = try XCTUnwrap(fixture.store.cards.first)
+
+        let result = await fixture.store.startRun(taskID: task.id, actor: "human@example.com")
+        XCTAssertEqual(result, .applied)
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let started = await port.startCount
+            if started >= 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let started = await port.startCount
+        XCTAssertEqual(started, 1, "The store must dispatch exactly once")
+        let approvals = try await fixture.repository.approvals(taskID: task.id)
+        XCTAssertEqual(approvals.map(\.action), [.executeRecipe])
+        XCTAssertEqual(approvals.first?.actor, "human@example.com")
+        XCTAssertEqual(approvals.first?.fingerprint, "store-live-fingerprint")
+    }
+
+    /// Canlı gönderim bağlı bir kompozisyon kurar: mağaza yalnızca servis
+    /// üzerinden konuşur, port ise zamanlayıcının içinde kalır.
+    private func makeLiveDispatchStore(
+        port: ServiceScriptedDispatchPort,
+        fingerprint: String
+    ) async throws -> (store: TaskBoardStore, repository: SQLiteTaskStore) {
+        let repository = try SQLiteTaskStore.inMemory()
+        let clock = ServiceTestClock(start: TaskBoardServiceFixtures.startDate)
+        let providers = ScriptedProviderRegistry(result: .eligible(runtimeID: "runtime-1", modelID: "model-1"))
+        let workspace = TaskBoardServiceFixtures.ownedWorkspace
+        let scheduler = TaskScheduler(
+            repository: repository,
+            providers: providers,
+            workspaces: FixedWorkspacePreflight(result: .owned(workspace)),
+            verifier: FixedVerifier(passed: true),
+            clock: clock,
+            schedulerID: "store-live-scheduler",
+            provisioning: nil,
+            dispatchPort: port
+        )
+        let recovery = TaskRecovery(
+            repository: repository,
+            providers: NoProviderSessions(),
+            workspaces: NoWorkspaceOwnership(),
+            processes: NoProcesses(),
+            clock: clock,
+            recoveryID: "store-live-recovery"
+        )
+        let service = CodingTaskService(
+            repository: repository,
+            scheduler: scheduler,
+            recovery: recovery,
+            providers: providers,
+            acceptanceEvidence: FixedAcceptanceEvidence(evidence: [], currentFingerprint: fingerprint),
+            executionFingerprints: FixedExecutionFingerprints(fingerprint: fingerprint),
+            clock: clock,
+            requiredSteps: [],
+            liveDispatchAvailable: true
+        )
+        let project = try await service.createProject(
+            name: "Store Live",
+            repositoryPath: workspace.repositoryPath,
+            gitIdentity: "dev@example.com",
+            protectedRefs: ["main"]
+        )
+        _ = try await service.createTask(
+            projectID: project.id,
+            title: "Live",
+            objective: "Dispatch through the store",
+            priority: 1,
+            criteria: []
+        )
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        return (store, repository)
+    }
 }

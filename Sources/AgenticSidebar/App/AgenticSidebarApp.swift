@@ -444,24 +444,22 @@ final class TaskBoardComposition {
     /// `register(projectID:)` ile ya da pano kayıt köprüsüyle beslenir.
     private(set) var knownProjectIDs: Set<UUID> = []
 
-    /// Canlı koşu gönderimi bu sürümde kablolanmaz: zamanlayıcının sağlayıcıya
-    /// koşu gönderen bir çağrısı yoktur. `DisabledLiveDispatchSessions` ve
-    /// `DisabledLiveDispatchProcesses` portları yalnızca bu ön koşul sürdüğü
-    /// sürece doğrudur; gönderim yeteneği eklenirse bayrak `true` yapılmalı ve
-    /// portlar önce gerçek oturum/süreç sahipliğini yansıtmalıdır, yoksa
-    /// kurtarma koşan bir denemeyi serbest bırakır.
-    static let liveDispatchCapabilityPresent = false
+    /// Canlı koşu gönderimi bu sürümde bağlıdır: `LiveOpenCodeTaskRunningPort`
+    /// gerçek `OpenCodeCodingAgentAdapter`'ı uygulamanın yönetilen sunucusu
+    /// üzerinden sürer ve `DisabledLiveDispatch*` portları yerini gerçek
+    /// sahiplik denetimine bırakır. Kurtarma portları asla `.stopped`/`.absent`
+    /// uydurmaz: kanıtlanamayan sahiplik `.unknown` olarak kalır ve kurtarma
+    /// koşan bir denemeyi serbest bırakmaz.
+    static let liveDispatchCapabilityPresent = true
 
-    /// `DisabledLiveDispatch*` portlarının ön koşulunu hata ayıklamada
-    /// doğrular; gönderim yeteneği eklenip portlar değiştirilmezse burada
-    /// durulur.
+    /// Canlı gönderim kablolamasının ön koşulunu doğrular: gönderim bağlıysa
+    /// bayrak da bunu söylemek zorundadır, aksi hâlde pano yeteneksiz görünür.
     static func assertLiveDispatchPrecondition() {
         #if DEBUG
-            if liveDispatchCapabilityPresent {
-                assertionFailure(
-                    "DisabledLiveDispatchSessions/Processes are only valid while live dispatch is not wired; replace them before enabling dispatch"
-                )
-            }
+            precondition(
+                liveDispatchCapabilityPresent,
+                "Live dispatch ports are wired; the capability flag must stay true"
+            )
         #endif
     }
 
@@ -492,11 +490,13 @@ final class TaskBoardComposition {
         providers: any TaskProviderRegistryPort,
         workspacePreflight: any TaskWorkspacePreflightPort,
         provisioning: any TaskWorkspaceProvisioningPort,
+        dispatchPort: (any TaskRunningPort)?,
         recoveryProviders: any TaskProviderSessionInspecting,
         recoveryWorkspaces: any TaskWorkspaceOwnershipInspecting,
         recoveryProcesses: any TaskProcessOwnershipInspecting,
         verifier: any TaskVerifying,
         acceptanceEvidence: any TaskAcceptanceEvidenceProviding,
+        executionFingerprints: any TaskExecutionFingerprintProviding,
         clock: any TaskSchedulerClock,
         schedulerID: String,
         recoveryID: String,
@@ -509,7 +509,8 @@ final class TaskBoardComposition {
             verifier: verifier,
             clock: clock,
             schedulerID: schedulerID,
-            provisioning: provisioning
+            provisioning: provisioning,
+            dispatchPort: dispatchPort
         )
         let recovery = TaskRecovery(
             repository: repository,
@@ -525,8 +526,10 @@ final class TaskBoardComposition {
             recovery: recovery,
             providers: providers,
             acceptanceEvidence: acceptanceEvidence,
+            executionFingerprints: executionFingerprints,
             clock: clock,
-            requiredSteps: requiredSteps
+            requiredSteps: requiredSteps,
+            liveDispatchAvailable: dispatchPort != nil
         )
         return TaskBoardComposition(
             store: TaskBoardStore(service: service),
@@ -649,27 +652,26 @@ extension TaskBoardComposition {
             return nil
         }
 
-        // Yetenek kaydı: koşu gönderimi bu sürümde bağlı değildir; kayıt
-        // yalnızca uygunluk sorusunu dürüstçe yanıtlar.
+        // Yetenek kaydı: kayıt, uygunluk sorusunu dürüstçe yanıtlar; canlı
+        // gönderim aynı adaptörü bu kayıt üzerinden çözer.
         let codingAgentRegistry = CodingAgentRegistry()
-        codingAgentRegistry.register(
-            runtime: OpenCodeCodingAgentAdapter(
-                serverManager: openCodeServerManager,
-                clientFactory: { connection in
-                    OpenCodeClient(transport: openCodeTransport, connection: connection)
-                },
-                permissionHandler: { request in
-                    await permissionApprovalCenter.submit(request)
-                },
-                cancelPendingPermissions: { remoteSessionID, appSessionID in
-                    await permissionApprovalCenter.rejectAll(
-                        remoteSessionID: remoteSessionID,
-                        appSessionID: appSessionID
-                    )
-                },
-                auditLog: toolAuditLog
-            )
+        let openCodeCodingAgentAdapter = OpenCodeCodingAgentAdapter(
+            serverManager: openCodeServerManager,
+            clientFactory: { connection in
+                OpenCodeClient(transport: openCodeTransport, connection: connection)
+            },
+            permissionHandler: { request in
+                await permissionApprovalCenter.submit(request)
+            },
+            cancelPendingPermissions: { remoteSessionID, appSessionID in
+                await permissionApprovalCenter.rejectAll(
+                    remoteSessionID: remoteSessionID,
+                    appSessionID: appSessionID
+                )
+            },
+            auditLog: toolAuditLog
         )
+        codingAgentRegistry.register(runtime: openCodeCodingAgentAdapter)
         codingAgentRegistry.register(
             runtime: OpenAITextCodingAdapter(
                 providerRuntime: OpenAIProviderRuntime(
@@ -721,6 +723,22 @@ extension TaskBoardComposition {
             ledger: evidenceLedger
         )
 
+        // Canlı koşu portu: zamanlayıcının kapılarından geçen denemeyi gerçek
+        // OpenCode adaptörüyle sürer. İzin yanıtları, portun aldığı
+        // deny-unless-safe çözücüsünden geçer; adaptörün kendi sohbet izin
+        // merkezi yalnızca yedek olarak kalır.
+        let dispatchPort = LiveOpenCodeTaskRunningPort(
+            registry: codingAgentRegistry,
+            serverManager: openCodeServerManager,
+            clientFactory: { connection in
+                OpenCodeClient(transport: openCodeTransport, connection: connection)
+            }
+        )
+        let executionFingerprints = LiveExecutionFingerprintProvider(
+            workspaces: preflight,
+            probe: WorkspaceFingerprintProbe(runner: verificationRunner)
+        )
+
         let composition = make(
             repository: repository,
             providers: LiveTaskProviderRegistry(
@@ -729,11 +747,16 @@ extension TaskBoardComposition {
             ),
             workspacePreflight: preflight,
             provisioning: provisioning,
-            recoveryProviders: DisabledLiveDispatchSessions(),
+            dispatchPort: dispatchPort,
+            recoveryProviders: AdapterTruthProviderSessions(
+                adapter: openCodeCodingAgentAdapter,
+                serverManager: openCodeServerManager
+            ),
             recoveryWorkspaces: recoveryWorkspaces,
-            recoveryProcesses: DisabledLiveDispatchProcesses(),
+            recoveryProcesses: ConservativeRecoveryProcesses(),
             verifier: verifier,
             acceptanceEvidence: evidenceLedger,
+            executionFingerprints: executionFingerprints,
             clock: SystemTaskSchedulerClock(),
             schedulerID: "taskboard-scheduler",
             recoveryID: "taskboard-recovery",
@@ -809,36 +832,159 @@ private struct LiveTaskProviderRegistry: TaskProviderRegistryPort {
     }
 }
 
-/// Canlı yazma gönderimi bağlı olmadığından hiçbir sağlayıcı oturumu kalıcı bir
-/// denemeye bağlı olamaz; kurtarma bu gerçeği `.stopped` olarak görür.
+/// Sağlayıcı oturumu sahipliğini bu sürecin bildiği kadarıyla yanıtlar.
 ///
-/// Ön koşul: bu yanıt yalnızca canlı gönderim kablolanmadığı sürece doğrudur.
-/// Gerçek koşular sahiplenilmeye başlanırsa `.stopped` yalan olur ve kurtarma
-/// koşan bir denemeyi serbest bırakır; gönderim eklenirken bu port gerçek
-/// oturum sahipliği denetimiyle değiştirilmelidir (bkz.
-/// `TaskBoardComposition.liveDispatchCapabilityPresent`).
-private struct DisabledLiveDispatchSessions: TaskProviderSessionInspecting {
+/// Bu süreç yalnızca kendi adaptörünün tuttuğu uzak oturum kimliğini bilir;
+/// sunucu tarafındaki canlılık sorgulanabilir değildir. Bu yüzden yanıt asla
+/// `.stopped` olmaz: kayıtlı bir oturum varsa da, yoksa da `.unknown` döner ve
+/// kurtarma koşan bir denemeyi kanıtsız serbest bırakmaz.
+struct AdapterTruthProviderSessions: TaskProviderSessionInspecting {
+    let adapter: OpenCodeCodingAgentAdapter
+    let serverManager: any OpenCodeServerManaging
+
     func providerStatus(for attempt: TaskAttempt) async -> TaskProviderSessionStatus {
-        .stopped
+        let trackedRemoteSessionID = await adapter.remoteSessionID(for: attempt.id)
+        let connection = await serverManager.currentConnection()
+        let reason: String
+        if let trackedRemoteSessionID {
+            reason =
+                connection == nil
+                ? "adapter tracks remote session \(trackedRemoteSessionID) but the server connection is unavailable; liveness cannot be proven"
+                : "adapter tracks remote session \(trackedRemoteSessionID); server-side liveness cannot be proven from this process"
+        } else {
+            reason =
+                connection == nil
+                ? "no session is tracked by this adapter and no server connection is available; server-side liveness is not knowable"
+                : "no session is tracked by this adapter; a server-side session from another process cannot be excluded"
+        }
+        return .unknown(reason: reason)
     }
 }
 
-/// Hiçbir görev süreci başlatılmadığından sahipli süreç yoktur.
+/// Görev süreci sahipliği bu süreçten kanıtlanamaz.
 ///
-/// Ön koşul: bu yanıt yalnızca canlı gönderim kablolanmadığı sürece doğrudur;
-/// gönderim eklenirse `.absent` yalan olur ve kurtarma koşan bir denemeyi
-/// serbest bırakır. Gönderim eklenirken bu port gerçek süreç sahipliği
-/// denetimiyle değiştirilmelidir (bkz.
-/// `TaskBoardComposition.liveDispatchCapabilityPresent`).
-private struct DisabledLiveDispatchProcesses: TaskProcessOwnershipInspecting {
+/// Canlı koşular çocuk süreçleri adaptör üzerinden sürer; kurtarma anında hangi
+/// PID'in bu denemeye ait olduğu kanıtlanamadığı için yanıt `.unknown`dur.
+/// `.absent` demek, koşan bir denemeyi kanıtsız serbest bırakırdı.
+struct ConservativeRecoveryProcesses: TaskProcessOwnershipInspecting {
     func processStatus(for attempt: TaskAttempt) async -> TaskProcessOwnershipStatus {
-        .absent
+        .unknown(pid: nil, reason: "process ownership for attempt \(attempt.id.uuidString) cannot be proven by this process")
+    }
+}
+
+/// Canlı koşu portu: zamanlayıcıdan geçen denemeyi sağlayıcı kaydındaki gerçek
+/// adaptörle sürer ve akışı olduğu gibi (sınırlı kanalıyla) aktarır.
+///
+/// Çalışma alanı sahipliği ve sağlayıcı uygunluğu zamanlayıcının kapılarında
+/// doğrulanmıştır; port yalnızca eşler, sunucunun ayakta olduğundan emin olur ve
+/// iptali adaptöre iletir. İzin yanıtları, koşuya özel deny-unless-safe
+/// çözücüsünden üretilir; adaptörün sohbet izin merkezi bu koşuda kullanılmaz.
+struct LiveOpenCodeTaskRunningPort: TaskRunningPort {
+    let registry: CodingAgentRegistry
+    let serverManager: any OpenCodeServerManaging
+    let clientFactory: @Sendable (OpenCodeServerConnection) -> any OpenCodeClientProtocol
+
+    func start(
+        _ request: TaskRunRequest,
+        approvalResolver: @escaping TaskRunApprovalResolver
+    ) async throws -> TaskRunSession {
+        guard let runtime = registry.runtime(for: request.attempt.providerID) else {
+            throw CodingAgentAdapterError.invalidProvider
+        }
+        if await serverManager.currentConnection() == nil {
+            _ = try await serverManager.start(computerUse: nil)
+        }
+
+        let configuration = SessionConfiguration(
+            providerID: ProviderID(request.attempt.providerID),
+            modelID: ProviderModelID(request.attempt.modelID),
+            variantID: request.attempt.variantSnapshot.map { ProviderVariantID($0) }
+        )
+        let executionRequest = CodingAgentExecutionRequest(
+            taskID: request.task.id,
+            attemptID: request.attempt.id,
+            generation: request.attempt.generation,
+            role: request.attempt.role,
+            configuration: configuration,
+            objective: request.task.objective,
+            acceptanceCriteria: request.task.criteria,
+            workspacePath: request.workspace.workspacePath,
+            relevantFiles: [],
+            stage: request.task.stage,
+            deadline: request.deadline,
+            policySnapshot: [:]
+        )
+
+        let run: CodingAgentRun
+        if let openCodeAdapter = runtime as? OpenCodeCodingAgentAdapter {
+            let replyProvider: OpenCodeCodingAgentAdapter.PermissionReplyProvider = { permissionRequest in
+                let reply = await approvalResolver(
+                    TaskRunApprovalRequest(
+                        id: permissionRequest.id,
+                        toolName: permissionRequest.toolName,
+                        patterns: permissionRequest.patterns
+                    )
+                )
+                switch reply {
+                case .approveOnce:
+                    return .once
+                case .deny:
+                    return .reject
+                }
+            }
+            run = try await openCodeAdapter.start(
+                request: executionRequest,
+                permissionReplyProvider: replyProvider
+            )
+        } else {
+            // Diğer çalıştırıcılar (ör. salt metin) protokolün kendi başlangıcını
+            // kullanır; yazma yetenekleri kayıt defterinde zaten kapıdadır.
+            run = try await runtime.start(request: executionRequest)
+        }
+        return LiveOpenCodeTaskRunSession(events: run.events, cancelHandler: { await run.cancel() })
+    }
+}
+
+/// `TaskRunSession` köprüsü: sınırlı adaptör akışını aynen taşır ve `cancel()`
+/// isteğini adaptörün iptal tutamağına iletir.
+struct LiveOpenCodeTaskRunSession: TaskRunSession {
+    let events: AsyncStream<CodingAgentEvent>
+    let cancelHandler: @Sendable () async -> Void
+
+    func cancel() async {
+        await cancelHandler()
+    }
+}
+
+/// Çalışma alanı ön kontrolünden güncel içerik parmak izini okur.
+///
+/// Ön koşul, görev için sahipli bir çalışma alanı bulunmasıdır; parmak izi
+/// üretilemezse onay uydurulmaz ve başlatma reddedilir.
+struct LiveExecutionFingerprintProvider: TaskExecutionFingerprintProviding {
+    let workspaces: any TaskWorkspacePreflightPort
+    let probe: WorkspaceFingerprintProbe
+
+    func executionFingerprint(projectID: UUID, taskID: UUID) async throws -> String {
+        switch await workspaces.preflight(projectID: projectID, taskID: taskID) {
+        case .owned(let workspace):
+            guard let fingerprint = await probe.fingerprint(of: workspace.workspacePath), !fingerprint.isEmpty else {
+                throw TaskExecutionFingerprintError.fingerprintUnavailable(
+                    taskID: taskID,
+                    workspacePath: workspace.workspacePath
+                )
+            }
+            return fingerprint
+        case .notOwned(let reason):
+            throw TaskExecutionFingerprintError.workspaceNotOwned(taskID: taskID, reason: reason)
+        case .unavailable(let reason):
+            throw TaskExecutionFingerprintError.workspaceNotOwned(taskID: taskID, reason: reason)
+        }
     }
 }
 
 /// Çözümlenmiş güvenilir tarifi koşturur ve adım kanıtını görev/deneme
 /// kimliğiyle bağlayıp mağazaya ve kanıt defterine yazar.
-private struct RecipeTaskVerifier: TaskVerifying {
+struct RecipeTaskVerifier: TaskVerifying {
     let resolver: VerificationResolver
     let runner: VerificationRunner
     let repository: any CodingTaskRepository
@@ -918,7 +1064,7 @@ actor TaskEvidenceLedger: TaskAcceptanceEvidenceProviding {
     private var entries: [UUID: [VerificationEvidence]] = [:]
     private var workspacePaths: [UUID: String] = [:]
 
-    fileprivate init(probe: WorkspaceFingerprintProbe) {
+    init(probe: WorkspaceFingerprintProbe) {
         self.probe = probe
     }
 
@@ -964,7 +1110,7 @@ enum TaskEvidenceLedgerError: LocalizedError {
 /// parmak izi hesabıyla okur: tek isteğe bağlı adımlı bir tarif koşturulur ve
 /// kaydedilen parmak izi alınır. Böylece parmak izi mantığı ikinci kez
 /// yazılmaz.
-private struct WorkspaceFingerprintProbe: Sendable {
+struct WorkspaceFingerprintProbe: Sendable {
     let runner: VerificationRunner
 
     func fingerprint(of workspacePath: String) async -> String? {

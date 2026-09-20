@@ -560,9 +560,23 @@ struct TaskDetailView: View {
         section(title: "Kabul ölçütleri") {
             ForEach(TaskDetailPresenter.criteria(detail)) { criterion in
                 HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: criterion.isCompleted ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 11))
-                        .foregroundStyle(criterion.isCompleted ? Color.green : Color.secondary)
+                    Button {
+                        toggleCriterion(detail.card.id, criterionID: criterion.id, isCompleted: criterion.isCompleted)
+                    } label: {
+                        Image(systemName: criterion.isCompleted ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(criterion.isCompleted ? Color.green : Color.secondary)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.isActionInFlight(for: detail.card.id))
+                    .pointingHandCursor()
+                    .help(criterion.isCompleted ? "Ölçütü geri al" : "Ölçütü tamamlandı işaretle")
+                    .accessibilityLabel(
+                        criterion.isCompleted
+                            ? "\(criterion.text). Tamamlandı işaretini geri al"
+                            : "\(criterion.text). Tamamlandı işaretle"
+                    )
                     VStack(alignment: .leading, spacing: 1) {
                         Text(criterion.text)
                             .font(.system(size: 11.5))
@@ -572,9 +586,19 @@ struct TaskDetailView: View {
                             .foregroundStyle(.tertiary)
                     }
                 }
-                .accessibilityElement(children: .combine)
+                .accessibilityElement(children: .contain)
                 .accessibilityLabel(criterion.accessibilityLabel)
             }
+        }
+    }
+
+    private func toggleCriterion(_ taskID: UUID, criterionID: UUID, isCompleted: Bool) {
+        Task {
+            _ = await store.setCriterionCompletion(
+                taskID: taskID,
+                criterionID: criterionID,
+                isCompleted: !isCompleted
+            )
         }
     }
 

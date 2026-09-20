@@ -6,6 +6,9 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
 
     typealias PermissionHandler = @Sendable (OpenCodePermissionRequest) async -> OpenCodePermissionReply
     typealias PermissionCancellationHandler = @Sendable (String, UUID) async -> Void
+    /// Çalıştırmaya özel izin yanıtı üreticisi; `nil` ise adaptörün sohbet
+    /// izin merkezi kullanılır.
+    typealias PermissionReplyProvider = @Sendable (OpenCodePermissionRequest) async -> OpenCodePermissionReply
 
     private let serverManager: any OpenCodeServerManaging
     private let clientFactory: @Sendable (OpenCodeServerConnection) -> any OpenCodeClientProtocol
@@ -77,6 +80,19 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
     }
 
     func start(request: CodingAgentExecutionRequest) async throws -> CodingAgentRun {
+        try await start(request: request, permissionReplyProvider: nil)
+    }
+
+    /// Çalıştırmaya özel izin yanıtı sağlayıcısıyla başlatır.
+    ///
+    /// Sağlayıcı verildiğinde her izin isteği ondan yanıtlanır ve sohbet izin
+    /// merkezi bu koşu için kullanılmaz; böylece görev panosunun deny-unless-safe
+    /// çözücüsü adaptörün kendi yanıtına da uygulanır. Sağlayıcı yoksa mevcut
+    /// sohbet davranışı aynen sürer.
+    func start(
+        request: CodingAgentExecutionRequest,
+        permissionReplyProvider: PermissionReplyProvider?
+    ) async throws -> CodingAgentRun {
         guard request.configuration.providerID.rawValue == runtimeID else {
             throw CodingAgentAdapterError.invalidProvider
         }
@@ -202,7 +218,9 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
 
                         Task { [weak self] in
                             let reply: OpenCodePermissionReply
-                            if let permissionHandler {
+                            if let permissionReplyProvider {
+                                reply = await permissionReplyProvider(permReq)
+                            } else if let permissionHandler {
                                 reply = await permissionHandler(permReq)
                             } else {
                                 reply = .reject

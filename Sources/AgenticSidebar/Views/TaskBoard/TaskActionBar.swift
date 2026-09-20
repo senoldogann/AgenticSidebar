@@ -102,7 +102,9 @@ enum TaskActionBarPresenter {
     }
 
     private static func requiresHumanActor(_ action: TaskBoardAction) -> Bool {
-        action == .accept || action == .requestChanges
+        // Başlatma, güncel parmak izine bağlı bir `executeRecipe` onayı yazar;
+        // bu yüzden kabul ve değişiklik isteğiyle aynı insan aktörünü ister.
+        action == .start || action == .accept || action == .requestChanges
     }
 
     private static func requiresFeedback(_ action: TaskBoardAction) -> Bool {
@@ -111,6 +113,7 @@ enum TaskActionBarPresenter {
 
     private static func humanActorReason(_ action: TaskBoardAction) -> String {
         switch action {
+        case .start: "Canlı koşu başlatmak için insan aktör adı gerekir"
         case .accept: "Kabul için insan aktör adı gerekir"
         case .requestChanges: "Değişiklik isteği için insan aktör adı gerekir"
         default: "İnsan aktör adı gerekir"
@@ -284,7 +287,7 @@ struct TaskActionBar: View {
             let result: TaskBoardActionResult
             switch action {
             case .start:
-                result = await store.start(taskID: taskID)
+                result = await store.startRun(taskID: taskID, actor: actor)
             case .pause:
                 result = await store.pause(taskID: taskID)
             case .resume:

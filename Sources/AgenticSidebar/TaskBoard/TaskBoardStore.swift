@@ -389,6 +389,71 @@ final class TaskBoardStore {
         }
     }
 
+    /// Canlı koşuyu insan aktörüyle başlatır: talep, parmak izine bağlı
+    /// `executeRecipe` onayı ve gönderim tek eylemde yürür.
+    ///
+    /// Aktör zorunludur; boş aktörle gönderim onaysız kalırdı. Pano yine
+    /// iyimser davranmaz: yalnızca servis talebi doğruladıysa `.applied` döner.
+    func startRun(taskID: UUID, actor: String) async -> TaskBoardActionResult {
+        await perform(.start, taskID: taskID) { card in
+            do {
+                switch try await self.service.startRun(
+                    taskID: taskID,
+                    expectedVersion: card.version,
+                    actor: actor
+                ) {
+                case .claimed:
+                    return .applied
+                case .blocked(let reason):
+                    return .refused(TaskBoardRefusal(kind: .blocked, message: reason.boardDescription))
+                case .unavailable(let unavailability):
+                    return .refused(TaskBoardRefusal(kind: .unavailable, message: unavailability.message))
+                case .deferred(let reason):
+                    return .refused(TaskBoardRefusal(kind: .deferred, message: "Not dispatched: \(reason)"))
+                }
+            } catch {
+                return .refused(Self.refusal(from: error))
+            }
+        }
+    }
+
+    /// İnsan bir kabul ölçütünü tamamlandı ya da geri aldı olarak işaretler.
+    ///
+    /// Eylem çubuğunun dışında ayrı bir yüzeydir; yine de panonun ortak
+    /// sonuç/refusal sözleşmesini kullanır ve sonrasında panoyu tazeler.
+    func setCriterionCompletion(
+        taskID: UUID,
+        criterionID: UUID,
+        isCompleted: Bool
+    ) async -> TaskBoardActionResult {
+        guard !inFlightTaskIDs.contains(taskID) else {
+            let refusal = TaskBoardRefusal(kind: .busy, message: "Another action is already in flight for this task")
+            return .refused(refusal)
+        }
+        guard let card = cards.first(where: { $0.id == taskID }) else {
+            return .refused(TaskBoardRefusal(kind: .rejected, message: "This task is not loaded on the board"))
+        }
+        inFlightTaskIDs.insert(taskID)
+        defer { inFlightTaskIDs.remove(taskID) }
+
+        do {
+            _ = try await service.setCriterionCompletion(
+                taskID: taskID,
+                criterionID: criterionID,
+                isCompleted: isCompleted,
+                expectedVersion: card.version
+            )
+            lastFailure = nil
+            await refresh()
+            return .applied
+        } catch {
+            let refusal = Self.refusal(from: error)
+            lastFailure = refusal.message
+            await refresh()
+            return .refused(refusal)
+        }
+    }
+
     func pause(taskID: UUID) async -> TaskBoardActionResult {
         await perform(.pause, taskID: taskID) { card in
             guard let attemptID = card.activeAttempt?.id else {
@@ -700,6 +765,15 @@ final class TaskBoardStore {
             return TaskBoardRefusal(kind: .blocked, message: reason)
         case .acceptanceInputUnavailable(_, let reason):
             return TaskBoardRefusal(kind: .unavailable, message: "Acceptance inputs unavailable: \(reason)")
+        case .liveDispatchUnavailable:
+            return TaskBoardRefusal(kind: .unavailable, message: "Live dispatch is not wired in this composition")
+        case .executionFingerprintUnavailable(_, let reason):
+            return TaskBoardRefusal(
+                kind: .unavailable,
+                message: "Cannot start without a current workspace fingerprint: \(reason)"
+            )
+        case .criterionNotFound(_, let criterionID):
+            return TaskBoardRefusal(kind: .rejected, message: "Acceptance criterion \(criterionID.uuidString) was not found")
         case .actionNotAvailable(_, let status):
             return TaskBoardRefusal(kind: .rejected, message: "This action is not available while the task is \(status.rawValue)")
         case .noActiveAttempt:

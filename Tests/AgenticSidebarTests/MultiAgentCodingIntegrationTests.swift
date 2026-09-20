@@ -651,6 +651,53 @@ final class MultiAgentCodingIntegrationTests: XCTestCase {
         await reopened.close()
     }
 
+    // MARK: - Step 5: canlı kompozisyon kablolaması
+
+    @MainActor
+    func testLiveCompositionWiresDispatchPortAndCapabilityFlag() async throws {
+        XCTAssertTrue(TaskBoardComposition.liveDispatchCapabilityPresent)
+        TaskBoardComposition.assertLiveDispatchPrecondition()
+
+        let root = try makeTemporaryRoot(name: "live-composition")
+        let appSupport = root.appendingPathComponent("app-support", isDirectory: true)
+        try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
+
+        let composition = try XCTUnwrap(
+            TaskBoardComposition.live(
+                applicationSupportDirectory: appSupport,
+                openCodeServerManager: IntegrationLiveServerManager(),
+                openCodeTransport: IntegrationLiveTransport(),
+                credentialStore: IntegrationLiveCredentialStore(),
+                toolAuditLog: ToolAuditLog(fileURL: root.appendingPathComponent("audit.jsonl")),
+                permissionApprovalCenter: PermissionApprovalCenter(
+                    automaticReplyProvider: { _, _ in nil },
+                    decisionTimeout: .milliseconds(50),
+                    auditLog: nil
+                ),
+                sessionConfiguration: { nil }
+            )
+        )
+
+        // Gönderim portu enjekte edilmiştir: kapı, port yokluğundan değil
+        // deneme kimliğinin yokluğundan reddeder. Port bağlı olmasaydı hata
+        // `.dispatchDisabled` olurdu.
+        do {
+            _ = try await composition.scheduler.dispatch(
+                taskID: UUID(),
+                attemptID: UUID(),
+                generation: 1,
+                fingerprint: "live-wiring-fingerprint"
+            )
+            XCTFail("Dispatch without an active attempt must be refused")
+        } catch let refusal as TaskDispatchRefusal {
+            guard case .staleAttempt = refusal else {
+                return XCTFail("Expected a stale-attempt refusal proving the port is wired, got \(refusal)")
+            }
+        }
+
+        await composition.repository.close()
+    }
+
     // MARK: - Fixture
 
     @MainActor
@@ -728,6 +775,7 @@ private struct IntegrationHarness {
             providers: registry,
             workspacePreflight: IntegrationWorkspacePreflight(),
             provisioning: provisioning,
+            dispatchPort: nil,
             recoveryProviders: IntegrationProviderSessions(status: .stopped),
             recoveryWorkspaces: IntegrationWorkspaceOwnership(
                 status: .notActivelyOwned(repositoryPath: provisioning.repositoryPath)
@@ -735,6 +783,7 @@ private struct IntegrationHarness {
             recoveryProcesses: IntegrationProcessOwnership(status: .absent),
             verifier: verifier,
             acceptanceEvidence: ledger,
+            executionFingerprints: IntegrationExecutionFingerprints(),
             clock: clock,
             schedulerID: "integration-scheduler",
             recoveryID: "integration-recovery",
@@ -1112,5 +1161,78 @@ private enum IntegrationGitFixture {
             throw FixtureError.gitFailed(arguments: arguments, stderr: result.stderr)
         }
         return result
+    }
+}
+
+// MARK: - Canlı kompozisyon sahteleri
+
+/// Canlı kompozisyon kurulumu için parmak izi sağlayıcısı; bu harness'ta hiçbir
+/// koşu başlatılmadığından yalnızca sözleşmeyi karşılar.
+struct IntegrationExecutionFingerprints: TaskExecutionFingerprintProviding {
+    func executionFingerprint(projectID: UUID, taskID: UUID) async throws -> String {
+        throw TaskExecutionFingerprintError.workspaceNotOwned(taskID: taskID, reason: "integration harness never dispatches")
+    }
+}
+
+/// Ayakta bir yönetilen sunucu taklit eder; canlı kompozisyon kurulumu
+/// bağlantıyı yalnızca saklar, hiçbir istek göndermez.
+private struct IntegrationLiveServerManager: OpenCodeServerManaging {
+    private var connection: OpenCodeServerConnection {
+        OpenCodeServerConnection(
+            baseURL: URL(string: "http://127.0.0.1:51999")!,
+            username: "opencode",
+            password: "integration-live-password"
+        )
+    }
+
+    func status() async -> OpenCodeServerStatus {
+        .running(version: "integration", baseURL: connection.baseURL)
+    }
+
+    func start(computerUse: ComputerUseConfiguration?) async throws -> OpenCodeServerConnection {
+        connection
+    }
+
+    func currentConnection() async -> OpenCodeServerConnection? {
+        connection
+    }
+
+    func stop() async {}
+
+    func workingDirectory() async -> URL? {
+        URL(fileURLWithPath: "/tmp/integration-live-workspace")
+    }
+}
+
+/// Canlı kompozisyon kurulumunda hiçbir HTTP çağrısı yapılmaz; çağrı gelirse
+/// açıkça başarısız olur.
+private struct IntegrationLiveTransport: OpenCodeTransport {
+    func send(_ request: URLRequest) async throws -> OpenCodeHTTPResponse {
+        throw ProviderRuntimeError.unavailable
+    }
+
+    func stream(_ request: URLRequest) async throws -> OpenCodeLineStream {
+        throw ProviderRuntimeError.unavailable
+    }
+}
+
+private final class IntegrationLiveCredentialStore: CredentialStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [CredentialKey: String] = [:]
+
+    func contains(_ key: CredentialKey) throws -> Bool {
+        lock.withLock { values[key] != nil }
+    }
+
+    func read(_ key: CredentialKey) throws -> String? {
+        lock.withLock { values[key] }
+    }
+
+    func write(_ value: String, for key: CredentialKey) throws {
+        lock.withLock { values[key] = value }
+    }
+
+    func delete(_ key: CredentialKey) throws {
+        lock.withLock { values[key] = nil }
     }
 }

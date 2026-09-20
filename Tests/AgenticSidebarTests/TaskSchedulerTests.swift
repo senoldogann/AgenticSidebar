@@ -1101,6 +1101,20 @@ final class TaskSchedulerTests: XCTestCase {
             try await base.addDependency(dependency)
         }
 
+        func setCriterionCompletion(
+            taskID: UUID,
+            criterionID: UUID,
+            isCompleted: Bool,
+            expectedVersion: Int
+        ) async throws -> CodingTask {
+            try await base.setCriterionCompletion(
+                taskID: taskID,
+                criterionID: criterionID,
+                isCompleted: isCompleted,
+                expectedVersion: expectedVersion
+            )
+        }
+
         func task(id: UUID) async throws -> CodingTask? {
             try await base.task(id: id)
         }

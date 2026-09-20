@@ -250,6 +250,54 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
     }
 
+    public func setCriterionCompletion(
+        taskID: UUID,
+        criterionID: UUID,
+        isCompleted: Bool,
+        expectedVersion: Int
+    ) async throws -> CodingTask {
+        try queue.sync {
+            try checkOpen()
+            return try executeTransaction {
+                guard var task = try loadTask(id: taskID) else {
+                    throw TaskRepositoryError.taskNotFound(taskID)
+                }
+                guard task.version == expectedVersion else {
+                    throw TaskRepositoryError.staleVersion(
+                        taskID: taskID,
+                        expected: expectedVersion,
+                        actual: task.version
+                    )
+                }
+                guard let index = task.criteria.firstIndex(where: { $0.id == criterionID }) else {
+                    throw TaskRepositoryError.underlying(
+                        "criterion \(criterionID.uuidString) not found for task \(taskID.uuidString)"
+                    )
+                }
+
+                let sql = "UPDATE criteria SET is_completed = ? WHERE id = ? AND task_id = ?;"
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                sqlite3_bind_int(stmt, 1, isCompleted ? 1 : 0)
+                bindText(stmt, 2, criterionID.uuidString)
+                bindText(stmt, 3, taskID.uuidString)
+                try stepDone(stmt)
+                guard sqlite3_changes(db) == 1 else {
+                    throw TaskRepositoryError.underlying(
+                        "criterion \(criterionID.uuidString) update affected \(sqlite3_changes(db)) rows"
+                    )
+                }
+
+                task.criteria[index].isCompleted = isCompleted
+                task.version += 1
+                task.updatedAt = Date()
+                try updateTask(task)
+                return task
+            }
+        }
+    }
+
     public func claimAttempt(
         taskID: UUID,
         expectedVersion: Int,

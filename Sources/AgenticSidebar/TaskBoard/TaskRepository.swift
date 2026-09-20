@@ -128,6 +128,16 @@ public protocol CodingTaskRepository: Sendable {
     func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot
     func createTask(_ task: CodingTask) async throws
     func addDependency(_ dependency: TaskDependency) async throws
+    /// İnsan bir kabul ölçütünü tamamlandı ya da geri aldı olarak işaretler.
+    ///
+    /// Ölçüt satırıyla birlikte görev sürümü de artar; böylece yarışan iki
+    /// işaretleme taze sürüm çitiyle ayrılır ve bayat yazım sessizce kazanamaz.
+    func setCriterionCompletion(
+        taskID: UUID,
+        criterionID: UUID,
+        isCompleted: Bool,
+        expectedVersion: Int
+    ) async throws -> CodingTask
     func task(id: UUID) async throws -> CodingTask?
     func attemptHistory(taskID: UUID) async throws -> [TaskAttempt]
     func transition(
