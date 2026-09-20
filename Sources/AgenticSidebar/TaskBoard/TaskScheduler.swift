@@ -235,6 +235,11 @@ actor TaskScheduler {
         let lease: TaskLease
     }
 
+    private struct ActiveRunRecord: Sendable {
+        let runID: UUID
+        var session: (any TaskRunSession)?
+    }
+
     private enum TaskBudgetState: Equatable {
         case available
         case attemptsExhausted(used: Int)
@@ -256,7 +261,14 @@ actor TaskScheduler {
     /// scheduler keeps the preflight-only behavior for already-owned workspaces.
     private let provisioning: (any TaskWorkspaceProvisioningPort)?
 
+    /// Optional live dispatch port.
+    ///
+    /// When present, `dispatch` may start one run for the exact accepted attempt;
+    /// when absent, live writing stays disabled and no run is ever started.
+    private let dispatchPort: (any TaskRunningPort)?
+
     private var activeAttempts: [UUID: ActiveAttemptRecord] = [:]
+    private var activeRuns: [UUID: ActiveRunRecord] = [:]
     private var pausedTaskIDs: Set<UUID> = []
     private var stoppedTaskIDs: Set<UUID> = []
 
@@ -269,6 +281,28 @@ actor TaskScheduler {
         schedulerID: String,
         provisioning: (any TaskWorkspaceProvisioningPort)?
     ) {
+        self.init(
+            repository: repository,
+            providers: providers,
+            workspaces: workspaces,
+            verifier: verifier,
+            clock: clock,
+            schedulerID: schedulerID,
+            provisioning: provisioning,
+            dispatchPort: nil
+        )
+    }
+
+    init(
+        repository: CodingTaskRepository,
+        providers: TaskProviderRegistryPort,
+        workspaces: TaskWorkspacePreflightPort,
+        verifier: TaskVerifying,
+        clock: TaskSchedulerClock,
+        schedulerID: String,
+        provisioning: (any TaskWorkspaceProvisioningPort)?,
+        dispatchPort: (any TaskRunningPort)?
+    ) {
         self.repository = repository
         self.providers = providers
         self.workspaces = workspaces
@@ -276,6 +310,7 @@ actor TaskScheduler {
         self.clock = clock
         self.schedulerID = schedulerID
         self.provisioning = provisioning
+        self.dispatchPort = dispatchPort
     }
 
     /// Lease currently owned by this scheduler instance for a task.
@@ -326,12 +361,264 @@ actor TaskScheduler {
         return TaskScheduleReport(projectID: projectID, entries: entries)
     }
 
+    /// Dispatches the exact claimed attempt to the injected running port.
+    ///
+    /// Every gate fails closed before any runtime call: an injected port, a single
+    /// live run per task, the exact active attempt identity, the owned workspace
+    /// identity, registry eligibility, accepted budgets and a human
+    /// `executeRecipe` approval bound to the exact task, attempt and fingerprint.
+    ///
+    /// Events are consumed serially (a bounded stream therefore applies backpressure),
+    /// only events matching the exact `(taskID, attemptID, generation)` identity may
+    /// mutate state, and the terminal outcome is recorded through `attemptDidComplete`
+    /// so the verification and acceptance flow continues unchanged. A stream that ends
+    /// without a terminal event is an interruption, never a success.
+    @discardableResult
+    func dispatch(
+        taskID: UUID,
+        attemptID: UUID,
+        generation: Int,
+        fingerprint: String
+    ) async throws -> TaskRunDispatchReport {
+        guard let dispatchPort else {
+            throw TaskDispatchRefusal.dispatchDisabled(taskID: taskID)
+        }
+        guard activeRuns[taskID] == nil else {
+            throw TaskDispatchRefusal.dispatchAlreadyActive(taskID: taskID)
+        }
+        guard
+            let record = activeAttempts[taskID],
+            record.attempt.id == attemptID,
+            record.attempt.generation == generation
+        else {
+            throw TaskDispatchRefusal.staleAttempt(
+                taskID: taskID,
+                expectedAttemptID: attemptID,
+                expectedGeneration: generation,
+                actualAttemptID: activeAttempts[taskID]?.attempt.id,
+                actualGeneration: activeAttempts[taskID]?.attempt.generation
+            )
+        }
+        guard let task = try await repository.task(id: taskID) else {
+            throw TaskSchedulerError.taskNotFound(taskID)
+        }
+        guard task.status == .running else {
+            throw TaskDispatchRefusal.taskNotRunning(taskID: taskID, status: task.status)
+        }
+
+        switch await workspaces.preflight(projectID: record.projectID, taskID: taskID) {
+        case .owned(let current):
+            guard current.workspaceID == record.workspace.workspaceID else {
+                throw TaskDispatchRefusal.workspaceIdentityMismatch(
+                    taskID: taskID,
+                    expectedWorkspaceID: record.workspace.workspaceID,
+                    actualWorkspaceID: current.workspaceID
+                )
+            }
+        case .notOwned(let reason):
+            throw TaskDispatchRefusal.workspaceNotOwned(taskID: taskID, reason: reason)
+        case .unavailable(let reason):
+            throw TaskDispatchRefusal.workspaceNotOwned(taskID: taskID, reason: reason)
+        }
+
+        switch await providers.candidate(for: task, stage: task.stage) {
+        case .eligible:
+            break
+        case .unsupported(let missingCapabilities):
+            throw TaskDispatchRefusal.providerNotEligible(taskID: taskID, missingCapabilities: missingCapabilities)
+        case .unavailable(let reason):
+            throw TaskDispatchRefusal.providerUnavailable(taskID: taskID, reason: reason)
+        }
+
+        let history = try await repository.attemptHistory(taskID: taskID)
+        switch dispatchBudgetState(for: task, record: record, history: history) {
+        case .available:
+            break
+        case .attemptsExhausted:
+            throw TaskDispatchRefusal.budgetExhausted(taskID: taskID, reason: "attemptBudgetExhausted")
+        case .toolCallsExhausted:
+            throw TaskDispatchRefusal.budgetExhausted(taskID: taskID, reason: "toolCallBudgetExceeded")
+        case .timeExhausted:
+            throw TaskDispatchRefusal.budgetExhausted(taskID: taskID, reason: "timeBudgetExhausted")
+        }
+
+        let approvals = try await repository.approvals(taskID: taskID)
+        let approved = approvals.contains { approval in
+            approval.authorizes(
+                action: .executeRecipe,
+                taskID: taskID,
+                attemptID: attemptID,
+                fingerprint: fingerprint
+            )
+                && !approval.actor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard approved else {
+            throw TaskDispatchRefusal.executeApprovalMissing(
+                taskID: taskID,
+                attemptID: attemptID,
+                fingerprint: fingerprint
+            )
+        }
+
+        let request = TaskRunRequest(
+            task: task,
+            attempt: record.attempt,
+            workspace: record.workspace,
+            approvalPolicy: .approveSafe,
+            deadline: record.startedAt.addingTimeInterval(TimeInterval(task.budget.maxTaskDurationSeconds))
+        )
+        let workspacePath = record.workspace.workspacePath
+        let resolver: TaskRunApprovalResolver = { approvalRequest in
+            TaskRunApprovalPolicy.resolve(
+                toolName: approvalRequest.toolName,
+                patterns: approvalRequest.patterns,
+                workspacePath: workspacePath
+            )
+        }
+
+        let runID = UUID()
+        activeRuns[taskID] = ActiveRunRecord(runID: runID, session: nil)
+        defer { clearRunIfOwned(taskID: taskID, runID: runID) }
+
+        let session: any TaskRunSession
+        do {
+            session = try await dispatchPort.start(request, approvalResolver: resolver)
+        } catch {
+            throw TaskDispatchRefusal.runtimeStartFailed(taskID: taskID, reason: String(describing: error))
+        }
+        if activeRuns[taskID]?.runID == runID {
+            activeRuns[taskID]?.session = session
+        } else {
+            // A concurrent stop/pause/retry retired this reservation while the port
+            // was starting; the just-started run is cancelled and never consumed.
+            await session.cancel()
+        }
+
+        var activityIDs: Set<String> = []
+        var approvalDecisions: [TaskRunApprovalDecision] = []
+        var outcome: AttemptOutcome = .cancelled
+        var fencedByScheduler = false
+
+        eventLoop: for await event in session.events {
+            guard event.matches(taskID: taskID, attemptID: attemptID, generation: generation) else {
+                continue
+            }
+            switch event.kind {
+            case .activityStarted(let id, _):
+                activityIDs.insert(id)
+                if activityIDs.count > task.budget.maxToolCallsPerAttempt, !fencedByScheduler {
+                    fencedByScheduler = true
+                    await session.cancel()
+                }
+            case .approvalRequested(let id, let tool, let params):
+                let approvalRequest = TaskRunApprovalRequest(
+                    id: id,
+                    toolName: tool,
+                    patterns: Self.approvalPatterns(from: params)
+                )
+                let reply = await resolver(approvalRequest)
+                approvalDecisions.append(TaskRunApprovalDecision(requestID: id, toolName: tool, reply: reply))
+                if case .deny = reply, !fencedByScheduler {
+                    fencedByScheduler = true
+                    await session.cancel()
+                }
+            case .terminalSuccess:
+                outcome = fencedByScheduler ? .cancelled : .succeeded
+                break eventLoop
+            case .terminalError:
+                outcome = .failed
+                break eventLoop
+            case .interrupted:
+                outcome = .cancelled
+                break eventLoop
+            default:
+                break
+            }
+        }
+
+        let toolCallCount = activityIDs.isEmpty ? nil : activityIDs.count
+        let completion = try await attemptDidComplete(
+            taskID: taskID,
+            attemptID: attemptID,
+            generation: generation,
+            ownerNonce: record.lease.ownerNonce,
+            outcome: outcome,
+            usage: TaskAttemptUsage(toolCallCount: toolCallCount, durationSeconds: nil)
+        )
+        return TaskRunDispatchReport(
+            taskID: taskID,
+            attemptID: attemptID,
+            outcome: outcome,
+            toolCallCount: toolCallCount,
+            approvalDecisions: approvalDecisions,
+            completion: completion
+        )
+    }
+
+    /// Cancels the live run bound to a task and awaits its cleanup.
+    ///
+    /// Only the exact run record is cleared, so cancelling a retired run can never
+    /// touch a newer attempt's run. `cancel()` must finish the run's event stream.
+    private func cancelActiveRun(taskID: UUID) async {
+        guard let record = activeRuns[taskID] else { return }
+        activeRuns[taskID] = nil
+        guard let session = record.session else { return }
+        await session.cancel()
+    }
+
+    private func clearRunIfOwned(taskID: UUID, runID: UUID) {
+        guard activeRuns[taskID]?.runID == runID else { return }
+        activeRuns[taskID] = nil
+    }
+
+    /// Splits the adapter's comma-joined `patterns` parameter back into entries.
+    private static func approvalPatterns(from params: [String: String]) -> [String] {
+        guard let joined = params["patterns"] else { return [] }
+        return
+            joined
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Budget acceptance for a claimed attempt.
+    ///
+    /// Prior attempts are measured exactly like the claim pipeline measures them; the
+    /// active attempt's own elapsed time counts against the task duration because a
+    /// dispatch after its deadline must not start a live run.
+    private func dispatchBudgetState(
+        for task: CodingTask,
+        record: ActiveAttemptRecord,
+        history: [TaskAttempt]
+    ) -> TaskBudgetState {
+        let prior = history.filter { $0.id != record.attempt.id }
+        if prior.count >= task.budget.maxAttempts {
+            return .attemptsExhausted(used: prior.count)
+        }
+        if let worstToolCalls = prior.compactMap(\.toolCallCount).max(),
+            worstToolCalls > task.budget.maxToolCallsPerAttempt
+        {
+            return .toolCallsExhausted(used: worstToolCalls)
+        }
+        let elapsedSeconds = max(0, Int(clock.now().timeIntervalSince(record.startedAt)))
+        let knownSeconds = prior.compactMap(\.durationSeconds).reduce(0, +) + elapsedSeconds
+        if knownSeconds >= task.budget.maxTaskDurationSeconds {
+            return .timeExhausted(usedSeconds: knownSeconds)
+        }
+        return .available
+    }
+
     /// Suspends scheduling for a task without ending its attempt.
+    ///
+    /// A live run is cancelled and awaited before the task is blocked: a suspended
+    /// task must not keep writing. The attempt row stays in progress until an
+    /// explicit retry or reconciliation replaces it, exactly as before.
     func pause(taskID: UUID) async throws {
         guard activeAttempts[taskID] != nil else {
             throw TaskSchedulerError.noActiveAttempt(taskID)
         }
         pausedTaskIDs.insert(taskID)
+        await cancelActiveRun(taskID: taskID)
 
         guard let task = try await repository.task(id: taskID) else {
             throw TaskSchedulerError.taskNotFound(taskID)
@@ -342,12 +629,17 @@ actor TaskScheduler {
     }
 
     /// Terminates the active attempt of a task and requires an explicit retry.
+    ///
+    /// A live run is cleared from the attempt record and cancelled before the lease
+    /// is released, so the run's own completion can no longer mutate the task and a
+    /// newer attempt's run is never touched.
     func stop(taskID: UUID) async throws {
         stoppedTaskIDs.insert(taskID)
         pausedTaskIDs.remove(taskID)
 
         if let record = activeAttempts[taskID] {
             clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
+            await cancelActiveRun(taskID: taskID)
             await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
             try await cancelAttempt(taskID: taskID, attemptID: record.attempt.id)
         } else if let task = try await repository.task(id: taskID) {
@@ -381,6 +673,7 @@ actor TaskScheduler {
 
         if let record = activeAttempts[taskID] {
             clearActiveAttemptIfOwned(taskID: taskID, attemptID: record.attempt.id)
+            await cancelActiveRun(taskID: taskID)
             await releaseLease(for: record.workspace.repositoryPath, taskID: taskID, attemptID: record.attempt.id)
             try await cancelAttempt(taskID: taskID, attemptID: record.attempt.id)
         }

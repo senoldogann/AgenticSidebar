@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import XCTest
 
 @testable import AgenticSidebar
@@ -1549,5 +1550,1026 @@ final class TaskSchedulerTests: XCTestCase {
             claim(in: followUp, taskID: waitingTask.id),
             "Stopping a dangling attempt must release its repository lease by the exact attempt identity"
         )
+    }
+
+    // MARK: - Live dispatch port
+
+    private enum DispatchTestStartError: Error, Equatable {
+        case startFailed
+    }
+
+    /// Bounded event stream with an observable cancel count; cancel finishes the stream.
+    private final class DispatchTestSession: TaskRunSession, @unchecked Sendable {
+        let events: AsyncStream<CodingAgentEvent>
+        private let continuation: AsyncStream<CodingAgentEvent>.Continuation
+        private let cancels = Mutex(0)
+
+        init() {
+            let (stream, continuation) = AsyncStream<CodingAgentEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
+            self.events = stream
+            self.continuation = continuation
+        }
+
+        func send(_ kind: CodingAgentEvent.Kind, taskID: UUID, attemptID: UUID, generation: Int) {
+            continuation.yield(
+                CodingAgentEvent(taskID: taskID, attemptID: attemptID, generation: generation, kind: kind)
+            )
+        }
+
+        func finish() {
+            continuation.finish()
+        }
+
+        func cancel() async {
+            cancels.withLock { $0 += 1 }
+            continuation.finish()
+        }
+
+        var cancelCount: Int {
+            cancels.withLock { $0 }
+        }
+    }
+
+    private final class ScriptedTaskRunningPort: TaskRunningPort, @unchecked Sendable {
+        private let sessionsByAttemptID: Mutex<[UUID: DispatchTestSession]>
+        private let startFailure: Error?
+        private let fallbackSessions = Mutex<[UUID: DispatchTestSession]>([:])
+        private let requests = Mutex<[TaskRunRequest]>([])
+        private let resolvers = Mutex<[TaskRunApprovalResolver]>([])
+
+        init(sessionsByAttemptID: [UUID: DispatchTestSession] = [:], startFailure: Error? = nil) {
+            self.sessionsByAttemptID = Mutex(sessionsByAttemptID)
+            self.startFailure = startFailure
+        }
+
+        func bind(_ session: DispatchTestSession, to attemptID: UUID) {
+            sessionsByAttemptID.withLock { $0[attemptID] = session }
+        }
+
+        func start(
+            _ request: TaskRunRequest,
+            approvalResolver: @escaping TaskRunApprovalResolver
+        ) async throws -> TaskRunSession {
+            if let startFailure {
+                throw startFailure
+            }
+            requests.withLock { $0.append(request) }
+            resolvers.withLock { $0.append(approvalResolver) }
+            if let session = sessionsByAttemptID.withLock({ $0[request.attempt.id] }) {
+                return session
+            }
+            if let existing = fallbackSessions.withLock({ $0[request.attempt.id] }) {
+                return existing
+            }
+            let session = DispatchTestSession()
+            fallbackSessions.withLock { $0[request.attempt.id] = session }
+            return session
+        }
+
+        var startCount: Int {
+            requests.withLock { $0.count }
+        }
+
+        var lastRequest: TaskRunRequest? {
+            requests.withLock { $0.last }
+        }
+
+        var lastResolver: TaskRunApprovalResolver? {
+            resolvers.withLock { $0.last }
+        }
+
+        func session(for attemptID: UUID) -> DispatchTestSession? {
+            sessionsByAttemptID.withLock { $0[attemptID] }
+                ?? fallbackSessions.withLock { $0[attemptID] }
+        }
+    }
+
+    private actor DispatchTestRegistry: TaskProviderRegistryPort {
+        private var results: [TaskProviderCandidate]
+
+        init(results: [TaskProviderCandidate]) {
+            self.results = results
+        }
+
+        func candidate(for task: CodingTask, stage: TaskStage) async -> TaskProviderCandidate {
+            if results.count > 1 {
+                return results.removeFirst()
+            }
+            return results.first ?? .unavailable(reason: "no-candidate")
+        }
+    }
+
+    private actor DispatchTestPreflight: TaskWorkspacePreflightPort {
+        private var result: TaskWorkspacePreflightResult
+
+        init(result: TaskWorkspacePreflightResult) {
+            self.result = result
+        }
+
+        func set(_ result: TaskWorkspacePreflightResult) {
+            self.result = result
+        }
+
+        func preflight(projectID: UUID, taskID: UUID) async -> TaskWorkspacePreflightResult {
+            result
+        }
+    }
+
+    private actor DispatchCountingVerifier: TaskVerifying {
+        private let passed: Bool
+        private var calls = 0
+
+        init(passed: Bool) {
+            self.passed = passed
+        }
+
+        func verify(
+            task: CodingTask,
+            attempt: TaskAttempt,
+            workspace: TaskWorkspaceDescriptor
+        ) async -> TaskVerificationReport {
+            calls += 1
+            return TaskVerificationReport(
+                passed: passed,
+                recipeName: "dispatch-recipe",
+                detailsRedacted: "dispatch-details"
+            )
+        }
+
+        var callCount: Int { calls }
+    }
+
+    private struct DispatchFixture {
+        let projectID: UUID
+        let task: CodingTask
+        let attemptID: UUID
+        let generation: Int
+        let leaseOwnerNonce: String
+    }
+
+    private static let dispatchWorkspacePath = "/tmp/agentic-sidebar-dispatch-tests/workspace"
+    private static let dispatchRepositoryPath = "/tmp/agentic-sidebar-dispatch-tests/repo"
+
+    private static func dispatchWorkspace(
+        workspaceID: UUID,
+        repositoryPath: String
+    ) -> TaskWorkspaceDescriptor {
+        TaskWorkspaceDescriptor(
+            workspaceID: workspaceID,
+            workspacePath: (repositoryPath as NSString).appendingPathComponent("workspace"),
+            repositoryPath: repositoryPath
+        )
+    }
+
+    private func makeDispatchFixture(
+        store: SQLiteTaskStore,
+        clock: TestTaskSchedulerClock,
+        providers: any TaskProviderRegistryPort,
+        workspaces: any TaskWorkspacePreflightPort,
+        verifier: any TaskVerifying,
+        port: any TaskRunningPort,
+        budget: ExecutionBudget,
+        schedulerID: String
+    ) async throws -> (scheduler: TaskScheduler, fixture: DispatchFixture) {
+        let scheduler = TaskScheduler(
+            repository: store,
+            providers: providers,
+            workspaces: workspaces,
+            verifier: verifier,
+            clock: clock,
+            schedulerID: schedulerID,
+            provisioning: nil,
+            dispatchPort: port
+        )
+        let projectID = UUID()
+        let now = clock.now()
+        let task = CodingTask(
+            id: UUID(),
+            projectID: projectID,
+            title: "Dispatch Task",
+            objective: "Dispatch Task objective",
+            priority: 1,
+            status: .ready,
+            stage: .implementation,
+            budget: budget,
+            createdAt: now,
+            updatedAt: now
+        )
+        try await store.createTask(task)
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimed = try XCTUnwrap(claim(in: report, taskID: task.id))
+        let activeLease = await scheduler.activeLease(taskID: task.id)
+        let lease = try XCTUnwrap(activeLease)
+        return (
+            scheduler,
+            DispatchFixture(
+                projectID: projectID,
+                task: task,
+                attemptID: claimed.attemptID,
+                generation: claimed.generation,
+                leaseOwnerNonce: lease.ownerNonce
+            )
+        )
+    }
+
+    private func recordExecuteApproval(
+        store: SQLiteTaskStore,
+        taskID: UUID,
+        attemptID: UUID,
+        fingerprint: String,
+        actor: String = "human@example.com"
+    ) async throws {
+        try await store.recordApproval(
+            TaskApproval(
+                taskID: taskID,
+                attemptID: attemptID,
+                fingerprint: fingerprint,
+                actor: actor,
+                timestamp: startDate,
+                action: .executeRecipe
+            )
+        )
+    }
+
+    private func waitForDispatchStart(_ port: ScriptedTaskRunningPort, count: Int) async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if port.startCount >= count {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Dispatch did not reach the running port before timeout")
+    }
+
+    private func expectDispatchRefusal(
+        _ scheduler: TaskScheduler,
+        taskID: UUID,
+        attemptID: UUID,
+        generation: Int,
+        fingerprint: String,
+        expected: TaskDispatchRefusal,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await scheduler.dispatch(
+                taskID: taskID,
+                attemptID: attemptID,
+                generation: generation,
+                fingerprint: fingerprint
+            )
+            XCTFail("Expected dispatch refusal \(expected)", file: file, line: line)
+        } catch let refusal as TaskDispatchRefusal {
+            XCTAssertEqual(refusal, expected, file: file, line: line)
+        } catch {
+            XCTFail("Expected typed dispatch refusal, got \(error)", file: file, line: line)
+        }
+    }
+
+    func testDispatchWithoutInjectedPortIsRefused() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let scheduler = makeScheduler(
+            store: store, clock: clock, providers: .eligible(runtimeID: "runtime", modelID: "model"),
+            workspaceOwned: true, sharedRepositoryPath: nil, verifierPassed: true, schedulerID: "scheduler-no-dispatch")
+        let task = makeTask(projectID: projectID, title: "No Dispatch Port", priority: 1, status: .ready, createdAt: startDate)
+        try await store.createTask(task)
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimed = try XCTUnwrap(claim(in: report, taskID: task.id))
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: task.id,
+            attemptID: claimed.attemptID,
+            generation: claimed.generation,
+            fingerprint: "fingerprint",
+            expected: .dispatchDisabled(taskID: task.id)
+        )
+    }
+
+    func testDispatchRefusedWhenWorkspaceIsNoLongerOwned() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let preflight = DispatchTestPreflight(result: .owned(workspace))
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: preflight, verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-not-owned")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        await preflight.set(.notOwned(reason: "manifest missing"))
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .workspaceNotOwned(taskID: fixture.task.id, reason: "manifest missing")
+        )
+        XCTAssertEqual(port.startCount, 0, "A refused dispatch must never start a runtime")
+    }
+
+    func testDispatchRefusedWhenWorkspaceIdentityDiffers() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let bound = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let swapped = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath + "-other")
+        let preflight = DispatchTestPreflight(result: .owned(bound))
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: preflight, verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-identity")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        await preflight.set(.owned(swapped))
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .workspaceIdentityMismatch(
+                taskID: fixture.task.id,
+                expectedWorkspaceID: bound.workspaceID,
+                actualWorkspaceID: swapped.workspaceID
+            )
+        )
+        XCTAssertEqual(port.startCount, 0)
+    }
+
+    func testDispatchRefusedWhenProviderNoLongerEligible() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [
+                .eligible(runtimeID: "runtime", modelID: "model"),
+                .unsupported(missingCapabilities: ["tools"]),
+            ]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-ineligible")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .providerNotEligible(taskID: fixture.task.id, missingCapabilities: ["tools"])
+        )
+        XCTAssertEqual(port.startCount, 0)
+    }
+
+    func testDispatchRefusedWhenTimeBudgetIsExhausted() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let port = ScriptedTaskRunningPort()
+        let budget = ExecutionBudget(maxAttempts: 3, maxTaskDurationSeconds: 60, maxToolCallsPerAttempt: 300)
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: budget, schedulerID: "scheduler-dispatch-budget")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        clock.advance(seconds: 120)
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .budgetExhausted(taskID: fixture.task.id, reason: "timeBudgetExhausted")
+        )
+        XCTAssertEqual(port.startCount, 0)
+    }
+
+    func testDispatchRefusedWithoutExecuteApprovalBoundToAttemptAndFingerprint() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-approval")
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .executeApprovalMissing(
+                taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        )
+
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: UUID(), fingerprint: "fingerprint")
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .executeApprovalMissing(
+                taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        )
+
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "stale-fingerprint")
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .executeApprovalMissing(
+                taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        )
+        XCTAssertEqual(port.startCount, 0)
+    }
+
+    func testDispatchRefusedAfterPauseBlocksTheTask() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let port = ScriptedTaskRunningPort()
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-paused")
+
+        try await scheduler.pause(taskID: fixture.task.id)
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .taskNotRunning(taskID: fixture.task.id, status: .blocked)
+        )
+        XCTAssertEqual(port.startCount, 0)
+    }
+
+    func testDispatchRefusedWhenRuntimeStartFails() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let port = ScriptedTaskRunningPort(startFailure: DispatchTestStartError.startFailed)
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-start-failure")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .runtimeStartFailed(taskID: fixture.task.id, reason: "startFailed")
+        )
+        XCTAssertEqual(port.startCount, 0)
+    }
+
+    func testDispatchHappyPathCompletesAttemptAndTriggersVerificationOnce() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let verifier = DispatchCountingVerifier(passed: true)
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: verifier, port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-happy")
+        let fingerprint = "fingerprint-happy"
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: fingerprint)
+        port.bind(session, to: fixture.attemptID)
+
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(
+            .activityStarted(id: "tool-1", title: "edit"),
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: fingerprint
+        )
+
+        XCTAssertEqual(report.outcome, .succeeded)
+        XCTAssertEqual(report.toolCallCount, 1)
+        XCTAssertTrue(report.approvalDecisions.isEmpty)
+        XCTAssertEqual(report.completion.disposition, .accepted)
+        XCTAssertEqual(port.startCount, 1)
+        XCTAssertEqual(session.cancelCount, 0)
+        let verifierCalls = await verifier.callCount
+        XCTAssertEqual(verifierCalls, 1, "Verification must run exactly once for the completed attempt")
+
+        let request = try XCTUnwrap(port.lastRequest)
+        XCTAssertEqual(request.attempt.id, fixture.attemptID)
+        XCTAssertEqual(request.workspace.workspaceID, workspace.workspaceID)
+        XCTAssertEqual(request.approvalPolicy, .approveSafe)
+        XCTAssertNotNil(port.lastResolver)
+
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .review)
+        let history = try await store.attemptHistory(taskID: fixture.task.id)
+        XCTAssertEqual(history.first?.outcome, .succeeded)
+        XCTAssertEqual(history.first?.toolCallCount, 1)
+    }
+
+    func testDispatchEOFWithoutTerminalEventIsInterruptionNotSuccess() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-eof")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+
+        XCTAssertEqual(report.outcome, .cancelled, "A stream that ends without a terminal event is an interruption")
+        XCTAssertNil(report.toolCallCount, "Unreported tool calls must stay unknown")
+        XCTAssertEqual(report.completion.disposition, .accepted)
+        XCTAssertEqual(session.cancelCount, 0)
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("attemptCancelled"))
+        let history = try await store.attemptHistory(taskID: fixture.task.id)
+        XCTAssertEqual(history.first?.outcome, .cancelled)
+    }
+
+    func testDispatchIgnoresStaleGenerationEvents() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-stale")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        let staleGeneration = fixture.generation - 1
+        session.send(
+            .activityStarted(id: "stale-tool", title: "edit"),
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: staleGeneration)
+        session.send(
+            .terminalSuccess,
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: staleGeneration)
+        session.send(
+            .terminalError("backend failed"),
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+
+        XCTAssertEqual(report.outcome, .failed, "A stale success must not win over the current generation's failure")
+        XCTAssertNil(report.toolCallCount, "Stale activity must not be counted against this attempt")
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("attemptFailed"))
+    }
+
+    func testDispatchUnknownToolCallsStayUnknown() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-unknown-usage")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(.textDelta("done"), taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+        XCTAssertEqual(report.outcome, .succeeded)
+        XCTAssertNil(report.toolCallCount)
+        let history = try await store.attemptHistory(taskID: fixture.task.id)
+        XCTAssertNil(history.first?.toolCallCount)
+    }
+
+    func testDispatchCancelsRunWhenToolCallBudgetIsExceeded() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let budget = ExecutionBudget(maxAttempts: 3, maxTaskDurationSeconds: 3600, maxToolCallsPerAttempt: 2)
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: budget, schedulerID: "scheduler-dispatch-usage-budget")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        for index in 1...3 {
+            session.send(
+                .activityStarted(id: "tool-\(index)", title: "edit"),
+                taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        }
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+
+        XCTAssertEqual(report.toolCallCount, 3)
+        XCTAssertEqual(report.outcome, .cancelled, "A budget-fenced run must not be recorded as a success")
+        XCTAssertEqual(session.cancelCount, 1)
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("toolCallBudgetExceeded"))
+    }
+
+    func testApprovalResolverApprovesSafeInWorkspaceEdit() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-approve-safe")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        session.send(
+            .approvalRequested(id: "req-edit", tool: "edit", params: ["patterns": "Sources/AgenticSidebar/App.swift"]),
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+
+        XCTAssertEqual(
+            report.approvalDecisions,
+            [TaskRunApprovalDecision(requestID: "req-edit", toolName: "edit", reply: .approveOnce)]
+        )
+        XCTAssertEqual(report.outcome, .succeeded)
+        XCTAssertEqual(session.cancelCount, 0)
+
+        let resolver = try XCTUnwrap(port.lastResolver)
+        let shellReply = await resolver(TaskRunApprovalRequest(id: "req-shell", toolName: "bash", patterns: ["rm -rf /"]))
+        XCTAssertEqual(shellReply, .deny(reason: "toolRequiresHumanApproval:bash"))
+    }
+
+    func testApprovalResolverRejectsExternalPathAndTerminatesRun() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-deny-outside")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        session.send(
+            .approvalRequested(id: "req-outside", tool: "edit", params: ["patterns": "/etc/passwd"]),
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+
+        XCTAssertEqual(
+            report.approvalDecisions,
+            [
+                TaskRunApprovalDecision(
+                    requestID: "req-outside",
+                    toolName: "edit",
+                    reply: .deny(reason: "outsideWorkspaceRequiresHumanApproval")
+                )
+            ]
+        )
+        XCTAssertEqual(report.outcome, .cancelled, "A denied approval must terminate the run, even against a racing success")
+        XCTAssertEqual(session.cancelCount, 1)
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("attemptCancelled"))
+
+        let resolver = try XCTUnwrap(port.lastResolver)
+        let networkReply = await resolver(
+            TaskRunApprovalRequest(id: "req-net", toolName: "webfetch", patterns: ["https://example.com"])
+        )
+        XCTAssertEqual(networkReply, .deny(reason: "networkRequiresHumanApproval"))
+    }
+
+    func testStopCancelsDispatchedRunOnce() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-stop")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+
+        async let dispatchCall = scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+        try await waitForDispatchStart(port, count: 1)
+        try await scheduler.stop(taskID: fixture.task.id)
+        let report = try await dispatchCall
+
+        XCTAssertEqual(session.cancelCount, 1, "Stop must cancel the run exactly once")
+        XCTAssertEqual(report.completion.disposition, .stale)
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("stopped"))
+        let history = try await store.attemptHistory(taskID: fixture.task.id)
+        XCTAssertEqual(history.first?.outcome, .cancelled)
+    }
+
+    func testPauseCancelsDispatchedRunOnce() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-pause")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+
+        async let dispatchCall = scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+        try await waitForDispatchStart(port, count: 1)
+        try await scheduler.pause(taskID: fixture.task.id)
+        let report = try await dispatchCall
+
+        XCTAssertEqual(session.cancelCount, 1)
+        XCTAssertEqual(report.completion.disposition, .stale)
+        let stored = try await store.task(id: fixture.task.id)
+        XCTAssertEqual(stored?.status, .blocked)
+        XCTAssertEqual(stored?.blockReason, .custom("paused"))
+    }
+
+    func testRetryCancelsDispatchedRunAndClaimsFreshAttempt() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-retry")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+
+        async let dispatchCall = scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+        try await waitForDispatchStart(port, count: 1)
+        let entry = try await scheduler.retry(
+            taskID: fixture.task.id,
+            expectedAttemptID: fixture.attemptID,
+            expectedGeneration: fixture.generation
+        )
+        let report = try await dispatchCall
+
+        guard case .claimed(let retriedAttemptID, let retriedGeneration) = entry.disposition else {
+            XCTFail("Retry must claim a fresh attempt, got \(entry.disposition)")
+            return
+        }
+        XCTAssertNotEqual(retriedAttemptID, fixture.attemptID)
+        XCTAssertEqual(retriedGeneration, fixture.generation + 1)
+        XCTAssertEqual(session.cancelCount, 1)
+        XCTAssertEqual(report.completion.disposition, .stale)
+    }
+
+    func testConcurrentDuplicateDispatchIsRefused() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-single-flight")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+        session.send(.started, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+
+        async let firstDispatch = scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+        try await waitForDispatchStart(port, count: 1)
+        await expectDispatchRefusal(
+            scheduler,
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint",
+            expected: .dispatchAlreadyActive(taskID: fixture.task.id)
+        )
+        XCTAssertEqual(port.startCount, 1, "A duplicate dispatch must not start a second runtime")
+
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+        let firstReport = try await firstDispatch
+        XCTAssertEqual(firstReport.outcome, .succeeded)
+    }
+
+    func testStopCancelsOnlyTheStoppedTasksRun() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let projectID = UUID()
+        let port = ScriptedTaskRunningPort()
+        let verifier = DispatchCountingVerifier(passed: true)
+        let scheduler = TaskScheduler(
+            repository: store,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: TestWorkspacePreflight(isOwned: true, sharedRepositoryPath: nil),
+            verifier: verifier,
+            clock: clock,
+            schedulerID: "scheduler-dispatch-two-runs",
+            provisioning: nil,
+            dispatchPort: port
+        )
+        let taskA = makeTask(projectID: projectID, title: "Run A", priority: 9, status: .ready, createdAt: startDate)
+        let taskB = makeTask(
+            projectID: projectID, title: "Run B", priority: 1, status: .ready, createdAt: startDate.addingTimeInterval(1))
+        try await store.createTask(taskA)
+        try await store.createTask(taskB)
+        let report = try await scheduler.schedule(projectID: projectID)
+        let claimedA = try XCTUnwrap(claim(in: report, taskID: taskA.id))
+        let claimedB = try XCTUnwrap(claim(in: report, taskID: taskB.id))
+        try await recordExecuteApproval(
+            store: store, taskID: taskA.id, attemptID: claimedA.attemptID, fingerprint: "fingerprint-a")
+        try await recordExecuteApproval(
+            store: store, taskID: taskB.id, attemptID: claimedB.attemptID, fingerprint: "fingerprint-b")
+
+        async let dispatchA = scheduler.dispatch(
+            taskID: taskA.id,
+            attemptID: claimedA.attemptID,
+            generation: claimedA.generation,
+            fingerprint: "fingerprint-a"
+        )
+        async let dispatchB = scheduler.dispatch(
+            taskID: taskB.id,
+            attemptID: claimedB.attemptID,
+            generation: claimedB.generation,
+            fingerprint: "fingerprint-b"
+        )
+        try await waitForDispatchStart(port, count: 2)
+        let sessionA = try XCTUnwrap(port.session(for: claimedA.attemptID))
+        let sessionB = try XCTUnwrap(port.session(for: claimedB.attemptID))
+
+        try await scheduler.stop(taskID: taskA.id)
+
+        sessionB.send(.terminalSuccess, taskID: taskB.id, attemptID: claimedB.attemptID, generation: claimedB.generation)
+        sessionB.finish()
+
+        let completedB = try await dispatchB
+        let stoppedA = try await dispatchA
+
+        XCTAssertEqual(completedB.outcome, .succeeded)
+        XCTAssertEqual(sessionA.cancelCount, 1)
+        XCTAssertEqual(sessionB.cancelCount, 0, "Stopping one task must never cancel another task's run")
+        XCTAssertEqual(stoppedA.completion.disposition, .stale)
+        let storedA = try await store.task(id: taskA.id)
+        XCTAssertEqual(storedA?.status, .blocked)
+        XCTAssertEqual(storedA?.blockReason, .custom("stopped"))
+        let storedB = try await store.task(id: taskB.id)
+        XCTAssertEqual(storedB?.status, .review)
     }
 }
