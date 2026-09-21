@@ -35,6 +35,18 @@ final class TimelineCollapseStore {
         namespacedKey("act:\(rawID)", sessionID: sessionID)
     }
 
+    /// Tur sonu dosya kartının anahtarı: varsayılan-açık karttır.
+    static func filesKey(_ groupID: UUID, sessionID: UUID) -> String {
+        namespacedKey("files:\(groupID.uuidString)", sessionID: sessionID)
+    }
+
+    /// Oturum sonu toplu dosya kartının anahtarı: varsayılan-açık karttır.
+    /// Tur kartlarından ayrıdır (`files:<grup>` ile çakışmaz), o yüzden
+    /// toplu kartla son turun kartı birbirini açıp kapatmaz.
+    static func sessionFilesKey(_ sessionID: UUID) -> String {
+        "ses:\(sessionID.uuidString):session-files"
+    }
+
     static func namespacedKey(_ key: String, sessionID: UUID) -> String {
         "ses:\(sessionID.uuidString):\(key)"
     }
@@ -68,6 +80,40 @@ final class TimelineCollapseStore {
         pruneIfNeeded()
     }
 
+    /// Dosya kartı açık mı: varsayılan açıktır, yalnız kullanıcı kapatırsa
+    /// kapanır. Eski çıplak anahtar (`files:<grup>`) sessizce tanınır.
+    func isFilesExpanded(groupID: UUID, sessionID: UUID) -> Bool {
+        let key = Self.filesKey(groupID, sessionID: sessionID)
+        let legacyKey = "files:\(groupID.uuidString)"
+        return !contains(collapsedIDs, key: key, legacyKey: legacyKey)
+    }
+
+    func setFilesExpanded(_ expanded: Bool, groupID: UUID, sessionID: UUID) {
+        let key = Self.filesKey(groupID, sessionID: sessionID)
+        if expanded {
+            collapsedIDs.remove(key)
+        } else {
+            collapsedIDs.insert(key)
+        }
+        pruneIfNeeded()
+    }
+
+    /// Oturum sonu toplu dosya kartı açık mı: varsayılan açıktır, yalnız
+    /// kullanıcı kapatırsa kapanır.
+    func isSessionFilesExpanded(sessionID: UUID) -> Bool {
+        !collapsedIDs.contains(Self.sessionFilesKey(sessionID))
+    }
+
+    func setSessionFilesExpanded(_ expanded: Bool, sessionID: UUID) {
+        let key = Self.sessionFilesKey(sessionID)
+        if expanded {
+            collapsedIDs.remove(key)
+        } else {
+            collapsedIDs.insert(key)
+        }
+        pruneIfNeeded()
+    }
+
     func isActivityExpanded(
         _ activity: AgentActivity,
         groupID: UUID,
@@ -87,8 +133,12 @@ final class TimelineCollapseStore {
         }
         // Boş düşünme varsayılan-açık değildir: içeriksiz kartın otomatik
         // açılması, boş gri "Thought" kutusunu her turda flaşlatıyordu.
+        // Biten düşünme de varsayılan-kapalıdır: tur koşarken biten her
+        // düşünme açık kalsaydı liste açık kartlarla dolar, kullanıcı her
+        // birini tek tek kapatmak zorunda kalırdı. Açık kalması istenen
+        // kart kullanıcı tarafından açıkça açılır (`expandedIDs`).
         if activity.kind == .thinking,
-            isTurnRunning,
+            activity.phase == .running,
             ThinkingDurationPresentation.hasVisibleContent(output: activity.output),
             !contains(
                 thinkingManuallyCollapsedGroups,

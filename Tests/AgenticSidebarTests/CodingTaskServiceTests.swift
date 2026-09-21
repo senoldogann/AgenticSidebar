@@ -513,6 +513,26 @@ actor ServiceHookingRepository: CodingTaskRepository {
         try await base.createTask(task)
     }
 
+    func updateTaskDetails(
+        taskID: UUID,
+        expectedVersion: Int,
+        title: String,
+        objective: String,
+        priority: Int
+    ) async throws -> CodingTask {
+        try await base.updateTaskDetails(
+            taskID: taskID,
+            expectedVersion: expectedVersion,
+            title: title,
+            objective: objective,
+            priority: priority
+        )
+    }
+
+    func deleteTask(taskID: UUID) async throws {
+        try await base.deleteTask(taskID: taskID)
+    }
+
     func addDependency(_ dependency: TaskDependency) async throws {
         addDependencyCount += 1
         try await base.addDependency(dependency)
@@ -657,6 +677,26 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func approvals(taskID: UUID) async throws -> [TaskApproval] {
         try await base.approvals(taskID: taskID)
+    }
+
+    func saveProject(_ project: CodingProject) async throws {
+        try await base.saveProject(project)
+    }
+
+    func renameProject(id: UUID, name: String) async throws -> CodingProject {
+        try await base.renameProject(id: id, name: name)
+    }
+
+    func deleteProject(id: UUID) async throws {
+        try await base.deleteProject(id: id)
+    }
+
+    func loadProject(id: UUID) async throws -> CodingProject? {
+        try await base.loadProject(id: id)
+    }
+
+    func listProjects() async throws -> [CodingProject] {
+        try await base.listProjects()
     }
 
     func saveAgentProfile(_ profile: AgentProfile) async throws {
@@ -827,6 +867,25 @@ final class CodingTaskServiceTests: XCTestCase {
         let project = try await makeProject(service: service)
         let reloaded = await service.project(id: project.id)
         XCTAssertEqual(reloaded, project)
+    }
+
+    func testCreateProjectPersistsToStoreAndSurvivesFreshService() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+
+        let stored = try await harness.store.loadProject(id: project.id)
+        XCTAssertEqual(stored, project)
+        let listed = await service.listProjects()
+        XCTAssertEqual(listed, [project])
+
+        let freshService = harness.makeService()
+        let cachedBeforeRestore = await freshService.project(id: project.id)
+        XCTAssertNil(cachedBeforeRestore)
+        let restored = await freshService.projectFromStore(id: project.id)
+        XCTAssertEqual(restored, project)
+        let relisted = await freshService.listProjects()
+        XCTAssertEqual(relisted, [project])
     }
 
     func testCreateTaskRejectsBlankObjectiveAndUnknownProject() async throws {
@@ -1801,7 +1860,8 @@ final class CodingTaskServiceTests: XCTestCase {
         clock: ServiceTestClock,
         fingerprint: String,
         fingerprintFailure: Error?,
-        fingerprintGate: AsyncGate?
+        fingerprintGate: AsyncGate?,
+        verificationPreflight: (any TaskVerificationPreflightProviding)? = nil
     ) async throws -> (
         store: SQLiteTaskStore,
         repository: ServiceHookingRepository,
@@ -1842,7 +1902,8 @@ final class CodingTaskServiceTests: XCTestCase {
             ),
             clock: clock,
             requiredSteps: [],
-            liveDispatchAvailable: true
+            liveDispatchAvailable: true,
+            verificationPreflight: verificationPreflight
         )
         let project = try await service.createProject(
             name: "Dispatch",
@@ -1908,6 +1969,92 @@ final class CodingTaskServiceTests: XCTestCase {
         }
         let counts = await harness.repository.mutationCounts()
         XCTAssertEqual(counts.claimAttempts, 0)
+    }
+
+    // MARK: - Doğrulama ön kontrolü (H1)
+
+    private struct ScriptedVerificationPreflight: TaskVerificationPreflightProviding {
+        let reason: String?
+        func unresolvableReason(projectID: UUID, taskID: UUID) async -> String? { reason }
+    }
+
+    /// H1: çözülemeyen çalışma alanı ajanı yakmadan ertelenir; talep geri
+    /// çekilir, onay uydurulmaz, gönderim doğmaz.
+    func testStartRunRefusesUnresolvableWorkspaceBeforeDispatch() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil,
+            verificationPreflight: ScriptedVerificationPreflight(
+                reason: "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanında Package.swift yok"
+            )
+        )
+        _ = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: ["done"]
+        )
+        let snapshotForPreflight = try await fixture.service.snapshot(projectID: fixture.project.id)
+        let preflightTask = try XCTUnwrap(snapshotForPreflight.tasks.first)
+
+        let result = try await fixture.service.startRun(
+            taskID: preflightTask.id,
+            expectedVersion: preflightTask.version,
+            actor: "human@example.com"
+        )
+        guard case .deferred(let reason) = result else {
+            return XCTFail("An unresolvable workspace must defer the run, got \(result)")
+        }
+        XCTAssertTrue(reason.contains("VERIFICATION_UNRECOGNIZED_PROJECT"))
+        let approvals = try await fixture.store.approvals(taskID: preflightTask.id)
+        XCTAssertTrue(approvals.isEmpty, "No approval may be invented for an unresolvable workspace")
+        try await assertClaimRetired(
+            taskID: preflightTask.id,
+            store: fixture.store,
+            port: port,
+            expectedStartCount: 0
+        )
+    }
+
+    /// Çözülebilen çalışma alanı kapıdan geçer ve koşu doğar.
+    func testStartRunDispatchesWhenWorkspaceResolves() async throws {
+        let port = ServiceScriptedDispatchPort()
+        let fixture = try await makeDispatchService(
+            port: port,
+            providers: makeEligibleProviders(),
+            workspaces: makeOwnedPreflight(),
+            clock: ServiceTestClock(start: TaskBoardServiceFixtures.startDate),
+            fingerprint: "fingerprint-live",
+            fingerprintFailure: nil,
+            fingerprintGate: nil,
+            verificationPreflight: ScriptedVerificationPreflight(reason: nil)
+        )
+        _ = try await fixture.service.createTask(
+            projectID: fixture.project.id,
+            title: "Live",
+            objective: "Run live",
+            priority: 1,
+            criteria: ["done"]
+        )
+        let snapshotForRun = try await fixture.service.snapshot(projectID: fixture.project.id)
+        let runTask = try XCTUnwrap(snapshotForRun.tasks.first)
+
+        let result = try await fixture.service.startRun(
+            taskID: runTask.id,
+            expectedVersion: runTask.version,
+            actor: "human@example.com"
+        )
+        guard case .claimed = result else {
+            return XCTFail("A resolvable workspace must claim the run, got \(result)")
+        }
+        try await waitForDispatchStart(port, count: 1)
     }
 
     func testStartRunRecordsExecuteApprovalBoundToAttemptAndFingerprint() async throws {

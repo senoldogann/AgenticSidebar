@@ -85,6 +85,8 @@ struct SkillInstaller: Sendable {
             try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
 
             var written = 0
+            // Karma pin yerine yazılan bayt toplamı günlüğe işlenir.
+            var totalBytes = 0
             for file in fetched.files {
                 let fileURL = try Self.resolvedURL(
                     forRelativePath: file.relativePath,
@@ -95,7 +97,12 @@ struct SkillInstaller: Sendable {
                     withIntermediateDirectories: true
                 )
                 try file.content.write(to: fileURL, options: .atomic)
+                // Yazılan yol sembolik bağ olamaz; varsa kurulum reddedilir.
+                if (try? fileManager.destinationOfSymbolicLink(atPath: fileURL.path)) != nil {
+                    throw ExtensionFetchError.badResponse
+                }
                 written += 1
+                totalBytes += file.content.count
             }
 
             try fileManager.createDirectory(
@@ -104,8 +111,15 @@ struct SkillInstaller: Sendable {
             )
             try swap(staging, into: destination)
 
+            // Betik klasörü tek başına engel değildir ama çalıştırılabilir
+            // içerik taşıdığı için uyarı günlüğe düşer.
+            if fetched.files.contains(where: { $0.relativePath == "scripts" || $0.relativePath.hasPrefix("scripts/") }) {
+                AppLog.extensions.warning(
+                    "Installed skill \(manifest.name, privacy: .public) contains scripts/"
+                )
+            }
             AppLog.extensions.info(
-                "Installed skill \(manifest.name, privacy: .public) (\(written, privacy: .public) files)"
+                "Installed skill \(manifest.name, privacy: .public) (\(written, privacy: .public) files, \(totalBytes, privacy: .public) bytes)"
             )
         } catch {
             // Nothing is left behind for the next discovery to read as a skill.

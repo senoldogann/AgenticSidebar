@@ -33,7 +33,8 @@ final class ComputerUseConfigurationTests: XCTestCase {
             rootPath: root.path,
             workingDirectoryURL: root,
             environment: ["PATH": "/nonexistent"],
-            fileManager: .default
+            fileManager: .default,
+            bundlePath: "/nonexistent-bundle"
         )
 
         guard case .failure(let error) = result else {
@@ -47,9 +48,38 @@ final class ComputerUseConfigurationTests: XCTestCase {
             ComputerUseConfiguration.locateNode(
                 environment: ["PATH": "/nonexistent/bin"],
                 fileManager: .default,
-                candidatePaths: []
+                candidatePaths: [],
+                bundlePath: "/nonexistent-bundle"
             )
         )
+    }
+
+    func testNodeLocatorRejectsDirectoriesOutsideTheAllowlist() throws {
+        // PATH'te çalıştırılabilir node olsa bile allowlist dışı dizin
+        // (sistem dizini ya da paket içi değil) elenir.
+        let nodeDirectory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: nodeDirectory) }
+        try makeExecutable(named: "node", in: nodeDirectory)
+
+        XCTAssertNil(
+            ComputerUseConfiguration.locateNode(
+                environment: ["PATH": nodeDirectory.path],
+                fileManager: .default,
+                candidatePaths: [],
+                bundlePath: "/nonexistent-bundle"
+            )
+        )
+    }
+
+    func testSanitizedSearchDirectoriesKeepsOnlySystemAndBundleEntries() {
+        let directories = ComputerUseConfiguration.sanitizedSearchDirectories(
+            environment: [
+                "PATH": "/usr/bin:/opt/evil/bin:relative:.:/usr/bin:/tmp/../usr/bin:/sbin"
+            ],
+            bundlePath: "/Applications/AgenticSidebar.app"
+        )
+
+        XCTAssertEqual(directories, ["/usr/bin", "/sbin"])
     }
 
     func testResolveFindsNodeOnTheSearchPath() throws {
@@ -62,11 +92,13 @@ final class ComputerUseConfigurationTests: XCTestCase {
         try makeCLI(at: root)
         try makeExecutable(named: "node", in: nodeDirectory)
 
+        // Geçici dizin paket içi sayılır: allowlist'in paket ayağı test edilir.
         let result = ComputerUseConfiguration.resolve(
             rootPath: root.path,
             workingDirectoryURL: root,
             environment: ["PATH": nodeDirectory.path],
-            fileManager: .default
+            fileManager: .default,
+            bundlePath: nodeDirectory.path
         )
 
         switch result {
@@ -92,7 +124,8 @@ final class ComputerUseConfigurationTests: XCTestCase {
                 rootPath: root.path,
                 workingDirectoryURL: root,
                 environment: ["PATH": "/nonexistent"],
-                fileManager: .default
+                fileManager: .default,
+                bundlePath: "/nonexistent-bundle"
             ),
             .disabled
         )
@@ -103,7 +136,8 @@ final class ComputerUseConfigurationTests: XCTestCase {
                 rootPath: root.path,
                 workingDirectoryURL: root,
                 environment: ["PATH": "/nonexistent"],
-                fileManager: .default
+                fileManager: .default,
+                bundlePath: "/nonexistent-bundle"
             )
         else {
             return XCTFail("Expected an invalid decision")
@@ -125,7 +159,8 @@ final class ComputerUseConfigurationTests: XCTestCase {
             rootPath: root.path,
             workingDirectoryURL: root,
             environment: ["PATH": nodeDirectory.path],
-            fileManager: .default
+            fileManager: .default,
+            bundlePath: nodeDirectory.path
         ).get()
 
         let serverConfig = configuration.mcpServerConfig()

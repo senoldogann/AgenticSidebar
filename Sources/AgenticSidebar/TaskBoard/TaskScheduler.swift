@@ -496,7 +496,8 @@ actor TaskScheduler {
             TaskRunApprovalPolicy.resolve(
                 toolName: approvalRequest.toolName,
                 patterns: approvalRequest.patterns,
-                workspacePath: workspacePath
+                workspacePath: workspacePath,
+                delegationTarget: approvalRequest.delegationTarget
             )
         }
 
@@ -537,7 +538,8 @@ actor TaskScheduler {
                 let approvalRequest = TaskRunApprovalRequest(
                     id: id,
                     toolName: tool,
-                    patterns: Self.approvalPatterns(from: params)
+                    patterns: Self.approvalPatterns(from: params),
+                    delegationTarget: params["delegationTarget"]
                 )
                 let reply = await resolver(approvalRequest)
                 approvalDecisions.append(TaskRunApprovalDecision(requestID: id, toolName: tool, reply: reply))

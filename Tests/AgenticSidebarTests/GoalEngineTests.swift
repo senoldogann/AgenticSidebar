@@ -233,4 +233,74 @@ final class GoalEngineTests: XCTestCase {
         let engine = makeEngine()
         XCTAssertEqual(engine.elapsedSeconds(now: date(-5)), 0)
     }
+
+    // MARK: - Hedef güncelleme ve oto-onay
+
+    func testUpdateObjectiveChangesTarget() {
+        var engine = makeEngine()
+        XCTAssertTrue(engine.begin(criteria: criteria("bir"), date: date(1)))
+        XCTAssertTrue(engine.updateObjective("Güncel hedef", date: date(2)))
+        XCTAssertEqual(engine.run.objective, "Güncel hedef")
+        XCTAssertFalse(engine.updateObjective("   ", date: date(3)))
+        XCTAssertEqual(engine.run.objective, "Güncel hedef")
+    }
+
+    func testMarkAllCriteriaMet() {
+        var engine = makeEngine()
+        XCTAssertTrue(engine.begin(criteria: criteria("bir", "iki"), date: date(1)))
+        XCTAssertTrue(engine.markAllCriteriaMet(date: date(2)))
+        XCTAssertEqual(engine.run.unmetCriteriaCount, 0)
+        XCTAssertFalse(engine.markAllCriteriaMet(date: date(3)), "Zaten hepsi met ise tekrar işlem yapmamalı")
+    }
+
+    // MARK: - Tur zaman aşımı
+
+    func testNoteTurnTimeoutRetriesInSamePhase() {
+        var engine = makeEngine()
+        XCTAssertTrue(engine.begin(criteria: criteria("bir"), date: date(1)))
+        XCTAssertTrue(engine.didFinishPlan(date: date(2)))
+        XCTAssertTrue(engine.noteTurnTimeout(date: date(3)))
+        XCTAssertEqual(engine.run.phase, .building, "Stall fazı değiştirmemeli")
+        XCTAssertEqual(engine.run.iteration, 1)
+        XCTAssertFalse(engine.run.isTerminal)
+    }
+
+    func testNoteTurnTimeoutFailsWhenBudgetExhausted() {
+        var engine = GoalEngine(
+            objective: "Hedef",
+            budget: GoalBudget(maxIterations: 1, maxDurationSeconds: 3_600, maxToolCalls: 300),
+            startedAt: date(0)
+        )
+        XCTAssertTrue(engine.begin(criteria: criteria("bir"), date: date(1)))
+        XCTAssertTrue(engine.didFinishPlan(date: date(2)))
+        XCTAssertTrue(engine.noteTurnTimeout(date: date(3)))
+        XCTAssertFalse(engine.run.isTerminal)
+        XCTAssertFalse(engine.noteTurnTimeout(date: date(4)), "Bütçe bitince yeniden deneme yok")
+        XCTAssertEqual(engine.run.phase, .failed)
+    }
+
+    func testNoteTransientTurnErrorRetriesInSamePhase() {
+        var engine = makeEngine()
+        XCTAssertTrue(engine.begin(criteria: criteria("bir"), date: date(1)))
+        XCTAssertTrue(engine.didFinishPlan(date: date(2)))
+        XCTAssertTrue(engine.noteTransientTurnError(detail: "transportFailure", date: date(3)))
+        XCTAssertEqual(engine.run.phase, .building, "Geçici hata fazı değiştirmemeli")
+        XCTAssertEqual(engine.run.iteration, 1)
+        XCTAssertFalse(engine.run.isTerminal)
+    }
+
+    func testNoteTransientTurnErrorFailsWhenBudgetExhausted() {
+        var engine = GoalEngine(
+            objective: "Hedef",
+            budget: GoalBudget(maxIterations: 0, maxDurationSeconds: 3_600, maxToolCalls: 300),
+            startedAt: date(0)
+        )
+        XCTAssertTrue(engine.begin(criteria: criteria("bir"), date: date(1)))
+        XCTAssertFalse(engine.noteTransientTurnError(detail: "rateLimited", date: date(2)), "Bütçe bitince yeniden deneme yok")
+        XCTAssertEqual(engine.run.phase, .failed)
+        if case .budgetExceeded = engine.run.failureReason {
+        } else {
+            XCTFail("expected budgetExceeded")
+        }
+    }
 }

@@ -99,7 +99,7 @@ struct ProviderModelCapability: Equatable, Sendable {
 
     /// Ayraçlar (`-`, `_`, `.`, `/`, boşluk) tek tireye indirgenir:
     /// `Claude Sonnet 4.5` ile `claude-sonnet-4-5` aynı sayılır.
-    private static func normalizedModelToken(_ raw: String) -> String {
+    static func normalizedModelToken(_ raw: String) -> String {
         var out = ""
         out.reserveCapacity(raw.count)
         var dashed = true
@@ -125,7 +125,17 @@ struct ProviderCapabilities: Equatable, Sendable {
     let models: [ProviderModelCapability]
 
     func model(id: ProviderModelID) -> ProviderModelCapability? {
-        models.first { $0.id == id }
+        if let exact = models.first(where: { $0.id == id }) {
+            return exact
+        }
+        // Biçime dayanıklı yedek: katalog kimliği ile seçili kimlik aynı
+        // modeli değişik yazımla taşıyabilir (`OpenAI/GPT-5` karşısında
+        // `openai/gpt-5`). Birebir tutmazsa ayraç/harf normalizasyonuyla
+        // denenir; o da tutmazsa `nil` (halka bilinmeyen gösterir).
+        let wanted = ProviderModelCapability.normalizedModelToken(id.rawValue)
+        return models.first {
+            ProviderModelCapability.normalizedModelToken($0.id.rawValue) == wanted
+        }
     }
 
     func supports(

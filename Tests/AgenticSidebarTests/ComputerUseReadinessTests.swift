@@ -399,7 +399,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -430,7 +431,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -464,7 +466,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -498,7 +501,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -523,7 +527,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
 
@@ -550,7 +555,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -573,7 +579,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -595,7 +602,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: false, rootPath: fixture.repo.path)
@@ -617,7 +625,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
 
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
@@ -642,7 +651,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: runner,
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
 
@@ -671,7 +681,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: runner,
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
 
@@ -699,7 +710,8 @@ final class ComputerUseStatusTests: XCTestCase {
             setupRunner: FakeSetupRunner(),
             fileManager: .default,
             homeDirectoryURL: fixture.home,
-            environment: fixture.environment
+            environment: fixture.environment,
+            bundlePath: fixture.root.path
         )
         await status.refresh(isEnabled: true, rootPath: fixture.repo.path)
 

@@ -21,13 +21,20 @@ INFO_PLIST="$APP_CONTENTS/Info.plist"
 # instead of racing the new instance against the old one's teardown — a race
 # here is what used to leave a server (and its whole process tree) orphaned on
 # every rebuild.
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+#
+# LaunchServices ile başlayan örneğin süreç adı tam yoldur (`ps` çıktısı
+# `/Applications/Ag…`), o yüzden `-x AgenticSidebar` onu hiç yakalayamaz ve
+# eski build yaşarken `LSMultipleInstancesProhibited` yenisini açtırmaz.
+# Yürütülebilir yol eşleştirilir; `[r]` deseni komutu çalıştıran kabuğun
+# kendisini eşlemekten korur.
+APP_PROCESS_PATTERN="AgenticSidebar\\.app/Contents/MacOS/AgenticSideba[r]"
+pkill -f "$APP_PROCESS_PATTERN" >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do
-  pgrep -x "$APP_NAME" >/dev/null 2>&1 || break
+  pgrep -f "$APP_PROCESS_PATTERN" >/dev/null 2>&1 || break
   sleep 0.25
 done
 
-if pgrep -x "$APP_NAME" >/dev/null 2>&1; then
+if pgrep -f "$APP_PROCESS_PATTERN" >/dev/null 2>&1; then
   echo "warning: $APP_NAME did not exit after SIGTERM; it may leave its OpenCode server behind." >&2
 fi
 
@@ -160,10 +167,10 @@ case "$MODE" in
     # Açılış + pencere + sunucu ayağa kalkması 1 sn'yi aşabilir; sabit uyku
     # yerine süre dolumlu yoklama yanlış negatifi önler.
     for _ in $(seq 1 40); do
-      pgrep -x "$APP_NAME" >/dev/null 2>&1 && break
+      pgrep -f "$APP_PROCESS_PATTERN" >/dev/null 2>&1 && break
       sleep 0.25
     done
-    pgrep -x "$APP_NAME" >/dev/null
+    pgrep -f "$APP_PROCESS_PATTERN" >/dev/null
     ;;
   *)
     echo "usage: $0 [run|build|--debug|--logs|--telemetry|--verify]" >&2

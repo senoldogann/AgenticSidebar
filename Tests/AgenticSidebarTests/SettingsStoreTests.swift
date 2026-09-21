@@ -20,6 +20,20 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(reloadedStore.menuBarSessionEnabled)
     }
 
+    func testDefaultProviderIDIsNilUntilChosenAndPersists() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertNil(store.defaultProviderID)
+
+        store.defaultProviderID = "opencode"
+
+        XCTAssertEqual(SettingsStore(defaults: defaults).defaultProviderID, "opencode")
+    }
+
     func testWindowOpacityDefaultsToExpectedValueAndPersistsClampedChanges() {
         let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -114,19 +128,19 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(store.isDark(systemColorScheme: .dark))
     }
 
-    func testResponseSpeedModeDefaultsToNormalAndPersistsChanges() {
+    func testResponseSpeedModeDefaultsToFastAndPersistsChanges() {
         let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let store = SettingsStore(defaults: defaults)
-        XCTAssertEqual(store.responseSpeedMode, .normal)
+        XCTAssertEqual(store.responseSpeedMode, .fast)
 
-        store.responseSpeedMode = .fast
+        store.responseSpeedMode = .normal
 
         let reloadedStore = SettingsStore(defaults: defaults)
-        XCTAssertEqual(reloadedStore.responseSpeedMode, .fast)
+        XCTAssertEqual(reloadedStore.responseSpeedMode, .normal)
     }
 
     func testComputerUseDefaultsAreOffWithTheDefaultRootAndPersist() {
@@ -138,7 +152,7 @@ final class SettingsStoreTests: XCTestCase {
         let store = SettingsStore(defaults: defaults)
         XCTAssertFalse(store.computerUseEnabled)
         XCTAssertEqual(store.chatgptSystemRootPath, SettingsStore.defaultChatgptSystemRootPath)
-        XCTAssertEqual(store.toolApprovalPolicy, .approveSafe)
+        XCTAssertEqual(store.toolApprovalPolicy, .fullAccess)
 
         store.computerUseEnabled = true
         store.chatgptSystemRootPath = "~/code/chatgpt-system"
@@ -150,14 +164,59 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(reloadedStore.toolApprovalPolicy, .ask)
     }
 
-    func testFreshInstallDefaultsToApproveSafe() {
+    func testFreshInstallDefaultsToFullAccess() {
         let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let store = SettingsStore(defaults: defaults)
-        XCTAssertEqual(store.toolApprovalPolicy, .approveSafe)
+        XCTAssertEqual(store.toolApprovalPolicy, .fullAccess)
+    }
+
+    func testFreshInstallAutonomyProfileIsBuildFastFullAccess() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertEqual(store.agentMode, .build)
+        XCTAssertEqual(store.responseSpeedMode, .fast)
+        XCTAssertEqual(store.toolApprovalPolicy, .fullAccess)
+        XCTAssertNotNil(ResponseSpeedMode.fast.instruction)
+        XCTAssertTrue(ResponseSpeedMode.fast.instruction?.hasPrefix("FAST MODE:") ?? false)
+    }
+
+    func testAutonomyNoticeAcknowledgedDefaultsToFalseAndPersists() {
+        let suiteName = "AgenticSidebarTests.SettingsStore.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = SettingsStore(defaults: defaults)
+        XCTAssertFalse(store.autonomyNoticeAcknowledged)
+
+        store.autonomyNoticeAcknowledged = true
+
+        XCTAssertTrue(SettingsStore(defaults: defaults).autonomyNoticeAcknowledged)
+    }
+
+    func testAutonomyNoticeShowsUntilExplicitChoice() {
+        XCTAssertTrue(
+            SettingsStore.shouldShowAutonomyNotice(policy: .fullAccess, acknowledged: false),
+            "Fresh-install Full access must ask for explicit acceptance"
+        )
+        XCTAssertFalse(
+            SettingsStore.shouldShowAutonomyNotice(policy: .fullAccess, acknowledged: true)
+        )
+        XCTAssertFalse(
+            SettingsStore.shouldShowAutonomyNotice(policy: .approveSafe, acknowledged: false),
+            "Stricter levels never show the notice"
+        )
+        XCTAssertFalse(
+            SettingsStore.shouldShowAutonomyNotice(policy: .ask, acknowledged: false)
+        )
     }
 
     func testTheOlderComputerUseOnlyLevelIsStillReadAsTheGlobalLevel() {

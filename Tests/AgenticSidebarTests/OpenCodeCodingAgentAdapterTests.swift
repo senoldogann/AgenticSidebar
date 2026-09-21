@@ -372,6 +372,166 @@ final class OpenCodeCodingAgentAdapterTests: XCTestCase {
         )
     }
 
+    /// Bırakılan attempt'in izleme durumu tek noktadan silinir: uzak eşleme,
+    /// bağlantı ve iptal damgası birlikte gider, komşu attempt'e dokunulmaz.
+    func testReleaseForgetsAttemptTrackingState() async throws {
+        let client = AdapterMockOpenCodeClient()
+        let manager = AdapterMockServerManager(
+            workingDirectory: URL(fileURLWithPath: "/workspace/project-a")
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: manager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+
+        let attemptA = UUID()
+        let attemptB = UUID()
+        let runA = try await adapter.start(
+            request: makeRequest(attemptID: attemptA, workspacePath: "/workspace/project-a", stage: .plan)
+        )
+        let runB = try await adapter.start(
+            request: makeRequest(attemptID: attemptB, workspacePath: "/workspace/project-a", stage: .plan)
+        )
+        _ = await runA.events.first { _ in true }
+        _ = await runB.events.first { _ in true }
+
+        await adapter.cancelAttempt(attemptID: attemptA)
+        let countAfterCancel = await adapter.trackedAttemptCount
+        XCTAssertEqual(countAfterCancel, 2 * 2 + 1)
+
+        await adapter.release(attemptID: attemptA)
+        let remoteAfterReleaseA = await adapter.remoteSessionID(for: attemptA)
+        XCTAssertNil(
+            remoteAfterReleaseA,
+            "Bırakılan attempt'in uzak eşlemesi kalmamalı"
+        )
+        let remoteAfterReleaseB = await adapter.remoteSessionID(for: attemptB)
+        XCTAssertNotNil(remoteAfterReleaseB)
+        let countAfterReleaseA = await adapter.trackedAttemptCount
+        XCTAssertEqual(countAfterReleaseA, 2)
+
+        await adapter.release(attemptID: attemptB)
+        let countAfterReleaseAll = await adapter.trackedAttemptCount
+        XCTAssertEqual(
+            countAfterReleaseAll, 0,
+            "Tüm attempt'ler bırakılınca izleme durumu boş kalmalı"
+        )
+    }
+
+    /// Hiç başlamamış bir attempt'in iptali kümeye damga yazmamalı: bitmiş bir
+    /// koşunun geç kapatılması izleme durumunu kirletmemeli.
+    func testCancelOfUnknownAttemptLeavesNoTrace() async throws {
+        let client = AdapterMockOpenCodeClient()
+        let manager = AdapterMockServerManager(
+            workingDirectory: URL(fileURLWithPath: "/workspace/project-a")
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: manager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+
+        await adapter.cancelAttempt(attemptID: UUID())
+        let countAfterUnknownCancel = await adapter.trackedAttemptCount
+        XCTAssertEqual(countAfterUnknownCancel, 0)
+    }
+
+    /// Bırakılmış bir koşuyu yeniden iptal etmek damgayı diriltmemeli ve
+    /// uzak abort'u tekrarlamamalı.
+    func testCancelAfterReleaseDoesNotResurrectTracking() async throws {
+        let client = AdapterMockOpenCodeClient()
+        let manager = AdapterMockServerManager(
+            workingDirectory: URL(fileURLWithPath: "/workspace/project-a")
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: manager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+
+        let attemptID = UUID()
+        let run = try await adapter.start(
+            request: makeRequest(attemptID: attemptID, workspacePath: "/workspace/project-a", stage: .plan)
+        )
+        _ = await run.events.first { _ in true }
+
+        await run.cancel()
+        await adapter.release(attemptID: attemptID)
+        let countAfterRelease = await adapter.trackedAttemptCount
+        XCTAssertEqual(countAfterRelease, 0)
+
+        await run.cancel()
+        let countAfterLateCancel = await adapter.trackedAttemptCount
+        XCTAssertEqual(
+            countAfterLateCancel, 0,
+            "Terminal sonrası iptal izleme durumunu kirletmemeli"
+        )
+        let abortCalls = await client.calls().filter {
+            if case .abort = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(abortCalls.count, 1, "Abort yalnız ilk iptalde gönderilmeli")
+    }
+
+    /// Gözetimsiz koşu istemi, reddedilecek delegasyonu modele önceden söyler:
+    /// `task` ile devretme yok, düzenleme doğrudan çalışma alanında yapılır.
+    /// Sohbet istemi değişmez; kısıt notu yalnız deny-unless-safe çözücülü
+    /// koşuya eklenir.
+    func testUnattendedRunPromptStatesDelegationAndWorkspaceConstraints() async throws {
+        let client = AdapterMockOpenCodeClient()
+        let manager = AdapterMockServerManager(
+            workingDirectory: URL(fileURLWithPath: "/workspace/project-a")
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: manager,
+            clientFactory: { _ in client },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+
+        let chatRun = try await adapter.start(
+            request: makeRequest(
+                attemptID: UUID(),
+                workspacePath: "/workspace/project-a",
+                stage: .implementation
+            )
+        )
+        for await _ in chatRun.events {}
+
+        let unattendedRun = try await adapter.start(
+            request: makeRequest(
+                attemptID: UUID(),
+                workspacePath: "/workspace/project-a",
+                stage: .implementation
+            ),
+            permissionReplyProvider: { _ in .reject }
+        )
+        for await _ in unattendedRun.events {}
+
+        let prompts = await client.sentPromptTexts()
+        XCTAssertEqual(prompts.count, 2, "Her başlatma tek bir istem göndermeli")
+        XCTAssertFalse(
+            prompts[0].contains("Unattended run constraints"),
+            "Sohbet istemine gözetimsiz kısıt notu eklenmemeli"
+        )
+        XCTAssertTrue(
+            prompts[1].contains("Unattended run constraints"),
+            "Gözetimsiz koşu, reddedilecek delegasyonu istemde önceden görmeli"
+        )
+        XCTAssertTrue(
+            prompts[1].contains(ManagedOpenCodeConfiguration.researchAgentName),
+            "İstisna olan salt-okunur araştırma hedefi istemde adıyla geçmeli"
+        )
+        XCTAssertTrue(
+            prompts[1].contains("Implement login view"),
+            "Özgün görev metni kısıt notuyla kaybolmamalı"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeRequest(
@@ -418,6 +578,7 @@ private actor AdapterMockOpenCodeClient: OpenCodeClientProtocol {
     private let customSessionID: String?
     private var streams: [OpenCodeLineStream]
     private var recordedCalls: [AdapterMockCall] = []
+    private var recordedPromptTexts: [String] = []
 
     init(customSessionID: String? = nil, eventStreams: [OpenCodeLineStream] = []) {
         self.customSessionID = customSessionID
@@ -426,6 +587,18 @@ private actor AdapterMockOpenCodeClient: OpenCodeClientProtocol {
 
     func calls() -> [AdapterMockCall] {
         recordedCalls
+    }
+
+    func sentPromptTexts() -> [String] {
+        recordedPromptTexts
+    }
+
+    private func recordPromptParts(_ parts: [OpenCodePromptPart]) {
+        let text = parts.compactMap { part -> String? in
+            guard case .text(let value) = part else { return nil }
+            return value
+        }.joined(separator: "\n")
+        recordedPromptTexts.append(text)
     }
 
     func capabilities() async throws -> ProviderCapabilities {
@@ -465,6 +638,7 @@ private actor AdapterMockOpenCodeClient: OpenCodeClientProtocol {
         variant: String?,
         parts: [OpenCodePromptPart]
     ) async throws {
+        recordPromptParts(parts)
         recordedCalls.append(.sendPrompt(sessionID: sessionID, model: model.flattenedID.rawValue))
     }
 
@@ -475,6 +649,7 @@ private actor AdapterMockOpenCodeClient: OpenCodeClientProtocol {
         parts: [OpenCodePromptPart],
         agent: String?
     ) async throws {
+        recordPromptParts(parts)
         recordedCalls.append(.sendPrompt(sessionID: sessionID, model: model.flattenedID.rawValue))
     }
 

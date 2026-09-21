@@ -252,12 +252,22 @@ extension Array where Element == AgentTurnActivityGroup {
 extension String {
     /// Keeps the head of a long tool result and says so, rather than dropping
     /// the tail silently.
+    ///
+    /// Hızlı yol O(1)'dir: UTF-16 uzunluğu grapheme sayısından küçük olamaz,
+    /// o yüzden eşik altındaki metin pahalı sayıma girmeden döner. Arşiv yazımı
+    /// her kayıtta bütün oturumları tarar; 3-4 akan oturumda kısa çıktılar için
+    /// `count` (yabancı NSString köprülü metinde karakter-boyu doğrulamalı)
+    /// cooperative havuzunu tıkayıp SSE olaylarını biriktiriyordu.
     fileprivate func boundedForArchive(maxLength: Int) -> String {
-        guard count > maxLength else {
+        if (self as NSString).length <= maxLength {
+            return self
+        }
+        let total = count
+        guard total > maxLength else {
             return self
         }
 
-        let marker = "\n… (\(count - maxLength) more characters were not stored)"
+        let marker = "\n… (\(total - maxLength) more characters were not stored)"
         return String(prefix(maxLength)) + marker
     }
 }

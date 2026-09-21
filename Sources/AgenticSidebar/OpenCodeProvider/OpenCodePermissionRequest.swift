@@ -14,6 +14,10 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
     let patterns: [String]
     let alwaysPatterns: [String]
     let detail: String?
+    /// Plan aşaması delegasyon yaptırımının gördüğü yapısal hedef: `task`
+    /// aracının `subagent_type` metadata'sı. Yalnızca `task` için dolar;
+    /// başka bir aracın aynı anahtarı taşıması kararı etkilemez.
+    let delegationTarget: String?
     /// Whether the request came from a session the turn did not open — in
     /// practice a subagent the `task` tool delegated to.
     ///
@@ -40,8 +44,23 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
             toolName: toolName,
             patterns: stringArray(from: properties["patterns"]),
             alwaysPatterns: stringArray(from: properties["always"]),
-            detail: detail(from: metadata, toolName: toolName)
+            detail: detail(from: metadata, toolName: toolName),
+            delegationTarget: delegationTarget(toolName: toolName, metadata: metadata)
         )
+    }
+
+    /// `task` delegasyonunun hedefi (`subagent_type`). Boş ya da boşluk
+    /// yığını hedefsiz sayılır; hedefsizlik fail-closed yönünde
+    /// değerlendirilir.
+    private static func delegationTarget(toolName: String, metadata: [String: Any]) -> String? {
+        guard toolName.lowercased() == "task" else {
+            return nil
+        }
+        guard let raw = metadata["subagent_type"] as? String else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// Marks the request as raised by a delegated session, judged against the

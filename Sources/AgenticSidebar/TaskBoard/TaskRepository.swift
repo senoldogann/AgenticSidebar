@@ -125,8 +125,26 @@ public struct CodingTaskEvent: Sendable, Identifiable, Codable, Equatable {
 
 /// Protocol defining transactional persistence operations for coding tasks and attempts.
 public protocol CodingTaskRepository: Sendable {
+    func saveProject(_ project: CodingProject) async throws
+    func loadProject(id: UUID) async throws -> CodingProject?
+    func listProjects() async throws -> [CodingProject]
+    /// Proje adını değiştirir; boş ad reddedilir.
+    func renameProject(id: UUID, name: String) async throws -> CodingProject
+    /// Projeyi ve altındaki tüm görevleri tek işlemde siler.
+    func deleteProject(id: UUID) async throws
     func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot
     func createTask(_ task: CodingTask) async throws
+    /// Başlık/amaç/öncelik üstverisini günceller; sürüm çitiyle yarışan
+    /// yazımı reddeder, sürümü bir artırır.
+    func updateTaskDetails(
+        taskID: UUID,
+        expectedVersion: Int,
+        title: String,
+        objective: String,
+        priority: Int
+    ) async throws -> CodingTask
+    /// Görevi ve bağımlılık kenarlarıyla birlikte tek işlemde siler.
+    func deleteTask(taskID: UUID) async throws
     func addDependency(_ dependency: TaskDependency) async throws
     /// İnsan bir kabul ölçütünü tamamlandı ya da geri aldı olarak işaretler.
     ///

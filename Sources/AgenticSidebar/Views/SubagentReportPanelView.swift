@@ -28,7 +28,7 @@ struct SubagentReportPanelView: View {
                     .padding(16)
             }
         }
-        .frame(minWidth: 340, idealWidth: 440, maxWidth: 640)
+        .frame(minWidth: 0, idealWidth: 440, maxWidth: 640)
         .background(
             (isDark ? preset.surfaceDark : preset.surfaceLight).opacity(0.96)
         )

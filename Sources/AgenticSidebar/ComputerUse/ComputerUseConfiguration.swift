@@ -43,6 +43,19 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         "/usr/bin/node",
     ]
 
+    /// PATH'ten node aranabilecek dizinler: yalnızca sistem dizinleri ve
+    /// uygulama paketi içi. Kullanıcının PATH'indeki yazılabilir dizinlerden
+    /// (Homebrew ön eki, nvm shimi, proje klasörleri) çalıştırılabilir almak,
+    /// o dizine yazabilen herkesin kodunu bu uygulamanın yetkisiyle çalıştırmak
+    /// olur; sabit adaylar (`nodeExecutableCandidates`) bu kuralın dışındadır,
+    /// çünkü onlar kullanıcının yazdığı bir listeden değil, koddan gelir.
+    static let trustedSystemDirectories: Set<String> = [
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+
     var cliURL: URL {
         projectRootURL
             .appendingPathComponent("dist", isDirectory: true)
@@ -89,7 +102,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         rootPath: String,
         workingDirectoryURL: URL,
         environment: [String: String],
-        fileManager: FileManager
+        fileManager: FileManager,
+        bundlePath: String
     ) -> ComputerUseLaunchDecision {
         guard enabled else {
             return .disabled
@@ -99,7 +113,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
             rootPath: rootPath,
             workingDirectoryURL: workingDirectoryURL,
             environment: environment,
-            fileManager: fileManager
+            fileManager: fileManager,
+            bundlePath: bundlePath
         ) {
         case .success(let configuration):
             return .ready(configuration)
@@ -112,7 +127,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         rootPath: String,
         workingDirectoryURL: URL,
         environment: [String: String],
-        fileManager: FileManager
+        fileManager: FileManager,
+        bundlePath: String
     ) -> Result<ComputerUseConfiguration, ComputerUseConfigurationError> {
         let expanded = expand(
             rootPath: rootPath,
@@ -136,7 +152,8 @@ struct ComputerUseConfiguration: Equatable, Sendable {
             let nodeExecutableURL = locateNode(
                 environment: environment,
                 fileManager: fileManager,
-                candidatePaths: Self.nodeExecutableCandidates
+                candidatePaths: Self.nodeExecutableCandidates,
+                bundlePath: bundlePath
             )
         else {
             return .failure(.nodeMissing)
@@ -169,19 +186,60 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         return trimmed
     }
 
+    /// PATH girdilerini güvenli kümeye indirger: boş, göreli ve `..` içeren
+    /// girdiler elenir; kalanlardan yalnızca sistem dizinleri ve uygulama
+    /// paketi içindekiler tutulur. Sıra korunur, tekrarlar atılır.
+    static func sanitizedSearchDirectories(
+        environment: [String: String],
+        bundlePath: String
+    ) -> [String] {
+        let rawEntries = (environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+        var seen = Set<String>()
+        var kept: [String] = []
+        let bundlePrefix = bundlePath.hasSuffix("/") ? bundlePath : bundlePath + "/"
+        for entry in rawEntries {
+            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            // Göreli girdiler çağrıldığı dizine göre çözülür; allowlist dışı bırakılır.
+            guard trimmed.hasPrefix("/") else {
+                continue
+            }
+            let components = trimmed.split(separator: "/").map(String.init)
+            guard !components.contains("..") else {
+                continue
+            }
+            let normalized = "/" + components.joined(separator: "/")
+            let allowed =
+                trustedSystemDirectories.contains(normalized)
+                || normalized == bundlePath
+                || normalized.hasPrefix(bundlePrefix)
+            guard allowed, seen.insert(normalized).inserted else {
+                continue
+            }
+            kept.append(normalized)
+        }
+        return kept
+    }
+
     static func locateNode(
         environment: [String: String],
         fileManager: FileManager,
-        candidatePaths: [String]
+        candidatePaths: [String],
+        bundlePath: String
     ) -> URL? {
         for candidate in candidatePaths
         where fileManager.isExecutableFile(atPath: candidate) {
             return URL(fileURLWithPath: candidate)
         }
 
-        let pathEntries = (environment["PATH"] ?? "")
-            .split(separator: ":")
-            .map(String.init)
+        let pathEntries = sanitizedSearchDirectories(
+            environment: environment,
+            bundlePath: bundlePath
+        )
 
         for entry in pathEntries {
             let candidate = URL(fileURLWithPath: entry, isDirectory: true)

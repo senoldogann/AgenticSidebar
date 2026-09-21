@@ -246,16 +246,19 @@ deletes its own throwaway item in the login keychain.
   control in the composer and on a waiting approval card:
   - **Ask** — reads and in-folder edits run; every shell command, every path
     outside the working folder and every network call waits for your decision.
-  - **Approve for me** — **this is the default**, so a fresh install asks about
+  - **Approve for me** — a fresh install no longer starts here; it asks about
     anything potentially unsafe without burying the user in prompts. A short
     list of exact inspection commands (`git status`, `git diff`, `ls`, `pwd`
     and selected fixed variants) and exact build/test commands run unattended
     within the working folder. Other commands, including arbitrary flags,
     commands that can change state, external paths and network access, require
     approval.
-  - **Full access** — nothing asks. It answers the requests the agent raises; a `deny` in the user's own
-    `opencode.json`, and the app's own `deny` for the computer-use file, git,
-    terminal and JavaScript tools, still apply — a denied tool is never asked
+  - **Full access** — **this is the default**, so a fresh install acts fast:
+    shell, edits, fetches, computer use actions and the authority lease run
+    without a prompt. It answers the requests the agent raises; a `deny` in
+    the user's own `opencode.json`, and the app's own `deny` for the
+    computer-use file, git, terminal and full-host JavaScript
+    (`computer_run_js`) tools, still apply — a denied tool is never asked
     about, so no level can allow it.
 
   The level is captured when a turn starts, not written into the agent's

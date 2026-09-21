@@ -111,4 +111,46 @@ final class ThinkingDurationPresentationTests: XCTestCase {
             "Thought for 3s"
         )
     }
+
+    func testCompactRunningThoughtOmitsForAndEllipsis() {
+        XCTAssertEqual(
+            ThinkingDurationPresentation.compactText(
+                startedAt: startedAt,
+                completedAt: nil,
+                turnEndedAt: nil,
+                isRunning: true,
+                hasRunningChildren: false,
+                now: startedAt.addingTimeInterval(3)
+            ),
+            "Thinking 3s"
+        )
+    }
+
+    func testCompactFinishedThoughtReadsAsThoughtNs() {
+        XCTAssertEqual(
+            ThinkingDurationPresentation.compactText(
+                startedAt: startedAt,
+                completedAt: startedAt.addingTimeInterval(10),
+                turnEndedAt: nil,
+                isRunning: false,
+                hasRunningChildren: false,
+                now: startedAt.addingTimeInterval(600)
+            ),
+            "Thought 10s"
+        )
+    }
+
+    func testCompactFinishedThoughtFormatsLongDurations() {
+        XCTAssertEqual(
+            ThinkingDurationPresentation.compactText(
+                startedAt: startedAt,
+                completedAt: startedAt.addingTimeInterval(100),
+                turnEndedAt: nil,
+                isRunning: false,
+                hasRunningChildren: false,
+                now: startedAt.addingTimeInterval(600)
+            ),
+            "Thought 1m 40s"
+        )
+    }
 }

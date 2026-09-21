@@ -8,10 +8,21 @@ import Foundation
 /// `AttributedString` directly keeps the emphasis and code-span styling without
 /// giving message content localization or format semantics.
 enum MarkdownInlineText {
+    /// Tek bir satır-içi birimin Foundation ile ayrıştırılabileceği en fazla
+    /// uzunluk. Üstündeki metin (yapışmış uzun döküm, dev tek paragraf) düz
+    /// yazı olarak döner: Foundation'ın satır-içi markdown ayrıştırması uzun
+    /// kesintisiz koşularda doğrusal-üstü maliyetlidir ve ana iş parçacığını
+    /// kilitler; ayrıca bu boyda bir dizgiyi önbellek anahtarı olarak
+    /// hash'lemek her gövde değerlendirmesinde megabaytları kopyalar.
+    static let maximumParsableCharacters = 8_000
+
     static func attributed(from text: String) -> AttributedString {
         // Her flush tüm transkript gövdelerini yeniden değerlendirir; metni
         // değişmeyen satırların Foundation parse'ı bu önbellekten döner.
         // Büyüyen kuyruk metni her flush'ta yenidir, o yine ayrıştırılır.
+        if text.count > maximumParsableCharacters {
+            return AttributedString(text)
+        }
         if let cached = MarkdownInlineCache.shared.attributed(for: text) {
             return cached
         }

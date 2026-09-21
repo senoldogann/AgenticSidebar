@@ -1,7 +1,9 @@
+import AppKit
 import SwiftUI
 
 struct AgentActivityTimelineView: View, Equatable {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(SettingsStore.self) private var settingsStore: SettingsStore?
 
     let group: AgentTurnActivityGroup
     let isTurnActive: Bool
@@ -11,6 +13,10 @@ struct AgentActivityTimelineView: View, Equatable {
     /// çizilmez.
     let onOpenReport: ((AgentActivity) -> Void)?
     let onOpenReview: ((TurnFileChangesSummary, FileChangeItem?) -> Void)?
+    /// Altta oturum toplu kartı dururken satır içi tur kartı gizlenir: aynı
+    /// dosyalar iki ayrı kartta sayılmaz. Oturum bitince toplu kart her zaman
+    /// çizildiği için (tek turlu değişim dahil) bu bayrak boşta `true` kalır.
+    let suppressesInlineFileCard: Bool
     /// Grup ya da kart açılıp kapandığında üst görünüme haber verir: transkript
     /// boyu yüzlerce pt değişir, üst görünüm kaydırma konumunu sabitler.
     /// `==` dışında tutulur (`onOpenReport` ile aynı gerekçe).
@@ -19,6 +25,7 @@ struct AgentActivityTimelineView: View, Equatable {
     nonisolated static func == (lhs: AgentActivityTimelineView, rhs: AgentActivityTimelineView) -> Bool {
         lhs.group == rhs.group && lhs.isTurnActive == rhs.isTurnActive && lhs.isSessionBusy == rhs.isSessionBusy
             && lhs.hasPendingApproval == rhs.hasPendingApproval && lhs.sessionID == rhs.sessionID
+            && lhs.suppressesInlineFileCard == rhs.suppressesInlineFileCard
     }
 
     /// Kartların açık/kapalı durumu sohbet değişiminde yaşasın diye görünüm
@@ -49,6 +56,7 @@ struct AgentActivityTimelineView: View, Equatable {
         collapseStore: TimelineCollapseStore,
         onOpenReport: ((AgentActivity) -> Void)?,
         onOpenReview: ((TurnFileChangesSummary, FileChangeItem?) -> Void)?,
+        suppressesInlineFileCard: Bool,
         onCollapseChange: (() -> Void)? = nil
     ) {
         self.group = group
@@ -59,6 +67,7 @@ struct AgentActivityTimelineView: View, Equatable {
         self.collapseStore = collapseStore
         self.onOpenReport = onOpenReport
         self.onOpenReview = onOpenReview
+        self.suppressesInlineFileCard = suppressesInlineFileCard
         self.onCollapseChange = onCollapseChange
     }
 
@@ -66,30 +75,52 @@ struct AgentActivityTimelineView: View, Equatable {
         isTurnActive || group.activities.contains { $0.phase == .running }
     }
 
+    /// Araç satırları `Working for` durum satırıyla aynı renkte ve sohbet
+    /// metniyle aynı boyutta çizilir: hepsi tek renk olur, biri parlamaz.
+    private var toolFontSize: CGFloat {
+        settingsStore?.fontSize.pointSize ?? 14
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             let nonThinkingActivities = group.activities.filter { $0.kind != .thinking }
-            let thinking = group.activities.first(where: { $0.kind == .thinking })
-
-            // Boş düşünme satırı çizilmez: reasoning paylaşmayan modellerde
-            // `output` hiç dolmaz ve "Thought for Ns" satırı tek başına
-            // anlamsız bir süre rozetine dönüşürdü.
-            if let thinking, shouldShowThinking(thinking) {
-                activityRow(thinking, isNested: false)
-            }
 
             if nonThinkingActivities.count > 1 {
                 let isExpanded = isGroupSummaryExpanded(group.id)
-                summaryButton(for: nonThinkingActivities, isExpanded: isExpanded)
+                // O an koşan iş varsa en sondaki koşandır (canlı satır).
+                let runningActivity = nonThinkingActivities.last(where: { $0.phase == .running })
 
                 if isExpanded {
+                    // Açıkken üst satır koşan işe sabitlenir (canlı düğme) ya
+                    // da özet satırına düşer; liste her iki durumda da AYNI
+                    // `ScrollView`'dur. Eski sürüm koşan varken/yokken iki ayrı
+                    // liste kuruyordu: tool'lar arası kısa boşlukta
+                    // (`running == nil` anı) ağaç yıkılıp yeniden kuruluyor,
+                    // kaydırma konumu sıfırlanıp kullanıcı en üste fırlıyordu.
+                    // Burada yalnız üst satır ve liste içeriği değişir, kayan
+                    // alanın kimliği değişmez; kullanıcı dipteyse dipte kalır.
+                    if let running = runningActivity {
+                        // Açıkken özet satırı (`Received N updates`) kalkar:
+                        // yerine o an çalışan komut sabitlenir ve her adımda
+                        // güncellenir. Liste yalnız bitenleri kaydırır, koşan
+                        // iş ScrollView dışında durur, dibe kaybolmaz.
+                        liveButton(for: running)
+                    } else {
+                        summaryButton(for: nonThinkingActivities, isExpanded: true)
+                    }
+
                     ScrollView(.vertical, showsIndicators: true) {
                         // Eager `VStack` 150 satırı tek turda kurup ana iş
                         // parçacığını blokluyordu; tembel yığın yalnız
                         // görünenleri kurar.
                         LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(nonThinkingActivities) { activity in
-                                activityRow(activity, isNested: true)
+                            ForEach(
+                                Self.displayedActivities(
+                                    from: group.activities,
+                                    isLiveRunning: runningActivity != nil
+                                )
+                            ) { activity in
+                                timelineRow(activity, isNested: true)
                             }
                         }
                         .padding(.leading, 8)
@@ -97,17 +128,51 @@ struct AgentActivityTimelineView: View, Equatable {
                     }
                     .frame(maxHeight: Self.expandedListMaxHeight)
                     .transition(.opacity)
-                } else if let preview = Self.collapsedPreviewActivity(from: nonThinkingActivities) {
-                    // Kapalı özetin altında o anki işin tek satırlık önizlemesi:
-                    // koşan varsa en son koşan, yoksa en son aktivite.
-                    activityRow(preview, isNested: true)
-                        .padding(.leading, 8)
-                        .transition(.opacity)
+                } else {
+                    // Kapalıyken klasik özet satırı: daraltılınca
+                    // `Received N updates` geri döner.
+                    summaryButton(for: nonThinkingActivities, isExpanded: false)
+
+                    if let preview = Self.collapsedPreviewActivity(from: nonThinkingActivities) {
+                        // Kapalı özetin altında o anki işin tek satırlık önizlemesi:
+                        // koşan varsa en son koşan, yoksa en son aktivite.
+                        activityRow(preview, isNested: true)
+                            .padding(.leading, 8)
+                            .transition(.opacity)
+                    }
                 }
             } else {
-                ForEach(nonThinkingActivities) { activity in
-                    activityRow(activity, isNested: false)
+                // Düşünme parçaları çağrıldıkları yerde durur: her reasoning
+                // bloğu kendi satırında (`Thought 10s`), grubun üstünde tek
+                // dev blokta toplanmaz.
+                ForEach(group.activities) { activity in
+                    timelineRow(activity, isNested: false)
                 }
+            }
+
+            // Tur sonu dosya özeti: tur bitmişse ve dosya değişmişse listenin
+            // altında "N files changed" kartı çizilir (Review düğmesiyle).
+            // Koşarken çizilmez: liste canlı uzar, kartın sayıları yalan olur.
+            // Bitmiş turların kartı oturum meşgulken de durur: sonraki tur
+            // koşarken önceki turun özeti kaybolmamalıdır.
+            // Oturum bitince altta toplu kart çizilir ve burası gizlenir: aynı
+            // dosyalar üstte/ortada ve altta iki kez sayılırdı.
+            let fileSummary = TurnFileChangesSummary.from(group: group)
+            if !isTurnRunning, !suppressesInlineFileCard, !fileSummary.isEmpty, let onOpenReview {
+                FileChangesSummaryCard(
+                    summary: fileSummary,
+                    isExpanded: Binding(
+                        get: {
+                            collapseStore.isFilesExpanded(groupID: group.id, sessionID: sessionID)
+                        },
+                        set: { expanded in
+                            collapseStore.setFilesExpanded(expanded, groupID: group.id, sessionID: sessionID)
+                            onCollapseChange?()
+                        }
+                    ),
+                    onOpenReview: onOpenReview
+                )
+                .padding(.top, 2)
             }
         }
         .padding(.vertical, 2)
@@ -151,9 +216,42 @@ struct AgentActivityTimelineView: View, Equatable {
         return activities.last
     }
 
+    /// Canlı başlık üstte sabit dururken listede yalnız bitenler kayar:
+    /// koşan iş hem üstte hem listede iki kez görünmez. Görünüm dışı saf
+    /// fonksiyondur, seçim mantığı test edilebilir.
+    nonisolated static func finishedActivities(from activities: [AgentActivity]) -> [AgentActivity] {
+        activities.filter { $0.phase != .running }
+    }
+
+    /// Genişletilmiş listenin içeriği: koşan iş üstte sabitlenmişken liste
+    /// yalnız bitenleri kaydırır, tur boşluğundaysa tamamını gösterir.
+    /// `ScrollView` kimliği daldan bağımsız tek kaldığı için kaydırma konumu
+    /// koşu geçişlerinde korunur. Görünüm dışı saf fonksiyondur.
+    nonisolated static func displayedActivities(
+        from activities: [AgentActivity],
+        isLiveRunning: Bool
+    ) -> [AgentActivity] {
+        isLiveRunning ? finishedActivities(from: activities) : activities
+    }
+
     private func summaryTitle(for activities: [AgentActivity]) -> String {
-        let commands = activities.filter { $0.kind == .command }.count
-        let updates = activities.filter { $0.kind != .command }.count
+        // Düşünme parçaları kendi satırlarında durur, sayıya katılmaz:
+        // yoksa 5 komut + 3 düşünme "Received 8 updates" olurdu.
+        let countable = activities.filter { $0.kind != .thinking }
+        guard !countable.isEmpty else {
+            return activities.count == 1 ? "Thought once" : "Thought \(activities.count) times"
+        }
+        let commands = countable.filter { $0.kind == .command }.count
+        let computers = countable.filter { $0.kind == .computer }.count
+        let otherUpdates = countable.filter { $0.kind != .command && $0.kind != .computer }.count
+
+        // Salt computer turu kendi adıyla anılır, genel "updates"e gömülmez.
+        if commands == 0 && otherUpdates == 0 && computers > 0 {
+            return computers == 1 ? "Ran 1 computer action" : "Ran \(computers) computer actions"
+        }
+
+        // Karışık grupta computer adımları sayıya dahildir, kaybolmaz.
+        let updates = otherUpdates + computers
 
         if commands > 0 && updates > 0 {
             let cmdWord = commands == 1 ? "command" : "commands"
@@ -172,7 +270,7 @@ struct AgentActivityTimelineView: View, Equatable {
         } else if updates == 1 {
             return "Received 1 update"
         } else {
-            return "Ran \(activities.count) actions"
+            return "Ran \(countable.count) actions"
         }
     }
 
@@ -252,6 +350,45 @@ struct AgentActivityTimelineView: View, Equatable {
         .help(isExpanded ? "Collapse this turn's steps" : "Expand this turn's steps")
     }
 
+    /// Açık grubun üstünde sabit duran canlı satır: o an koşan komut.
+    ///
+    /// Özet düğmesiyle aynı kromu taşır (tıklayınca grup kapanır, ok hep
+    /// aşağı bakar), ama metni sayı değil koşan işin başlığıdır ve her
+    /// adımda güncellenir. `rowLabel` yeniden kullanılır: başlık evrimi
+    /// ("Running" → "Running ls") zıplamasız akar, shimmer koşarken sürer.
+    @ViewBuilder
+    private func liveButton(for activity: AgentActivity) -> some View {
+        Button {
+            withAnimation(Self.toggleAnimation(for: group.activities.count)) {
+                toggleGroupSummaryExpanded(group.id)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                activityIcon(for: activity)
+
+                rowLabel(for: activity)
+
+                Spacer(minLength: 8)
+
+                // Sabit yuva: gösterge tak-çıkar yerine hep durur, sondaki
+                // ok kımıldamaz.
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 12, height: 12)
+
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary.opacity(0.8))
+            }
+            .padding(.vertical, 3)
+            .padding(.horizontal, 4)
+            .contentShape(Rectangle())
+            .interactiveHoverPill(cornerRadius: 6)
+        }
+        .buttonStyle(.plain)
+        .help("Collapse this turn's steps")
+    }
+
     private func isActivityExpanded(_ activity: AgentActivity) -> Bool {
         collapseStore.isActivityExpanded(activity, groupID: group.id, sessionID: sessionID, isTurnRunning: isTurnRunning)
     }
@@ -263,6 +400,15 @@ struct AgentActivityTimelineView: View, Equatable {
 
     private var workingText: String {
         "Working" + String(repeating: ".", count: workingDotCount)
+    }
+
+    @ViewBuilder
+    private func timelineRow(_ activity: AgentActivity, isNested: Bool) -> some View {
+        if activity.kind == .thinking {
+            thinkingRow(activity)
+        } else {
+            activityRow(activity, isNested: isNested)
+        }
     }
 
     @ViewBuilder
@@ -391,13 +537,13 @@ struct AgentActivityTimelineView: View, Equatable {
         if activity.kind == .command {
             let cmd = activity.detail ?? activity.title ?? "command"
             Text(cmd)
-                .font(.system(size: 12.5, weight: .regular, design: .monospaced))
+                .font(.system(size: toolFontSize, weight: .regular, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .sunshineShimmer(isActive: activity.phase == .running)
         } else if activity.kind == .thinking {
-            thinkingRowLabel(thinking: activity)
+            thinkingCompactLabel(thinking: activity)
         } else if let title = activity.title, !title.isEmpty {
             parseTitleText(title)
                 .sunshineShimmer(isActive: activity.phase == .running)
@@ -406,12 +552,12 @@ struct AgentActivityTimelineView: View, Equatable {
             let fallbackTitle = activity.phase == .running ? presentation.runningStatusName : presentation.title
             HStack(spacing: 5) {
                 Text(fallbackTitle)
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.system(size: toolFontSize, weight: .regular))
                     .foregroundStyle(.secondary)
 
                 if let detail = activity.detail, !detail.isEmpty {
                     Text(detail)
-                        .font(.system(size: 13, weight: .regular))
+                        .font(.system(size: toolFontSize, weight: .regular))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -431,58 +577,106 @@ struct AgentActivityTimelineView: View, Equatable {
         return isTurnRunning && thinking.phase == .running
     }
 
+    /// Her düşünme bloğu kendi satırında açılır-kapanır durur: bitince
+    /// `Thought 10s` rozeti kalır, gövde varsayılan kapalıdır. Koşarken
+    /// varsayılan açıktır ve süre canlı akar.
     @ViewBuilder
-    private func thinkingRowLabel(thinking: AgentActivity) -> some View {
-        let hasRunningChildren = group.activities.contains { $0.id != thinking.id && $0.phase == .running }
+    private func thinkingRow(_ thinking: AgentActivity) -> some View {
+        // Boş düşünme satırı çizilmez: reasoning paylaşmayan modellerde
+        // `output` hiç dolmaz ve süre satırı tek başına anlamsız bir
+        // rozete dönüşürdü.
+        if shouldShowThinking(thinking) {
+            let isExpanded = isActivityExpanded(thinking)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                        toggleActivityExpanded(thinking)
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "brain")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+
+                        thinkingCompactLabel(thinking: thinking)
+
+                        Spacer(minLength: 8)
+
+                        // Sabit yuva düzeni burada yok: koşan düşünme zaten
+                        // canlı süreyle belli olur, bitende rozet yeter.
+                        if thinking.phase == .running {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .frame(width: 12, height: 12)
+                        }
+
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary.opacity(0.8))
+                    }
+                    .padding(.vertical, 3)
+                    .padding(.horizontal, 4)
+                    .contentShape(Rectangle())
+                    .interactiveHoverPill(cornerRadius: 6)
+                }
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse thought" : "Expand thought")
+
+                if isExpanded,
+                    ThinkingDurationPresentation.hasVisibleContent(output: thinking.output)
+                {
+                    thinkingBody(output: thinking.output ?? "")
+                        .transition(.opacity)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func thinkingCompactLabel(thinking: AgentActivity) -> some View {
         let turnEndedAt = group.activities.compactMap(\.completedAt).max()
 
-        if thinking.phase == .running || hasRunningChildren {
+        // Bitmiş düşünme statiktir: saniye saati ve sunshine yalnız koşarken
+        // yaşar. Eski sürüm turdaki araçlar koşarken bitmiş düşünmeyi de
+        // `SecondTick` ile her saniye yeniden kuruyordu; süre zaten
+        // `completedAt` ile donmuşken zamanlayıcı ve parlama katmanı boşuna
+        // dönüyordu (`Thought` sonrası sunshine olmaz).
+        if thinking.phase == .running {
             // Satır başına `TimelineView` yerine paylaşılan saniye saati:
             // N düşünen satır tek zamanlayıcıyı dinler.
             SecondTick { date in
                 Text(
-                    thinkingText(
-                        thinking: thinking,
+                    ThinkingDurationPresentation.compactText(
+                        startedAt: thinking.startedAt,
+                        completedAt: thinking.completedAt,
                         turnEndedAt: turnEndedAt,
-                        hasRunningChildren: hasRunningChildren,
-                        at: date
+                        isRunning: true,
+                        hasRunningChildren: false,
+                        now: date
                     )
                 )
-                .font(.system(size: 13, weight: .regular))
+                .font(.system(size: toolFontSize, weight: .regular))
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
                 .sunshineShimmer(isActive: true)
             }
         } else {
             Text(
-                thinkingText(
-                    thinking: thinking,
+                ThinkingDurationPresentation.compactText(
+                    startedAt: thinking.startedAt,
+                    completedAt: thinking.completedAt,
                     turnEndedAt: turnEndedAt,
+                    isRunning: false,
                     hasRunningChildren: false,
-                    at: Date()
+                    now: Date()
                 )
             )
-            .font(.system(size: 13, weight: .regular))
+            .font(.system(size: toolFontSize, weight: .regular))
             .foregroundStyle(.secondary)
             .monospacedDigit()
         }
-    }
-
-    /// Ölçüm görünümün dışında, saf bir fonksiyonda durur.
-    private func thinkingText(
-        thinking: AgentActivity,
-        turnEndedAt: Date?,
-        hasRunningChildren: Bool,
-        at date: Date
-    ) -> String {
-        ThinkingDurationPresentation.text(
-            startedAt: thinking.startedAt,
-            completedAt: thinking.completedAt,
-            turnEndedAt: turnEndedAt,
-            isRunning: thinking.phase == .running,
-            hasRunningChildren: hasRunningChildren,
-            now: date
-        )
     }
 
     @ViewBuilder
@@ -499,12 +693,12 @@ struct AgentActivityTimelineView: View, Equatable {
 
         HStack(spacing: parts.count == 2 ? 5 : 0) {
             Text(verb)
-                .font(.system(size: 13, weight: .regular))
+                .font(.system(size: toolFontSize, weight: .regular))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
 
             Text(target)
-                .font(.system(size: 13, weight: .regular))
+                .font(.system(size: toolFontSize, weight: .regular))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -530,14 +724,11 @@ struct AgentActivityTimelineView: View, Equatable {
                 // Düşünme içeriği: modelin ara adımları. `output`'ta birikir
                 // (arşiv sınırı orayı kırpar), kart kapalıyken yalnız süre
                 // görünür; canlı turda kart varsayılan açıktır.
-                // Boşken iç kart çizilmez: dış satır zaten durumu söyler,
-                // içeriksiz gri "Thought" kutusu çift başlık etkisi yapıyordu.
+                // Zeminsiz düz metin: dış satır ("Thought Ns") zaten
+                // başlığı söyler, iç kartın zemini ve ikinci "Thought"
+                // başlığı çiftlik etkisi yapıyordu.
                 if ThinkingDurationPresentation.hasVisibleContent(output: activity.output) {
-                    resultCard(
-                        header: "Thought",
-                        headerSymbol: "brain",
-                        body: activity.output
-                    )
+                    thinkingBody(output: activity.output ?? "")
                 }
             } else if activity.kind == .subagent {
                 subagentExecutionCard(activity: activity)
@@ -547,6 +738,8 @@ struct AgentActivityTimelineView: View, Equatable {
                     headerSymbol: "server.rack",
                     body: activity.output ?? (activity.phase == .running ? "Executing MCP tool..." : nil)
                 )
+            } else if activity.kind == .computer {
+                computerCard(activity: activity)
             } else if let output = activity.output, !output.isEmpty {
                 // For reads and writes the tool's result *is* the file content,
                 // so the card is labelled with the path it came from.
@@ -567,6 +760,158 @@ struct AgentActivityTimelineView: View, Equatable {
         .padding(.vertical, 2)
     }
 
+    /// Düşünme gövdesi: kart kromu yok, başlık yok — yalnız metin.
+    /// Uzunsa kendi içinde kayar, çevreyi büyütmez.
+    @ViewBuilder
+    private func thinkingBody(output: String) -> some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            Text(output)
+                .font(.system(size: toolFontSize))
+                .foregroundStyle(.primary)
+                .lineSpacing(2)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: 220)
+        .padding(.leading, 24)
+        .padding(.trailing, 8)
+    }
+
+    /// Computer adımı: ekran görüntüsü varsa önizleme, metin çıktısı varsa
+    /// kart. İkisi de varsa ikisi de çizilir (görsel üstte); hiçbiri yoksa
+    /// boş kart değil, yalnız ayrıntı satırı düşer.
+    @ViewBuilder
+    private func computerCard(activity: AgentActivity) -> some View {
+        let imageURL = Self.computerImageURL(for: activity)
+        let textOutput = Self.computerTextOutput(for: activity, imageURL: imageURL)
+
+        VStack(alignment: .leading, spacing: 6) {
+            if let imageURL {
+                computerImagePreview(url: imageURL)
+            }
+            if let textOutput, !textOutput.isEmpty {
+                resultCard(
+                    header: activity.title ?? activity.detail ?? "Computer action",
+                    headerSymbol: "computermouse",
+                    body: textOutput
+                )
+            } else if imageURL == nil, activity.diff == nil,
+                let detail = activity.detail, !detail.isEmpty
+            {
+                HStack(spacing: 6) {
+                    Text(detail)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 24)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// Computer çıktısındaki görsel dosya başvurusu: `output` satırları ve
+    /// `detail` taranır, var olan ilk görsel dosya alınır. Görünüm dışı saf
+    /// mantık ayrı test edilir; dosya varlığı burada denetlenir, gövdede
+    /// disk okunmaz.
+    nonisolated static func computerImageURL(for activity: AgentActivity) -> URL? {
+        let lines =
+            ((activity.output ?? "") + "\n" + (activity.detail ?? ""))
+            .components(separatedBy: .newlines)
+        for raw in lines {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            // "Screenshot saved: /tmp/x.png" biçimi: satırdaki ilk mutlak yol.
+            let candidates: [String]
+            if trimmed.hasPrefix("/") || trimmed.hasPrefix("file://") {
+                candidates = [trimmed]
+            } else if let slash = trimmed.firstIndex(of: "/") {
+                candidates = [String(trimmed[slash...])]
+            } else {
+                candidates = []
+            }
+            for candidate in candidates {
+                let path =
+                    candidate.hasPrefix("file://")
+                    ? String(candidate.dropFirst("file://".count))
+                    : candidate
+                let url = URL(fileURLWithPath: path)
+                guard Self.isImageExtension(url.pathExtension),
+                    FileManager.default.fileExists(atPath: url.path)
+                else {
+                    continue
+                }
+                return url
+            }
+        }
+        return nil
+    }
+
+    /// Metin kartına gidecek çıktı: görsel yolu satırları çıkarılır, geriye
+    /// metin kalmazsa `nil` (boş kart çizilmez).
+    nonisolated static func computerTextOutput(for activity: AgentActivity, imageURL: URL?) -> String? {
+        guard let output = activity.output, !output.isEmpty else {
+            return nil
+        }
+        guard let imageURL else {
+            return output
+        }
+        let rest =
+            output
+            .components(separatedBy: .newlines)
+            .filter { !$0.contains(imageURL.path) }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty ? nil : rest
+    }
+
+    nonisolated static func isImageExtension(_ ext: String) -> Bool {
+        ["png", "jpg", "jpeg", "gif", "webp", "tiff", "tif", "heic", "bmp"].contains(ext.lowercased())
+    }
+
+    /// Ekran görüntüsü önizlemesi: küçük resim önbelleğinden kırpılmış kare
+    /// değil, geniş önizleme; tıklayınca dosya varsayılan uygulamada açılır.
+    @ViewBuilder
+    private func computerImagePreview(url: URL) -> some View {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
+            if let image = AttachmentPreviewCache.shared.imageThumbnail(for: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: 280, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+                    )
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    Color.primary.opacity(0.05),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .help("Open \(url.lastPathComponent)")
+        .padding(.leading, 24)
+        .padding(.trailing, 8)
+    }
+
     /// The console-style surface shared by command output and file results.
     @ViewBuilder
     private func resultCard(
@@ -585,7 +930,7 @@ struct AgentActivityTimelineView: View, Equatable {
 
                 Text(header ?? "command")
                     .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                    .foregroundStyle(isDark ? Color(white: 0.82) : Color(white: 0.22))
+                    .foregroundStyle(.secondary)
                     .lineLimit(3)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
@@ -596,7 +941,7 @@ struct AgentActivityTimelineView: View, Equatable {
                 ScrollView(.vertical, showsIndicators: true) {
                     Text(text)
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(isDark ? Color(white: 0.68) : Color(white: 0.38))
+                        .foregroundStyle(.primary)
                         .lineSpacing(2)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -639,7 +984,7 @@ struct AgentActivityTimelineView: View, Equatable {
 
                 Text(activity.title ?? activity.detail ?? "Subagent Execution")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
 
                 Spacer(minLength: 4)
@@ -989,7 +1334,7 @@ struct AgentActivityTimelineView: View, Equatable {
 
 /// Soldan sağa kayan sunshine parlaması.
 ///
-/// İki kuralı vardır:
+/// Üç kuralı vardır:
 /// 1. Yapısal kararlılık: `isActive` değişimi `if/else` dalı değiştirmez.
 ///    Eski sürüm aktif/pasif için iki ayrı ağaç kuruyordu; tur sırasında
 ///    bayrak yanıp söndükçe metin yıkılıp yeniden kuruluyor, satır ve
@@ -998,6 +1343,11 @@ struct AgentActivityTimelineView: View, Equatable {
 /// 2. Görünmez iş yok: döngü yalnız satır koşarken döner. Durunca
 ///    `repeatForever` iptal edilip bant başa alınır; bitmiş satırlar render
 ///    döngüsünü beslemez.
+/// 3. Harf-içi parlama: maske kayan bandın değil, overlay'in tamamınadır.
+///    Maske bandın %55'lik çerçevesinde kalsaydı metin o dar şeride sıkışır,
+///    parlama harflerden geçmek yerine düz çizgi gibi görünürdü. Burada
+///    maske alttaki metinle aynı boyda kurulur, bant altında kayar ve ışık
+///    yalnız harf formlarından görünür.
 private struct SunshineShimmerModifier: ViewModifier {
     let isActive: Bool
     @State private var sweep: CGFloat = 0
@@ -1023,9 +1373,11 @@ private struct SunshineShimmerModifier: ViewModifier {
                     )
                     .frame(width: width * 0.55)
                     .offset(x: -width * 0.6 + sweep * width * 1.7)
-                    .mask { content }
-                    .opacity(isActive ? 1 : 0)
                 }
+                // Maske overlay boyundadır: metin alttakiyle birebir aynı
+                // yerleşir, bant altında kayar.
+                .mask { content }
+                .opacity(isActive ? 1 : 0)
                 .allowsHitTesting(false)
             }
             .animation(.easeInOut(duration: 0.35), value: isActive)

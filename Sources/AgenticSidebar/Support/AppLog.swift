@@ -15,5 +15,6 @@ enum AppLog {
     static let openCode = Logger(subsystem: subsystem, category: "OpenCodeProvider")
     static let automation = Logger(subsystem: subsystem, category: "Automation")
     static let settings = Logger(subsystem: subsystem, category: "Settings")
+    static let credentials = Logger(subsystem: subsystem, category: "Credentials")
     static let extensions = Logger(subsystem: subsystem, category: "Extensions")
 }

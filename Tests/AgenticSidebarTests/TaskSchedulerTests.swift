@@ -1097,6 +1097,26 @@ final class TaskSchedulerTests: XCTestCase {
             try await base.createTask(task)
         }
 
+        func updateTaskDetails(
+            taskID: UUID,
+            expectedVersion: Int,
+            title: String,
+            objective: String,
+            priority: Int
+        ) async throws -> CodingTask {
+            try await base.updateTaskDetails(
+                taskID: taskID,
+                expectedVersion: expectedVersion,
+                title: title,
+                objective: objective,
+                priority: priority
+            )
+        }
+
+        func deleteTask(taskID: UUID) async throws {
+            try await base.deleteTask(taskID: taskID)
+        }
+
         func addDependency(_ dependency: TaskDependency) async throws {
             try await base.addDependency(dependency)
         }
@@ -1216,6 +1236,26 @@ final class TaskSchedulerTests: XCTestCase {
 
         func saveAgentProfile(_ profile: AgentProfile) async throws {
             try await base.saveAgentProfile(profile)
+        }
+
+        func saveProject(_ project: CodingProject) async throws {
+            try await base.saveProject(project)
+        }
+
+        func renameProject(id: UUID, name: String) async throws -> CodingProject {
+            try await base.renameProject(id: id, name: name)
+        }
+
+        func deleteProject(id: UUID) async throws {
+            try await base.deleteProject(id: id)
+        }
+
+        func loadProject(id: UUID) async throws -> CodingProject? {
+            try await base.loadProject(id: id)
+        }
+
+        func listProjects() async throws -> [CodingProject] {
+            try await base.listProjects()
         }
 
         func loadAgentProfile(id: UUID) async throws -> AgentProfile? {
@@ -2367,7 +2407,11 @@ final class TaskSchedulerTests: XCTestCase {
         XCTAssertEqual(session.cancelCount, 0)
 
         let resolver = try XCTUnwrap(port.lastResolver)
-        let shellReply = await resolver(TaskRunApprovalRequest(id: "req-shell", toolName: "bash", patterns: ["rm -rf /"]))
+        let shellReply = await resolver(
+            TaskRunApprovalRequest(
+                id: "req-shell", toolName: "bash", patterns: ["rm -rf /"], delegationTarget: nil
+            )
+        )
         XCTAssertEqual(shellReply, .deny(reason: "toolRequiresHumanApproval:bash"))
     }
 
@@ -2418,9 +2462,86 @@ final class TaskSchedulerTests: XCTestCase {
 
         let resolver = try XCTUnwrap(port.lastResolver)
         let networkReply = await resolver(
-            TaskRunApprovalRequest(id: "req-net", toolName: "webfetch", patterns: ["https://example.com"])
+            TaskRunApprovalRequest(id: "req-net", toolName: "webfetch", patterns: ["https://example.com"], delegationTarget: nil)
         )
         XCTAssertEqual(networkReply, .deny(reason: "networkRequiresHumanApproval"))
+    }
+
+    /// Plan aşaması delegasyon yaptırımı (gönderim hattı): araştırma hedefine
+    /// delegasyon bir kez onaylanır, yazılabilir ya da bilinmeyen hedef kapalı
+    /// kalır. Gözetimsiz koşuda kullanıcı diyaloğu yoktur, karar reddir.
+    func testTaskDelegationPolicyAllowsOnlyResearchTarget() {
+        XCTAssertEqual(
+            TaskRunApprovalPolicy.resolve(
+                toolName: "task",
+                patterns: [],
+                workspacePath: "/tmp/ws",
+                delegationTarget: ManagedOpenCodeConfiguration.researchAgentName
+            ),
+            .approveOnce
+        )
+        XCTAssertEqual(
+            TaskRunApprovalPolicy.resolve(
+                toolName: "task",
+                patterns: [],
+                workspacePath: "/tmp/ws",
+                delegationTarget: "build"
+            ),
+            .deny(reason: "taskDelegationOutsideResearchTarget:build")
+        )
+        XCTAssertEqual(
+            TaskRunApprovalPolicy.resolve(
+                toolName: "task",
+                patterns: [],
+                workspacePath: "/tmp/ws",
+                delegationTarget: nil
+            ),
+            .deny(reason: "taskDelegationOutsideResearchTarget:unknown")
+        )
+    }
+
+    /// Olay yolundaki hedef taşıma: adaptör `approvalRequested` olayına
+    /// `delegationTarget` parametresini koyar, zamanlayıcı kararı aynı kuralla
+    /// verir; araştırma delegasyonu koşuyu bitirmez.
+    func testApprovalEventCarryingResearchTargetIsApprovedOnce() async throws {
+        let store = try SQLiteTaskStore.inMemory()
+        let clock = TestTaskSchedulerClock(start: startDate)
+        let workspace = Self.dispatchWorkspace(workspaceID: UUID(), repositoryPath: Self.dispatchRepositoryPath)
+        let session = DispatchTestSession()
+        let port = ScriptedTaskRunningPort(sessionsByAttemptID: [:])
+        let (scheduler, fixture) = try await makeDispatchFixture(
+            store: store, clock: clock,
+            providers: DispatchTestRegistry(results: [.eligible(runtimeID: "runtime", modelID: "model")]),
+            workspaces: DispatchTestPreflight(result: .owned(workspace)),
+            verifier: DispatchCountingVerifier(passed: true), port: port,
+            budget: ExecutionBudget(), schedulerID: "scheduler-dispatch-task-target")
+        try await recordExecuteApproval(
+            store: store, taskID: fixture.task.id, attemptID: fixture.attemptID, fingerprint: "fingerprint")
+        port.bind(session, to: fixture.attemptID)
+
+        session.send(
+            .approvalRequested(
+                id: "req-task",
+                tool: "task",
+                params: ["delegationTarget": ManagedOpenCodeConfiguration.researchAgentName]
+            ),
+            taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.send(.terminalSuccess, taskID: fixture.task.id, attemptID: fixture.attemptID, generation: fixture.generation)
+        session.finish()
+
+        let report = try await scheduler.dispatch(
+            taskID: fixture.task.id,
+            attemptID: fixture.attemptID,
+            generation: fixture.generation,
+            fingerprint: "fingerprint"
+        )
+
+        XCTAssertEqual(
+            report.approvalDecisions,
+            [TaskRunApprovalDecision(requestID: "req-task", toolName: "task", reply: .approveOnce)]
+        )
+        XCTAssertEqual(report.outcome, .succeeded)
+        XCTAssertEqual(session.cancelCount, 0)
     }
 
     func testStopCancelsDispatchedRunOnce() async throws {

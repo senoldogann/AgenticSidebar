@@ -162,6 +162,9 @@ public enum TaskStateMachine {
             guard approval.taskID == task.id else {
                 throw TaskTransitionError.missingHumanAcceptance
             }
+            guard let currentAttemptID = task.currentAttemptID, approval.attemptID == currentAttemptID else {
+                throw TaskTransitionError.missingHumanAcceptance
+            }
             guard approval.fingerprint == context.fingerprint else {
                 throw TaskTransitionError.fingerprintMismatch(
                     expected: context.fingerprint,

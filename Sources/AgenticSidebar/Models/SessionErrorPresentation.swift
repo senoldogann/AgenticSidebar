@@ -70,6 +70,10 @@ extension AgentSessionNotice {
             "Couldn't branch from that message; it may have been removed."
         case .dictationUnavailable:
             "Microphone or speech recognition isn't allowed. Enable it in System Settings → Privacy & Security."
+        case .promptEnhancementFailed:
+            "The prompt could not be improved; the draft is unchanged. Check the provider and try again."
+        case .promptEnhancementSuperseded:
+            "The prompt was improved, but the draft changed meanwhile; the new text was kept and the improvement discarded."
         case .contextCompacted:
             "Earlier context was compacted into a summary; the on-screen transcript is unchanged."
         case .compactionFailed(let reason):
@@ -85,6 +89,10 @@ extension AgentSessionNotice {
             "arrow.triangle.branch"
         case .dictationUnavailable:
             "mic.slash"
+        case .promptEnhancementFailed:
+            "wand.and.stars"
+        case .promptEnhancementSuperseded:
+            "wand.and.stars"
         case .contextCompacted:
             "archivebox"
         case .compactionFailed:

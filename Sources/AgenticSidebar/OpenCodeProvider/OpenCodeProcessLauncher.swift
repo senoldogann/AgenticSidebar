@@ -6,6 +6,11 @@ struct OpenCodeProcessLaunchRequest: Equatable, Sendable {
     let arguments: [String]
     let environment: [String: String]
     let workingDirectoryURL: URL
+    /// Sunucu günlüğünün yazılacağı dizin. Sohbet sunucusunda çalışma diziniyle
+    /// aynıdır; çalışma alanına köklenmiş sunucularda çalışma dizini sahipli
+    /// çalışma kopyasıdır ve günlük durum ad alanına düşer — çalışma kopyasına
+    /// `opencode-server.log` yazmak izlenmeyen dosya olarak parmak izini bozar.
+    let logDirectoryURL: URL
 }
 
 protocol OpenCodeProcessHandling: Sendable {
@@ -331,8 +336,12 @@ struct FoundationOpenCodeProcessLauncher: OpenCodeProcessLaunching {
         }
         process.currentDirectoryURL = request.workingDirectoryURL
         // `/dev/null` meant a child that died on startup left nothing to read.
-        // Its own log is truncated on every start, so it cannot grow without bound.
-        let logHandle = FileHandle.openTruncatedLog(at: request.workingDirectoryURL)
+        // Its own log is truncated on every start and capped at shutdown
+        // (`capServerLogIfNeeded`), so it cannot grow without bound.
+        // Günlük çalışma dizinine değil isteğin günlük dizinine düşer: kök
+        // çalışma alanındayken çalışma kopyası sahiplidir ve kirletilemez.
+        let logURL = FileHandle.serverLogURL(in: request.logDirectoryURL)
+        let logHandle = FileHandle.openTruncatedLog(at: request.logDirectoryURL)
         process.standardOutput = logHandle
         process.standardError = logHandle
 
@@ -343,15 +352,62 @@ struct FoundationOpenCodeProcessLauncher: OpenCodeProcessLaunching {
             throw ProviderRuntimeError.startupFailure
         }
 
-        return FoundationOpenCodeProcessHandle(process: process, logHandle: logHandle === FileHandle.nullDevice ? nil : logHandle)
+        return FoundationOpenCodeProcessHandle(
+            process: process,
+            logHandle: logHandle === FileHandle.nullDevice ? nil : logHandle,
+            logURL: logURL
+        )
     }
 }
 
 extension FileHandle {
+    /// Sunucu günlüğünün tavanı: 5 MB üstünde kuyruk tutulur (son yarısı),
+    /// başına kesme notu yazılır.
+    static let maximumServerLogBytes = 5 * 1024 * 1024
+
+    static func serverLogURL(in directoryURL: URL) -> URL {
+        directoryURL.appendingPathComponent("opencode-server.log")
+    }
+
+    /// Günlük tavanını uygular: dosya 5 MB'ı aştıysa son yarısı tutulur.
+    /// Çocuk öldükten sonra çağrılmalıdır; yazma ucu kapalıdır, atomik
+    /// yeniden yazım güvenlidir.
+    static func capServerLogIfNeeded(
+        at logURL: URL,
+        maximumBytes: Int = maximumServerLogBytes
+    ) {
+        guard
+            let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? NSNumber)?.intValue,
+            size > maximumBytes
+        else {
+            return
+        }
+        guard let readHandle = try? FileHandle(forReadingFrom: logURL) else {
+            return
+        }
+        defer { try? readHandle.close() }
+        do {
+            let keepBytes = max(1, maximumBytes / 2)
+            try readHandle.seek(toOffset: UInt64(max(0, size - keepBytes)))
+            var tail = try readHandle.readToEnd() ?? Data()
+            // Kuyruk satır ortasından kesilmesin: ilk satır sonuna kadar atlanır.
+            if let newline = tail.firstIndex(of: 0x0A) {
+                tail = tail[tail.index(after: newline)...]
+            }
+            var capped = Data("... [truncated: log exceeded 5MB, kept the tail]\n".utf8)
+            capped.append(tail)
+            try capped.write(to: logURL, options: .atomic)
+        } catch {
+            AppLog.openCode.error(
+                "Could not cap the OpenCode server log: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
     /// Opens the backend's log inside the managed directory, truncated, falling
     /// back to the null device when the file cannot be created.
     static func openTruncatedLog(at directoryURL: URL) -> FileHandle {
-        let logURL = directoryURL.appendingPathComponent("opencode-server.log")
+        let logURL = serverLogURL(in: directoryURL)
         let header = Data("OpenCode server log; truncated on every start\n".utf8)
 
         do {
@@ -384,10 +440,12 @@ extension FileHandle {
 private actor FoundationOpenCodeProcessHandle: OpenCodeProcessHandling {
     private let process: Process
     private var logHandle: FileHandle?
+    private let logURL: URL?
 
-    init(process: Process, logHandle: FileHandle? = nil) {
+    init(process: Process, logHandle: FileHandle? = nil, logURL: URL? = nil) {
         self.process = process
         self.logHandle = logHandle
+        self.logURL = logURL
     }
 
     func isRunning() -> Bool {
@@ -447,8 +505,12 @@ private actor FoundationOpenCodeProcessHandle: OpenCodeProcessHandling {
         }
 
         // Ebeveyndeki yazma ucu kapatılmazsa sunucu yeniden başlatma başına
-        // bir fd sızardı; çocuk zaten öldü, log burada kapanır.
+        // bir fd sızardı; çocuk zaten öldü, log burada kapanır ve tavan
+        // uygulanır (yazma ucu kapalı, yeniden yazım güvenli).
         try? logHandle?.close()
         logHandle = nil
+        if let logURL {
+            FileHandle.capServerLogIfNeeded(at: logURL)
+        }
     }
 }

@@ -50,6 +50,10 @@ protocol ExtensionHTTPTransport: Sendable {
 
 struct URLSessionExtensionTransport: ExtensionHTTPTransport {
     static let defaultTimeout: TimeInterval = 30
+    /// Tek yanıt için üst sınır. Kurulum toplamı `maximumTotalBytes` ile ayrıca sınırlıdır.
+    static let maximumResponseBytes = 5 * 1024 * 1024
+    /// Taşıyıcı belirteci yalnızca bu ana bilgisayara gönderir.
+    static let gitHubAPIHost = "api.github.com"
 
     private let session: URLSession
 
@@ -62,13 +66,28 @@ struct URLSessionExtensionTransport: ExtensionHTTPTransport {
         configuration.timeoutIntervalForRequest = defaultTimeout
         configuration.timeoutIntervalForResource = 120
         configuration.waitsForConnectivity = false
+        // Tanımlama bilgisi ve önbellek kapalı: her kurulum temiz ve izsiz başlar.
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         return Self(session: URLSession(configuration: configuration))
     }
 
     func get(_ url: URL, headers: [String: String]) async throws -> ExtensionHTTPResponse {
+        // Belirteç yalnızca API ana bilgisayarına gider; ham içerik ve olası
+        // yönlendirme hedeflerine `Authorization` taşınmaz.
+        let outgoing: [String: String]
+        if url.host?.lowercased() == Self.gitHubAPIHost {
+            outgoing = headers
+        } else {
+            // Başlık adı farklı yazımla gelse bile belirteç sızmaz.
+            outgoing = headers.filter { $0.key.lowercased() != "authorization" }
+        }
+
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        for (field, value) in headers {
+        for (field, value) in outgoing {
             request.setValue(value, forHTTPHeaderField: field)
         }
 
@@ -80,6 +99,10 @@ struct URLSessionExtensionTransport: ExtensionHTTPTransport {
 
             switch response.statusCode {
             case 200..<300:
+                // Aşırı büyük yanıt belleğe yığılmadan elenir.
+                guard data.count <= Self.maximumResponseBytes else {
+                    throw ExtensionFetchError.tooLarge
+                }
                 return ExtensionHTTPResponse(statusCode: response.statusCode, data: data)
             case 401, 403:
                 throw ExtensionFetchError.unauthorized

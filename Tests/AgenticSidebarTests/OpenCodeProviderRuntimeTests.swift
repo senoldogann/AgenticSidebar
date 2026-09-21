@@ -145,6 +145,22 @@ final class OpenCodeProviderRuntimeTests: XCTestCase {
         )
     }
 
+    func testAskTurnsUseTheReadOnlyBackendAgent() async throws {
+        let client = RuntimeMockOpenCodeClient(eventStreams: [
+            completedLineStream(sessionID: "ses_remote")
+        ])
+        let runtime = makeRuntime(client: client, permissionHandler: nil, cancelPendingPermissions: nil)
+        let sessionID = UUID()
+        let ask = try await runtime.startStream(for: makeRequest(sessionID: sessionID, text: "Explain", mode: .ask))
+        _ = try await collect(ask.events)
+        let agents = await client.agents()
+        XCTAssertEqual(
+            agents,
+            [ManagedOpenCodeConfiguration.planAgentName],
+            "An ask turn must stay read-only and never run with build powers"
+        )
+    }
+
     func testRuntimeNormalizesTextToolAndCompletionEvents() async throws {
         let linePair = AsyncThrowingStream<String, Error>.makeStream()
         linePair.continuation.yield(

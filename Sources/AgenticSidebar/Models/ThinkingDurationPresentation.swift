@@ -41,6 +41,25 @@ enum ThinkingDurationPresentation {
         return "Thought for \(format(thoughtSeconds))"
     }
 
+    /// Satır başlığı için kısa biçim: bitince `Thought 10s`, koşarken
+    /// `Thinking 3s`. `text` ile aynı ölçümü kullanır, yalnız sözdizimi
+    /// kısadır.
+    static func compactText(
+        startedAt: Date,
+        completedAt: Date?,
+        turnEndedAt: Date?,
+        isRunning: Bool,
+        hasRunningChildren: Bool,
+        now: Date
+    ) -> String {
+        if isRunning {
+            return "Thinking \(format(seconds(from: startedAt, to: now)))"
+        }
+
+        let thoughtSeconds = seconds(from: startedAt, to: completedAt ?? turnEndedAt ?? now)
+        return "Thought \(format(thoughtSeconds))"
+    }
+
     /// Geçen saniye. Saat geri alınmış olsa bile negatif bir süre gösterilmez ve
     /// bir saniyenin altı "0s" değil "1s" okunur.
     private static func seconds(from startedAt: Date, to endedAt: Date) -> Int {

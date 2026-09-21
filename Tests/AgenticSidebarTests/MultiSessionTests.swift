@@ -127,6 +127,8 @@ final class MultiSessionTests: XCTestCase {
         )
     }
 
+    /// Ayarlardan sağlayıcı seçimi tüm sohbetlerde geçerlidir: o anki
+    /// seçim boşta duran her oturuma yayılır, yeni sohbet tercihle açılır.
     func testConfigurationIsIndependentPerSession() async throws {
         let service = AgentSessionService(runtimes: [makeAlphaRuntime(), makeBetaRuntime()])
         await service.refreshCapabilities()
@@ -135,13 +137,42 @@ final class MultiSessionTests: XCTestCase {
         try service.selectProvider(ProviderID("beta"))
 
         let secondID = service.createSession()
+        XCTAssertEqual(
+            service.session(for: secondID)?.state.configuration?.providerID,
+            ProviderID("beta"),
+            "A new conversation opens with the Settings provider choice"
+        )
+
         try service.selectProvider(ProviderID("alpha"))
 
         service.selectSession(firstID)
-        XCTAssertEqual(service.state.configuration?.providerID, ProviderID("beta"))
+        XCTAssertEqual(service.state.configuration?.providerID, ProviderID("alpha"))
 
         service.selectSession(secondID)
-        XCTAssertEqual(service.state.configuration?.providerID, ProviderID("alpha"))
+        XCTAssertEqual(
+            service.state.configuration?.providerID,
+            ProviderID("alpha"),
+            "The Settings choice reaches every idle conversation, not only the active one"
+        )
+    }
+
+    /// Oturum düzeyinde seçim yalnız o sohbeti etkiler: besteciden yapılan
+    /// açık seçim diğer sohbetlere yayılmaz.
+    func testPerSessionOverrideSurvivesGlobalChoice() async throws {
+        let service = AgentSessionService(runtimes: [makeAlphaRuntime(), makeBetaRuntime()])
+        await service.refreshCapabilities()
+
+        try service.selectProvider(ProviderID("beta"))
+        let firstID = service.activeSessionID
+        try service.session(for: firstID)?.selectProvider(ProviderID("alpha"))
+
+        XCTAssertEqual(
+            service.session(for: firstID)?.state.configuration?.providerID,
+            ProviderID("alpha")
+        )
+        for session in service.sessions where session.id != firstID {
+            XCTAssertEqual(session.state.configuration?.providerID, ProviderID("beta"))
+        }
     }
 
     func testSessionListReportsTitlesAndBusyState() async throws {

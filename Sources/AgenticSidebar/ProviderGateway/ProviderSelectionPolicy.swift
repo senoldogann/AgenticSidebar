@@ -26,10 +26,30 @@ enum ProviderSelectionPolicy {
     static func defaultConfiguration(
         from providers: [ProviderCapabilities]
     ) -> SessionConfiguration? {
+        defaultConfiguration(from: providers, preferring: nil)
+    }
+
+    /// Kullanıcının genel seçimi (`preferring`) varsa ve modeli varsa o
+    /// kazanır; yoksa ürün varsayılanı çalışır. `nil` tercih = seçim yok.
+    static func defaultConfiguration(
+        from providers: [ProviderCapabilities],
+        preferring preferredProviderID: ProviderID?
+    ) -> SessionConfiguration? {
         let usable = providers.filter { !$0.models.isEmpty }
 
+        if let preferredProviderID,
+            let provider = usable.first(where: { $0.id == preferredProviderID }),
+            let model = preferredModel(in: provider)
+        {
+            return SessionConfiguration(
+                providerID: provider.id,
+                modelID: model.id,
+                variantID: nil
+            )
+        }
+
         guard
-            let provider = usable.first(where: { $0.id == preferredProviderID })
+            let provider = usable.first(where: { $0.id == Self.preferredProviderID })
                 ?? usable.first
         else {
             return nil

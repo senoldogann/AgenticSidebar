@@ -1062,7 +1062,7 @@ final class AgentSession {
             return
         }
         // Sunucu tarafı dönüyor: eski sayım bayatlar, sonraki turun
-        // bildirimi gelene kadar halka yerel tahmini gösterir.
+        // bildirimi gelene kadar halka bilinmeyen gösterir ("–").
         lastTurnUsage = nil
         presentNotice(.contextCompacted, autoDismissAfter: .seconds(6))
         // Yarış notu: `await` sırasında yeni bir tur başlayabilir; o turun ilk
@@ -1408,7 +1408,9 @@ final class AgentSession {
         activeTask = nil
         activeStream = nil
         activeTurnID = nil
-        onTurnEnded?(id, cancelledTurnID)
+        // Bitiş bildirimi yalnızca `consume`'un `defer` bloğundan gelir (tek
+        // kaynak); burada ikinci kez çağrılmaz, yoksa onay merkezi aynı turu
+        // iki kez kapatır.
         onImmediatePersistentChange?()
         startNextQueuedTurn()
     }
@@ -1914,33 +1916,37 @@ final class AgentSession {
         appendThinkingContent(text, turnID: turnID)
     }
 
-    /// Biriken düşünmeyi turdaki `.thinking` aktivitesinin `output`'una ekler.
+    /// Biriken düşünmeyi turdaki `.thinking` aktivitesine ekler.
     ///
     /// `output` seçimi bilinçlidir: arşiv sınırı (`boundedForArchive`) yalnız
     /// `output`/`diff`'i kırpar, `detail`'i değil — düşünme arşivi şişirmez.
     /// Geçmişe taşınmaz (`OpenCodeHistoryPreamble` thinking'i atlar) ve
     /// boş-tur sayılmaz (`shouldReportEmptyTurn` thinking'i yok sayar).
+    ///
+    /// Her reasoning bloğu kendi kartını kurar: koşan kart varsa metin oraya
+    /// akar (aynı blok tek kartta birikir); kapanmış bir kart ASLA yeniden
+    /// açılmaz — araç/metin sonrası gelen ikinci blok grubun sonuna yeni kart
+    /// olarak eklenir. Böylece düşünme parçaları komutlar gibi çağrıldıkları
+    /// yerde alt alta sıralanır, tek dev kartta toplanmaz.
     private func appendThinkingContent(_ text: String, turnID: UUID) {
         guard let groupIndex = activityGroupIndex(turnID: turnID) else {
             return
         }
-        // İlk thinking deltası satırı kurar; düşünme her zaman grubun başında
-        // durur, böylece araç satırları kronolojik olarak arkasına düşer.
         let activityIndex: Int
-        if let existingIndex = state.activityGroups[groupIndex].activities.firstIndex(
-            where: { $0.kind == .thinking }
+        if let runningIndex = state.activityGroups[groupIndex].activities.firstIndex(
+            where: { $0.kind == .thinking && $0.phase == .running }
         ) {
-            activityIndex = existingIndex
+            activityIndex = runningIndex
         } else {
-            state.activityGroups[groupIndex].activities.insert(
+            let segment = state.activityGroups[groupIndex].activities.filter { $0.kind == .thinking }.count
+            state.activityGroups[groupIndex].activities.append(
                 AgentActivity(
-                    id: thinkingActivityID(turnID: turnID),
+                    id: ProviderActivityID("turn-\(turnID.uuidString)-thinking-\(segment)"),
                     kind: .thinking,
                     phase: .running
-                ),
-                at: 0
+                )
             )
-            activityIndex = 0
+            activityIndex = state.activityGroups[groupIndex].activities.count - 1
             hasRunningThinkingActivity = true
         }
 
@@ -1953,13 +1959,6 @@ final class AgentSession {
         let room = Self.maximumThinkingCharacters - existing.utf8.count
         let fitting = text.utf8.count <= room ? text : String(text.prefix(room)) + "\n… (thought truncated)"
         activity.output = existing + fitting
-        // Araç sonrası ikinci reasoning bloğu: kart kapanmıştı, yeniden açılır
-        // ve bir sonraki metin/araç olayında yine kapanır.
-        if activity.phase != .running {
-            activity.phase = .running
-            activity.completedAt = nil
-            hasRunningThinkingActivity = true
-        }
         state.activityGroups[groupIndex].activities[activityIndex] = activity
         noteActivityChange()
     }
@@ -2046,10 +2045,6 @@ final class AgentSession {
         }
 
         state.activityGroups = bounded
-    }
-
-    private func thinkingActivityID(turnID: UUID) -> ProviderActivityID {
-        ProviderActivityID("turn-\(turnID.uuidString)-thinking")
     }
 
     private func finishThinkingActivity(turnID: UUID) {

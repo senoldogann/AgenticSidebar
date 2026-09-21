@@ -277,7 +277,8 @@ final class PermissionApprovalCenterTests: XCTestCase {
                 toolName: "bash",
                 patterns: ["git status"],
                 alwaysPatterns: ["git status*"],
-                detail: nil
+                detail: nil,
+                delegationTarget: nil
             )
         )
 
@@ -348,7 +349,8 @@ final class PermissionApprovalCenterTests: XCTestCase {
                     toolName: "bash",
                     patterns: ["ls"],
                     alwaysPatterns: ["ls"],
-                    detail: nil
+                    detail: nil,
+                    delegationTarget: nil
                 )
             )
         }
@@ -364,7 +366,8 @@ final class PermissionApprovalCenterTests: XCTestCase {
                     toolName: "bash",
                     patterns: ["rm -rf build"],
                     alwaysPatterns: ["rm -rf build"],
-                    detail: nil
+                    detail: nil,
+                    delegationTarget: nil
                 )
             )
         }
@@ -509,10 +512,9 @@ final class PermissionApprovalCenterTests: XCTestCase {
         live.setFullAccess()
         center.endTurn(appSessionID: session, turnID: turn)
 
-        // Tur politikası testi bilgisayar aracı kullanamaz: `fullAccess`
-        // bile bilgisayar kullanımını otomatik onaylamaz
-        // (`testFullAccessStillAsksForComputerUse`). Kabuk isteği tur
-        // sınırını korur.
+        // Tur politikası testi kabuk isteği kullanır: bilgisayar araçları
+        // `fullAccess` altında otomatik onaylandığı için (`ask` turunda
+        // bile beklemezler) tur sınırını kabuk isteği korur.
         var request = makeBashRequest(id: "per_next", sessionID: "ses_1")
         request.appSessionID = session
         let reply = await center.submit(request)
@@ -551,8 +553,8 @@ final class PermissionApprovalCenterTests: XCTestCase {
         )
         let running = UUID()
         let idle = UUID()
-        // `fullAccess` bilgisayar araçlarını otomatik onaylamaz, o yüzden
-        // bu tur-sınır testi kabuk istekleri kullanır.
+        // Bilgisayar araçları `fullAccess` altında otomatik onaylandığı
+        // için bu tur-sınır testi kabuk istekleri kullanır.
         var runningRequest = makeBashRequest(id: "per_running", sessionID: "ses_1")
         runningRequest.appSessionID = running
         var idleRequest = makeBashRequest(id: "per_idle", sessionID: "ses_2")
@@ -578,20 +580,82 @@ final class PermissionApprovalCenterTests: XCTestCase {
         XCTAssertTrue(center.pending.isEmpty)
     }
 
-    /// `fullAccess` bile bilgisayar isteğini otomatik onaylamaz: merkez
-    /// üzerinden uçtan uca kilit.
-    func testFullAccessStillAsksComputerThroughCenter() async {
+    /// `fullAccess` bilgisayar isteğini merkez üzerinden otomatik onaylar;
+    /// `computer_run_js` kilidi uçtan uca kapalı kalır.
+    func testFullAccessAutoApprovesComputerThroughCenter() async {
         let center = PermissionApprovalCenter(
             automaticReplyProvider: { toolName, patterns in
                 ToolApprovalPolicy.fullAccess.automaticReply(for: toolName, patterns: patterns)
             },
             decisionTimeout: .seconds(60)
         )
-        let decision = Task {
-            await center.submit(makeRequest(id: "per_computer_full", sessionID: "ses_1"))
+        let reply = await center.submit(makeRequest(id: "per_computer_full", sessionID: "ses_1"))
+        XCTAssertEqual(reply, .once)
+        XCTAssertTrue(center.pending.isEmpty)
+
+        var runJs = makeRequest(id: "per_runjs_full", sessionID: "ses_1")
+        runJs = OpenCodePermissionRequest(
+            id: runJs.id,
+            remoteSessionID: "ses_1",
+            toolName: "chatgpt-system_computer_run_js",
+            patterns: ["*"],
+            alwaysPatterns: ["chatgpt-system_computer_run_js*"],
+            detail: "description: Run JavaScript",
+            delegationTarget: nil
+        )
+        let runJsDecision = Task {
+            await center.submit(runJs)
         }
         await waitUntil { center.pending.count == 1 }
-        center.resolve(id: "per_computer_full", reply: .reject)
+        center.resolve(id: "per_runjs_full", reply: .reject)
+        let runJsReply = await runJsDecision.value
+        XCTAssertEqual(runJsReply, .reject)
+    }
+
+    /// Plan aşaması delegasyon yaptırımı: tek meşru hedef olan araştırma
+    /// alt-ajanına delegasyon diyalogsuz bir kez onaylanır; başka hedef
+    /// kullanıcıya sorulur. Sessiz `allow` backend'de bitti, karar burada verilir.
+    func testTaskDelegationToResearchAgentIsApprovedOnceWithoutDialog() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+        let reply = await center.submit(
+            OpenCodePermissionRequest(
+                id: "per_task_research",
+                remoteSessionID: "ses_1",
+                toolName: "task",
+                patterns: [],
+                alwaysPatterns: [],
+                detail: "subagent_type: agenticsidebar-research",
+                delegationTarget: ManagedOpenCodeConfiguration.researchAgentName
+            )
+        )
+        XCTAssertEqual(reply, .once)
+        XCTAssertTrue(center.pending.isEmpty)
+    }
+
+    func testTaskDelegationToAnotherAgentAsksTheUser() async {
+        let center = PermissionApprovalCenter(
+            automaticReplyProvider: { _, _ in nil },
+            decisionTimeout: .seconds(60)
+        )
+        let decision = Task {
+            await center.submit(
+                OpenCodePermissionRequest(
+                    id: "per_task_build",
+                    remoteSessionID: "ses_1",
+                    toolName: "task",
+                    patterns: [],
+                    alwaysPatterns: [],
+                    detail: "subagent_type: build",
+                    delegationTarget: "build"
+                )
+            )
+        }
+        await waitUntil { center.pending.count == 1 }
+        XCTAssertEqual(center.pending.first?.toolName, "task")
+        center.resolve(id: "per_task_build", reply: .reject)
         let reply = await decision.value
         XCTAssertEqual(reply, .reject)
     }
@@ -614,13 +678,15 @@ final class PermissionApprovalCenterTests: XCTestCase {
             toolName: "chatgpt-system_computer_click",
             patterns: ["*"],
             alwaysPatterns: ["chatgpt-system_computer_click*"],
-            detail: "description: Click the Run button"
+            detail: "description: Click the Run button",
+            delegationTarget: nil
         )
     }
 
     /// Tur-seviye testleri için bilgisayar-dışı istek: `ask` sorar,
-    /// `fullAccess` otomatik onaylar. Bilgisayar araçları her seviyede
-    /// sorduğu için tur sınırı davranışı bunlarla sınanamaz.
+    /// `fullAccess` otomatik onaylar. Tur sınırı davranışı kabuk
+    /// istekleriyle sınanır, böylece bilgisayar onayı seviyeye bağlı
+    /// kalmaz.
     private func makeBashRequest(id: String, sessionID: String) -> OpenCodePermissionRequest {
         OpenCodePermissionRequest(
             id: id,
@@ -628,7 +694,8 @@ final class PermissionApprovalCenterTests: XCTestCase {
             toolName: "bash",
             patterns: ["ls"],
             alwaysPatterns: ["ls*"],
-            detail: "description: List files"
+            detail: "description: List files",
+            delegationTarget: nil
         )
     }
 

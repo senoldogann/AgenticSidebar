@@ -28,6 +28,10 @@ struct FileInspectorPanelView: View {
 
     nonisolated private static let maximumTextBytes = 1_000_000
     nonisolated private static let maximumTruncatedCharacters = 100_000
+    /// Bu uzunluğun üstündeki markdown tam ağaç olarak dizilmez; bkz.
+    /// `markdownPreview`. 11 KB'lık bir rapor altta rahatça kalır, 100 KB'lık
+    /// bir döküm paneli kilitlemez.
+    nonisolated private static let maximumMarkdownCharacters = 30_000
 
     /// Küçültülmüş kopya çözülemediğinde (ör. SVG) dosya doğrudan yüklenir;
     /// o yol tam çözünürlüklü olduğu için çok büyük dosyalarda atlanır.
@@ -214,9 +218,18 @@ struct FileInspectorPanelView: View {
             case .loading:
                 loadingPlaceholder
             case .text(let content):
-                MarkdownContentView(markdown: content, allowsPlanDocuments: false)
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                if content.count > Self.maximumMarkdownCharacters {
+                    // Tam markdown ağacı bu boyda binlerce görünüm + dev bir
+                    // metin yerleşimi demektir: önizleme paneli açılırken ana
+                    // iş parçacığı kilitlenir. Sınır üstü dosyalar satır
+                    // numaralı düz metin olarak gösterilir; içerik kaybı yok,
+                    // biçimleme fedadır.
+                    codeOrTextBody(content: content)
+                } else {
+                    MarkdownContentView(markdown: content, allowsPlanDocuments: false)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             case .unreadable:
                 errorNotice(message: "File is not UTF-8 text or is inaccessible.")
             }
@@ -238,29 +251,33 @@ struct FileInspectorPanelView: View {
         case .unreadable:
             errorNotice(message: "Binary or non-UTF-8 file.")
         case .text(let content):
-            ScrollView {
-                let lines = content.components(separatedBy: "\n")
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
-                        HStack(alignment: .top, spacing: 10) {
-                            Text("\(index + 1)")
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                                .frame(width: 32, alignment: .trailing)
-                                .userSelectable(false)
+            codeOrTextBody(content: content)
+        }
+    }
 
-                            Text(line.isEmpty ? " " : line)
-                                .font(.system(size: 11.5, design: .monospaced))
-                                .foregroundStyle(.primary)
-                                .textSelection(.enabled)
+    private func codeOrTextBody(content: String) -> some View {
+        ScrollView {
+            let lines = content.components(separatedBy: "\n")
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                    HStack(alignment: .top, spacing: 10) {
+                        Text("\(index + 1)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 32, alignment: .trailing)
+                            .userSelectable(false)
 
-                            Spacer(minLength: 0)
-                        }
+                        Text(line.isEmpty ? " " : line)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .textSelection(.enabled)
+
+                        Spacer(minLength: 0)
                     }
                 }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

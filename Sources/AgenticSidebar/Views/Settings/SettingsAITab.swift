@@ -70,6 +70,7 @@ extension SettingsView {
                     icon: nil,
                     isDisabled: false
                 ) {
+                    settingsStore.defaultProviderID = provider.id.rawValue
                     try? sessionService.selectProvider(provider.id)
                 }
             }
@@ -105,6 +106,13 @@ extension SettingsView {
             icon: "lock.shield.fill"
         ) {
             VStack(alignment: .leading, spacing: 8) {
+                if SettingsStore.shouldShowAutonomyNotice(
+                    policy: settingsStore.toolApprovalPolicy,
+                    acknowledged: settingsStore.autonomyNoticeAcknowledged
+                ) {
+                    autonomyNoticeBody
+                }
+
                 ForEach(ToolApprovalPolicy.allCases) { policy in
                     toolApprovalRow(policy)
                 }
@@ -271,6 +279,55 @@ extension SettingsView {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Fresh-install tam erişim kabul şeridi: kapatma düğmesi yoktur,
+    /// görmezden gelmek kabul sayılmaz. İki düğmeden biri açık seçimdir ve
+    /// bayrağı kapatır; seviye değişirse bekleyen istekler yeniden yorumlanır.
+    @ViewBuilder
+    private var autonomyNoticeBody: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "bolt.shield.fill")
+                    .foregroundStyle(.orange)
+                    .font(.system(size: 14))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Full access is on")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+
+                    Text(
+                        "Fresh installs start here so the agent acts fast: shell commands, edits, network calls and computer use run without a prompt. Full-host JavaScript stays denied. Tighten it any time below."
+                    )
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 8) {
+                primaryActionButton(
+                    title: "Keep Full access",
+                    icon: "checkmark.shield.fill",
+                    isDisabled: false
+                ) {
+                    settingsStore.autonomyNoticeAcknowledged = true
+                }
+
+                secondaryActionButton(
+                    title: "Use Approve for me",
+                    icon: "hand.raised.fill"
+                ) {
+                    settingsStore.toolApprovalPolicy = .approveSafe
+                    settingsStore.autonomyNoticeAcknowledged = true
+                    permissionApprovalCenter.reinterpretPendingRequests()
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .accessibilityLabel("Full access is on. Keep Full access or Use Approve for me.")
     }
 
     @ViewBuilder

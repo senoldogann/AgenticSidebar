@@ -44,7 +44,7 @@ enum ResponseSpeedMode: String, CaseIterable, Codable, Identifiable, Sendable {
             FAST MODE: Prioritize immediate time-to-first-token and maximum velocity without compromising code correctness or engineering quality.
             - Deliver the same thorough, high-caliber, and accurate solution as normal mode, with zero preamble, no greeting, and no filler summary.
             - Start outputting the concrete solution and code changes directly.
-            - When tools are required, execute them decisively and concisely.
+            - When tools are required, execute them decisively and concisely: batch independent tool calls, do not narrate the plan, and do not ask clarifying questions when the request is actionable.
             """
         }
     }

@@ -15,10 +15,9 @@ final class LiveTaskDispatchPortTests: XCTestCase {
         await runtime.scriptTerminalSuccess()
         let registry = CodingAgentRegistry()
         registry.register(runtime: runtime)
-        let manager = PortTestServerManager(workingDirectory: URL(fileURLWithPath: "/tmp/workspace"))
         let port = LiveOpenCodeTaskRunningPort(
             registry: registry,
-            serverManager: manager,
+            workspaceServerFactory: nil,
             clientFactory: { _ in PortTestOpenCodeClient() }
         )
 
@@ -86,7 +85,7 @@ final class LiveTaskDispatchPortTests: XCTestCase {
         registry.register(runtime: runtime)
         let port = LiveOpenCodeTaskRunningPort(
             registry: registry,
-            serverManager: PortTestServerManager(workingDirectory: URL(fileURLWithPath: "/tmp/workspace")),
+            workspaceServerFactory: nil,
             clientFactory: { _ in PortTestOpenCodeClient() }
         )
         let request = makePortRequest(runtimeID: "stub-runtime")
@@ -345,6 +344,487 @@ final class LiveTaskDispatchPortTests: XCTestCase {
     }
 }
 
+// MARK: - Çalışma alanına köklenmiş canlı gönderim
+
+/// Üretim gönderim yolunun çalışma alanına köklenmiş sunucu yaşam döngüsü:
+/// koşu başına ayrı sunucu, terminal/iptal/hata yollarında bırakma, sözleşmeye
+/// uymayan kablolamada kapalı kalma.
+final class WorkspaceRootedLiveDispatchPortTests: XCTestCase {
+
+    // MARK: - Yetenek doğruluğu
+
+    func testAdapterAdvertisesWorkspaceWriteOnlyWhenServerIsRootedAtTheWorkspace() async {
+        let config = SessionConfiguration(
+            providerID: ProviderID("opencode"),
+            modelID: ProviderModelID("stub/model"),
+            variantID: nil
+        )
+
+        let rootedManager = PortTestServerManager(
+            workingDirectory: URL(fileURLWithPath: "/workspace/project-a")
+        )
+        let rooted = OpenCodeCodingAgentAdapter(
+            serverManager: rootedManager,
+            clientFactory: { _ in PortTestOpenCodeClient() },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+        let rootedCapabilities = await rooted.capabilities(configuration: config)
+        XCTAssertTrue(
+            rootedCapabilities.contains(.workspaceWrite),
+            "A server rooted at the workspace may write"
+        )
+
+        let chatRooted = OpenCodeCodingAgentAdapter(
+            serverManager: PortTestServerManager(
+                workingDirectory: ManagedAppDirectories.openCodeWorkingDirectory()
+            ),
+            clientFactory: { _ in PortTestOpenCodeClient() },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+        let chatCapabilities = await chatRooted.capabilities(configuration: config)
+        XCTAssertFalse(
+            chatCapabilities.contains(.workspaceWrite),
+            "The shared chat server root is not the task workspace; writing must fail closed"
+        )
+
+        let managedRooted = OpenCodeCodingAgentAdapter(
+            serverManager: PortTestServerManager(
+                workingDirectory: URL(fileURLWithPath: "/managed/app/directory")
+            ),
+            clientFactory: { _ in PortTestOpenCodeClient() },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil
+        )
+        let managedCapabilities = await managedRooted.capabilities(configuration: config)
+        XCTAssertFalse(managedCapabilities.contains(.workspaceWrite))
+    }
+
+    /// Gönderim hattı koşu başına çalışma alanına kökleniyorsa yetenek bunu
+    /// söyler: aksi hâlde uygulama içi uygulama aşaması kapıda reddedilirdi.
+    func testAdapterWithRootedPerRunAccessAdvertisesWorkspaceWriteOnTheSharedConnection() async {
+        let config = SessionConfiguration(
+            providerID: ProviderID("opencode"),
+            modelID: ProviderModelID("stub/model"),
+            variantID: nil
+        )
+        let adapter = OpenCodeCodingAgentAdapter(
+            serverManager: PortTestServerManager(
+                workingDirectory: ManagedAppDirectories.openCodeWorkingDirectory()
+            ),
+            clientFactory: { _ in PortTestOpenCodeClient() },
+            permissionHandler: nil,
+            cancelPendingPermissions: nil,
+            workspaceAccess: .rootedPerRun
+        )
+        let capabilities = await adapter.capabilities(configuration: config)
+        XCTAssertTrue(capabilities.contains(.workspaceWrite))
+    }
+
+    @MainActor
+    func testLiveProviderRegistryTreatsRootedPerRunOpenCodeAsWritingEligible() async {
+        let configuration = SessionConfiguration(
+            providerID: ProviderID("opencode"),
+            modelID: ProviderModelID("stub/model"),
+            variantID: nil
+        )
+        let task = CodingTask(
+            id: UUID(),
+            projectID: UUID(),
+            title: "Registry eligibility",
+            objective: "Write in the owned workspace",
+            status: .ready,
+            stage: .implementation
+        )
+
+        let rootedRegistry = CodingAgentRegistry()
+        rootedRegistry.register(
+            runtime: OpenCodeCodingAgentAdapter(
+                serverManager: PortTestServerManager(
+                    workingDirectory: ManagedAppDirectories.openCodeWorkingDirectory()
+                ),
+                clientFactory: { _ in PortTestOpenCodeClient() },
+                permissionHandler: nil,
+                cancelPendingPermissions: nil,
+                workspaceAccess: .rootedPerRun
+            )
+        )
+        let rootedProvider = LiveTaskProviderRegistry(
+            registry: rootedRegistry,
+            configuration: { configuration }
+        )
+        let eligible = await rootedProvider.candidate(for: task, stage: .implementation)
+        XCTAssertEqual(eligible, .eligible(runtimeID: "opencode", modelID: "stub/model"))
+
+        let sharedRegistry = CodingAgentRegistry()
+        sharedRegistry.register(
+            runtime: OpenCodeCodingAgentAdapter(
+                serverManager: PortTestServerManager(
+                    workingDirectory: ManagedAppDirectories.openCodeWorkingDirectory()
+                ),
+                clientFactory: { _ in PortTestOpenCodeClient() },
+                permissionHandler: nil,
+                cancelPendingPermissions: nil
+            )
+        )
+        let sharedProvider = LiveTaskProviderRegistry(
+            registry: sharedRegistry,
+            configuration: { configuration }
+        )
+        let refused = await sharedProvider.candidate(for: task, stage: .implementation)
+        guard case .unsupported(let missing) = refused else {
+            return XCTFail("A chat-server adapter must fail closed for writing, got \(refused)")
+        }
+        XCTAssertEqual(missing, ["workspaceWrite"])
+    }
+
+    // MARK: - Port yaşam döngüsü
+
+    func testPortRootsWorkspaceServerForOpenCodeRunAndReleasesOnTerminal() async throws {
+        let workspace = try makeExistingWorkspace()
+        let stateRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("port-factory-state-\(UUID().uuidString)", isDirectory: true)
+        let launcher = PortTestProcessLauncher()
+        let factory = makePortWorkspaceFactory(stateRoot: stateRoot, launcher: launcher)
+        let client = PortTestOpenCodeClient(
+            sessionID: "task-session",
+            streams: [completedIdleStream(sessionID: "task-session")]
+        )
+        let port = makePort(factory: factory, client: client)
+        let request = makeRootingPortRequest(workspacePath: workspace.path)
+
+        let session = try await port.start(request, approvalResolver: { _ in .approveOnce })
+        var events: [CodingAgentEvent] = []
+        for await event in session.events {
+            events.append(event)
+        }
+
+        XCTAssertTrue(
+            CodingAgentRun.isTerminatedSuccessfully(events: events),
+            "A completed run must finish its stream with terminal success: \(events)"
+        )
+        try await waitUntil { await factory.activeWorkspacePaths().isEmpty }
+        let handle = try XCTUnwrap(launcher.recordedHandles.last)
+        XCTAssertEqual(handle.terminationCount, 1, "The workspace server is stopped after the terminal event")
+
+        let calls = await client.calls()
+        XCTAssertTrue(calls.contains("createSession"))
+        XCTAssertTrue(
+            OpenCodeServerLedger.leases(in: stateRoot).isEmpty,
+            "No lease may survive a completed run"
+        )
+    }
+
+    func testPortStopsWorkspaceServerWhenRunIsCancelled() async throws {
+        let workspace = try makeExistingWorkspace()
+        let stateRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("port-factory-state-\(UUID().uuidString)", isDirectory: true)
+        let launcher = PortTestProcessLauncher()
+        let factory = makePortWorkspaceFactory(stateRoot: stateRoot, launcher: launcher)
+        let hangingStream = AsyncThrowingStream<String, Error>.makeStream()
+        let client = PortTestOpenCodeClient(
+            sessionID: "task-session",
+            streams: [OpenCodeLineStream(statusCode: 200, lines: hangingStream.stream)]
+        )
+        let port = makePort(factory: factory, client: client)
+        let request = makeRootingPortRequest(workspacePath: workspace.path)
+
+        let session = try await port.start(request, approvalResolver: { _ in .approveOnce })
+        await session.cancel()
+
+        try await waitUntil { await factory.activeWorkspacePaths().isEmpty }
+        let handle = try XCTUnwrap(launcher.recordedHandles.last)
+        XCTAssertEqual(handle.terminationCount, 1, "A cancelled run must stop its workspace server")
+        hangingStream.continuation.finish()
+    }
+
+    func testPortStopsWorkspaceServerWhenAdapterStartFails() async throws {
+        let workspace = try makeExistingWorkspace()
+        let stateRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("port-factory-state-\(UUID().uuidString)", isDirectory: true)
+        let launcher = PortTestProcessLauncher()
+        let factory = makePortWorkspaceFactory(stateRoot: stateRoot, launcher: launcher)
+        let client = PortTestOpenCodeClient(promptError: PortTestPromptFailure())
+        let port = makePort(factory: factory, client: client)
+        let request = makeRootingPortRequest(workspacePath: workspace.path)
+
+        do {
+            _ = try await port.start(request, approvalResolver: { _ in .approveOnce })
+            XCTFail("An adapter start failure must propagate")
+        } catch is PortTestPromptFailure {
+            // Beklenen: hata yolu sunucuyu bırakır.
+        }
+
+        try await waitUntil { await factory.activeWorkspacePaths().isEmpty }
+        let handle = try XCTUnwrap(launcher.recordedHandles.last)
+        XCTAssertEqual(handle.terminationCount, 1, "A failed start must not leak its server")
+    }
+
+    func testPortFailsClosedWithoutWorkspaceServerFactory() async throws {
+        let client = PortTestOpenCodeClient()
+        let registry = CodingAgentRegistry()
+        registry.register(
+            runtime: OpenCodeCodingAgentAdapter(
+                serverManager: PortTestServerManager(
+                    workingDirectory: ManagedAppDirectories.openCodeWorkingDirectory()
+                ),
+                clientFactory: { _ in client },
+                permissionHandler: nil,
+                cancelPendingPermissions: nil,
+                workspaceAccess: .rootedPerRun
+            )
+        )
+        let port = LiveOpenCodeTaskRunningPort(
+            registry: registry,
+            workspaceServerFactory: nil,
+            clientFactory: { _ in client }
+        )
+
+        do {
+            _ = try await port.start(
+                makeRootingPortRequest(workspacePath: "/tmp/whatever"),
+                approvalResolver: { _ in .approveOnce }
+            )
+            XCTFail("Without a rooting factory the OpenCode run must be refused, not run on the chat server")
+        } catch let error as OpenCodeWorkspaceServerError {
+            guard case .rootingUnavailable = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        let calls = await client.calls()
+        XCTAssertTrue(calls.isEmpty, "A refused run must not create a remote session")
+    }
+
+    func testPortFailsClosedWhenWorkspaceCannotBeRooted() async throws {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("port-missing-\(UUID().uuidString)", isDirectory: true)
+        let launcher = PortTestProcessLauncher()
+        let factory = makePortWorkspaceFactory(
+            stateRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("port-factory-state-\(UUID().uuidString)", isDirectory: true),
+            launcher: launcher
+        )
+        let client = PortTestOpenCodeClient()
+        let port = makePort(factory: factory, client: client)
+
+        do {
+            _ = try await port.start(
+                makeRootingPortRequest(workspacePath: missing.path),
+                approvalResolver: { _ in .approveOnce }
+            )
+            XCTFail("A workspace that cannot be rooted must fence the dispatch")
+        } catch let error as OpenCodeWorkspaceServerError {
+            guard case .workspaceNotRootable = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        let calls = await client.calls()
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertTrue(launcher.recordedHandles.isEmpty)
+    }
+
+    // MARK: - Yardımcılar
+
+    private func makePort(
+        factory: OpenCodeWorkspaceServerFactory,
+        client: PortTestOpenCodeClient
+    ) -> LiveOpenCodeTaskRunningPort {
+        let registry = CodingAgentRegistry()
+        registry.register(
+            runtime: OpenCodeCodingAgentAdapter(
+                serverManager: PortTestServerManager(
+                    workingDirectory: ManagedAppDirectories.openCodeWorkingDirectory()
+                ),
+                clientFactory: { _ in client },
+                permissionHandler: nil,
+                cancelPendingPermissions: nil,
+                workspaceAccess: .rootedPerRun
+            )
+        )
+        return LiveOpenCodeTaskRunningPort(
+            registry: registry,
+            workspaceServerFactory: factory,
+            clientFactory: { _ in client }
+        )
+    }
+
+    private func makePortWorkspaceFactory(
+        stateRoot: URL,
+        launcher: PortTestProcessLauncher
+    ) -> OpenCodeWorkspaceServerFactory {
+        OpenCodeWorkspaceServerFactory(
+            executableLocator: PortTestExecutableLocator(),
+            processLauncher: launcher,
+            healthChecker: PortTestHealthChecker(),
+            portAllocator: PortTestPortAllocator(ports: [52_201, 52_202, 52_203]),
+            listenerVerifier: PortTestListenerVerifier(),
+            credentialStore: PortTestCredentialStore(),
+            stateRootURL: stateRoot,
+            passwordGenerator: { "port-workspace-password" }
+        )
+    }
+
+    private func completedIdleStream(sessionID: String) -> OpenCodeLineStream {
+        let pair = AsyncThrowingStream<String, Error>.makeStream()
+        pair.continuation.yield(
+            "data: {\"type\":\"session.status\",\"properties\":{\"sessionID\":\"\(sessionID)\",\"status\":{\"type\":\"idle\"}}}"
+        )
+        pair.continuation.finish()
+        return OpenCodeLineStream(statusCode: 200, lines: pair.stream)
+    }
+
+    private func makeRootingPortRequest(workspacePath: String) -> TaskRunRequest {
+        let taskID = UUID()
+        return TaskRunRequest(
+            task: CodingTask(
+                id: taskID,
+                projectID: UUID(),
+                title: "Rooted",
+                objective: "Write in the owned workspace",
+                status: .running,
+                stage: .implementation
+            ),
+            attempt: TaskAttempt(
+                taskID: taskID,
+                attemptSequence: 1,
+                role: .developer,
+                providerID: "opencode",
+                modelID: "stub/model",
+                generation: 1,
+                startedAt: Date()
+            ),
+            workspace: TaskWorkspaceDescriptor(
+                workspaceID: UUID(),
+                workspacePath: workspacePath,
+                repositoryPath: workspacePath
+            ),
+            approvalPolicy: .approveSafe,
+            deadline: nil
+        )
+    }
+
+    private func makeExistingWorkspace() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("port-workspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        _ condition: @escaping () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Condition was not met before timeout")
+    }
+}
+
+private struct PortTestPromptFailure: Error {}
+
+private struct PortTestExecutableLocator: OpenCodeExecutableLocating {
+    func resolution() -> OpenCodeExecutableResolution {
+        .found(URL(fileURLWithPath: "/opt/homebrew/bin/opencode"))
+    }
+}
+
+private struct PortTestHealthChecker: OpenCodeHealthChecking {
+    func waitUntilHealthy(connection: OpenCodeServerConnection) async throws -> String {
+        "9.9.9"
+    }
+}
+
+private struct PortTestListenerVerifier: OpenCodeListenerVerifying {
+    func waitUntilProcessOwnsListeningPort(
+        _ port: UInt16,
+        processIdentifier: Int32?
+    ) async -> Bool {
+        true
+    }
+}
+
+private final class PortTestPortAllocator: OpenCodePortAllocating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var ports: [UInt16]
+
+    init(ports: [UInt16]) {
+        self.ports = ports
+    }
+
+    func allocate() throws -> UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !ports.isEmpty else {
+            throw ProviderRuntimeError.startupFailure
+        }
+        return ports.removeFirst()
+    }
+}
+
+private final class PortTestCredentialStore: CredentialStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [CredentialKey: String] = [:]
+
+    func contains(_ key: CredentialKey) throws -> Bool {
+        lock.withLock { values[key] != nil }
+    }
+
+    func read(_ key: CredentialKey) throws -> String? {
+        lock.withLock { values[key] }
+    }
+
+    func write(_ value: String, for key: CredentialKey) throws {
+        lock.withLock { values[key] = value }
+    }
+
+    func delete(_ key: CredentialKey) throws {
+        lock.withLock { values[key] = nil }
+    }
+}
+
+private final class PortTestProcessLauncher: OpenCodeProcessLaunching, @unchecked Sendable {
+    private let lock = NSLock()
+    private var handles: [PortTestProcessHandle] = []
+
+    var recordedHandles: [PortTestProcessHandle] {
+        lock.withLock { handles }
+    }
+
+    func launch(_ request: OpenCodeProcessLaunchRequest) async throws -> any OpenCodeProcessHandling {
+        let handle = PortTestProcessHandle()
+        lock.withLock { handles.append(handle) }
+        return handle
+    }
+}
+
+private final class PortTestProcessHandle: OpenCodeProcessHandling, @unchecked Sendable {
+    private let lock = NSLock()
+    private var terminations = 0
+
+    var terminationCount: Int {
+        lock.withLock { terminations }
+    }
+
+    func isRunning() async -> Bool {
+        lock.withLock { terminations == 0 }
+    }
+
+    func processIdentifier() async -> Int32? {
+        9_001
+    }
+
+    func terminate() async {
+        lock.withLock { terminations += 1 }
+    }
+}
+
 // MARK: - Çalıştırıcı sahteleri
 
 private actor StubCodingAgentRuntime: CodingAgentRuntime {
@@ -468,14 +948,21 @@ private actor PortTestOpenCodeClient: OpenCodeClientProtocol {
     private let sessionID: String
     private var streams: [OpenCodeLineStream]
     private var recordedReplies: [Reply] = []
+    private var recordedCalls: [String] = []
+    private let promptError: Error?
 
-    init(sessionID: String = "port-session", streams: [OpenCodeLineStream] = []) {
+    init(sessionID: String = "port-session", streams: [OpenCodeLineStream] = [], promptError: Error? = nil) {
         self.sessionID = sessionID
         self.streams = streams
+        self.promptError = promptError
     }
 
     func replies() -> [Reply] {
         recordedReplies
+    }
+
+    func calls() -> [String] {
+        recordedCalls
     }
 
     func capabilities() async throws -> ProviderCapabilities {
@@ -496,7 +983,8 @@ private actor PortTestOpenCodeClient: OpenCodeClientProtocol {
     func setAPIKey(providerID: String, key: String, metadata: [String: String]) async throws {}
 
     func createSession() async throws -> String {
-        sessionID
+        recordedCalls.append("createSession")
+        return sessionID
     }
 
     func deleteSession(sessionID: String) async throws {}
@@ -506,7 +994,15 @@ private actor PortTestOpenCodeClient: OpenCodeClientProtocol {
         model: OpenCodeModelReference,
         variant: String?,
         parts: [OpenCodePromptPart]
-    ) async throws {}
+    ) async throws {
+        try await sendPromptAsync(
+            sessionID: sessionID,
+            model: model,
+            variant: variant,
+            parts: parts,
+            agent: nil
+        )
+    }
 
     func sendPromptAsync(
         sessionID: String,
@@ -514,7 +1010,12 @@ private actor PortTestOpenCodeClient: OpenCodeClientProtocol {
         variant: String?,
         parts: [OpenCodePromptPart],
         agent: String?
-    ) async throws {}
+    ) async throws {
+        recordedCalls.append("sendPromptAsync")
+        if let promptError {
+            throw promptError
+        }
+    }
 
     func abort(sessionID: String) async throws {}
 

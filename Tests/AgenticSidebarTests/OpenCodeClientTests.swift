@@ -317,7 +317,7 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(permissions["websearch"], "allow")
         XCTAssertEqual(permissions["webfetch"], "allow")
         XCTAssertEqual(permissions["todowrite"], "allow")
-        XCTAssertEqual(permissions["task"], "allow")
+        XCTAssertEqual(permissions["task"], "ask")
         XCTAssertEqual(permissions["external_directory"], "allow")
         XCTAssertEqual(permissions["skill"], "allow")
         XCTAssertEqual(permissions["bash"], nil)

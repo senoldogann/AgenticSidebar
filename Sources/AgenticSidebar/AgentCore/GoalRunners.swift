@@ -23,11 +23,14 @@ struct GoalCommandResult: Equatable, Sendable {
 /// Enjekte edilir; üretim `Process` kullanır, testler sahte döndürür.
 typealias GoalCommandExecutor = @Sendable (_ executable: URL, _ arguments: [String], _ workingDirectory: URL) async -> GoalCommandResult
 
-/// Bitiş kapılarının gerçek doğrulaması: `swift build` + `swift test`
-/// hedef projenin dizininde koşar. Komutlar sabittir (kullanıcı girdisi
-/// komuta gömülmez), kabuk yoktur, o yüzden enjeksiyon yüzeyi yoktur;
-/// tek girdi çalışma dizinidir ve o da `Package.swift` barındırma şartıyla
-/// doğrulanır.
+/// Bitiş kapılarının gerçek doğrulaması: hedef projenin dizininde koşar.
+/// SwiftPM'de `swift build` + `swift test`, Xcode projesinde `xcodebuild`
+/// build + test. Komutlar sabittir (kullanıcı girdisi komuta gömülmez),
+/// kabuk yoktur, o yüzden enjeksiyon yüzeyi yoktur; tek girdi çalışma
+/// dizinidir ve o da proje işareti (`Package.swift` ya da Xcode projesi)
+/// şartıyla doğrulanır. Şema adı projenin kendi listesinden gelir
+/// (`xcodebuild -list -json`), `Package.swift` ürün adı gibi güvenilir
+/// projen metadata'sıdır.
 struct GoalRunners: Sendable {
     /// Ham çıktıda tutulan üst sınır; derleme günlüğü diski şişirmez.
     static let maximumOutputBytes = 200_000
@@ -42,13 +45,14 @@ struct GoalRunners: Sendable {
         self.timeoutSeconds = timeoutSeconds
     }
 
-    /// Üretim koşucusu: hangi çalıştırılabilir istenirse istensin çözümlenmiş
-    /// `swift` koşar (sabit-komut politikası: kullanıcı girdisi komuta gömülmez).
+    /// Üretim koşucusu: çalıştırılabilir sabit çözümleyicilerden gelir
+    /// (`swift` ya da `xcodebuild`); `verify` bunlardan başkasını istemez.
+    /// Kullanıcı girdisi komuta gömülmez (sabit-komut politikası).
     static func live(timeoutSeconds: TimeInterval = 600) -> GoalRunners {
         GoalRunners(
-            execute: { _, arguments, workingDirectory in
+            execute: { executable, arguments, workingDirectory in
                 await runThroughProcess(
-                    executable: swiftExecutable() ?? URL(fileURLWithPath: "/usr/bin/swift"),
+                    executable: executable,
                     arguments: arguments,
                     workingDirectory: workingDirectory,
                     timeoutSeconds: timeoutSeconds
@@ -58,10 +62,101 @@ struct GoalRunners: Sendable {
         )
     }
 
+    /// Desteklenen proje türü: SwiftPM ya da Xcode. Doğrulama komutları türe
+    /// göre seçilir; ikisi de yoksa dizin kapıdan reddedilir.
+    enum GoalProjectKind: Equatable, Sendable {
+        case swiftPM
+        case xcode(XcodeProjectRef)
+    }
+
+    /// Xcode proje başvurusu: dizindeki `*.xcodeproj` ya da `*.xcworkspace`.
+    /// Yalnız en üst düzey aranır; iç içe örnekler belirsiz olurdu.
+    struct XcodeProjectRef: Equatable, Sendable {
+        let url: URL
+        let isWorkspace: Bool
+        /// `xcodebuild` bayrağı: `-project` ya da `-workspace`.
+        var flag: String {
+            isWorkspace ? "-workspace" : "-project"
+        }
+    }
+
     /// Dizin Swift paketi mi: `swift build`/`swift test` ancak o zaman anlamlı.
     /// Yanlış dizinde tur harcamamak için kapıdan önce bakılır.
     static func isSwiftPackage(at directory: URL, fileManager: FileManager = .default) -> Bool {
         fileManager.fileExists(atPath: directory.appendingPathComponent("Package.swift").path)
+    }
+
+    /// Dizindeki Xcode projesi: önce `*.xcodeproj`, yoksa `*.xcworkspace`.
+    /// Birden çok adayda alfabetik ilk kazanır (belirleyicidir). Dönen yol
+    /// çağıranın verdiği dizin biçimini korur (`/var` ↔ `/private/var`
+    /// çözünmesi karşılaştırmaları bozardı).
+    static func xcodeProject(at directory: URL, fileManager: FileManager = .default) -> XcodeProjectRef? {
+        guard
+            let contents = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return nil
+        }
+        func firstChild(withExtension ext: String) -> URL? {
+            contents
+                .filter { $0.pathExtension == ext && isDirectory($0, fileManager: fileManager) }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                .first
+                .map { directory.appendingPathComponent($0.lastPathComponent, isDirectory: true) }
+        }
+        if let project = firstChild(withExtension: "xcodeproj") {
+            return XcodeProjectRef(url: project, isWorkspace: false)
+        }
+        if let workspace = firstChild(withExtension: "xcworkspace") {
+            return XcodeProjectRef(url: workspace, isWorkspace: true)
+        }
+        return nil
+    }
+
+    /// Dizin desteklenen proje mi: önce SwiftPM, sonra Xcode.
+    static func supportedProject(at directory: URL, fileManager: FileManager = .default) -> GoalProjectKind? {
+        if isSwiftPackage(at: directory, fileManager: fileManager) {
+            return .swiftPM
+        }
+        if let xcode = xcodeProject(at: directory, fileManager: fileManager) {
+            return .xcode(xcode)
+        }
+        return nil
+    }
+
+    /// Seçilen klasörün kullanılabilir hâli: kendisi projeseyse kendisi,
+    /// değilse tek bir alt dizini projeseyse o alt dizin (klasik "bir üstü
+    /// seçme" hatası sessizce düzelir). Birden çok adayda `nil` döner —
+    /// tahmin yürütülmez, kullanıcı seçer.
+    static func usableProjectDirectory(at directory: URL, fileManager: FileManager = .default) -> URL? {
+        if supportedProject(at: directory, fileManager: fileManager) != nil {
+            return directory
+        }
+        guard
+            let children = try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return nil
+        }
+        let candidates =
+            children
+            .filter {
+                isDirectory($0, fileManager: fileManager)
+                    && supportedProject(at: $0, fileManager: fileManager) != nil
+            }
+            .map { directory.appendingPathComponent($0.lastPathComponent, isDirectory: true) }
+        return candidates.count == 1 ? candidates[0] : nil
+    }
+
+    private static func isDirectory(_ url: URL, fileManager: FileManager) -> Bool {
+        var isDirectory: ObjCBool = false
+        return fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
     }
 
     /// Yukarı yürümenin üst sınırı: derin monorepo içleri için yeterlidir,
@@ -75,6 +170,25 @@ struct GoalRunners: Sendable {
     /// barındıran ilk dizin, kullanıcıya klasör sormadan hedef dizindir.
     /// Var olmayan yollar sessizce atlanır. Yalnız yerel disk okunur.
     static func enclosingSwiftPackage(for path: String, fileManager: FileManager = .default) -> URL? {
+        enclosingDirectory(for: path, fileManager: fileManager) {
+            isSwiftPackage(at: $0, fileManager: fileManager)
+        }
+    }
+
+    /// Dosya ya da dizin yolunu kapsayan en yakın Xcode proje dizini.
+    static func enclosingXcodeProject(for path: String, fileManager: FileManager = .default) -> URL? {
+        enclosingDirectory(for: path, fileManager: fileManager) {
+            xcodeProject(at: $0, fileManager: fileManager) != nil
+        }
+    }
+
+    /// Yukarı yürümenin ortak gövdesi: dosya ise dizininden başlar, eşleşen
+    /// ilk atayı döndürür.
+    private static func enclosingDirectory(
+        for path: String,
+        fileManager: FileManager,
+        match: (URL) -> Bool
+    ) -> URL? {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return nil
@@ -88,7 +202,7 @@ struct GoalRunners: Sendable {
             current = current.deletingLastPathComponent()
         }
         for _ in 0..<Self.maximumEnclosingLevels {
-            if isSwiftPackage(at: current, fileManager: fileManager) {
+            if match(current) {
                 return current
             }
             let parent = current.deletingLastPathComponent()
@@ -101,25 +215,40 @@ struct GoalRunners: Sendable {
     }
 
     /// Hedef dizin seçimi: önce bilinen dizinler (önceki koşu, kayıtlı
-    /// tercih), sonra oturumdaki dosya sinyallerinden türetilen paket
-    /// dizini. `nil` = hiçbir aday paket değildir; çağıran yedeğe düşer.
+    /// tercih; SwiftPM öncelikli, sonra Xcode), sonra oturumdaki dosya
+    /// sinyallerinden türetilen dizin (aynı öncelik). `nil` = hiçbir aday
+    /// desteklenen proje değildir; çağıran yedeğe düşer.
     static func resolvePackageDirectory(
         knownPaths: [String],
         seedPaths: [String],
         fileManager: FileManager = .default
     ) -> URL? {
-        for path in knownPaths {
-            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else {
-                continue
+        func knownDirectory(match: (URL) -> Bool) -> URL? {
+            for path in knownPaths {
+                let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    continue
+                }
+                let url = URL(fileURLWithPath: trimmed)
+                if match(url) {
+                    return url
+                }
             }
-            let url = URL(fileURLWithPath: trimmed)
-            if isSwiftPackage(at: url, fileManager: fileManager) {
-                return url
-            }
+            return nil
+        }
+        if let swift = knownDirectory(match: { isSwiftPackage(at: $0, fileManager: fileManager) }) {
+            return swift
+        }
+        if let xcode = knownDirectory(match: { xcodeProject(at: $0, fileManager: fileManager) != nil }) {
+            return xcode
         }
         for seed in seedPaths {
             if let found = enclosingSwiftPackage(for: seed, fileManager: fileManager) {
+                return found
+            }
+        }
+        for seed in seedPaths {
+            if let found = enclosingXcodeProject(for: seed, fileManager: fileManager) {
                 return found
             }
         }
@@ -128,7 +257,27 @@ struct GoalRunners: Sendable {
 
     /// Tam kapı: önce derleme, yeşilse testler. Derleme kırmızıysa testler
     /// koşulmaz (`tests == nil`); rapor bunu "atlandı" diye yazar.
+    /// Komutlar proje türüne göre seçilir (SwiftPM ya da Xcode).
     func verify(packageDirectory: URL) async -> GoalVerificationReport {
+        switch Self.supportedProject(at: packageDirectory) {
+        case .swiftPM:
+            return await verifySwiftPM(packageDirectory: packageDirectory)
+        case .xcode(let project):
+            return await verifyXcode(project: project, packageDirectory: packageDirectory)
+        case nil:
+            return GoalVerificationReport(
+                build: GoalCommandResult(
+                    exitCode: -1,
+                    outputTail: "Not a SwiftPM package or Xcode project directory.",
+                    timedOut: false
+                ),
+                tests: nil
+            )
+        }
+    }
+
+    /// SwiftPM kapısı: `swift build`, yeşilse `swift test`.
+    private func verifySwiftPM(packageDirectory: URL) async -> GoalVerificationReport {
         guard let swift = Self.swiftExecutable() else {
             let missing = GoalCommandResult(
                 exitCode: -1,
@@ -148,6 +297,76 @@ struct GoalRunners: Sendable {
         return GoalVerificationReport(build: build, tests: tests)
     }
 
+    /// Xcode kapısı: şema projenin kendi listesinden çözülür
+    /// (`xcodebuild -list -json`, salt okunur keşif), sonra aynı şemayla
+    /// build + test. Derleme kırmızıysa testler koşulmaz.
+    private func verifyXcode(project: XcodeProjectRef, packageDirectory: URL) async -> GoalVerificationReport {
+        func refusal(_ text: String) -> GoalVerificationReport {
+            GoalVerificationReport(
+                build: GoalCommandResult(exitCode: -1, outputTail: text, timedOut: false),
+                tests: nil
+            )
+        }
+        guard let xcodebuild = Self.xcodebuildExecutable() else {
+            return refusal("Xcode command line tools not found; install Xcode and retry.")
+        }
+        let projectFlag = [project.flag, project.url.lastPathComponent]
+        let list = await execute(xcodebuild, projectFlag + ["-list", "-json"], packageDirectory)
+        guard !Task.isCancelled else {
+            return GoalVerificationReport(build: list, tests: nil)
+        }
+        guard list.succeeded else {
+            return refusal("Could not list Xcode schemes: \(list.outputTail)")
+        }
+        let schemes = Self.xcodeSchemes(fromListJSON: Data(list.outputTail.utf8))
+        let projectName = project.url.deletingPathExtension().lastPathComponent
+        guard let scheme = Self.preferredXcodeScheme(from: schemes, projectName: projectName) else {
+            return refusal("No Xcode schemes found in \(project.url.lastPathComponent).")
+        }
+        let schemeFlag = projectFlag + ["-scheme", scheme]
+        let build = await execute(
+            xcodebuild,
+            schemeFlag + ["-destination", "generic/platform=macOS", "build"],
+            packageDirectory
+        )
+        guard !Task.isCancelled else {
+            return GoalVerificationReport(build: build, tests: nil)
+        }
+        guard build.succeeded else {
+            return GoalVerificationReport(build: build, tests: nil)
+        }
+        let tests = await execute(
+            xcodebuild,
+            schemeFlag + ["-destination", "platform=macOS", "test"],
+            packageDirectory
+        )
+        return GoalVerificationReport(build: build, tests: tests)
+    }
+
+    /// `xcodebuild -list -json` çıktısındaki şemalar. Saf fonksiyondur.
+    nonisolated static func xcodeSchemes(fromListJSON data: Data) -> [String] {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        for container in ["project", "workspace"] {
+            if let dict = root[container] as? [String: Any],
+                let schemes = dict["schemes"] as? [String]
+            {
+                return schemes
+            }
+        }
+        return []
+    }
+
+    /// Şema seçimi: proje adıyla birebir eşleşen kazanır, yoksa alfabetik
+    /// ilk. Belirleyicidir; hangi şemanın koşacağı komut satırından bellidir.
+    nonisolated static func preferredXcodeScheme(from schemes: [String], projectName: String) -> String? {
+        if schemes.contains(projectName) {
+            return projectName
+        }
+        return schemes.sorted().first
+    }
+
     /// `swift` konumu: kullanıcının ortamı kazanır (sürüm yöneticisi ve
     /// `xcode-select` şimleri), bilinen kurulumlar yedektir. Bulunamazsa `nil`
     /// döner, çağıran bunu "araç zinciri yok" diye raporlar.
@@ -163,6 +382,24 @@ struct GoalRunners: Sendable {
             "/usr/local/bin/swift",
             "/usr/bin/swift",
         ])
+        for candidate in candidates where fileManager.isExecutableFile(atPath: candidate) {
+            return URL(fileURLWithPath: candidate)
+        }
+        return nil
+    }
+
+    /// `xcodebuild` konumu: `swift` ile aynı kural (ortam kazanır, bilinen
+    /// kurulum yedektir). Bulunamazsa `nil`, çağıran "araç zinciri yok" yazar.
+    static func xcodebuildExecutable(
+        fileManager: FileManager = .default, environment: [String: String] = ProcessInfo.processInfo.environment
+    )
+        -> URL?
+    {
+        var candidates: [String] = []
+        if let path = environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map { String($0) + "/xcodebuild" })
+        }
+        candidates.append("/usr/bin/xcodebuild")
         for candidate in candidates where fileManager.isExecutableFile(atPath: candidate) {
             return URL(fileURLWithPath: candidate)
         }

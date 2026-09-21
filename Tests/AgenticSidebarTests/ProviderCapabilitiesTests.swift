@@ -13,6 +13,33 @@ final class ProviderCapabilitiesTests: XCTestCase {
         XCTAssertNil(capabilities.model(id: ProviderModelID("missing")))
     }
 
+    /// Biçime dayanıklı yedek: aynı model değişik yazımla da eşleşir, payda
+    /// bulunamazsa halka bilinmeyene düşmez.
+    func testModelLookupFallsBackToNormalizedIdentifier() {
+        let capabilities = ProviderCapabilities(
+            id: ProviderID("test"),
+            displayName: "Test Provider",
+            models: [
+                ProviderModelCapability(
+                    id: ProviderModelID("openai/gpt-5"),
+                    displayName: "GPT-5",
+                    variants: [],
+                    contextLimit: 400_000
+                )
+            ]
+        )
+
+        XCTAssertEqual(
+            capabilities.model(id: ProviderModelID("OpenAI/GPT-5"))?.displayName,
+            "GPT-5"
+        )
+        XCTAssertEqual(
+            capabilities.model(id: ProviderModelID("openai_gpt 5"))?.contextLimit,
+            400_000
+        )
+        XCTAssertNil(capabilities.model(id: ProviderModelID("openai/gpt-6")))
+    }
+
     func testVariantSupportIsScopedToSelectedModel() {
         let capabilities = makeCapabilities()
 

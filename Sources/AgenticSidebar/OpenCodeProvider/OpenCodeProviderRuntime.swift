@@ -141,14 +141,14 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 )
                 : nil
         )
-        // Plan, Review ve Exam salt-okunur backend ajanıyla çalışır: üçü de dosya
-        // değiştirmeyen işlerdir (plan önerir, review denetler, exam çözer).
+        // Plan, Review, Exam ve Ask salt-okunur backend ajanıyla çalışır: dördü de dosya
+        // değiştirmeyen işlerdir (plan önerir, review denetler, exam çözer, ask yanıtlar).
         // Özellikle Exam, pano/ekran görüntüsü gibi güvenilmez girdileri otomatik
         // kuyruğa aldığı için `build` yetkisiyle koşması prompt-injection yüzeyidir.
-        // Review de aynı sınırda koşar: kuyruğa review seçiliyken giren bir mesaj
-        // build yetkisiyle çalışırsa kullanıcının seçimi sessizce delinir.
+        // Review ve Ask de aynı sınırda koşar: kuyruğa bu kipler seçiliyken giren
+        // bir mesaj build yetkisiyle çalışırsa kullanıcının seçimi sessizce delinir.
         let agentName =
-            (request.mode == .plan || request.mode == .exam || request.mode == .review)
+            (request.mode == .plan || request.mode == .exam || request.mode == .review || request.mode == .ask)
             ? ManagedOpenCodeConfiguration.planAgentName : "build"
 
         // Subscribe before submitting so fast backend events cannot be missed.

@@ -43,6 +43,74 @@ final class PaneIsolationTests: XCTestCase {
     }
 
     @MainActor
+    func testRunningThinkingIsExpandedByDefaultWhileTurnRuns() {
+        let store = TimelineCollapseStore()
+        let thinking = AgentActivity(
+            id: ProviderActivityID(UUID().uuidString),
+            kind: .thinking,
+            phase: .running,
+            title: nil,
+            detail: nil,
+            output: "Adım adım çözüm",
+            diff: nil,
+            startedAt: Date(),
+            completedAt: nil
+        )
+        XCTAssertTrue(store.isActivityExpanded(thinking, groupID: UUID(), sessionID: UUID(), isTurnRunning: true))
+    }
+
+    @MainActor
+    func testCompletedThinkingCollapsesByDefaultWhileTurnRuns() {
+        let store = TimelineCollapseStore()
+        let thinking = AgentActivity(
+            id: ProviderActivityID(UUID().uuidString),
+            kind: .thinking,
+            phase: .completed,
+            title: nil,
+            detail: nil,
+            output: "Adım adım çözüm",
+            diff: nil,
+            startedAt: Date(),
+            completedAt: Date()
+        )
+        XCTAssertFalse(store.isActivityExpanded(thinking, groupID: UUID(), sessionID: UUID(), isTurnRunning: true))
+    }
+
+    @MainActor
+    func testManuallyExpandedThinkingStaysOpenAfterCompletion() {
+        let store = TimelineCollapseStore()
+        let group = UUID()
+        let session = UUID()
+        let id = ProviderActivityID(UUID().uuidString)
+        let running = AgentActivity(
+            id: id,
+            kind: .thinking,
+            phase: .running,
+            title: nil,
+            detail: nil,
+            output: "Adım adım çözüm",
+            diff: nil,
+            startedAt: Date(),
+            completedAt: nil
+        )
+        store.toggleActivity(running, groupID: group, sessionID: session, isTurnRunning: true)
+        XCTAssertFalse(store.isActivityExpanded(running, groupID: group, sessionID: session, isTurnRunning: true))
+        let completed = AgentActivity(
+            id: id,
+            kind: .thinking,
+            phase: .completed,
+            title: nil,
+            detail: nil,
+            output: "Adım adım çözüm",
+            diff: nil,
+            startedAt: Date(),
+            completedAt: Date()
+        )
+        store.toggleActivity(completed, groupID: group, sessionID: session, isTurnRunning: true)
+        XCTAssertTrue(store.isActivityExpanded(completed, groupID: group, sessionID: session, isTurnRunning: true))
+    }
+
+    @MainActor
     func testLegacyBareKeyIsReadButWritesAreNamespaced() {
         let store = TimelineCollapseStore()
         let group = UUID()
@@ -52,6 +120,19 @@ final class PaneIsolationTests: XCTestCase {
         store.toggleGroup(groupID: group, sessionID: session, isTurnRunning: true)
         XCTAssertTrue(store.collapsedIDs.contains(TimelineCollapseStore.groupKey(group, sessionID: session)))
         XCTAssertFalse(store.collapsedIDs.contains(TimelineCollapseStore.groupKey(group)))
+    }
+
+    @MainActor
+    func testSessionFilesCardIsExpandedByDefaultAndScopedToSession() {
+        let store = TimelineCollapseStore()
+        let sessionA = UUID()
+        let sessionB = UUID()
+        XCTAssertTrue(store.isSessionFilesExpanded(sessionID: sessionA))
+        store.setSessionFilesExpanded(false, sessionID: sessionA)
+        XCTAssertFalse(store.isSessionFilesExpanded(sessionID: sessionA))
+        XCTAssertTrue(store.isSessionFilesExpanded(sessionID: sessionB))
+        store.setSessionFilesExpanded(true, sessionID: sessionA)
+        XCTAssertTrue(store.isSessionFilesExpanded(sessionID: sessionA))
     }
 
     // MARK: - Dal kimlikleri kaynakla çakışmaz

@@ -4,6 +4,10 @@ import SwiftUI
 struct AgentQuestionCard: View {
     static let allOptionID = "__all__"
 
+    /// Seçenek listesinin kapak yüksekliği: ~5 satır görünür, kartın başlığı
+    /// ve alt düğmeleri her zaman ekranda kalır.
+    static let optionsListMaxHeight: CGFloat = 300
+
     let question: AgentQuestion
     let preset: AppThemePreset
     let isDark: Bool
@@ -144,16 +148,23 @@ struct AgentQuestionCard: View {
             }
 
             // Multi-choice Option Pills
+            //
+            // Liste kendi içinde kayar ve yükseklik kapaklıdır: çok seçenekli
+            // soruda kart uzayıp alt düğmeler (Skip / Submit) görünmezdi.
+            // Başlık ve alt düğmeler sabit durur, yalnız seçenekler kayar.
             if !effectiveOptions.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(effectiveOptions.enumerated()), id: \.element.id) { index, option in
-                        optionRow(
-                            option: option,
-                            index: index,
-                            accent: accent
-                        )
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(effectiveOptions.enumerated()), id: \.element.id) { index, option in
+                            optionRow(
+                                option: option,
+                                index: index,
+                                accent: accent
+                            )
+                        }
                     }
                 }
+                .frame(maxHeight: Self.optionsListMaxHeight)
             }
 
             // Custom Answer Text Input

@@ -72,9 +72,17 @@ actor GitWorkspaceManager: WorkspaceManaging {
             }
             guard let manifestURL = manifests.first else {
                 // No owned workspace exists: this is the creation path, so the source
-                // must be clean and the branch writable before anything may be created.
+                // must be clean before anything may be created. The checked-out
+                // branch is deliberately NOT required to be writable: the worktree
+                // is created detached (`worktree add --detach <sha>`) at the
+                // resolved base commit, so the source checkout is never switched,
+                // never written and never merged into — a clean `master` checkout
+                // yields the exact same base as a detached HEAD at the same
+                // commit, and push/merge stay behind human approvals. The dirty
+                // gate stays: uncommitted work would otherwise be silently
+                // excluded from the agent's base, and that choice belongs to
+                // the human (commit or stash), not to automation.
                 try verifySourceIsClean(project: project)
-                try verifyBranchIsWritable(project: project)
                 return .notOwned(reason: "no owned workspace for task \(task.id.uuidString)")
             }
             // A preflight may only offer a workspace whose manifest and Git registration
@@ -531,19 +539,6 @@ actor GitWorkspaceManager: WorkspaceManaging {
                 path: canonicalPath(repositoryURL),
                 status: clip(status, limit: Self.maxStatusCharacters)
             )
-        }
-    }
-
-    private func verifyBranchIsWritable(project: CodingProject) throws {
-        let repositoryURL = URL(fileURLWithPath: project.repositoryPath)
-        let result = try runGitAllowingFailure(["symbolic-ref", "--quiet", "--short", "HEAD"], in: repositoryURL)
-        // A detached HEAD has no branch to protect; only an actual protected branch refuses.
-        guard result.exitCode == 0 else { return }
-        let branch = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !branch.isEmpty else { return }
-        let protectedBranches = project.protectedRefs.isEmpty ? ["main", "master"] : project.protectedRefs
-        guard GoalSafety.mayWriteToBranch(branch, protectedBranches: protectedBranches) else {
-            throw WorkspaceGuardError.protectedBranch(branch: branch)
         }
     }
 

@@ -105,6 +105,13 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
     private let lock = NSLock()
     private var currentProcess: Process?
 
+    /// Karta iletilen satır tavanı: `swift build` gibi adımlar çok konuşkandır;
+    /// kart zaten son 120 satırı tutar, buradaki tavan ana iş parçacığı selini
+    /// keser. Süreç akmaya devam eder, yalnızca iletim durur.
+    static let maximumForwardedLines = 2_000
+    /// Tek satır tavanı (bayt): anormal uzun bir satır kartı şişirmesin.
+    static let maximumLineBytes = 8_000
+
     func run(
         step: ComputerUseSetupStep,
         in directoryURL: URL,
@@ -145,14 +152,24 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
             group.addTask {
                 let reader = Task.detached(priority: .utility) { () -> Int in
                     var lines = 0
+                    var forwarded = 0
                     do {
                         for try await line in output.fileHandleForReading.bytes.lines {
                             lines += 1
-                            onLine(String(line))
+                            // Tavan aşıldıysa akıtmaya devam et (çocuk tıkanmasın),
+                            // karta yazma; sonunda tek satırlık kesme notu düşülür.
+                            guard forwarded < Self.maximumForwardedLines else {
+                                continue
+                            }
+                            forwarded += 1
+                            onLine(Self.cappedLine(String(line)))
                         }
                     } catch {
                         // A stream that ends badly still ends; the exit status below is
                         // what the user is told to act on.
+                    }
+                    if lines > forwarded {
+                        onLine("… output truncated (\(lines - forwarded) further lines not shown)")
                     }
                     return lines
                 }
@@ -224,6 +241,16 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
         lock.withLock {
             currentProcess?.terminate()
         }
+    }
+
+    /// Uzun satırı bayt tavanında kırpar; `utf8.count` (karakter sayımının
+    /// aksine) sabit zamanlıdır ve karakter sayısından küçük olamaz, yani eşik
+    /// ön elemesi için yeterlidir. Kesme karakter sınırında yapılır.
+    static func cappedLine(_ line: String) -> String {
+        guard line.utf8.count > maximumLineBytes else {
+            return line
+        }
+        return String(line.prefix(maximumLineBytes)) + "…"
     }
 }
 

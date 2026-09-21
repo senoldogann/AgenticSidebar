@@ -67,14 +67,26 @@ enum ChatMessagePresenter {
     static func cleanUserDisplayText(from rawText: String, hasAttachments: Bool) -> String {
         var text = rawText
 
-        if let ocrRange = text.range(of: #"Extracted content from screenshot:\s*"""[\s\S]*?"""\s*"#, options: .regularExpression) {
+        // Bu temizlik her balon gövde değerlendirmesinde çalışır; aşağıdaki
+        // kalıplar ekran-görüntüsü kazanına özeldir. İşaret dizgisi yoksa
+        // pahalı düzenli ifade geçişleri atlanır: uzun bir yapıştırma her
+        // karede dört regex'ten geçmesin diye.
+        if text.contains("Extracted content from screenshot:"),
+            let ocrRange = text.range(of: #"Extracted content from screenshot:\s*"""[\s\S]*?"""\s*"#, options: .regularExpression)
+        {
             text.removeSubrange(ocrRange)
         }
 
-        text = text.replacingOccurrences(
-            of: #"\s*\(No machine-readable text found in screenshot\)\s*"#, with: "", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"\[Screenshot captured:[^\]]*\]\s*"#, with: "", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"\s*Please inspect this screenshot carefully:.*"#, with: "", options: .regularExpression)
+        if text.contains("No machine-readable text found in screenshot") {
+            text = text.replacingOccurrences(
+                of: #"\s*\(No machine-readable text found in screenshot\)\s*"#, with: "", options: .regularExpression)
+        }
+        if text.contains("Screenshot captured:") {
+            text = text.replacingOccurrences(of: #"\[Screenshot captured:[^\]]*\]\s*"#, with: "", options: .regularExpression)
+        }
+        if text.contains("Please inspect this screenshot carefully:") {
+            text = text.replacingOccurrences(of: #"\s*Please inspect this screenshot carefully:.*"#, with: "", options: .regularExpression)
+        }
 
         // Sağlayıcı çerçevesi (`<user_turn>…</user_turn>`) istemciye giden metne
         // aittir; model yankısı, yapıştırma ya da geri yükleme artığı olarak

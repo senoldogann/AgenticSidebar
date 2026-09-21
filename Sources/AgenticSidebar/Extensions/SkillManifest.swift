@@ -155,6 +155,21 @@ enum SkillManifestParser {
         return !previousWasHyphen
     }
 
+    /// Gövde önizlemesi için kırpma yapar; kullanıcı arayüzü yoktur, yalnızca yardımcıdır.
+    ///
+    /// `limit` karakterden uzun gövde sonuna `…` eklenerek kesilir.
+    static func previewBody(_ body: String, limit: Int) -> String {
+        // Geçersiz sınırda boş dönülür, çağrıcı kırpmayı kendisi denetler.
+        guard limit > 0 else {
+            return ""
+        }
+        // Sınır içindeki gövde aynen korunur.
+        guard body.count > limit else {
+            return body
+        }
+        return String(body.prefix(limit)) + "…"
+    }
+
     /// A skill whose folder and `name` disagree never loads, so the installer
     /// refuses it rather than writing a file the agent cannot see.
     static func validate(

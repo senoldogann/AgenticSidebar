@@ -1,6 +1,6 @@
 import Foundation
 
-/// Bestecideki yerleşik eğik-çizgi komutları (`/btw`, `/goal`, `/compact`).
+/// Bestecideki yerleşik eğik-çizgi komutları (`/btw`, `/goal`).
 ///
 /// Bunlar beceri (`skill`) değildir: beceriler tura etiket olarak eklenir,
 /// komutlar ise gönderimde yakalanıp kendi akışına yönlenir. `/` öneri
@@ -27,15 +27,8 @@ struct SlashCommand: Identifiable, Equatable, Sendable {
         name: "btw",
         detail: "Ask a side question without interrupting the turn"
     )
-    /// `/compact` bağlam sıkıştırma: düşen ön eki özetler, sunucu tarafını
-    /// döndürür. Transkripte yazmaz; özet sonraki isteklerin başına eklenir.
-    static let compact = SlashCommand(
-        name: "compact",
-        detail: "Summarize dropped context and rotate the backend session"
-    )
-
-    /// Paneldeki sabit sıra: önce hedef, sonra yan soru, sonra sıkıştırma.
-    static let all: [SlashCommand] = [.goal, .btw, .compact]
+    /// Paneldeki sabit sıra: önce hedef, sonra yan soru.
+    static let all: [SlashCommand] = [.goal, .btw]
 
     /// Sorguyla süzme: boş sorgu hepsini verir, dolu sorgu adın içinde
     /// geçer (büyük/küçük harf duyarsız). `query` eğik çizgisiz gelir
@@ -65,11 +58,5 @@ struct SlashCommand: Identifiable, Equatable, Sendable {
         }
         let objective = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
         return objective.isEmpty ? nil : objective
-    }
-
-    /// Yalın `/compact`: argümansız, büyük/küçük harf duyarsız tam eşleşme.
-    /// `/compact foo` gibi kuyruklu yazım komut değildir, düz metin gider.
-    static func isCompactCommand(_ text: String) -> Bool {
-        text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "/compact"
     }
 }

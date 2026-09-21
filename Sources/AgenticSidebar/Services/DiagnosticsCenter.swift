@@ -14,7 +14,7 @@ struct DiagnosticsSnapshot: Sendable {
     let crashReports: [CrashReport]
     let recentDecisions: [ToolAuditLog.Record]
     let recentExecutions: [ToolAuditLog.ExecutionRecord]
-    /// Diskteki aktif `/goal` koşusunun tek satırlık özeti; koşu yoksa `nil`.
+    /// Diskteki aktif `/goal` koşularının tek satırlık özeti; koşu yoksa `nil`.
     /// `var` tutulur: `let` + varsayılan değer üye-başlatıcıya parametre
     /// olarak girmez, eski çağrı noktalarının derlenmesi için varsayılan şart.
     var goalSummary: String? = nil
@@ -27,7 +27,8 @@ enum DiagnosticsCenter {
     static func collect(
         auditLog: ToolAuditLog = .live(),
         crashesDirectory: URL = CrashReporter.crashesDirectory(),
-        goalStoreURL: URL? = GoalStore.liveFileURL()
+        goalStoreURL: URL? = GoalStore.liveFileURL(),
+        goalStoreDirectory: URL? = nil
     ) async -> DiagnosticsSnapshot {
         let decisions = await auditLog.recent(limit: maximumDecisions)
         let executions = await auditLog.recentExecutions(limit: maximumExecutions)
@@ -39,12 +40,65 @@ enum DiagnosticsCenter {
             crashReports: CrashReporter.reports(in: crashesDirectory),
             recentDecisions: decisions,
             recentExecutions: executions,
-            goalSummary: Self.storedGoalSummary(storeURL: goalStoreURL)
+            goalSummary: Self.combinedGoalSummary(storeURL: goalStoreURL, directory: goalStoreDirectory)
         )
     }
 
-    /// Diskteki terminal-olmayan hedef koşusunu tek satırda özetler. Koşu
+    /// Çoklu-goal özeti: açık dizin verildiyse dizindeki tüm aktif koşular,
+    /// yoksa tek-dosya davranışı (eski çağrılar/testler). Varsayılan çağrıda
+    /// (`goal-run.json` mirası) üretim dizini taranır ki farklı sohbetlerin
+    /// eşzamanlı goal koşuları tanıda görünsün.
+    static func combinedGoalSummary(storeURL: URL?, directory: URL?) -> String? {
+        if let directory {
+            var seen = Set<UUID>()
+            var lines: [String] = []
+            if let single = storeURL, let stored = GoalStore.load(from: single),
+                !stored.run.isTerminal, seen.insert(stored.run.id).inserted
+            {
+                lines.append(singleGoalLine(stored))
+            }
+            for stored in GoalStore.activeStoredRuns(in: directory)
+                .sorted(by: { $0.updatedAt < $1.updatedAt })
+            {
+                guard seen.insert(stored.run.id).inserted else {
+                    continue
+                }
+                lines.append(singleGoalLine(stored))
+            }
+            if lines.isEmpty {
+                return nil
+            }
+            if lines.count == 1 {
+                return lines[0]
+            }
+            return "\(lines.count) active goals: " + lines.joined(separator: " | ")
+        }
+        // Açık dizin yok: miras varsayılan çağrıysa üretim dizinini tara,
+        // açık tek-dosya çağrısıysa (testler) yalnız o dosyayı oku.
+        if let storeURL, let legacyDefault = GoalStore.liveFileURL(), storeURL == legacyDefault,
+            let liveDirectory = GoalStore.directoryURL()
+        {
+            let active = GoalStore.activeStoredRuns(in: liveDirectory)
+                .sorted(by: { $0.updatedAt < $1.updatedAt })
+            if active.isEmpty {
+                return storedGoalSummary(storeURL: storeURL)
+            }
+            let lines = active.map(singleGoalLine)
+            if lines.count == 1 {
+                return lines[0]
+            }
+            return "\(lines.count) active goals: " + lines.joined(separator: " | ")
+        }
+        return storedGoalSummary(storeURL: storeURL)
+    }
+
+    private static func singleGoalLine(_ stored: GoalStoredRun) -> String {
+        "“\(stored.run.objective)” · \(stored.run.phase.rawValue) · iteration \(stored.run.iteration)/\(stored.budget.maxIterations)"
+    }
+
+    /// Diskteki terminal-olmayan tek hedef koşusunu özetler. Koşu
     /// yoksa, bitmişse ya da dosya okunamazsa `nil` döner; saf okumadır.
+    /// Çoklu-goal görünümü için `combinedGoalSummary` kullanılır.
     static func storedGoalSummary(storeURL: URL?) -> String? {
         guard let storeURL, let stored = GoalStore.load(from: storeURL) else {
             return nil
@@ -52,7 +106,7 @@ enum DiagnosticsCenter {
         guard !stored.run.isTerminal else {
             return nil
         }
-        return "“\(stored.run.objective)” · \(stored.run.phase.rawValue) · iteration \(stored.run.iteration)/\(stored.budget.maxIterations)"
+        return singleGoalLine(stored)
     }
 
     /// Önceki-çalış durumu: varsayılan dizinde `install` anında yakalanan

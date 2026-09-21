@@ -1,6 +1,21 @@
 import Foundation
 import Synchronization
 
+/// Adaptörün sahipli çalışma alanına erişim biçimi.
+///
+/// Yazma yeteneği yalnızca sunucu kökü çalışma alanı olduğunda doğrudur. Sohbet
+/// sunucusunun kökü yönetilen dizindir; görev gönderimi ise her koşu için
+/// çalışma alanına köklenmiş ayrı bir sunucu açar. İkinci durumda yetenek, koşu
+/// anındaki sunucu kökü sorulmadan da dürüstçe söylenebilir; kapsama denetimi
+/// yine `start` içinde kapalı kalır.
+enum OpenCodeWorkspaceAccess: Sendable, Equatable {
+    /// Gönderim hattı koşu başına çalışma alanına köklenmiş sunucu açar.
+    case rootedPerRun
+    /// Yalnızca enjekte edilen sunucu kullanılabilir; yazma, o sunucu
+    /// yönetilen dizinin dışında bir köke sahipse ilan edilir.
+    case injectedServerOnly
+}
+
 actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
     nonisolated let runtimeID: String = "opencode"
 
@@ -15,23 +30,54 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
     private let permissionHandler: PermissionHandler?
     private let cancelPendingPermissions: PermissionCancellationHandler?
     private let auditLog: ToolAuditLog?
+    private let workspaceAccess: OpenCodeWorkspaceAccess
 
     private var attemptRemoteSessions: [UUID: String] = [:]
     private var attemptConnections: [UUID: OpenCodeServerConnection] = [:]
     private var cancelledAttemptIDs: Set<UUID> = []
+
+    /// İptal damgası taşıyan kimliklerin üst sınırı. Eskiden bu küme süreç
+    /// ömrü boyunca sınırsız büyüyordu (iptal edilen her attempt kalıcıydı).
+    /// Sınır aşılınca yalnız uzak eşlemesi kalmamış — yani terminal —
+    /// kimlikler atılır: eşlemesi duran bir kimliği atmak, geç gelen bir izin
+    /// yanıtını yeniden geçerli kılardı. Hepsi canlıysa sınır esner: yanlış
+    /// bir onaya kapı aralamak yerine bellek seçilir (ret yönü güvenlidir).
+    private static let maximumCancelledAttemptIDs = 1_024
+
+    /// Testlerin terminal temizliğinin izleme durumunu sınırladığını
+    /// kanıtlaması için; üretim akışı kullanmaz.
+    var trackedAttemptCount: Int {
+        attemptRemoteSessions.count + attemptConnections.count + cancelledAttemptIDs.count
+    }
 
     init(
         serverManager: any OpenCodeServerManaging,
         clientFactory: @escaping @Sendable (OpenCodeServerConnection) -> any OpenCodeClientProtocol,
         permissionHandler: PermissionHandler? = nil,
         cancelPendingPermissions: PermissionCancellationHandler? = nil,
-        auditLog: ToolAuditLog? = nil
+        auditLog: ToolAuditLog? = nil,
+        workspaceAccess: OpenCodeWorkspaceAccess = .injectedServerOnly
     ) {
         self.serverManager = serverManager
         self.clientFactory = clientFactory
         self.permissionHandler = permissionHandler
         self.cancelPendingPermissions = cancelPendingPermissions
         self.auditLog = auditLog
+        self.workspaceAccess = workspaceAccess
+    }
+
+    /// Bu adaptörün aynı politika kablolamasıyla, belirli bir sunucuya bağlı
+    /// kopyası. Canlı gönderim her koşu için çalışma alanına köklenmiş sunucuyu
+    /// bu yolla adaptöre verir.
+    func bound(to serverManager: any OpenCodeServerManaging) -> OpenCodeCodingAgentAdapter {
+        OpenCodeCodingAgentAdapter(
+            serverManager: serverManager,
+            clientFactory: clientFactory,
+            permissionHandler: permissionHandler,
+            cancelPendingPermissions: cancelPendingPermissions,
+            auditLog: auditLog,
+            workspaceAccess: workspaceAccess
+        )
     }
 
     func capabilities(configuration: SessionConfiguration) async -> CodingAgentCapabilities {
@@ -60,12 +106,7 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
                 .usageReporting,
             ]
 
-            let serverDir = await serverManager.workingDirectory()
-            if let serverDir,
-                !serverDir.path.isEmpty,
-                serverDir != ManagedAppDirectories.openCodeWorkingDirectory(),
-                !serverDir.path.contains("/managed/")
-            {
+            if await advertisesWorkspaceWrite() {
                 capabilities.insert(.workspaceWrite)
             }
 
@@ -75,12 +116,41 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
         }
     }
 
+    /// Yazma yeteneği yalnızca sunucunun sahipli çalışma alanına köklenmiş
+    /// olmasıyla doğrudur. Koşu başına kökleme kablolandıysa bu, her koşu için
+    /// geçerlidir ve `start` kapsama denetimiyle kapalı kalır.
+    private func advertisesWorkspaceWrite() async -> Bool {
+        if workspaceAccess == .rootedPerRun {
+            return true
+        }
+
+        guard let serverDir = await serverManager.workingDirectory(), !serverDir.path.isEmpty else {
+            return false
+        }
+        let canonicalRoot = serverDir.resolvingSymlinksInPath().standardized.path
+        let canonicalManaged =
+            ManagedAppDirectories.openCodeWorkingDirectory()
+            .resolvingSymlinksInPath().standardized.path
+        return canonicalRoot != canonicalManaged && !canonicalRoot.contains("/managed/")
+    }
+
     func remoteSessionID(for attemptID: UUID) -> String? {
         attemptRemoteSessions[attemptID]
     }
 
     func start(request: CodingAgentExecutionRequest) async throws -> CodingAgentRun {
         try await start(request: request, permissionReplyProvider: nil)
+    }
+
+    /// Gözetimsiz koşu kısıt notu: deny-unless-safe çözücünün reddedeceği
+    /// delegasyonu modele önceden söyler, boşa reddedilen `task` çağrılarını
+    /// azaltır. Yalnız koşuya özel izin sağlayıcılı başlatmada eklenir; sohbet
+    /// akışının istemi değişmez.
+    private static var unattendedRunConstraints: String {
+        "\nUnattended run constraints:\n"
+            + "- Do the work yourself in this workspace with the edit/write tools; do not delegate via the task tool.\n"
+            + "- Subagent delegation is denied unattended; only read-only research delegation to `\(ManagedOpenCodeConfiguration.researchAgentName)` is allowed and it cannot edit files.\n"
+            + "- File edits outside this workspace are denied; stay inside and do not ask.\n"
     }
 
     /// Çalıştırmaya özel izin yanıtı sağlayıcısıyla başlatır.
@@ -134,6 +204,9 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
                 promptText += "- \(file)\n"
             }
         }
+        if permissionReplyProvider != nil {
+            promptText += Self.unattendedRunConstraints
+        }
 
         let parts: [OpenCodePromptPart] = [.text(promptText)]
         let agentName =
@@ -167,7 +240,7 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
             queuedPermissions.withLock { $0.append(attributed) }
         }
 
-        let forwardingTask = Task {
+        let forwardingTask = Task { [self] in
             var normalizer = OpenCodeStreamNormalizer(
                 sessionID: remoteSessionID,
                 onPermissionRequest: onPermissionRequest
@@ -201,6 +274,11 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
                         }
                         if let detail = permReq.detail {
                             params["detail"] = detail
+                        }
+                        // Delegasyon hedefi olay üzerinden de yapısal taşınır:
+                        // zamanlayıcının olay-döngüsü kararı aynı kuralla verir.
+                        if permReq.toolName.lowercased() == "task", let target = permReq.delegationTarget {
+                            params["delegationTarget"] = target
                         }
 
                         try await channel.send(
@@ -366,7 +444,14 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
     }
 
     func cancelAttempt(attemptID: UUID) async {
+        // Bilinmeyen attempt: ne eşleme var ne damga. Terminal temizlikten
+        // sonra gelen geç bir iptal (örn. bitmiş bir koşunun kapatılması)
+        // kümeye yeni damga yazmasın diye erken dönülür.
+        guard attemptRemoteSessions[attemptID] != nil || cancelledAttemptIDs.contains(attemptID) else {
+            return
+        }
         cancelledAttemptIDs.insert(attemptID)
+        pruneDeadCancelledAttemptIDs()
         guard let remoteID = attemptRemoteSessions[attemptID] else { return }
         if let connection = attemptConnections[attemptID] {
             try? await clientFactory(connection).abort(sessionID: remoteID)
@@ -375,12 +460,32 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
     }
 
     func release(attemptID: UUID) async {
-        cancelledAttemptIDs.insert(attemptID)
-        guard let remoteID = attemptRemoteSessions.removeValue(forKey: attemptID) else { return }
+        // Terminal durum tek noktadan unutulur: uzak oturum silinirken iptal
+        // damgası da kalkar. Eskiden burası damga *ekliyordu*, o yüzden
+        // bırakılan her attempt kümede sonsuza dek kalıyordu.
+        guard let remoteID = attemptRemoteSessions.removeValue(forKey: attemptID) else {
+            attemptConnections.removeValue(forKey: attemptID)
+            cancelledAttemptIDs.remove(attemptID)
+            return
+        }
         let connection = attemptConnections.removeValue(forKey: attemptID)
+        cancelledAttemptIDs.remove(attemptID)
         await cancelPendingPermissions?(remoteID, attemptID)
         if let connection {
             try? await clientFactory(connection).deleteSession(sessionID: remoteID)
+        }
+    }
+
+    /// Uzak eşlemesi kalmamış damgaları atar; eşlemesi duran damgaya
+    /// dokunulmaz (`permissionReplyIsCurrent` ona dayanır).
+    private func pruneDeadCancelledAttemptIDs() {
+        guard cancelledAttemptIDs.count > Self.maximumCancelledAttemptIDs else {
+            return
+        }
+        let overflow = cancelledAttemptIDs.count - Self.maximumCancelledAttemptIDs
+        let dead = cancelledAttemptIDs.filter { attemptRemoteSessions[$0] == nil }.prefix(overflow)
+        for id in dead {
+            cancelledAttemptIDs.remove(id)
         }
     }
 }

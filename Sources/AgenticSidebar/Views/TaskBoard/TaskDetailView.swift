@@ -89,13 +89,34 @@ struct TaskBoardInspectorInput: Equatable {
     let findings: [ReviewFinding]?
     let workspaceID: UUID?
     let diffSummary: String?
+    /// Denetçi okuma uyarısı (`nil` = kayıp yok).
+    let warning: String?
+
+    /// `warning` sonradan eklendi: `let` + varsayılan üye-init'e girmediği
+    /// için açık init gerekir, yoksa eski 5-argümanlı çağrılar derlenmez.
+    init(
+        evidence: [VerificationEvidence]?,
+        currentFingerprint: String?,
+        findings: [ReviewFinding]?,
+        workspaceID: UUID?,
+        diffSummary: String?,
+        warning: String? = nil
+    ) {
+        self.evidence = evidence
+        self.currentFingerprint = currentFingerprint
+        self.findings = findings
+        self.workspaceID = workspaceID
+        self.diffSummary = diffSummary
+        self.warning = warning
+    }
 
     static let unwired: TaskBoardInspectorInput = TaskBoardInspectorInput(
         evidence: nil,
         currentFingerprint: nil,
         findings: nil,
         workspaceID: nil,
-        diffSummary: nil
+        diffSummary: nil,
+        warning: nil
     )
 }
 
@@ -396,6 +417,14 @@ struct TaskDetailView: View {
 
     @State private var actor = ""
     @State private var feedback = ""
+    /// Ölçüt anahtarının son sonucu; ret panoda kart değişmeden açıklamasıyla
+    /// durur, başarıda temizlenir. Görev değişince görünüm kimliğiyle sıfırlanır.
+    @State private var criterionFailureMessage: String?
+    /// Düzenleme sayfası ve silme onayı; silme başarıyla dönünce mağaza
+    /// seçimi düşürdüğü için detay bölmesi kendiliğinden kapanır.
+    @State private var showsEditSheet = false
+    @State private var showsDeleteConfirmation = false
+    @State private var deleteFailureMessage: String?
 
     private var detail: TaskBoardTaskDetail? { store.detail }
 
@@ -551,13 +580,84 @@ struct TaskDetailView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.orange)
             }
+
+            metadataActions(detail)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel(card.accessibilityLabel)
+        .sheet(isPresented: $showsEditSheet) {
+            TaskEditSheet(detail: detail, store: store, preset: preset, isDark: isDark)
+        }
+        .confirmationDialog(
+            "Görevi sil",
+            isPresented: $showsDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Görevi sil", role: .destructive) { deleteTask(detail.card.id) }
+            Button("Vazgeç", role: .cancel) {}
+        } message: {
+            Text("“\(detail.card.title)” panodan kalıcı olarak silinir. Bu işlem geri alınamaz.")
+        }
+    }
+
+    /// Başlık altı üstveri eylemleri: düzenleme sayfası ve silme onayı.
+    /// Silme ve düzenleme koşan görevde kapalıdır; ret gerekçesi satırda durur.
+    private func metadataActions(_ detail: TaskBoardTaskDetail) -> some View {
+        let isRunning = detail.card.status == .running
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Button {
+                    showsEditSheet = true
+                } label: {
+                    Label("Düzenle", systemImage: "pencil")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .pointingHandCursor()
+                .disabled(isRunning || store.isActionInFlight(for: detail.card.id))
+                .help(isRunning ? "Koşan görev düzenlenemez — önce durdurun" : "Başlık, amaç ve önceliği düzenleyin")
+                .accessibilityLabel("Görevi düzenle")
+
+                Button {
+                    showsDeleteConfirmation = true
+                } label: {
+                    Label("Sil", systemImage: "trash")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.red.opacity(0.85))
+                .pointingHandCursor()
+                .disabled(isRunning || store.isActionInFlight(for: detail.card.id))
+                .help(isRunning ? "Koşan görev silinemez — önce durdurun" : "Görevi panodan kalıcı olarak silin")
+                .accessibilityLabel("Görevi sil")
+            }
+            if let deleteFailureMessage {
+                Label(deleteFailureMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Görev silinemedi: \(deleteFailureMessage)")
+            }
+        }
+    }
+
+    private func deleteTask(_ taskID: UUID) {
+        Task {
+            let result = await store.deleteTask(taskID: taskID)
+            deleteFailureMessage = TaskActionBarPresenter.refusalMessage(result)
+        }
     }
 
     private func criteriaSection(_ detail: TaskBoardTaskDetail) -> some View {
         section(title: "Kabul ölçütleri") {
+            if let criterionFailureMessage {
+                Label(criterionFailureMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Ölçüt güncellenemedi: \(criterionFailureMessage)")
+            }
             ForEach(TaskDetailPresenter.criteria(detail)) { criterion in
                 HStack(alignment: .top, spacing: 6) {
                     Button {
@@ -594,11 +694,12 @@ struct TaskDetailView: View {
 
     private func toggleCriterion(_ taskID: UUID, criterionID: UUID, isCompleted: Bool) {
         Task {
-            _ = await store.setCriterionCompletion(
+            let result = await store.setCriterionCompletion(
                 taskID: taskID,
                 criterionID: criterionID,
                 isCompleted: !isCompleted
             )
+            criterionFailureMessage = TaskActionBarPresenter.refusalMessage(result)
         }
     }
 
@@ -667,10 +768,23 @@ struct TaskDetailView: View {
                     Spacer(minLength: 0)
                 }
 
-                if !summary.isWired {
-                    Text("Kanıt kaynağı bu sürümde bağlı değil; yeşil rozet gösterilmez")
+                if let inspectorWarning = input.warning {
+                    Label(inspectorWarning, systemImage: "exclamationmark.triangle")
                         .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !summary.isWired {
+                    if detail.card.status == .review {
+                        Text("Bu görev incelemede ama kanıt bu süreçte görünmüyor — uygulama yeniden başlatıldıysa normaldir; kanıtı görmek için koşunun bu açılışta üretilmesi gerekir")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Henüz kanıt yok — görev çalışıp doğrulama ürettiğinde burada listelenir; o zamana dek yeşil rozet gösterilmez")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 ForEach(summary.rows) { row in
@@ -713,7 +827,7 @@ struct TaskDetailView: View {
         let presentation = TaskDetailPresenter.findings(input.findings)
         return section(title: "İnceleme bulguları") {
             if !presentation.isWired {
-                Text("Bulgu kaynağı bu sürümde bağlı değil")
+                Text("Henüz bulgu kaydı yok — inceleme bulguları burada listelenir")
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
                     .accessibilityLabel(presentation.accessibilityLabel)
@@ -771,22 +885,30 @@ struct TaskDetailView: View {
     }
 
     private var actorField: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "person.crop.circle")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            TextField("İnceleyen adı", text: $actor)
-                .textFieldStyle(.plain)
-                .font(.system(size: 11.5))
-                .accessibilityLabel("İnceleyen insan aktör adı")
-            Divider().frame(height: 14).opacity(0.4)
-            Image(systemName: "text.bubble")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            TextField("Değişiklik geri bildirimi", text: $feedback)
-                .textFieldStyle(.plain)
-                .font(.system(size: 11.5))
-                .accessibilityLabel("Değişiklik isteği geri bildirimi")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                TextField("İnceleyen adı", text: $actor)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .help("Başlatma ve kabul, onayı size bağlamak için adınızı ister")
+                    .accessibilityLabel("İnceleyen insan aktör adı")
+                Divider().frame(height: 14).opacity(0.4)
+                Image(systemName: "text.bubble")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                TextField("Değişiklik geri bildirimi", text: $feedback)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11.5))
+                    .accessibilityLabel("Değişiklik isteği geri bildirimi")
+            }
+            if actor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("Başlatma ve kabul için adınızı yazın — onay size bağlanır, bir kez yazmanız yeterli")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
@@ -823,6 +945,125 @@ struct TaskDetailView: View {
         case .neutral: "minus.circle"
         case .warning: "clock.badge.exclamationmark"
         case .negative: "xmark.octagon.fill"
+        }
+    }
+}
+
+// MARK: - Görev düzenleme
+
+/// Başlık/amaç/öncelik düzenleme formu; doğrulama oluşturma formuyla aynı
+/// dili konuşur, yazım yalnızca store üzerinden gider ve ret gizlenmez.
+@MainActor
+private struct TaskEditSheet: View {
+    let card: TaskBoardCard
+    let store: TaskBoardStore
+    let preset: AppThemePreset
+    let isDark: Bool
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+    @State private var objective: String
+    @State private var priority: TaskCreationForm.Priority
+    @State private var isSubmitting = false
+    @State private var failureMessage: String?
+
+    init(detail: TaskBoardTaskDetail, store: TaskBoardStore, preset: AppThemePreset, isDark: Bool) {
+        self.card = detail.card
+        self.store = store
+        self.preset = preset
+        self.isDark = isDark
+        self._title = State(initialValue: detail.card.title)
+        self._objective = State(initialValue: detail.card.objective)
+        self._priority = State(initialValue: Self.priority(for: detail.card.priority))
+    }
+
+    private static func priority(for value: Int) -> TaskCreationForm.Priority {
+        switch value {
+        case ...0: .low
+        case 1: .normal
+        default: .high
+        }
+    }
+
+    private var formError: String? {
+        TaskCreationForm.validationError(title: title, objective: objective)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Görevi düzenle")
+                .font(.system(size: 14, weight: .semibold))
+
+            Text("Yalnızca üstveri değişir; durum, aşama ve ölçütler aynen kalır.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            TextField("Başlık", text: $title)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Görev başlığı")
+
+            TextField("Amaç", text: $objective, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(2...4)
+                .accessibilityLabel("Görev amacı")
+
+            Picker("Öncelik", selection: $priority) {
+                ForEach(TaskCreationForm.Priority.allCases) { option in
+                    Text(option.rawValue).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 240)
+            .help("Yüksek öncelik panoda üstte görünür")
+            .accessibilityLabel("Öncelik")
+
+            if let failureMessage {
+                Label(failureMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .lineLimit(3)
+                    .accessibilityLabel("Görev güncellenemedi: \(failureMessage)")
+            }
+
+            HStack {
+                Spacer()
+                Button("Vazgeç") { dismiss() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .pointingHandCursor()
+                Button("Kaydet") { submit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(isSubmitting || formError != nil)
+                    .help(formError ?? "Değişiklikleri kaydedin")
+                    .accessibilityLabel(isSubmitting ? "Görev kaydediliyor" : "Değişiklikleri kaydet")
+            }
+        }
+        .padding(16)
+        .frame(width: 440)
+        .background(preset.background(isDark: isDark))
+    }
+
+    private func submit() {
+        if let formError {
+            failureMessage = formError
+            return
+        }
+        isSubmitting = true
+        failureMessage = nil
+        Task {
+            let result = await store.updateTask(
+                taskID: card.id,
+                title: title,
+                objective: objective,
+                priority: TaskCreationForm.priorityValue(for: priority)
+            )
+            isSubmitting = false
+            switch result {
+            case .applied:
+                dismiss()
+            case .refused(let refusal):
+                failureMessage = refusal.message
+            }
         }
     }
 }

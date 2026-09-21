@@ -3,6 +3,8 @@ import SwiftUI
 
 /// Right-side slide-in panel displaying the list of changed files and interactive diffs.
 struct FileChangesReviewPanelView: View {
+    @Environment(\.paneWidth) private var paneWidth
+
     let summary: TurnFileChangesSummary
     let initialSelectedFile: FileChangeItem?
     let preset: AppThemePreset
@@ -77,6 +79,13 @@ struct FileChangesReviewPanelView: View {
 
     // MARK: - Header
 
+    /// Dar panelde başlık taşardı: 135'lik dilim seçici + 3 düğme + geri/başlık
+    /// aynı satıra sığmaz, yazılar simgelerin üstüne binerdi. Daraltmada
+    /// seçici küçülür, ikincil düğme (Finder) kalkar, dolgular incelir.
+    private var isCompactHeader: Bool {
+        PaneResponsive.isCompact(width: paneWidth)
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
             if let selected = selectedFile {
@@ -88,8 +97,10 @@ struct FileChangesReviewPanelView: View {
                     HStack(spacing: 4) {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 11, weight: .semibold))
-                        Text("All files")
-                            .font(.system(size: 12, weight: .medium))
+                        if !isCompactHeader {
+                            Text("All files")
+                                .font(.system(size: 12, weight: .medium))
+                        }
                     }
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 6)
@@ -112,6 +123,7 @@ struct FileChangesReviewPanelView: View {
                         .font(.system(size: 12.5, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
 
                     HStack(spacing: 4) {
                         Text("+\(selected.additions)")
@@ -160,8 +172,8 @@ struct FileChangesReviewPanelView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .controlSize(.small)
-                    .frame(width: 135)
+                    .controlSize(isCompactHeader ? .mini : .small)
+                    .frame(maxWidth: isCompactHeader ? 118 : 135)
                     .onChange(of: viewMode) { _, newMode in
                         if newMode == .fullFile {
                             loadDiskContent(for: selected.path)
@@ -181,18 +193,21 @@ struct FileChangesReviewPanelView: View {
                     .pointingHandCursor()
                     .help("Copy diff or path")
 
-                    Button {
-                        revealInFinder(path: selected.path)
-                    } label: {
-                        Image(systemName: "arrow.up.forward.square")
-                            .font(.system(size: 11, weight: .regular))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 24, height: 24)
-                            .interactiveHoverCircle()
+                    // Daraltmada kalkar: kopyala + kapat yeter, satır nefes alır.
+                    if !isCompactHeader {
+                        Button {
+                            revealInFinder(path: selected.path)
+                        } label: {
+                            Image(systemName: "arrow.up.forward.square")
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 24, height: 24)
+                                .interactiveHoverCircle()
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .help("Reveal in Finder")
                     }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                    .help("Reveal in Finder")
                 } else {
                     Button {
                         copyAllPaths()
@@ -223,7 +238,7 @@ struct FileChangesReviewPanelView: View {
                 .accessibilityLabel("Close review")
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, isCompactHeader ? 10 : 14)
         .padding(.vertical, 10)
     }
 
@@ -248,6 +263,7 @@ struct FileChangesReviewPanelView: View {
                                 .font(.system(size: 12.5, weight: .medium))
                                 .foregroundStyle(.primary)
                                 .lineLimit(1)
+                                .truncationMode(.tail)
 
                             Text(file.directoryPath)
                                 .font(.system(size: 11, design: .monospaced))

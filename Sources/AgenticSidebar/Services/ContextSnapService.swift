@@ -176,12 +176,22 @@ struct AppleScriptBrowserURLProvider: ContextBrowserURLProvider {
         else {
             return nil
         }
+        // bundleID dış süreçten gelir: sabit şablonla eşlenir, asla
+        // AppleScript metnine enterpole edilmez.
         let source: String
         switch bundleID {
         case "com.apple.Safari":
             source = "tell application \"Safari\" to get URL of current tab of front window"
-        case "com.google.Chrome", "com.google.Chrome.canary", "com.microsoft.edgemac", "com.brave.Browser", "com.arc.Browser":
-            source = "tell application id \"\(bundleID)\" to get URL of active tab of front window"
+        case "com.google.Chrome":
+            source = "tell application id \"com.google.Chrome\" to get URL of active tab of front window"
+        case "com.google.Chrome.canary":
+            source = "tell application id \"com.google.Chrome.canary\" to get URL of active tab of front window"
+        case "com.microsoft.edgemac":
+            source = "tell application id \"com.microsoft.edgemac\" to get URL of active tab of front window"
+        case "com.brave.Browser":
+            source = "tell application id \"com.brave.Browser\" to get URL of active tab of front window"
+        case "com.arc.Browser":
+            source = "tell application id \"com.arc.Browser\" to get URL of active tab of front window"
         default:
             return nil
         }
@@ -193,8 +203,17 @@ struct AppleScriptBrowserURLProvider: ContextBrowserURLProvider {
         guard error == nil else {
             return nil
         }
-        let url = result.stringValue
-        return (url?.isEmpty == false) ? url : nil
+        guard let url = result.stringValue, !url.isEmpty else {
+            return nil
+        }
+        // Sahte bundleID'li uygulama zararlı metin döndürebilir: yalnız
+        // http/https şemalı gerçek adresler prompt'a girer.
+        guard let scheme = URL(string: url)?.scheme?.lowercased(),
+            scheme == "http" || scheme == "https"
+        else {
+            return nil
+        }
+        return url
     }
 }
 

@@ -28,10 +28,10 @@ enum PreviewArtifactBuilder {
     static func document(for source: Source) -> String {
         switch source {
         case .html(let body):
-            return wrapped(body: body, extraHead: "")
+            return wrapped(body: sanitizedMarkup(body), extraHead: "")
         case .svg(let svg):
             return wrapped(
-                body: "<div class=\"svg-stage\">\(svg)</div>",
+                body: "<div class=\"svg-stage\">\(sanitizedMarkup(svg))</div>",
                 extraHead: """
                     <style>.svg-stage{display:flex;justify-content:center;padding:24px}svg{max-width:100%;height:auto}</style>
                     """
@@ -39,6 +39,39 @@ enum PreviewArtifactBuilder {
         case .mermaid(let code):
             return mermaidDocument(code: code)
         }
+    }
+
+    /// Ham model çıktısındaki etkin içeriği şeritler: betik ve gömülü
+    /// çerçeve öğeleri, on* olay öznitelikleri ve javascript: adresleri.
+    /// CSP ve izolasyon katmanları yerinde durur; bu, tek katman hatasında
+    /// aktifleşecek vektörleri baştan kaldırır.
+    static func sanitizedMarkup(_ markup: String) -> String {
+        var result = markup
+        for element in ["script", "iframe", "object", "embed", "form", "foreignobject"] {
+            result = replacingMatches(
+                pattern: "<\(element)\\b[^>]*>([\\s\\S]*?)</\(element)\\s*>",
+                in: result
+            )
+            result = replacingMatches(pattern: "<\(element)\\b[^>]*/?>", in: result)
+        }
+        result = replacingMatches(pattern: "<meta\\b[^>]*>", in: result)
+        result = replacingMatches(
+            pattern: "\\s+on[a-z]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)",
+            in: result
+        )
+        result = replacingMatches(pattern: "javascript\\s*:", in: result)
+        return result
+    }
+
+    private static func replacingMatches(pattern: String, in text: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return text
+        }
+        return regex.stringByReplacingMatches(
+            in: text,
+            range: NSRange(text.startIndex..., in: text),
+            withTemplate: ""
+        )
     }
 
     // MARK: - Özel

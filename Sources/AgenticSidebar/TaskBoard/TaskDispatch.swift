@@ -4,10 +4,16 @@ import Foundation
 ///
 /// `patterns` carries the paths the request names. An empty list means the request
 /// names none; a file-mutating tool with no patterns can never be proven in-workspace.
+///
+/// `delegationTarget` carries the `task` tool's `subagent_type`: the scheduler's
+/// deny-unless-safe decision for delegations is made on it, never on the display
+/// text. `nil` for every other tool, and for a `task` request that names none —
+/// a targetless delegation fails closed.
 struct TaskRunApprovalRequest: Sendable, Equatable {
     let id: String
     let toolName: String
     let patterns: [String]
+    let delegationTarget: String?
 }
 
 /// The reply to one permission request. A denial always names its reason.
@@ -73,8 +79,19 @@ enum TaskRunApprovalPolicy {
     static func resolve(
         toolName: String,
         patterns: [String],
-        workspacePath: String
+        workspacePath: String,
+        delegationTarget: String?
     ) -> TaskRunApprovalReply {
+        // Plan aşaması delegasyon yaptırımı: gözetimsiz koşuda `task`
+        // delegasyonu yalnız araştırma hedefine bir kez onaylanır. Yazılabilir
+        // ya da hedefsiz delegasyon reddedilir — kullanıcı diyaloğu yoktur,
+        // karar ret yönünde verilir.
+        if toolName.lowercased() == "task" {
+            guard ToolApprovalPolicy.isResearchDelegationTarget(delegationTarget) else {
+                return .deny(reason: "taskDelegationOutsideResearchTarget:\(delegationTarget ?? "unknown")")
+            }
+            return .approveOnce
+        }
         guard !ToolApprovalPolicy.isComputerUseTool(toolName) else {
             return .deny(reason: "computerUseRequiresHumanApproval")
         }
