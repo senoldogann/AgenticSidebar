@@ -140,6 +140,9 @@ final class ScreenshotMonitorService {
     private var trackedFilePaths: [String] = []
     private var trackedFilePathSet: Set<String> = []
     private var pendingSubmissions: [PendingSubmission] = []
+    /// Son taranan dizin mtime'ı (`nil` = henüz taranmadı). Dizin değişmediyse
+    /// tarama atlanır (enerji); pano ve kuyruk akışı etkilenmez.
+    private var lastScannedDirectoryModDate: Date?
     private var timer: Timer?
     /// Whether a tick is still running; see ``tick()``.
     private var isTicking = false
@@ -242,11 +245,19 @@ final class ScreenshotMonitorService {
         isTicking = true
         defer { isTicking = false }
 
-        for fileURL in await scannedRecentScreenshotFileURLs()
-        where !trackedFilePathSet.contains(fileURL.path) {
-            // Mark before awaiting so a slow analysis cannot re-process the file.
-            track(fileURL.path)
-            await analyzeScreenshot(at: fileURL)
+        // Enerji: dizin değişmediyse tarama atlanır. Her saniye yapılan tam
+        // dizin gezmesi + Spotlight sorgusu, boşta bile CPU'yu uyandırıp
+        // "önemli enerji" listesine sokuyordu. Dizin mtime'ı değişmediyse
+        // yeni dosya da yoktur; pano ve kuyruk akışı aynen çalışır.
+        let directoryModDate = Self.directoryModificationDate(of: screenshotsDirectoryURL)
+        if Self.shouldRescan(directoryModDate: directoryModDate, lastScannedModDate: lastScannedDirectoryModDate) {
+            lastScannedDirectoryModDate = directoryModDate
+            for fileURL in await scannedRecentScreenshotFileURLs()
+            where !trackedFilePathSet.contains(fileURL.path) {
+                // Mark before awaiting so a slow analysis cannot re-process the file.
+                track(fileURL.path)
+                await analyzeScreenshot(at: fileURL)
+            }
         }
 
         await capturePasteboardImageIfNeeded()
@@ -270,7 +281,7 @@ final class ScreenshotMonitorService {
                 [Screenshot captured: \(fileName)]
                 \(contentSection)
 
-                EXAM SOLVER: Inspect this screenshot carefully. Identify any test, exam, quiz, or homework questions visible in the image. State the direct answer first (e.g. "**Correct Answer: B**"), then provide the step-by-step mathematical derivation, reasoning, or code solution.
+                EXAM SOLVER: Inspect this screenshot carefully. Detect every visible test, exam, quiz, or homework question (single/multi choice, true/false, numeric, written, or code) and the question language; answer in that language. State the direct answer first (e.g. "**Correct Answer: B**"), then the step-by-step derivation, reasoning, or complete code solution. Use Unicode math in prose and $$ blocks only for display equations.
                 """
         }
 
@@ -440,6 +451,21 @@ final class ScreenshotMonitorService {
         return await Task.detached(priority: .utility) {
             Self.scanRecentScreenshots(in: directoryURL, now: now)
         }.value
+    }
+
+    /// Dizin mtime'ı: atlama kararının tek girdisi. Tek `stat` maliyetindedir;
+    /// dizin yoksa `nil` döner (o zaman tarama koşar, zaten boş döner).
+    nonisolated static func directoryModificationDate(of directoryURL: URL) -> Date? {
+        try? directoryURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    /// Dizin değişmediyse tarama atlanır. İlk tarama (`nil`) ve okunamayan
+    /// dizin her zaman tarar; yanlış atlama yeni dosyayı kaçırırdı.
+    nonisolated static func shouldRescan(directoryModDate: Date?, lastScannedModDate: Date?) -> Bool {
+        guard let last = lastScannedModDate, let current = directoryModDate else {
+            return true
+        }
+        return current > last
     }
 
     /// One walk of the screenshots folder, filtered to the files that appeared in

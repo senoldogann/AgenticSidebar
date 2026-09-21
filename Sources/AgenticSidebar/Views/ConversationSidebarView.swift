@@ -76,7 +76,10 @@ struct ConversationSidebarView: View {
         List {
             Section("Sessions") {
                 Button {
-                    sessionService.createSession()
+                    // Sohbet hemen doğmaz: bekleyen taslak açılır, ilk
+                    // gönderimde gerçek oturum olur. Taslak varsa aynı
+                    // anahtar döner, yazılan korunur.
+                    sessionService.beginPendingSession()
                 } label: {
                     HStack(spacing: 8) {
                         Image(systemName: "plus")
@@ -140,6 +143,9 @@ struct ConversationSidebarView: View {
         }
         .listStyle(.sidebar)
         .scrollContentBackground(.hidden)
+        // Liste odağı mavi çerçeve çizer (tıklama ve sağ tıkta): satırlar
+        // kendi seçili zeminini zaten çizer, sistem odak efekti kapalı.
+        .focusEffectDisabled()
         .navigationTitle(AppIdentity.name)
         .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 290)
         .toolbar {
@@ -738,6 +744,8 @@ struct ConversationSidebarView: View {
             .help("Drag onto the open conversation to work side by side")
         }
         .buttonStyle(.plain)
+        // Sağ tık odağı mavi çerçeve çizer; görsel odak efekti kapalı, işlev aynı.
+        .focusEffectDisabled()
         .accessibilityLabel(accessibilityLabel(for: session, isActive: isActive, isSelected: isSelected))
         .contextMenu {
             Button {

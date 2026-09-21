@@ -281,6 +281,18 @@ enum TaskBoardPresenter {
         }
     }
 
+    /// Boş-durum birincil eylemi: yalnız yüklü ve boş panoda "İlk görevi
+    /// oluştur" çıkar; projesiz/yükleniyor/hatalı durumda eylem yoktur
+    /// (proje kaydı pano altındaki satırdan yapılır).
+    static func emptyCallToAction(cards: [TaskBoardCard], state: TaskBoardLoadState) -> String? {
+        switch state {
+        case .loaded where cards.isEmpty:
+            "İlk görevi oluştur"
+        default:
+            nil
+        }
+    }
+
     /// Bırakma hiçbir durum mutasyonu üretmez; yalnızca kullanıcıya gerçeği söyler.
     static func dropFeedback(target: TaskBoardColumnKind) -> TaskBoardDropFeedback {
         TaskBoardDropFeedback(
@@ -426,15 +438,49 @@ struct TaskBoardView: View {
         TaskBoardPresenter.present(cards: store.cards, state: loadState)
     }
 
+    /// Detay bölmesine giden denetçi girdisi: mağaza seçili görev için
+    /// kanıt/bulgu yüklediyse gerçek değerler kullanılır, yoksa çağrı
+    /// anındaki enjekte girdi (üretimde `unwired`) korunur. Gövde mağaza
+    /// değiştikçe yeniden hesaplandığı için seçim sonrası yüklenen
+    /// değerler karta yansır.
+    private var resolvedInspectorInput: TaskBoardInspectorInput {
+        if let selected = store.selectedTaskID, store.selectedInspectorTaskID == selected {
+            return TaskBoardInspectorInput(
+                evidence: store.selectedTaskEvidence,
+                currentFingerprint: store.selectedTaskFingerprint,
+                findings: store.selectedTaskFindings,
+                workspaceID: store.selectedTaskWorkspaceID,
+                diffSummary: nil,
+                warning: store.selectedInspectorWarning
+            )
+        }
+        return inspectorInput
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             boardColumn
 
             if let selectedTaskID = store.selectedTaskID {
                 Divider().opacity(0.4)
-                TaskDetailView(store: store, preset: preset, isDark: isDark, input: inspectorInput)
+                TaskDetailView(store: store, preset: preset, isDark: isDark, input: resolvedInspectorInput)
                     .id(TaskDetailPresenter.paneIdentity(for: selectedTaskID))
                     .frame(minWidth: 320, idealWidth: 380, maxWidth: 460)
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            Task { await store.selectTask(nil) }
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .frame(width: 22, height: 22)
+                                .interactiveHoverCircle()
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .help("Görev detayını kapat")
+                        .accessibilityLabel("Görev detayını kapat")
+                        .padding(6)
+                    }
             }
         }
         .background(preset.background(isDark: isDark))
@@ -539,7 +585,10 @@ struct TaskBoardView: View {
     @ViewBuilder
     private var content: some View {
         if store.cards.isEmpty, let emptyMessage = presentation.emptyMessage {
-            emptyState(emptyMessage)
+            emptyState(
+                emptyMessage,
+                callToAction: TaskBoardPresenter.emptyCallToAction(cards: store.cards, state: loadState)
+            )
         } else if showsBlockedOnly {
             blockedLane
         } else {
@@ -638,7 +687,7 @@ struct TaskBoardView: View {
         )
     }
 
-    private func emptyState(_ message: String) -> some View {
+    private func emptyState(_ message: String, callToAction: String?) -> some View {
         VStack(spacing: 8) {
             Image(systemName: "rectangle.split.3x1")
                 .font(.system(size: 22, weight: .light))
@@ -646,6 +695,21 @@ struct TaskBoardView: View {
             Text(message)
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
+            if loadState == .idle {
+                Text("Başlayın: aşağıdaki satırdan projenizin Git klasörünü ekleyin")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+            if let callToAction {
+                Button(callToAction) {
+                    showsCreationSheet = true
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .pointingHandCursor()
+                .help("Bu projeye ilk görevi ekleyin")
+                .accessibilityLabel(callToAction)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .combine)
@@ -786,6 +850,67 @@ private struct TaskBoardCardView: View {
 
 // MARK: - Görev oluşturma
 
+/// Oluşturma formunun görünümden bağımsız mantığı: doğrulama, öncelik
+/// eşlemesi ve hazır şablonlar. Panodaki sıralama önceliği büyükten küçüğe
+/// yaptığı için Yüksek her zaman Normal'in üstündedir.
+enum TaskCreationForm {
+    enum Priority: String, CaseIterable, Identifiable {
+        case low = "Düşük"
+        case normal = "Normal"
+        case high = "Yüksek"
+
+        var id: String { rawValue }
+    }
+
+    struct Template: Equatable {
+        let name: String
+        let title: String
+        let objective: String
+        let criteria: [String]
+    }
+
+    static let templates: [Template] = [
+        Template(
+            name: "Hata düzeltmesi",
+            title: "Hata düzeltmesi: ",
+            objective: "Hatayı yeniden üretin, kök nedeni düzeltin, regresyon testiyle doğrulayın.",
+            criteria: ["Hata yeniden üretildi", "Kök neden düzeltildi", "Regresyon testi yeşil"]
+        ),
+        Template(
+            name: "Küçük özellik",
+            title: "Özellik: ",
+            objective: "İstenen davranışı en küçük kapsamda uygulayın ve testle kanıtlayın.",
+            criteria: ["Davranış çalışıyor", "Test eklendi ve yeşil", "Lint temiz"]
+        ),
+        Template(
+            name: "Kod incelemesi",
+            title: "İnceleme: ",
+            objective: "Değişikliği okuyun, bulguları kaydedin, kabul kararını verin.",
+            criteria: ["Değişiklik okundu", "Bulgular kaydedildi", "Kabul kararı verildi"]
+        ),
+    ]
+
+    /// Pano sıralamasıyla aynı ölçek: büyük sayı üstte.
+    static func priorityValue(for priority: Priority) -> Int {
+        switch priority {
+        case .low: 0
+        case .normal: 1
+        case .high: 2
+        }
+    }
+
+    /// Formun eksik yanı varsa tek cümlelik Türkçe gerekçe, yoksa nil.
+    static func validationError(title: String, objective: String) -> String? {
+        if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Başlık zorunlu — görevi tek cümleyle adlandırın"
+        }
+        if objective.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Amaç zorunlu — ajanın ne yapacağını yazın"
+        }
+        return nil
+    }
+}
+
 /// Yeni görev formu; yalnızca store üzerinden yazar ve reddi gizlemez.
 @MainActor
 private struct TaskCreationSheet: View {
@@ -796,29 +921,53 @@ private struct TaskCreationSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var title = ""
     @State private var objective = ""
-    @State private var priorityText = "1"
+    @State private var priority: TaskCreationForm.Priority = .normal
     @State private var criteriaText = ""
     @State private var isSubmitting = false
     @State private var failureMessage: String?
+
+    private var formError: String? {
+        TaskCreationForm.validationError(title: title, objective: objective)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Yeni görev")
                 .font(.system(size: 14, weight: .semibold))
 
-            TextField("Başlık", text: $title)
+            Text("Başlık ve amaç zorunlu; ölçütler her satırda bir tane. Öncelik pano sırasını belirler.")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            Menu("Şablondan doldur") {
+                ForEach(TaskCreationForm.templates, id: \.name) { template in
+                    Button(template.name) {
+                        apply(template)
+                    }
+                }
+            }
+            .controlSize(.small)
+            .help("Hazır bir şablonla formu doldurun, sonra kendinize göre düzenleyin")
+            .accessibilityLabel("Şablondan doldur")
+
+            TextField("Başlık (ör. Giriş ekranındaki çökme)", text: $title)
                 .textFieldStyle(.roundedBorder)
                 .accessibilityLabel("Görev başlığı")
 
-            TextField("Amaç", text: $objective, axis: .vertical)
+            TextField("Amaç (ör. Çökmenin kök nedenini bulup düzeltin)", text: $objective, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(2...4)
                 .accessibilityLabel("Görev amacı")
 
-            TextField("Öncelik (sayı)", text: $priorityText)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 140)
-                .accessibilityLabel("Öncelik")
+            Picker("Öncelik", selection: $priority) {
+                ForEach(TaskCreationForm.Priority.allCases) { option in
+                    Text(option.rawValue).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 240)
+            .help("Yüksek öncelik panoda üstte görünür")
+            .accessibilityLabel("Öncelik")
 
             TextField("Ölçütler (her satır bir ölçüt)", text: $criteriaText, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
@@ -841,7 +990,8 @@ private struct TaskCreationSheet: View {
                     .pointingHandCursor()
                 Button("Oluştur") { submit() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(isSubmitting || store.selectedProjectID == nil)
+                    .disabled(isSubmitting || store.selectedProjectID == nil || formError != nil)
+                    .help(formError ?? "Görevi backlog'a ekleyin")
                     .accessibilityLabel(isSubmitting ? "Görev oluşturuluyor" : "Görevi oluştur")
             }
         }
@@ -850,13 +1000,20 @@ private struct TaskCreationSheet: View {
         .background(preset.background(isDark: isDark))
     }
 
+    private func apply(_ template: TaskCreationForm.Template) {
+        title = template.title
+        objective = template.objective
+        criteriaText = template.criteria.joined(separator: "\n")
+        failureMessage = nil
+    }
+
     private func submit() {
         guard let projectID = store.selectedProjectID else {
             failureMessage = "Proje seçilmedi"
             return
         }
-        guard let priority = Int(priorityText.trimmingCharacters(in: .whitespacesAndNewlines)), priority >= 0 else {
-            failureMessage = "Öncelik sıfır veya pozitif bir sayı olmalı"
+        if let formError {
+            failureMessage = formError
             return
         }
         let criteria =
@@ -872,7 +1029,7 @@ private struct TaskCreationSheet: View {
                 projectID: projectID,
                 title: title,
                 objective: objective,
-                priority: priority,
+                priority: TaskCreationForm.priorityValue(for: priority),
                 criteria: criteria
             )
             isSubmitting = false

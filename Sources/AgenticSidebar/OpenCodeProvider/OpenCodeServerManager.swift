@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Security
 
@@ -13,6 +14,12 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     private let listenerVerifier: any OpenCodeListenerVerifying
     private let credentialStore: any CredentialStore
     private let workingDirectoryURL: URL
+    /// Uygulamanın kendi defteri: üretilen yapılandırma dosyaları ve sunucu
+    /// kiraları burada yaşar. Çalışma dizini ajanın çalıştığı yerdir; ikisi
+    /// ayrıldığında çalışma alanına köklenmiş bir sunucu sahipli çalışma
+    /// kopyasına kendi dosyalarını yazmaz. Varsayılan, sohbet sunucusunun
+    /// mevcut davranışıdır: durum dizini çalışma dizinidir.
+    private let stateDirectoryURL: URL
     private let passwordGenerator: @Sendable () async throws -> String
 
     private var processHandle: (any OpenCodeProcessHandling)?
@@ -42,6 +49,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         listenerVerifier: any OpenCodeListenerVerifying = LibprocListenerVerifier(),
         credentialStore: any CredentialStore,
         workingDirectoryURL: URL,
+        stateDirectoryURL: URL? = nil,
         passwordGenerator: @escaping @Sendable () async throws -> String,
         extensionSnapshotProvider: (@Sendable () async -> ExtensionRuntimeSnapshot)? = nil
     ) {
@@ -52,6 +60,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         self.listenerVerifier = listenerVerifier
         self.credentialStore = credentialStore
         self.workingDirectoryURL = workingDirectoryURL
+        self.stateDirectoryURL = stateDirectoryURL ?? workingDirectoryURL
         self.passwordGenerator = passwordGenerator
         // Set here, not by a later call: a provider installed after construction
         // leaves a window in which a start writes a configuration with no
@@ -83,7 +92,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         _ = try? Self.writeManagedConfiguration(
             computerUse: activeComputerUse,
             extensions: configuration,
-            workingDirectoryURL: workingDirectoryURL
+            workingDirectoryURL: stateDirectoryURL
         )
     }
 
@@ -105,7 +114,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                     let pid = activePID ?? handlePID ?? 0
                     await processHandle.terminate()
                     if pid > 0 {
-                        OpenCodeServerLedger.release(pid: pid, in: workingDirectoryURL)
+                        OpenCodeServerLedger.release(pid: pid, in: stateDirectoryURL)
                     }
                 }
                 activePID = nil
@@ -153,7 +162,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         // portunu almadan süpürme bitmelidir.
         if !hasReapedOrphans {
             hasReapedOrphans = true
-            let directory = workingDirectoryURL
+            let directory = stateDirectoryURL
             _ = await Task.detached(priority: .utility) {
                 OpenCodeServerLedger.reapOrphans(in: directory)
             }.value
@@ -164,7 +173,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         }
 
         let password = try await resolveServerPassword()
-        try Self.writeBaseConfiguration(at: workingDirectoryURL)
+        try Self.writeBaseConfiguration(at: stateDirectoryURL)
 
         if let extensionConfigurationProvider {
             extensionConfiguration = await extensionConfigurationProvider()
@@ -177,7 +186,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         let configurationPath = try Self.writeManagedConfiguration(
             computerUse: computerUse,
             extensions: extensionConfiguration,
-            workingDirectoryURL: workingDirectoryURL
+            workingDirectoryURL: stateDirectoryURL
         )
 
         var lastError = ProviderRuntimeError.startupFailure
@@ -218,7 +227,12 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                     connection: candidateConnection,
                     configurationPath: configurationPath
                 ),
-                workingDirectoryURL: workingDirectoryURL
+                workingDirectoryURL: workingDirectoryURL,
+                // Süreç çalışma dizini ajanın çalıştığı yerdir, günlük ise
+                // uygulamanın defterine düşer. İkisi ayrıldığında (çalışma
+                // alanına köklenmiş sunucu) sahipli çalışma kopyasına
+                // `opencode-server.log` yazılmaz.
+                logDirectoryURL: stateDirectoryURL
             )
 
             serverStatus = .starting
@@ -272,17 +286,20 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                             executablePath: executableURL.path,
                             startedAt: Date()
                         ),
-                        in: workingDirectoryURL
+                        in: stateDirectoryURL
                     )
                 }
                 AppLog.openCode.info(
                     "OpenCode \(version, privacy: .public) listening on authenticated loopback"
                 )
+                // Sabitlenen sürümden sapma şema kayması demektir; kayıt düşülür,
+                // başlatma engellenmez.
+                ManagedOpenCodeConfiguration.validateRuntimeVersion(version)
                 return candidateConnection
             } catch let error as ProviderRuntimeError {
                 await launchedHandle.terminate()
                 if let launchedPID, launchedPID > 0 {
-                    OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                    OpenCodeServerLedger.release(pid: launchedPID, in: stateDirectoryURL)
                 }
                 activePID = nil
                 processHandle = nil
@@ -304,7 +321,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                 // was both wasteful and misleading.
                 await launchedHandle.terminate()
                 if let launchedPID, launchedPID > 0 {
-                    OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                    OpenCodeServerLedger.release(pid: launchedPID, in: stateDirectoryURL)
                 }
                 activePID = nil
                 processHandle = nil
@@ -314,7 +331,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             } catch {
                 await launchedHandle.terminate()
                 if let launchedPID, launchedPID > 0 {
-                    OpenCodeServerLedger.release(pid: launchedPID, in: workingDirectoryURL)
+                    OpenCodeServerLedger.release(pid: launchedPID, in: stateDirectoryURL)
                 }
                 activePID = nil
                 processHandle = nil
@@ -333,7 +350,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             let pid = activePID ?? handlePID ?? 0
             await processHandle.terminate()
             if pid > 0 {
-                OpenCodeServerLedger.release(pid: pid, in: workingDirectoryURL)
+                OpenCodeServerLedger.release(pid: pid, in: stateDirectoryURL)
             }
         }
 
@@ -506,7 +523,7 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         }
     }
 
-    private static func generateSecurePassword() async throws -> String {
+    static func generateSecurePassword() async throws -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         guard status == errSecSuccess else {
@@ -579,5 +596,252 @@ struct URLSessionOpenCodeHealthChecker: OpenCodeHealthChecking {
     private struct HealthResponse: Decodable {
         let healthy: Bool
         let version: String
+    }
+}
+
+/// Bir görev çalışma alanına köklenmiş sunucunun tek kullanımlık oturumu.
+///
+/// `release` idempotenttir: terminal tamamlanma, iptal, kapanış ve başlatma
+/// hatası aynı yolu kullanır; ikinci çağrı hiçbir şeye dokunmaz.
+struct OpenCodeWorkspaceServerSession: Sendable {
+    /// Kanonik çalışma alanı yolu; sunucunun çalışma dizini budur.
+    let workspacePath: String
+    let manager: any OpenCodeServerManaging
+    let connection: OpenCodeServerConnection
+    /// Sunucuyu durdurur ve çalışma alanı slotunu serbest bırakır.
+    let release: @Sendable () async -> Void
+}
+
+/// Çalışma alanına köklenmiş sunucu üretiminin kapalı kalma hataları.
+enum OpenCodeWorkspaceServerError: Error, Equatable, LocalizedError {
+    /// Sahipli çalışma alanı gerçek bir dizin değil; köklenemez.
+    case workspaceNotRootable(path: String, reason: String)
+    /// Bu çalışma alanı için zaten etkin bir sunucu var.
+    case workspaceServerAlreadyActive(path: String)
+    /// Sunucu süreci ayağa kalkamadı.
+    case startupFailed(path: String, reason: String)
+    /// Gönderim hattı çalışma alanına köklenmiş sunucu üretemiyor.
+    case rootingUnavailable(workspacePath: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .workspaceNotRootable(let path, let reason):
+            return "The owned workspace at \(path) cannot be rooted: \(reason)"
+        case .workspaceServerAlreadyActive(let path):
+            return "A workspace-rooted OpenCode server is already active for \(path)"
+        case .startupFailed(let path, let reason):
+            return "The workspace-rooted OpenCode server for \(path) failed to start: \(reason)"
+        case .rootingUnavailable(let workspacePath):
+            return
+                "No workspace-rooted OpenCode server factory is wired; refusing to run task dispatch against a server that is not rooted at \(workspacePath)"
+        }
+    }
+}
+
+/// Her canlı koşu için sahipli çalışma alanına köklenmiş ayrı bir OpenCode
+/// sunucusu açar.
+///
+/// Sunucu uygulaması yeniden yazılmaz: her çalışma alanı, mevcut
+/// ``ManagedOpenCodeServerManager``'ın kendi kökü (süreç çalışma dizini) ve
+/// kendi durum ad alanı (yapılandırma + kiralar) ile kurulmuş bir örneğini
+/// alır. Durum ad alanı çalışma alanının kanonik yolundan türetilir, böylece
+/// aynı çalışma alanının çökme artıkları sonraki açılışta yalnızca kendi
+/// defterinden süpürülür; sohbet sunucusunun defterine karışılmaz.
+///
+/// Eşzamanlılık sınırı: etkin çalışma alanı başına en fazla bir sunucu. Farklı
+/// çalışma alanları paralel koşabilir; portlar işletim sisteminin boş port
+/// dağıtımından, parolalar her başlatmada üretilen rastgele değerlerden gelir.
+actor OpenCodeWorkspaceServerFactory {
+    private struct ActiveServer {
+        let id: UUID
+        let manager: any OpenCodeServerManaging
+    }
+
+    private let executableLocator: any OpenCodeExecutableLocating
+    private let processLauncher: any OpenCodeProcessLaunching
+    private let healthChecker: any OpenCodeHealthChecking
+    private let portAllocator: any OpenCodePortAllocating
+    private let listenerVerifier: any OpenCodeListenerVerifying
+    private let credentialStore: any CredentialStore
+    private let stateRootURL: URL
+    private let passwordGenerator: @Sendable () async throws -> String
+
+    private var activeServers: [String: ActiveServer] = [:]
+    /// `acquire` askıya alındığında (süreç başlatma) aynı çalışma alanı için
+    /// ikinci bir çağrının ikinci bir sunucu açmasını engelleyen rezervasyon.
+    private var reservations: Set<String> = []
+
+    init(
+        executableLocator: any OpenCodeExecutableLocating,
+        processLauncher: any OpenCodeProcessLaunching,
+        healthChecker: any OpenCodeHealthChecking,
+        portAllocator: any OpenCodePortAllocating,
+        listenerVerifier: any OpenCodeListenerVerifying,
+        credentialStore: any CredentialStore,
+        stateRootURL: URL,
+        passwordGenerator: @escaping @Sendable () async throws -> String
+    ) {
+        self.executableLocator = executableLocator
+        self.processLauncher = processLauncher
+        self.healthChecker = healthChecker
+        self.portAllocator = portAllocator
+        self.listenerVerifier = listenerVerifier
+        self.credentialStore = credentialStore
+        self.stateRootURL = stateRootURL
+        self.passwordGenerator = passwordGenerator
+    }
+
+    /// Sistem ikilisini ve gerçek süreç altyapısını kullanan üretim fabrikası.
+    static func live(
+        credentialStore: any CredentialStore,
+        stateRootURL: URL
+    ) -> OpenCodeWorkspaceServerFactory {
+        OpenCodeWorkspaceServerFactory(
+            executableLocator: SystemOpenCodeExecutableLocator.current(),
+            processLauncher: FoundationOpenCodeProcessLauncher(),
+            healthChecker: URLSessionOpenCodeHealthChecker.shared(),
+            portAllocator: SystemOpenCodePortAllocator(),
+            listenerVerifier: LibprocListenerVerifier(),
+            credentialStore: credentialStore,
+            stateRootURL: stateRootURL,
+            passwordGenerator: ManagedOpenCodeServerManager.generateSecurePassword
+        )
+    }
+
+    /// Sahipli çalışma alanı için bir sunucu açar.
+    ///
+    /// - Throws: `workspaceNotRootable` (dizin yok), `workspaceServerAlreadyActive`
+    ///   (aynı çalışma alanı için etkin/rezerve sunucu var) ya da
+    ///   `startupFailed` (süreç ayağa kalkmadı). Her hata yolu çocuk süreçleri
+    ///   sonlandırır; slot serbest kalır.
+    func acquire(workspacePath: String) async throws -> OpenCodeWorkspaceServerSession {
+        let canonicalPath = Self.canonicalPath(workspacePath)
+
+        var isDirectory: ObjCBool = false
+        guard
+            FileManager.default.fileExists(atPath: canonicalPath, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        else {
+            throw OpenCodeWorkspaceServerError.workspaceNotRootable(
+                path: canonicalPath,
+                reason: "the owned workspace path is not an existing directory"
+            )
+        }
+
+        guard activeServers[canonicalPath] == nil, !reservations.contains(canonicalPath) else {
+            throw OpenCodeWorkspaceServerError.workspaceServerAlreadyActive(path: canonicalPath)
+        }
+        reservations.insert(canonicalPath)
+        defer { reservations.remove(canonicalPath) }
+
+        let manager = ManagedOpenCodeServerManager(
+            executableLocator: executableLocator,
+            processLauncher: processLauncher,
+            healthChecker: healthChecker,
+            portAllocator: portAllocator,
+            listenerVerifier: listenerVerifier,
+            credentialStore: credentialStore,
+            workingDirectoryURL: URL(fileURLWithPath: canonicalPath, isDirectory: true),
+            stateDirectoryURL: stateDirectoryURL(forCanonicalPath: canonicalPath),
+            passwordGenerator: passwordGenerator
+        )
+
+        let connection: OpenCodeServerConnection
+        do {
+            connection = try await manager.start(computerUse: nil)
+        } catch {
+            // Manager kendi çocuğunu ve kirasını temizler; burada yalnızca
+            // rezervasyon serbest kalır (defer) ve hata tiplenir.
+            throw OpenCodeWorkspaceServerError.startupFailed(
+                path: canonicalPath,
+                reason: String(describing: error)
+            )
+        }
+
+        let id = UUID()
+        activeServers[canonicalPath] = ActiveServer(id: id, manager: manager)
+        let release: @Sendable () async -> Void = { [weak self] in
+            await self?.release(workspacePath: canonicalPath, serverID: id)
+        }
+        return OpenCodeWorkspaceServerSession(
+            workspacePath: canonicalPath,
+            manager: manager,
+            connection: connection,
+            release: release
+        )
+    }
+
+    /// Sunucuyu durdurur ve slotu serbest bırakır; yalnızca aynı oturum için
+    /// etkilidir, sonradan açılmış bir sunucuya dokunmaz.
+    func release(workspacePath: String, serverID: UUID) async {
+        guard let active = activeServers[workspacePath], active.id == serverID else {
+            return
+        }
+        activeServers[workspacePath] = nil
+        await active.manager.stop()
+    }
+
+    /// Bu süreçte etkin sunucu bulunan çalışma alanlarının kanonik yolları.
+    func activeWorkspacePaths() -> Set<String> {
+        Set(activeServers.keys)
+    }
+
+    /// Kapanış yolu: hâlâ etkin olan bütün çalışma alanı sunucularını durdurur.
+    ///
+    /// Terminal tamamlanmadan sonra bırakma asenkron tamamlanır; uygulama
+    /// kapanırken bu pencere kapatılır. Bırakma yolları idempotenttir, geç
+    /// gelen bir `release` artık hiçbir şeye dokunmaz.
+    ///
+    /// Durdurmalar paralel koşar (`TaskGroup`) ve 10 sn üst sınırı vardır:
+    /// süre dolarsa bekleme bırakılır, kalan durdurmalar iptal edilir.
+    /// Slotlar önceden boşaltıldığı için geç gelen `release` yine de
+    /// hiçbir şeye dokunmaz.
+    static let stopAllTimeout: Duration = .seconds(10)
+
+    @discardableResult
+    func stopAll() async -> Int {
+        let servers = Array(activeServers.values)
+        activeServers.removeAll()
+        guard !servers.isEmpty else {
+            return 0
+        }
+        let finished = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+            group.addTask {
+                await withTaskGroup(of: Void.self) { inner in
+                    for server in servers {
+                        inner.addTask { await server.manager.stop() }
+                    }
+                }
+                return !Task.isCancelled
+            }
+            group.addTask {
+                try? await Task.sleep(for: Self.stopAllTimeout)
+                return false
+            }
+            guard let first = await group.next() else {
+                return true
+            }
+            group.cancelAll()
+            return first
+        }
+        if !finished {
+            AppLog.openCode.error("stopAll exceeded its 10s budget; remaining stops were cancelled")
+        }
+        return servers.count
+    }
+
+    /// Bir çalışma alanının yapılandırma/kiralama ad alanı.
+    func stateDirectoryURL(forWorkspacePath workspacePath: String) async -> URL {
+        stateDirectoryURL(forCanonicalPath: Self.canonicalPath(workspacePath))
+    }
+
+    private func stateDirectoryURL(forCanonicalPath canonicalPath: String) -> URL {
+        let digest = SHA256.hash(data: Data(canonicalPath.utf8))
+        let namespace = digest.map { String(format: "%02x", $0) }.joined()
+        return stateRootURL.appendingPathComponent(namespace, isDirectory: true)
+    }
+
+    private static func canonicalPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardized.path
     }
 }

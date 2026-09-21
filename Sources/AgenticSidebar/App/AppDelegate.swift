@@ -17,6 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Kapanışın beklenebileceği en uzun süre. Adımların her biri kendi başına
     /// sınırlı; ama tek bir adımın takılması uygulamayı kapatılamaz hâle
     /// getirmemeli.
+    ///
+    /// İki kademelidir: yumuşak sürede (`shutdownSoftDeadline`) işin kendi
+    /// başına bitmesi beklenir, dolarsa iptal istenip sert süre
+    /// (`shutdownDeadline`) kadar son şans verilir.
+    static let shutdownSoftDeadline = Duration.seconds(2)
     static let shutdownDeadline = Duration.seconds(3)
 
     private var terminationTask: Task<Void, Never>?
@@ -98,6 +103,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 _ = await Self.runShutdown(managedShutdown)
             }
 
+            // Sinyal yolu `applicationShouldTerminate`e uğramaz: temiz çıkış
+            // işareti burada da silinir, yoksa sonraki açılış çökme sanır.
+            CrashReporter.markCleanExit()
             AppLog.lifecycle.info("Termination signal handled; exiting")
             exit(EXIT_SUCCESS)
         }
@@ -173,7 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let finished = await Self.runShutdown(managedShutdown)
                 if !finished {
                     AppLog.lifecycle.error(
-                        "Managed shutdown did not finish within \(Self.shutdownDeadline.components.seconds, privacy: .public)s; terminating anyway"
+                        "Managed shutdown did not finish within soft \(Self.shutdownSoftDeadline.components.seconds, privacy: .public)s + hard \(Self.shutdownDeadline.components.seconds, privacy: .public)s; terminating anyway"
                     )
                 }
 
@@ -190,10 +198,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .terminateLater
     }
 
-    /// Kapanışı bir son tarihle çalıştırır.
+    /// Kapanışı iki kademeli son tarihle çalıştırır.
     ///
-    /// Sonuç `true` ise temizlik kendi başına bitti; `false` ise süre doldu ve
-    /// uygulama yine de kapanıyor. Kapatmak kullanıcının kararıdır: yanıt vermeyen
+    /// Sonuç `true` ise temizlik kendi başına bitti (yumuşak sürede ya da
+    /// iptal sonrası sert sürede); `false` ise iki süre de doldu ve uygulama
+    /// yine de kapanıyor. Kapatmak kullanıcının kararıdır: yanıt vermeyen
     /// bir pencere bırakmak, tek bir adımın tamamlanmamasından daha kötüdür.
     ///
     /// Yarış bir görev grubu yerine tek noktadan sonuçlanan bir kapı ile kurulur:
@@ -201,7 +210,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// yalıtım denetleyicisini takıyor.
     static func runShutdown(
         _ shutdown: @escaping @MainActor () async -> Void,
-        deadline: Duration = AppDelegate.shutdownDeadline
+        softDeadline: Duration = AppDelegate.shutdownSoftDeadline,
+        hardDeadline: Duration = AppDelegate.shutdownDeadline
     ) async -> Bool {
         let gate = ShutdownGate()
 
@@ -210,16 +220,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await gate.complete(true)
         }
 
-        let timeout = Task {
-            try? await Task.sleep(for: deadline)
+        let softTimeout = Task {
+            try? await Task.sleep(for: softDeadline)
             await gate.complete(false)
         }
 
-        let finished = await gate.wait()
-        timeout.cancel()
-        if !finished {
-            work.cancel()
+        let finishedSoft = await gate.wait()
+        softTimeout.cancel()
+        if finishedSoft {
+            return true
         }
+
+        // Yumuşak süre doldu: koşan işe iptal verilir, sert süre kadar
+        // bitmesi beklenir. İlk kapı `false` ile kapanmıştır, ikinci yarış
+        // için ayrı kapı gerekir (kapı tek sefer sonuçlanır).
+        AppLog.lifecycle.error("Managed shutdown exceeded its soft deadline; cancelling and waiting out the hard deadline")
+        work.cancel()
+
+        let hardGate = ShutdownGate()
+        let waiter = Task {
+            await work.value
+            await hardGate.complete(true)
+        }
+        let hardTimeout = Task {
+            try? await Task.sleep(for: hardDeadline)
+            await hardGate.complete(false)
+        }
+
+        let finished = await hardGate.wait()
+        hardTimeout.cancel()
+        waiter.cancel()
 
         return finished
     }
@@ -246,8 +276,14 @@ private actor ShutdownGate {
             return decided
         }
 
-        return await withCheckedContinuation { continuation in
-            self.continuation = continuation
+        // İptal kapıyı `false` ile kapatır: bekleyen görev iptal edildiğinde
+        // asılı continuation kalmaz, kapanış iptal edilen işi durdurup sonlanır.
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                self.continuation = continuation
+            }
+        } onCancel: {
+            Task { await self.complete(false) }
         }
     }
 }

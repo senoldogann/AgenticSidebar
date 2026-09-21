@@ -3,9 +3,10 @@ import XCTest
 
 @testable import AgenticSidebar
 
-/// Thinking kanalı (`ProviderEvent.thinkingDelta`) turdaki `.thinking`
-/// aktivitesini doldurur: transkripte karışmaz, boş-tur sayılmaz, araç sonrası
-/// ikinci reasoning bloğunda kart yeniden açılır.
+/// Thinking kanalı (`ProviderEvent.thinkingDelta`) `.thinking` aktivitelerini
+/// doldurur: transkripte karışmaz, boş-tur sayılmaz. Her reasoning bloğu kendi
+/// kartını kurar — araç sonrası ikinci blok kapanan kartı yeniden açmaz,
+/// kronolojik sırada yeni kart olur.
 @MainActor
 final class ThinkingContentSessionTests: XCTestCase {
     func testThinkingDeltasAccumulateInThinkingActivity() async throws {
@@ -48,8 +49,9 @@ final class ThinkingContentSessionTests: XCTestCase {
         XCTAssertEqual(thinking.output, "Hmm")
     }
 
-    /// Araç sonrası ikinci reasoning bloğu kapanan kartı yeniden açar.
-    func testSecondReasoningBlockAfterToolReopensThinking() async throws {
+    /// Araç sonrası ikinci reasoning bloğu yeni kart kurar: düşünme parçaları
+    /// çağrıldıkları yerde alt alta sıralanır, tek kartta toplanmaz.
+    func testSecondReasoningBlockAfterToolCreatesNewThinkingCard() async throws {
         let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
         let session = makeSession(pair: pair)
         let turn = try XCTUnwrap(session.submit("Check then decide"))
@@ -71,11 +73,31 @@ final class ThinkingContentSessionTests: XCTestCase {
         pair.continuation.finish()
         await turn.value
 
-        let thinking = try XCTUnwrap(
-            session.state.activityGroups.flatMap(\.activities).first(where: { $0.kind == .thinking })
-        )
-        XCTAssertEqual(thinking.output, "Plan APlan B")
+        let activities = session.state.activityGroups.flatMap(\.activities)
+        let thinkings = activities.filter { $0.kind == .thinking }
+        XCTAssertEqual(thinkings.map(\.output), ["Plan A", "Plan B"])
+        // Kronolojik sıra: ilk düşünme, araç, ikinci düşünme.
+        let kinds = activities.map(\.kind)
+        XCTAssertEqual(kinds, [.thinking, .read, .thinking])
         XCTAssertEqual(session.state.status, .completed)
+    }
+
+    /// Sınır olayı yoksa ardışık deltalar aynı kartta birikir (kart bölünmez).
+    func testConsecutiveDeltasWithoutBoundaryStayInOneCard() async throws {
+        let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+        let session = makeSession(pair: pair)
+        let turn = try XCTUnwrap(session.submit("Think twice"))
+
+        pair.continuation.yield(.thinkingDelta("First. "))
+        pair.continuation.yield(.thinkingDelta("Second."))
+        pair.continuation.yield(.assistantTextDelta("Answer"))
+        pair.continuation.yield(.completed)
+        pair.continuation.finish()
+        await turn.value
+
+        let thinkings = session.state.activityGroups.flatMap(\.activities).filter { $0.kind == .thinking }
+        XCTAssertEqual(thinkings.count, 1)
+        XCTAssertEqual(thinkings.first?.output, "First. Second.")
     }
 
     /// Thinking deltası gelmeyen turda thinking satırı kurulmaz: reasoning

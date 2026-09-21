@@ -35,7 +35,15 @@ struct SkillsShEntry: Identifiable, Equatable, Sendable, Codable {
 /// where it lives. Fetching the files is `GitHubSkillFetcher`'s job, so a skill
 /// from skills.sh and a skill from a git URL go through the same code path.
 struct SkillsShClient: Sendable {
-    static let searchEndpoint = URL(string: "https://skills.sh/api/search")!
+    static let searchEndpoint: URL = {
+        guard let url = URL(string: "https://skills.sh/api/search") else {
+            preconditionFailure("skills.sh arama uç noktası geçersiz")
+        }
+        return url
+    }()
+
+    /// Katalog yanıtı üst sınırı: üstü çözümlenmez, reddedilir.
+    static let maximumResponseBytes = 1_048_576
 
     let transport: any ExtensionHTTPTransport
 
@@ -69,6 +77,10 @@ struct SkillsShClient: Sendable {
 
     /// Split out so the payload can be tested without a network.
     static func decode(_ data: Data) throws -> [SkillsShEntry] {
+        // Bellek şişmesine karşı çözümlemeden önce bayt sınırı.
+        guard data.count <= maximumResponseBytes else {
+            throw ExtensionFetchError.tooLarge
+        }
         do {
             return try JSONDecoder().decode(SearchResponse.self, from: data).skills
         } catch {

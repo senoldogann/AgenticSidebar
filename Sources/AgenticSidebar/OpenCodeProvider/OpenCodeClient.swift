@@ -399,6 +399,13 @@ struct OpenCodeClient: OpenCodeClientProtocol {
 
     /// The field the flow's URL arrives in has moved between server versions, so
     /// the three names it has used are all read rather than one being trusted.
+    ///
+    /// Yalnızca `https`/`http` düzenleri döndürülür: sunucudan gelen `file`,
+    /// `opencode` gibi düzenler `NSWorkspace.open` üzerinden yerel dosya ya da
+    /// uygulama tetiklerdi. Reddedilen aday loglanıp atlanır; hepsi elenirse
+    /// `nil` döner ve çağıran hiçbir şeyi açmaz.
+    private static let allowedAuthorizationSchemes: Set<String> = ["https", "http"]
+
     static func authorizationURL(in data: Data) -> URL? {
         guard
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -407,9 +414,17 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         }
 
         for key in ["url", "authorizationUrl", "authorization_url"] {
-            if let text = object[key] as? String, let url = URL(string: text) {
-                return url
+            guard let text = object[key] as? String, let url = URL(string: text) else {
+                continue
             }
+            guard let scheme = url.scheme?.lowercased(), allowedAuthorizationSchemes.contains(scheme) else {
+                // Adayın tamamı loglanmaz: sorgu dizgisinde belirteç olabilir.
+                AppLog.openCode.error(
+                    "Rejected MCP authorization URL with disallowed scheme \(url.scheme ?? "-", privacy: .public) in field \(key, privacy: .public)"
+                )
+                continue
+            }
+            return url
         }
 
         return nil

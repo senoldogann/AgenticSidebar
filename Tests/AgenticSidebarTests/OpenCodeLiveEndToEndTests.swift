@@ -51,11 +51,12 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
     private struct E2EStack {
         let composition: TaskBoardComposition
         let repository: SQLiteTaskStore
-        let serverManager: ManagedOpenCodeServerManager
+        let workspaceServers: OpenCodeWorkspaceServerFactory
         let counter: E2EEventCounter
         let registry: E2EProviderRegistry
         let projectID: UUID
         let worktreePath: String
+        let dbURL: URL
     }
 
     @MainActor
@@ -84,33 +85,44 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         try E2EGitFixture.addWorktree(at: worktreeURL, to: repositoryURL, baseSHA: baseSHA)
         print("E2E fixture: repository=\(repositoryURL.path) worktree=\(worktreeURL.path) base=\(baseSHA)")
 
-        // Yönetilen sunucu kökü tek kullanımlık çalışma kopyasıdır; adaptörün
-        // çalışma alanı kapsama denetimi sunucu cwd'sinin çalışma alanına eşit
-        // olmasını şart koşar. Kullanıcının çalışan sunucusuna dokunulmaz.
-        let serverManager = ManagedOpenCodeServerManager(
+        // Üretim kompozisyon yolu: her koşu için çalışma alanına köklenmiş sunucu
+        // fabrikadan alınır. Kullanıcının çalışan sunucusuna dokunulmaz; keşif
+        // sunucusu da aynı fabrikadan gelir ve koşulardan önce bırakılır.
+        let workspaceServers = OpenCodeWorkspaceServerFactory(
             executableLocator: SystemOpenCodeExecutableLocator.current(),
             processLauncher: FoundationOpenCodeProcessLauncher(),
             healthChecker: URLSessionOpenCodeHealthChecker.shared(),
             portAllocator: SystemOpenCodePortAllocator(),
             listenerVerifier: LibprocListenerVerifier(),
             credentialStore: E2ECredentialStore(),
-            workingDirectoryURL: worktreeURL,
+            stateRootURL: root.appendingPathComponent("opencode-workspaces", isDirectory: true),
             passwordGenerator: { "e2e-\(UUID().uuidString)" }
         )
 
+        var discoveryServer: OpenCodeWorkspaceServerSession?
         var stack: E2EStack?
         do {
-            let connection = try await serverManager.start(computerUse: nil)
+            let discovery = try await workspaceServers.acquire(workspacePath: worktreeURL.path)
+            discoveryServer = discovery
+            let connection = discovery.connection
             let transport = URLSessionOpenCodeTransport.streaming()
             let discoveryClient = OpenCodeClient(transport: transport, connection: connection)
             let capabilities = try await discoveryClient.capabilities()
-            let candidates = Self.orderedCandidates(from: capabilities.models)
+            let preferredOverride =
+                ProcessInfo.processInfo.environment["E2E_PREFERRED_PROVIDER"]?
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty } ?? []
+            let candidates = Self.orderedCandidates(
+                from: capabilities.models,
+                preferredProviders: preferredOverride
+            )
             guard let firstCandidate = candidates.first else {
                 throw XCTSkip(
                     "OpenCode prerequisite failed: server is up but no authenticated provider/model is available (GET /provider returned no connected models)"
                 )
             }
-            let serverStatus = await serverManager.status()
+            let serverStatus = await discovery.manager.status()
             var version = "unknown"
             if case .running(let reportedVersion, _) = serverStatus {
                 version = reportedVersion
@@ -118,13 +130,18 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
             print(
                 "E2E candidate models (first 12): " + candidates.prefix(12).map(\.id.rawValue).joined(separator: ",")
             )
+            if !preferredOverride.isEmpty {
+                print("E2E preferred provider override: " + preferredOverride.joined(separator: ","))
+            }
+            print("E2E workspace server: root=\(discovery.workspacePath) baseURL=\(connection.baseURL.absoluteString)")
 
             stack = try await makeStack(
                 root: root,
                 repositoryURL: repositoryURL,
                 worktreeURL: worktreeURL,
                 baseSHA: baseSHA,
-                serverManager: serverManager,
+                serverManager: discovery.manager,
+                workspaceServers: workspaceServers,
                 transport: transport,
                 modelID: firstCandidate.id.rawValue
             )
@@ -134,12 +151,13 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
             )
 
             let adapterCapabilities = await OpenCodeCodingAgentAdapter(
-                serverManager: serverManager,
+                serverManager: discovery.manager,
                 clientFactory: { connection in
                     OpenCodeClient(transport: transport, connection: connection)
                 },
                 permissionHandler: nil,
-                cancelPendingPermissions: nil
+                cancelPendingPermissions: nil,
+                workspaceAccess: .rootedPerRun
             ).capabilities(
                 configuration: SessionConfiguration(
                     providerID: ProviderID("opencode"),
@@ -166,8 +184,14 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
                 print("E2E recipe step: \(step.name) command=\(step.executable) \(step.arguments.joined(separator: " "))")
             }
 
+            // Koşular kendi sunucularını açabilmeli: keşif sunucusu bırakılır.
+            await discovery.release()
+            discoveryServer = nil
+
             try await runHappyPath(stack: stack, candidates: candidates, worktreeURL: worktreeURL)
             try await exerciseCancellation(stack: stack)
+            try await exerciseProviderRestart(stack: stack)
+            try await exerciseAppRestart(stack: stack)
         } catch {
             // Dürüst sonuç: yalnızca gerçekten eksik ortam atlanır; gönderim
             // reddi, düzenleme/terminal üretmeyen koşu ve tüm adayların gerçek
@@ -179,10 +203,11 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
             case .fail(let reason):
                 print("E2E result: failed (\(reason))")
             }
+            if let discoveryServer {
+                await discoveryServer.release()
+            }
             if let stack {
                 await cleanup(stack: stack)
-            } else {
-                await serverManager.stop()
             }
             switch disposition {
             case .skip(let reason):
@@ -241,6 +266,65 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         }
     }
 
+    /// Gerçek koşu olmadan sabitlenen sözleşme: sağlayıcı başına üst sınır,
+    /// onlarca modelli tek sağlayıcının pencereyi tekeline almasını önler.
+    func testCappedCandidatesKeepsEveryProviderRepresented() {
+        func model(_ id: String) -> ProviderModelCapability {
+            ProviderModelCapability(
+                id: ProviderModelID(id),
+                displayName: id,
+                variants: [],
+                contextLimit: nil
+            )
+        }
+        let ordered = Self.orderedCandidates(
+            from: [
+                model("opencode-go/a"),
+                model("opencode-go/b"),
+                model("opencode-go/c"),
+                model("minimax/m1"),
+                model("deepseek/d1"),
+            ]
+        )
+        let capped = Self.cappedCandidates(from: ordered, perProviderLimit: 2, totalLimit: 12)
+        let keys = Set(capped.map(Self.providerKey(of:)))
+        XCTAssertTrue(keys.contains("minimax"), "minimax ilk pencerede temsil edilmeli")
+        XCTAssertTrue(keys.contains("deepseek"), "deepseek ilk pencerede temsil edilmeli")
+        XCTAssertLessThanOrEqual(
+            capped.filter { Self.providerKey(of: $0) == "opencode-go" }.count,
+            2,
+            "opencode-go pencereyi tekeline alamaz"
+        )
+    }
+
+    /// Gerçek koşu olmadan sabitlenen sözleşme: `E2E_PREFERRED_PROVIDER` ile
+    /// verilen önek varsayılan sıranın önüne alınır; diğer adaylar elenmez,
+    /// yalnız arkaya dizilir. Boş liste eski sıralamayı aynen korur.
+    func testPreferredProviderRotatesFirstWithoutDroppingOthers() {
+        func model(_ id: String) -> ProviderModelCapability {
+            ProviderModelCapability(
+                id: ProviderModelID(id),
+                displayName: id,
+                variants: [],
+                contextLimit: nil
+            )
+        }
+        let models = [
+            model("opencode-go/kimi-k2.7-code"),
+            model("deepseek/d1"),
+            model("minimax/m1"),
+        ]
+        let rotated = Self.orderedCandidates(from: models, preferredProviders: ["minimax"])
+        XCTAssertEqual(rotated.first?.id.rawValue, "minimax/m1", "Öncelikli önek ilk aday olmalı")
+        XCTAssertEqual(rotated.count, 3, "Öncelik kimseyi elememeli")
+        let classic = Self.orderedCandidates(from: models)
+        XCTAssertEqual(
+            classic.first?.id.rawValue,
+            "opencode-go/kimi-k2.7-code",
+            "Varsayılan sıra değişmemeli"
+        )
+    }
+
     // MARK: - Mutlu yol
 
     @MainActor
@@ -253,7 +337,10 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         let proofURL = worktreeURL.appendingPathComponent("Sources/FixtureKit/AgentProof.swift")
         var candidateFailures: [String] = []
 
-        for candidate in candidates.prefix(8) {
+        for candidate in Self.cappedCandidates(from: candidates, perProviderLimit: 2, totalLimit: 12) {
+            // Bir önceki adayın sunucusu bırakılmadan aynı çalışma kopyasında
+            // yeni sunucu açılamaz; bekleme bu yarışı deterministik kılar.
+            try await waitForWorkspaceServerRelease(stack: stack, timeout: 120)
             // Her aday temiz bir çalışma kopyasıyla başlar: önceki adayın
             // yarım düzenlemesi sonrakinin işi gibi görünemez.
             try E2EGitFixture.resetWorktree(at: worktreeURL)
@@ -265,6 +352,7 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
                     Create a new Swift file at Sources/FixtureKit/AgentProof.swift with exactly this content:
                     public func agentProof() -> String { "agent-proof" }
                     Do not change any other file. Use the edit or write tool for that path.
+                    Do not use the task tool and do not delegate to a subagent; unattended runs deny subagent delegation, so do the edit yourself.
                     """,
                 priority: 1,
                 criteria: ["Sources/FixtureKit/AgentProof.swift defines agentProof()"]
@@ -285,7 +373,9 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
                 service: service,
                 projectID: stack.projectID,
                 taskID: task.id,
-                timeout: 600
+                timeout: 600,
+                counter: stack.counter,
+                candidateID: candidate.id.rawValue
             )
             let details = await stack.counter.terminalDetails()
             let activityStarted = await stack.counter.count(named: "activityStarted")
@@ -393,21 +483,27 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
 
     /// Konuşma değil, görsel/gömme/ses üreten modelleri baştan eler ve önce her
     /// sağlayıcıdan birer aday sıralar: tümü tükenmiş tek bir sağlayıcının
-    /// arkasında takılıp kalmak yerine diğerleri de denenir.
-    private static func orderedCandidates(from models: [ProviderModelCapability]) -> [ProviderModelCapability] {
+    /// arkasında takılıp kalmak yerine diğerleri de denenir. `preferredProviders`
+    /// boş değilse listedeki önekler varsayılan sıra önüne alınır; canlı koşuda
+    /// `E2E_PREFERRED_PROVIDER` ortam değişkeninden beslenir ve kayda geçer.
+    /// Varsayılan boş liste eski sıralamayı aynen korur.
+    private static func orderedCandidates(
+        from models: [ProviderModelCapability],
+        preferredProviders: [String] = []
+    ) -> [ProviderModelCapability] {
         let nonCodingMarkers = [
             "image", "embedding", "tts", "whisper", "realtime", "audio", "video",
             "lyria", "moderation", "guard", "safety", "rerank", "morph", "vision-exp",
         ]
-        let preferred = ["opencode-go", "deepseek", "minimax", "github-copilot", "nvidia", "ollama-cloud", "openai", "openrouter"]
+        let preferred =
+            preferredProviders + [
+                "opencode-go", "deepseek", "minimax", "github-copilot", "nvidia", "ollama-cloud",
+                "openai", "openrouter",
+            ]
         let codingMarkers = ["codex", "coder", "code", "kimi", "qwen", "glm", "claude", "gpt-5", "deepseek-v4"]
         let codingModels = models.filter { model in
             let name = model.id.rawValue.lowercased()
             return !nonCodingMarkers.contains { name.contains($0) }
-        }
-
-        func providerKey(_ model: ProviderModelCapability) -> String {
-            String(model.id.rawValue.split(separator: "/").first ?? Substring(model.id.rawValue))
         }
 
         func codingRank(_ model: ProviderModelCapability) -> Int {
@@ -416,8 +512,8 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         }
 
         return codingModels.sorted { lhs, rhs in
-            let lhsProvider = preferred.firstIndex(where: { providerKey(lhs).hasPrefix($0) }) ?? preferred.count
-            let rhsProvider = preferred.firstIndex(where: { providerKey(rhs).hasPrefix($0) }) ?? preferred.count
+            let lhsProvider = preferred.firstIndex(where: { Self.providerKey(of: lhs).hasPrefix($0) }) ?? preferred.count
+            let rhsProvider = preferred.firstIndex(where: { Self.providerKey(of: rhs).hasPrefix($0) }) ?? preferred.count
             if lhsProvider != rhsProvider {
                 return lhsProvider < rhsProvider
             }
@@ -428,11 +524,41 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         }
     }
 
+    /// Aday kimliğinin sağlayıcı öneki: sıralama ile sağlayıcı başına üst
+    /// sınır aynı anahtarı kullanır, iki ayrı çıkarım yolu oluşmaz.
+    private static func providerKey(of model: ProviderModelCapability) -> String {
+        String(model.id.rawValue.split(separator: "/").first ?? Substring(model.id.rawValue))
+    }
+
+    /// Sıralı adayları sağlayıcı başına üst sınırla kısaltır. Tek sağlayıcının
+    /// onlarca modeli ilk pencereyi doldurup diğer sağlayıcıları aç bırakamaz;
+    /// önceki `prefix(8)` davranışı 8+ modelli ilk sağlayıcıda takılı kalırdı.
+    private static func cappedCandidates(
+        from candidates: [ProviderModelCapability],
+        perProviderLimit: Int,
+        totalLimit: Int
+    ) -> [ProviderModelCapability] {
+        var used: [String: Int] = [:]
+        var picked: [ProviderModelCapability] = []
+        for candidate in candidates {
+            guard picked.count < totalLimit else { break }
+            let key = Self.providerKey(of: candidate)
+            let count = used[key, default: 0]
+            guard count < perProviderLimit else { continue }
+            used[key] = count + 1
+            picked.append(candidate)
+        }
+        return picked
+    }
+
     // MARK: - İptal
 
     @MainActor
     private func exerciseCancellation(stack: E2EStack) async throws {
         let service = stack.composition.service
+        // Mutlu yolun son sunucusu bırakılmadan bu koşu aynı çalışma kopyasına
+        // köklenemez.
+        try await waitForWorkspaceServerRelease(stack: stack, timeout: 120)
         let task = try await service.createTask(
             projectID: stack.projectID,
             title: "Real OpenCode cancellation",
@@ -477,6 +603,93 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         )
     }
 
+    // MARK: - Sağlayıcı yeniden başlatma
+
+    /// Gerçek arka uç sonlanmasını gözler, aynı çalışma kopyasında sunucuyu
+    /// yeniden açar ve hiçbir görevin yinelenmediğini doğrular. Yeniden açış
+    /// yeni bir bağlantı noktası alır; eski uzak oturumlar hatırlanamaz.
+    @MainActor
+    private func exerciseProviderRestart(stack: E2EStack) async throws {
+        let service = stack.composition.service
+        let before = try await service.snapshot(projectID: stack.projectID)
+        let beforeIDs = before.tasks.map(\.id).sorted(by: { $0.uuidString < $1.uuidString })
+        // İptal koşusunun sunucusu bırakılmadan yeniden açış aynı çalışma
+        // kopyasına köklenemez; bekleme sonlanmanın gözlendiği andır.
+        try await waitForWorkspaceServerRelease(stack: stack, timeout: 120)
+        let activeBefore = await stack.workspaceServers.activeWorkspacePaths()
+        print("E2E provider restart: active servers before reacquire=\(activeBefore)")
+        guard activeBefore.isEmpty else {
+            throw E2EFlowFailure(description: "workspace servers did not terminate after cancellation: \(activeBefore)")
+        }
+        let reacquired = try await stack.workspaceServers.acquire(workspacePath: stack.worktreePath)
+        do {
+            let status = await reacquired.manager.status()
+            var version = "unknown"
+            var baseURL = reacquired.connection.baseURL.absoluteString
+            if case .running(let reportedVersion, let reportedURL) = status {
+                version = reportedVersion
+                baseURL = reportedURL.absoluteString
+            }
+            let transport = URLSessionOpenCodeTransport.streaming()
+            let client = OpenCodeClient(transport: transport, connection: reacquired.connection)
+            let capabilities = try await client.capabilities()
+            print(
+                "E2E provider restart: version=\(version) baseURL=\(baseURL) connectedModels=\(capabilities.models.count)"
+            )
+            await reacquired.release()
+        } catch {
+            await reacquired.release()
+            throw error
+        }
+        try await waitForWorkspaceServerRelease(stack: stack, timeout: 120)
+        let after = try await service.snapshot(projectID: stack.projectID)
+        let afterIDs = after.tasks.map(\.id).sorted(by: { $0.uuidString < $1.uuidString })
+        guard beforeIDs == afterIDs else {
+            throw E2EFlowFailure(description: "provider restart changed the task set: before=\(beforeIDs.count) after=\(afterIDs.count)")
+        }
+        for task in after.tasks {
+            let previous = before.tasks.first { $0.id == task.id }
+            guard previous?.status == task.status else {
+                throw E2EFlowFailure(
+                    description: "provider restart mutated task \(task.id.uuidString)"
+                )
+            }
+        }
+        print("E2E provider restart: task set unchanged count=\(afterIDs.count), no duplicate execution")
+    }
+
+    // MARK: - Uygulama yeniden açılışı
+
+    /// Canlı kompozisyona dokunmadan aynı SQLite dosyasını ikinci bir
+    /// tutamaçla yeniden açar ve görevlerin bayt-eşdeğer durduğunu doğrular.
+    /// Tam süreç-ölümü belirsizliği MultiAgent çökme testlerindedir; burası
+    /// çökme-güvenli yazma ile geri yükleme yolunun canlı kanıtıdır.
+    @MainActor
+    private func exerciseAppRestart(stack: E2EStack) async throws {
+        let service = stack.composition.service
+        let live = try await service.snapshot(projectID: stack.projectID)
+        let reopened = try SQLiteTaskStore.open(at: stack.dbURL)
+        do {
+            let restored = try await reopened.snapshot(projectID: stack.projectID)
+            let liveIDs = live.tasks.map(\.id).sorted(by: { $0.uuidString < $1.uuidString })
+            let restoredIDs = restored.tasks.map(\.id).sorted(by: { $0.uuidString < $1.uuidString })
+            guard liveIDs == restoredIDs else {
+                throw E2EFlowFailure(description: "reopened store lost tasks: live=\(liveIDs.count) restored=\(restoredIDs.count)")
+            }
+            for task in restored.tasks {
+                let current = live.tasks.first { $0.id == task.id }
+                guard current?.status == task.status, current?.version == task.version else {
+                    throw E2EFlowFailure(description: "reopened store disagrees on task \(task.id.uuidString)")
+                }
+            }
+            print("E2E app restart: reopened store matches live count=\(restoredIDs.count)")
+            await reopened.close()
+        } catch {
+            await reopened.close()
+            throw error
+        }
+    }
+
     // MARK: - Yığın
 
     @MainActor
@@ -485,13 +698,15 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         repositoryURL: URL,
         worktreeURL: URL,
         baseSHA: String,
-        serverManager: ManagedOpenCodeServerManager,
+        serverManager: any OpenCodeServerManaging,
+        workspaceServers: OpenCodeWorkspaceServerFactory,
         transport: any OpenCodeTransport,
         modelID: String
     ) async throws -> E2EStack {
         let repository: SQLiteTaskStore
+        let dbURL = root.appendingPathComponent("taskboard.sqlite")
         do {
-            repository = try SQLiteTaskStore.open(at: root.appendingPathComponent("taskboard.sqlite"))
+            repository = try SQLiteTaskStore.open(at: dbURL)
         } catch {
             throw E2EPreconditionFailure(description: "temporary SQLite store could not be opened: \(error)")
         }
@@ -504,7 +719,8 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
                     OpenCodeClient(transport: transport, connection: connection)
                 },
                 permissionHandler: nil,
-                cancelPendingPermissions: nil
+                cancelPendingPermissions: nil,
+                workspaceAccess: .rootedPerRun
             )
         )
 
@@ -512,7 +728,7 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         let port = CountingTaskRunningPort(
             inner: LiveOpenCodeTaskRunningPort(
                 registry: registry,
-                serverManager: serverManager,
+                workspaceServerFactory: workspaceServers,
                 clientFactory: { connection in
                     OpenCodeClient(transport: transport, connection: connection)
                 }
@@ -586,22 +802,39 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
         return E2EStack(
             composition: composition,
             repository: repository,
-            serverManager: serverManager,
+            workspaceServers: workspaceServers,
             counter: counter,
             registry: providerRegistry,
             projectID: project.id,
-            worktreePath: worktreeURL.path
+            worktreePath: worktreeURL.path,
+            dbURL: dbURL
         )
     }
 
     // MARK: - Bitiş ve temizlik
+
+    /// Koşu terminal olduktan sonra sunucunun bırakılması asenkron tamamlanır;
+    /// aynı çalışma kopyasında sıradaki koşu başlamadan önce beklenir.
+    @MainActor
+    private func waitForWorkspaceServerRelease(
+        stack: E2EStack,
+        timeout: TimeInterval
+    ) async throws {
+        let canonical = URL(fileURLWithPath: stack.worktreePath).resolvingSymlinksInPath().standardized.path
+        try await waitUntil(timeout: timeout) {
+            let active = await stack.workspaceServers.activeWorkspacePaths()
+            return !active.contains(canonical)
+        }
+    }
 
     @MainActor
     private func waitForTerminalTask(
         service: CodingTaskService,
         projectID: UUID,
         taskID: UUID,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        counter: E2EEventCounter,
+        candidateID: String
     ) async throws -> CodingTask {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -613,16 +846,30 @@ final class OpenCodeLiveEndToEndTests: XCTestCase {
             }
             try await Task.sleep(for: .seconds(2))
         }
-        throw E2EFlowFailure(description: "the real agent run did not reach a terminal state within \(Int(timeout))s")
+        let events = await counter.describe()
+        let approvals = await counter.approvalSummary()
+        let terminals = await counter.terminalDetails()
+        throw E2EFlowFailure(
+            description: "the real agent run did not reach a terminal state within \(Int(timeout))s "
+                + "candidate=\(candidateID) events=\(events) approvals=\(approvals) terminals=\(terminals.joined(separator: " | "))"
+        )
     }
 
     @MainActor
     private func cleanup(stack: E2EStack) async {
         await stack.composition.shutdown()
-        await stack.serverManager.stop()
-        let status = await stack.serverManager.status()
-        print("E2E cleanup: server status=\(String(describing: status))")
-        XCTAssertEqual(status, .stopped)
+        let activeWorkspaces = await stack.workspaceServers.activeWorkspacePaths()
+        print("E2E cleanup: active workspace servers=\(activeWorkspaces)")
+        XCTAssertTrue(
+            activeWorkspaces.isEmpty,
+            "Every workspace-rooted server must be stopped by the run lifecycle"
+        )
+        let stateDirectory = await stack.workspaceServers.stateDirectoryURL(
+            forWorkspacePath: stack.worktreePath
+        )
+        let leases = OpenCodeServerLedger.leases(in: stateDirectory)
+        print("E2E cleanup: workspace server leases=\(leases.count)")
+        XCTAssertTrue(leases.isEmpty, "No workspace server lease may survive cleanup")
     }
 
     @MainActor

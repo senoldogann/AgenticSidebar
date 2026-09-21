@@ -59,19 +59,30 @@ final class ToolApprovalPolicyTests: XCTestCase {
         )
     }
 
-    func testFullAccessStillAsksForComputerUse() {
+    func testFullAccessAutoApprovesComputerUseButKeepsRunJsDenied() {
         for tool in [
             "chatgpt-system_computer_click", "computer_click", "computer_run",
             "chatgpt-system_computer_run", "session_authority_start",
             "chatgpt-system_session_authority_start", "chatgpt-system_computer_observe",
         ] {
+            XCTAssertEqual(
+                ToolApprovalPolicy.fullAccess.automaticReply(for: tool, patterns: []),
+                .once,
+                "\(tool) Tam erişimde gözetimsiz çalışmalı"
+            )
+        }
+        for tool in [
+            "computer_run_js", "chatgpt-system_computer_run_js",
+        ] {
             XCTAssertNil(
                 ToolApprovalPolicy.fullAccess.automaticReply(for: tool, patterns: []),
-                "\(tool) her seviyede sormalı"
+                "\(tool) Tam erişimde bile sorulmalı (deny kilidi)"
             )
         }
         XCTAssertTrue(ToolApprovalPolicy.isComputerUseTool("chatgpt-system_computer_click"))
         XCTAssertFalse(ToolApprovalPolicy.isComputerUseTool("bash"))
+        XCTAssertTrue(ToolApprovalPolicy.isBlockedComputerTool("chatgpt-system_computer_run_js"))
+        XCTAssertFalse(ToolApprovalPolicy.isBlockedComputerTool("chatgpt-system_computer_click"))
     }
 
     // MARK: - Shell commands

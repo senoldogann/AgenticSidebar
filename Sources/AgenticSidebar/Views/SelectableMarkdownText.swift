@@ -92,15 +92,14 @@ struct MarkdownRunTypography: Equatable {
 /// what makes selecting a whole reply in a single gesture work.
 enum MarkdownTextRunBuilder {
     /// The blocks that can live in the shared text view.
-    ///
-    /// Code, tables, charts and plan documents keep their own views: they carry
-    /// their own affordances (a copy button, a chart, an approval bar) and end the
-    /// run — a run never spans them.
+    /// Code, tables, charts, plan documents and solutions keep their own views:
+    /// they carry their own affordances (a copy button, a chart, an approval
+    /// bar) and end the run — a run never spans them.
     static func isTextual(_ block: MarkdownBlock) -> Bool {
         switch block {
         case .paragraph, .heading, .bulletItem, .numberedItem, .blockquote:
             true
-        case .code, .divider, .table, .chart, .plan, .math:
+        case .code, .divider, .table, .chart, .plan, .solution, .math:
             false
         }
     }
@@ -123,6 +122,7 @@ enum MarkdownTextRunBuilder {
             case .table(let id, _, _, _): "table:\(id)"
             case .chart(let id, _): "chart:\(id)"
             case .plan(let id, _): "plan:\(id)"
+            case .solution(let id, _): "solution:\(id)"
             case .math(let id, _): "math:\(id)"
             }
         }
@@ -244,7 +244,7 @@ enum MarkdownTextRunBuilder {
                 style: paragraphStyle(typography: typography, indent: 12, isLast: isLast)
             )
 
-        case .code, .divider, .table, .chart, .plan, .math:
+        case .code, .divider, .table, .chart, .plan, .solution, .math:
             // Not textual: `isTextual` keeps these out of a run, and an empty
             // paragraph is the safe answer if one ever arrives.
             return NSAttributedString()
@@ -515,32 +515,67 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
     ///
     /// Static — and separate from the representable — because the height computed
     /// here is the height the run is *given*: under-report it and the answer is
-    /// clipped. The text container follows the text view's width, so the frame has
-    /// to be widened before measuring; measuring against a stale, narrower frame
-    /// is exactly how a long answer comes back too tall for the space it is
-    /// handed.
+    /// clipped. The measurement never touches the live view: `sizeThatFits` runs
+    /// inside SwiftUI's layout pass, and widening the live text view (or its text
+    /// container) from inside that pass asks AppKit for another constraint-update
+    /// cycle while the window is already laying out. With a short answer that
+    /// request is absorbed; with a long pasted answer plus an inspector opening
+    /// beside it, every visible row re-measures at the new width in the same
+    /// display cycle and the window aborts the layout loop (SIGABRT, bug 309).
+    /// A detached measurer — never in a window, never in a hierarchy — lays out
+    /// a copy of the same string instead, so the live view is only ever read.
     static func measuredSize(of textView: NSTextView, width: CGFloat) -> CGSize {
-        var frame = textView.frame
-        if frame.size.width != width {
-            frame.size.width = width
-            textView.frame = frame
+        guard width > 0 else {
+            return CGSize(width: max(0, width), height: 0)
         }
-
-        if let container = textView.textContainer, container.containerSize.width != width {
+        guard let storage = textView.textStorage, storage.length > 0 else {
+            return CGSize(width: width, height: 0)
+        }
+        let measurer = Self.sharedMeasurer()
+        // The measurer outlives the call, so a stale copy from an earlier row
+        // must never be measured: the string comparison is a memcmp, not a
+        // hash, and it only runs when a height is actually requested.
+        if measurer.textStorage?.string != storage.string {
+            measurer.textStorage?.setAttributedString(storage)
+        }
+        if let container = measurer.textContainer,
+            container.containerSize.width != width
+        {
             container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
         }
-
+        var frame = measurer.frame
+        if frame.size.width != width {
+            frame.size.width = width
+            measurer.frame = frame
+        }
         guard
-            let container = textView.textContainer,
-            let layoutManager = textView.layoutManager
+            let container = measurer.textContainer,
+            let layoutManager = measurer.layoutManager
         else {
             return CGSize(width: width, height: 0)
         }
-
         layoutManager.ensureLayout(for: container)
         let used = layoutManager.usedRect(for: container)
-
         return CGSize(width: width, height: ceil(used.height))
+    }
+
+    /// A text view that exists only to answer `measuredSize`.
+    ///
+    /// Main-thread only, like every other AppKit view here: `sizeThatFits` and
+    /// the tests both run on the main thread. Same configuration as the live
+    /// view (no padding, width-tracking container) so the height matches what
+    /// the row is given.
+    ///
+    /// `nonisolated(unsafe)` because the holder is a non-Sendable AppKit view;
+    /// the main-thread-only contract above is what makes sharing it sound.
+    nonisolated(unsafe) private static var measurerStorage: NSTextView?
+    private static func sharedMeasurer() -> NSTextView {
+        if let measurerStorage {
+            return measurerStorage
+        }
+        let measurer = makeTextView()
+        measurerStorage = measurer
+        return measurer
     }
 
     /// A text view that lets the transcript keep the scroll wheel.

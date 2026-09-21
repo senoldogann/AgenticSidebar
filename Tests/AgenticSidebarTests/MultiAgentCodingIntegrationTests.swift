@@ -448,12 +448,17 @@ final class MultiAgentCodingIntegrationTests: XCTestCase {
 
         let first = try await IntegrationHarness.make(root: root, dbURL: dbURL)
         // Proje panonun kayıt yoluyla açılır: kompozisyon kayıt defteri bu
-        // süreçte projeyi böyle tanır. Klasör denetimi en iyi çabadır;
-        // fixture deposuna Git işareti konur.
+        // süreçte projeyi böyle tanır. Klasör denetimi kayıt anında fail-fast
+        // verir; fixture deposuna Git işareti ve SwiftPM işareti konur.
         let repositoryURL = URL(fileURLWithPath: first.provisioning.repositoryPath, isDirectory: true)
         try FileManager.default.createDirectory(
             at: repositoryURL.appendingPathComponent(".git", isDirectory: true),
             withIntermediateDirectories: true
+        )
+        try "// swift-tools-version: 5.9\n".write(
+            to: repositoryURL.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
         )
         let registration = await first.composition.store.createProject(
             name: "Launch",
@@ -522,16 +527,12 @@ final class MultiAgentCodingIntegrationTests: XCTestCase {
         try editContent.write(to: editURL)
         await first.repository.close()
 
-        // Taze süreç: kayıt defteri süreç ömürlüdür ve boş başlar, bu yüzden
-        // uzlaştırma turu bilinçli olarak boştur. Proje listesi henüz kalıcı
-        // olmadığından bilinen proje açıkça kaydedilir (takip işi).
+        // Taze süreç: proje listesi kalıcı depodan geri yüklenir, bu yüzden
+        // açılış uzlaştırması kayıtlı projeyi kapsar ve çökme artığını kapatır.
         let relaunch = try await IntegrationHarness.make(root: root, dbURL: dbURL)
-        let emptyReports = await relaunch.composition.reconcileKnownProjects()
-        XCTAssertTrue(emptyReports.isEmpty, "A fresh process must not guess projects it does not know")
-
-        relaunch.composition.register(projectID: projectID)
         let reports = await relaunch.composition.reconcileKnownProjects()
-        XCTAssertEqual(reports.count, 1)
+        XCTAssertEqual(reports.count, 1, "A fresh process must restore persisted projects")
+        XCTAssertEqual(relaunch.composition.knownProjectIDs, [projectID])
         let report = try XCTUnwrap(reports.first)
         XCTAssertEqual(report.projectID, projectID)
         XCTAssertNil(report.failure)
@@ -677,6 +678,13 @@ final class MultiAgentCodingIntegrationTests: XCTestCase {
                 sessionConfiguration: { nil }
             )
         )
+
+        // Canlı gönderim çalışma alanına köklenmiş sunucu fabrikasıyla
+        // kablolanmıştır: gönderim yolu sohbet sunucusuna değil, koşu başına
+        // açılan sunucuya bağlanır. Fabrika hiçbir sunucuyu önceden açmaz.
+        let workspaceServerFactory = try XCTUnwrap(composition.workspaceServerFactory)
+        let activeWorkspaces = await workspaceServerFactory.activeWorkspacePaths()
+        XCTAssertTrue(activeWorkspaces.isEmpty)
 
         // Gönderim portu enjekte edilmiştir: kapı, port yokluğundan değil
         // deneme kimliğinin yokluğundan reddeder. Port bağlı olmasaydı hata

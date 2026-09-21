@@ -19,6 +19,9 @@ enum MarkdownBlock: Identifiable, Equatable {
     /// A `plan` fence: the assistant's proposal, rendered as a document instead
     /// of as chat prose.
     case plan(id: String, content: String)
+    /// A `solution` fence: an exam answer's full derivation, rendered as a
+    /// document card with a single copy action instead of as chat prose.
+    case solution(id: String, content: String)
     /// A math formula or LaTeX block (`$$...$$` or ```math fence).
     case math(id: String, formula: String)
 
@@ -34,6 +37,7 @@ enum MarkdownBlock: Identifiable, Equatable {
         case .table(let id, _, _, _): id
         case .chart(let id, _): id
         case .plan(let id, _): id
+        case .solution(let id, _): id
         case .math(let id, _): id
         }
     }
@@ -284,6 +288,9 @@ struct MarkdownContentView: View {
         case .plan(_, let content):
             PlanDocumentView(markdown: content)
 
+        case .solution(_, let content):
+            SolutionDocumentView(markdown: content)
+
         case .math(_, let formula):
             MathBlockView(
                 formula: formula,
@@ -468,7 +475,7 @@ private struct MathBlockView: View {
                 Spacer()
 
                 Button {
-                    confirmation.copy(cleanFormula(formula))
+                    confirmation.copy(MathFormulaDisplay.copyText(raw: formula))
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: confirmation.isCopied ? "checkmark" : "doc.on.doc")
@@ -493,7 +500,7 @@ private struct MathBlockView: View {
                 .opacity(0.25)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(cleanFormula(formula))
+                Text(MathFormulaDisplay.displayText(raw: formula))
                     .font(.system(size: max(14, fontSize + 1.5), weight: .regular, design: .serif))
                     .lineSpacing(4)
                     .foregroundStyle(isDark ? Color(white: 0.92) : Color(white: 0.12))
@@ -513,14 +520,6 @@ private struct MathBlockView: View {
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
         .padding(.vertical, 3)
-    }
-
-    private func cleanFormula(_ raw: String) -> String {
-        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if text.hasPrefix("$$") && text.hasSuffix("$$") && text.count >= 4 {
-            text = String(text.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return text
     }
 }
 
@@ -707,6 +706,10 @@ func parseMarkdownBlocks(
                 isPlanFenceLanguage(language)
             {
                 blocks.append(.plan(id: "plan-\(blockCounter)", content: fenceContent))
+            } else if allowsPlanDocuments,
+                isSolutionFenceLanguage(language)
+            {
+                blocks.append(.solution(id: "solution-\(blockCounter)", content: fenceContent))
             } else if let chartSpec = chartSpec(fromFenceLanguage: language, content: fenceContent) {
                 blocks.append(.chart(id: "chart-\(blockCounter)", spec: chartSpec))
             } else if isMathFenceLanguage(language) {
@@ -895,6 +898,13 @@ func parseMarkdownBlocks(
 func isPlanFenceLanguage(_ language: String) -> Bool {
     let tokens = language.lowercased().split(separator: " ").map(String.init)
     return tokens.first == AgentMode.planFenceLanguage
+}
+
+/// `plan` ile aynı kural: ilk token `solution` ise dildir, arkası
+/// parametredir (örn. ` ```solution full`).
+func isSolutionFenceLanguage(_ language: String) -> Bool {
+    let tokens = language.lowercased().split(separator: " ").map(String.init)
+    return tokens.first == AgentMode.solutionFenceLanguage
 }
 
 /// `plan`/`chart` ile aynı kural: ilk token `math`/`latex` ise dildir,

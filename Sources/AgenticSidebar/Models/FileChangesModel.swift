@@ -62,6 +62,24 @@ struct TurnFileChangesSummary: Identifiable, Equatable, Hashable, Sendable, Coda
             ))
     }
 
+    /// Detail alanının dosya yolu sayılması: `/` içermeli, `..` kaçışı
+    /// taşımamalı ve son bileşen uzantılı olmalı. Yoksa `a/b` gibi dosya
+    /// olmayan bilgi satırları hayali review öğesi üretiyordu.
+    static func isFilePathDetail(_ rawPath: String) -> Bool {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.contains("/") else {
+            return false
+        }
+        let components = trimmed.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard !components.contains("..") else {
+            return false
+        }
+        guard let last = components.last, last.contains(".") else {
+            return false
+        }
+        return true
+    }
+
     /// Extracts file modifications from an activity group.
     static func from(group: AgentTurnActivityGroup) -> TurnFileChangesSummary {
         var itemsByPath: [String: (additions: Int, deletions: Int, isNewFile: Bool, diffs: [String])] = [:]
@@ -69,7 +87,7 @@ struct TurnFileChangesSummary: Identifiable, Equatable, Hashable, Sendable, Coda
 
         for activity in group.activities {
             // Must have a path or detail representing a file
-            guard let rawPath = activity.detail, !rawPath.isEmpty, rawPath.contains("/") else {
+            guard let rawPath = activity.detail, !rawPath.isEmpty, Self.isFilePathDetail(rawPath) else {
                 continue
             }
 
@@ -82,8 +100,8 @@ struct TurnFileChangesSummary: Identifiable, Equatable, Hashable, Sendable, Coda
 
             let diffText = activity.diff ?? ""
             let lines = diffText.components(separatedBy: "\n")
-            let addedCount = lines.filter { ($0.hasPrefix("+ ") || $0.hasPrefix("+")) && !$0.hasPrefix("+++") }.count
-            let removedCount = lines.filter { ($0.hasPrefix("- ") || $0.hasPrefix("-")) && !$0.hasPrefix("---") }.count
+            let addedCount = lines.filter { $0.hasPrefix("+ ") && !$0.hasPrefix("+++ ") }.count
+            let removedCount = lines.filter { $0.hasPrefix("- ") && !$0.hasPrefix("--- ") }.count
 
             let titleLower = activity.title?.lowercased() ?? ""
             let isNew =
@@ -183,6 +201,17 @@ struct TurnFileChangesSummary: Identifiable, Equatable, Hashable, Sendable, Coda
             id: groups.last?.id ?? UUID(),
             files: changeItems
         )
+    }
+
+    /// Oturum sonu toplu kartın özeti: oturumda herhangi bir dosya değişikliği
+    /// varsa birleştirilmiş özet, yoksa `nil`. Oturum bitince (boşta) bu kart
+    /// transkriptin en altında tek review yüzeyi olarak çizilir ve satır içi
+    /// tur kartlarının tamamı gizlenir; tek turlu değişimde bile özet alta
+    /// taşınır ki aynı dosyalar üstte/ortada ikinci kez sayılmasın.
+    /// Görünüm dışı saf fonksiyondur.
+    static func sessionReviewSummary(from groups: [AgentTurnActivityGroup]) -> TurnFileChangesSummary? {
+        let mergedSummary = merged(from: groups)
+        return mergedSummary.isEmpty ? nil : mergedSummary
     }
 }
 

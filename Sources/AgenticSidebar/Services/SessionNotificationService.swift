@@ -8,9 +8,19 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
     static let shared = SessionNotificationService()
 
     /// Action invoked when user clicks a notification to switch to the target session.
-    var onSelectSession: ((UUID) -> Void)?
+    ///
+    /// `MainActor` yalıtımlıdır: bildirim temsilcisi yalıtımsız bağlamdan gelir,
+    /// seçim ise oturum durumunda koşar; yanlış iş parçacığından çağrı derleyici
+    /// düzeyinde engellenir. `@Sendable` değildir; atayan kapanış oturum
+    /// servisini (`Sendable` olmayan) yakalar.
+    var onSelectSession: (@MainActor (UUID) -> Void)?
 
     private let center: UNUserNotificationCenter
+
+    /// Son bitiş zilinin zamanı; 3-4 oturum aynı anda bitince her zil
+    /// AudioToolbox HAL kurulumunu senkron tetikler ve ana iş parçacığı
+    /// üst üste tutulur (örneklemde ~220ms). Patlama anında tek zil çalar.
+    private var lastCompletionSoundAt: Date?
 
     override init() {
         self.center = UNUserNotificationCenter.current()
@@ -49,7 +59,11 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
             if soundName == "Default" {
                 NSSound.beep()
             } else {
-                NSSound(named: soundName)?.play()
+                let now = Date()
+                if shouldPlayCompletionSound(now: now) {
+                    lastCompletionSoundAt = now
+                    NSSound(named: soundName)?.play()
+                }
             }
         }
 
@@ -93,6 +107,25 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
     }
 
     // MARK: - Bildirim gövdesi (saf, test edilebilir)
+
+    /// Patlama anında zil teklenir: son zilden bu kadar süre geçmeden yeni zil çalınmaz.
+    /// Değişmez sabit olduğu için yalıtımsız bağlamdan da okunur.
+    nonisolated static let completionSoundCoalescingInterval: TimeInterval = 2
+
+    /// Saf karar: verilen zamanda zil çalınmalı mı.
+    nonisolated static func shouldPlayCompletionSound(
+        now: Date,
+        lastPlayedAt: Date?
+    ) -> Bool {
+        guard let lastPlayedAt else {
+            return true
+        }
+        return now.timeIntervalSince(lastPlayedAt) >= completionSoundCoalescingInterval
+    }
+
+    private func shouldPlayCompletionSound(now: Date) -> Bool {
+        Self.shouldPlayCompletionSound(now: now, lastPlayedAt: lastCompletionSoundAt)
+    }
 
     /// Bildirim gövdesini kurar: önizleme açıksa ilk 160 karakter, kapalıysa
     /// veya alıntı yoksa genel metin.

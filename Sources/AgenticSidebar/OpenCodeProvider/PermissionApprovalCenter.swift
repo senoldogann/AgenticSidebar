@@ -156,6 +156,17 @@ final class PermissionApprovalCenter {
             return reply
         }
 
+        // Plan aşaması delegasyon yaptırımı (sohbet hattı): araştırma hedefine
+        // delegasyon seviyeden bağımsız bir kez onaylanır; başka hedef
+        // aşağıdaki olağan yola düşer ve kullanıcıya sorulur.
+        if request.toolName.lowercased() == "task",
+            ToolApprovalPolicy.isResearchDelegationTarget(request.delegationTarget)
+        {
+            let reply = OpenCodePermissionReply.once
+            await record(request, source: .policy, reply: reply)
+            return reply
+        }
+
         if let automaticReply = automaticReply(
             toolName: request.toolName,
             patterns: request.patterns,

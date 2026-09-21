@@ -31,6 +31,8 @@ enum AgentSessionNotice: Equatable, Sendable {
     case transcriptTrimmed(droppedMessageCount: Int)
     case forkUnavailable
     case dictationUnavailable
+    case promptEnhancementFailed
+    case promptEnhancementSuperseded
     case contextCompacted
     case compactionFailed(reason: CompactionFailureReason)
 

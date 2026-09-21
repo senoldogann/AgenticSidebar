@@ -3,7 +3,7 @@ import XCTest
 
 @testable import AgenticSidebar
 
-/// Doğrulama koşucuları: paket kontrolü, derleme-kırmızıysa-testi-atla,
+/// Doğrulama koşucuları: proje kontrolü (SwiftPM + Xcode), derleme-kırmızıysa-testi-atla,
 /// gerçek süreç ve zaman aşımı yolu.
 final class GoalRunnersTests: XCTestCase {
     private func temporaryDirectory() -> URL {
@@ -96,7 +96,13 @@ final class GoalRunnersTests: XCTestCase {
             },
             timeoutSeconds: 5
         )
-        let report = await runners.verify(packageDirectory: temporaryDirectory())
+        let package = temporaryDirectory()
+        try? "// swift-tools-version: 6.0".write(
+            to: package.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let report = await runners.verify(packageDirectory: package)
         XCTAssertFalse(report.buildSucceeded)
         XCTAssertFalse(report.testsSucceeded)
         XCTAssertNil(report.tests)
@@ -110,7 +116,14 @@ final class GoalRunnersTests: XCTestCase {
             },
             timeoutSeconds: 5
         )
-        let report = await runners.verify(packageDirectory: temporaryDirectory())
+        // `verify` desteklenen proje dizini ister (SwiftPM ya da Xcode).
+        let package = temporaryDirectory()
+        try? "// swift-tools-version: 6.0".write(
+            to: package.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let report = await runners.verify(packageDirectory: package)
         XCTAssertTrue(report.buildSucceeded)
         XCTAssertTrue(report.testsSucceeded)
         XCTAssertTrue(report.summary.contains("build and tests passed"))
@@ -125,7 +138,13 @@ final class GoalRunnersTests: XCTestCase {
             },
             timeoutSeconds: 5
         )
-        let report = await runners.verify(packageDirectory: temporaryDirectory())
+        let package = temporaryDirectory()
+        try? "// swift-tools-version: 6.0".write(
+            to: package.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let report = await runners.verify(packageDirectory: package)
         XCTAssertTrue(report.buildSucceeded)
     }
 
@@ -244,5 +263,262 @@ final class GoalRunnersTests: XCTestCase {
         XCTAssertFalse(result.succeeded)
         XCTAssertFalse(result.timedOut)
         XCTAssertTrue(result.outputTail.contains("Could not launch"))
+    }
+
+    // MARK: - Xcode projeleri
+
+    private func xcodeDirectory(projectName: String = "Demo") -> URL {
+        let dir = temporaryDirectory()
+        try? FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("\(projectName).xcodeproj"),
+            withIntermediateDirectories: true
+        )
+        return dir
+    }
+
+    func testXcodeProjectPrefersProjectOverWorkspace() {
+        let dir = temporaryDirectory()
+        try? FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("B.xcworkspace"),
+            withIntermediateDirectories: true
+        )
+        try? FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("A.xcodeproj"),
+            withIntermediateDirectories: true
+        )
+        let ref = GoalRunners.xcodeProject(at: dir)
+        XCTAssertEqual(ref?.url.lastPathComponent, "A.xcodeproj")
+        XCTAssertEqual(ref?.isWorkspace, false)
+        XCTAssertEqual(ref?.flag, "-project")
+    }
+
+    func testXcodeProjectFindsWorkspaceWhenNoProject() {
+        let dir = temporaryDirectory()
+        try? FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("Pods.xcworkspace"),
+            withIntermediateDirectories: true
+        )
+        let ref = GoalRunners.xcodeProject(at: dir)
+        XCTAssertEqual(ref?.url.lastPathComponent, "Pods.xcworkspace")
+        XCTAssertEqual(ref?.isWorkspace, true)
+        XCTAssertEqual(ref?.flag, "-workspace")
+    }
+
+    func testXcodeProjectIgnoresStrayFilesAndEmptyDirs() {
+        let dir = temporaryDirectory()
+        try? "sahte".write(
+            to: dir.appendingPathComponent("A.xcodeproj"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertNil(GoalRunners.xcodeProject(at: dir))
+        XCTAssertNil(GoalRunners.xcodeProject(at: temporaryDirectory()))
+    }
+
+    func testSupportedProjectPrefersSwiftPM() {
+        let dir = xcodeDirectory()
+        try? "// swift-tools-version: 6.0".write(
+            to: dir.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(GoalRunners.supportedProject(at: dir), .swiftPM)
+    }
+
+    func testSupportedProjectFindsXcode() {
+        let dir = xcodeDirectory(projectName: "OSJarvis")
+        XCTAssertEqual(
+            GoalRunners.supportedProject(at: dir),
+            .xcode(
+                GoalRunners.XcodeProjectRef(
+                    url: dir.appendingPathComponent("OSJarvis.xcodeproj"),
+                    isWorkspace: false
+                )
+            )
+        )
+    }
+
+    func testUsableProjectDirectory() {
+        let swift = temporaryDirectory()
+        try? "// swift-tools-version: 6.0".write(
+            to: swift.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(GoalRunners.usableProjectDirectory(at: swift)?.path, swift.path)
+
+        let parent = temporaryDirectory()
+        let child = parent.appendingPathComponent("App")
+        try? FileManager.default.createDirectory(
+            at: child.appendingPathComponent("Demo.xcodeproj"),
+            withIntermediateDirectories: true
+        )
+        XCTAssertEqual(GoalRunners.usableProjectDirectory(at: parent)?.path, child.path)
+
+        let ambiguous = temporaryDirectory()
+        for name in ["One", "Two"] {
+            try? FileManager.default.createDirectory(
+                at: ambiguous.appendingPathComponent(name).appendingPathComponent("D.xcodeproj"),
+                withIntermediateDirectories: true
+            )
+        }
+        XCTAssertNil(
+            GoalRunners.usableProjectDirectory(at: ambiguous),
+            "Birden çok adayda tahmin yürütülmez"
+        )
+        XCTAssertNil(GoalRunners.usableProjectDirectory(at: temporaryDirectory()))
+    }
+
+    func testXcodeSchemesParsing() {
+        let project = """
+            {"project":{"name":"Demo","schemes":["Demo","DemoTests"]}}
+            """.data(using: .utf8)!
+        XCTAssertEqual(GoalRunners.xcodeSchemes(fromListJSON: project), ["Demo", "DemoTests"])
+        let workspace = """
+            {"workspace":{"name":"Pods","schemes":["Pods"]}}
+            """.data(using: .utf8)!
+        XCTAssertEqual(GoalRunners.xcodeSchemes(fromListJSON: workspace), ["Pods"])
+        XCTAssertEqual(GoalRunners.xcodeSchemes(fromListJSON: Data("bozuk".utf8)), [])
+    }
+
+    func testPreferredXcodeScheme() {
+        XCTAssertEqual(
+            GoalRunners.preferredXcodeScheme(from: ["B", "Demo", "A"], projectName: "Demo"),
+            "Demo"
+        )
+        XCTAssertEqual(
+            GoalRunners.preferredXcodeScheme(from: ["B", "A"], projectName: "Demo"),
+            "A"
+        )
+        XCTAssertNil(GoalRunners.preferredXcodeScheme(from: [], projectName: "Demo"))
+    }
+
+    func testXcodebuildExecutableResolvesFromPATH() throws {
+        let dir = temporaryDirectory()
+        let fake = dir.appendingPathComponent("xcodebuild")
+        try "#!/bin/sh\nexit 0\n".write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        let resolved = GoalRunners.xcodebuildExecutable(
+            fileManager: .default,
+            environment: ["PATH": dir.path]
+        )
+        XCTAssertEqual(resolved?.path, fake.path)
+    }
+
+    func testVerifyXcodeRunsListBuildThenTest() async {
+        let recorder = XcodeCallRecorder()
+        let runners = GoalRunners(
+            execute: { _, arguments, _ in
+                await recorder.append(arguments)
+                if arguments.contains("-list") {
+                    return GoalCommandResult(
+                        exitCode: 0,
+                        outputTail: #"{"project":{"name":"Demo","schemes":["Demo"]}}"#,
+                        timedOut: false
+                    )
+                }
+                return GoalCommandResult(exitCode: 0, outputTail: "ok", timedOut: false)
+            },
+            timeoutSeconds: 5
+        )
+        let report = await runners.verify(packageDirectory: xcodeDirectory(projectName: "Demo"))
+        XCTAssertTrue(report.buildSucceeded)
+        XCTAssertTrue(report.testsSucceeded)
+        let calls = await recorder.calls
+        XCTAssertEqual(calls.count, 3)
+        XCTAssertTrue(calls[0].contains("-list"))
+        XCTAssertTrue(calls[1].contains("build"))
+        XCTAssertTrue(calls[2].contains("test"))
+        XCTAssertTrue(calls[1].contains("Demo"), "Şema komuta taşınmalı")
+    }
+
+    func testVerifyXcodeSkipsTestWhenBuildFails() async {
+        let recorder = XcodeCallRecorder()
+        let runners = GoalRunners(
+            execute: { _, arguments, _ in
+                await recorder.append(arguments)
+                if arguments.contains("-list") {
+                    return GoalCommandResult(
+                        exitCode: 0,
+                        outputTail: #"{"project":{"name":"Demo","schemes":["Demo"]}}"#,
+                        timedOut: false
+                    )
+                }
+                if arguments.contains("build") {
+                    return GoalCommandResult(exitCode: 65, outputTail: "derleme patladı", timedOut: false)
+                }
+                return GoalCommandResult(exitCode: 0, outputTail: "ok", timedOut: false)
+            },
+            timeoutSeconds: 5
+        )
+        let report = await runners.verify(packageDirectory: xcodeDirectory(projectName: "Demo"))
+        XCTAssertFalse(report.buildSucceeded)
+        XCTAssertNil(report.tests)
+        let recordedCount = await recorder.calls.count
+        XCTAssertEqual(recordedCount, 2)
+    }
+
+    func testVerifyXcodeRefusesWhenNoSchemes() async {
+        let runners = GoalRunners(
+            execute: { _, _, _ in
+                GoalCommandResult(
+                    exitCode: 0,
+                    outputTail: #"{"project":{"name":"Demo","schemes":[]}}"#,
+                    timedOut: false
+                )
+            },
+            timeoutSeconds: 5
+        )
+        let report = await runners.verify(packageDirectory: xcodeDirectory(projectName: "Demo"))
+        XCTAssertFalse(report.buildSucceeded)
+        XCTAssertTrue(report.build.outputTail.contains("No Xcode schemes"))
+    }
+
+    func testVerifyRefusesUnsupportedDirectory() async {
+        let runners = GoalRunners(
+            execute: { _, _, _ in
+                GoalCommandResult(exitCode: 0, outputTail: "ok", timedOut: false)
+            },
+            timeoutSeconds: 5
+        )
+        let report = await runners.verify(packageDirectory: temporaryDirectory())
+        XCTAssertFalse(report.buildSucceeded)
+        XCTAssertNil(report.tests)
+    }
+
+    func testEnclosingXcodeProjectWalksUpFromNestedFile() {
+        let root = xcodeDirectory()
+        let nested = root.appendingPathComponent("Demo/Sources")
+        try? FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let file = nested.appendingPathComponent("App.swift")
+        try? "// empty".write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertEqual(GoalRunners.enclosingXcodeProject(for: file.path)?.path, root.path)
+    }
+
+    func testResolvePackageDirectoryFindsXcodeAndPrefersSwiftPM() {
+        let xcode = xcodeDirectory(projectName: "Demo")
+        XCTAssertEqual(
+            GoalRunners.resolvePackageDirectory(knownPaths: [xcode.path], seedPaths: [])?.path,
+            xcode.path
+        )
+        let swift = temporaryDirectory()
+        try? "// swift-tools-version: 6.0".write(
+            to: swift.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(
+            GoalRunners.resolvePackageDirectory(knownPaths: [xcode.path, swift.path], seedPaths: [])?.path,
+            swift.path
+        )
+    }
+}
+
+/// `verify` stub'unda komut kaydı: `execute` eşzamanlı-kısıtlı kapanıştır,
+/// o yüzden sayaç `actor` arkasında tutulur.
+private actor XcodeCallRecorder {
+    private(set) var calls: [[String]] = []
+    func append(_ call: [String]) {
+        calls.append(call)
     }
 }

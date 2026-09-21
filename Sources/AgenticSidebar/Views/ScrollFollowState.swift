@@ -65,6 +65,11 @@ final class ScrollFollowState {
     /// akan yanıt görünümü dibe çekerdi.
     private var awayFromBottom = false
 
+    /// En son ölçülen dipten uzaklık. Inspector açılıp kapanırken atılan
+    /// gecikmeli sabitleme bunu okur: görünüm zaten dipteyse kör `scrollTo`
+    /// atlanir (sistem çapası tutar), ıssızda kalınmışsa iyileştirilir.
+    private(set) var lastDistanceFromBottom: CGFloat?
+
     /// Yukarı hareketi fark etmek için önceki ölçüm.
     private var lastOffsetY: CGFloat?
 
@@ -84,6 +89,7 @@ final class ScrollFollowState {
         let isSuppressed = suppressOffsetDropUntil.map { ContinuousClock.now < $0 } ?? false
         let movedUp = lastOffsetY.map { snapshot.offsetY < $0 - Self.upwardStep } ?? false
         lastOffsetY = snapshot.offsetY
+        lastDistanceFromBottom = snapshot.distanceFromBottom
 
         if movedUp && (!isSuppressed || isUserScrolling) {
             isUserPosition = true
@@ -111,6 +117,18 @@ final class ScrollFollowState {
         }
 
         guard isUserPosition || isUserScrolling else {
+            // Programatik ıssızlık: kullanıcı dokunmadan dipten çok uzakta
+            // kalınırsa (inspector animasyonunun geçici geometriye bıraktığı
+            // kör kayma, geri yükleme) "Scroll to end" kurtarma düğmesi
+            // görünür. Yoksa görünüm kara bir bölgede takılı kalır ve
+            // kullanıcının dönecek düğmesi olmaz — programatik kayma kullanıcı
+            // konumu sayılmadığı için düğme başka türlü hiç belirmezdi.
+            // Geçici yerleşim sarsıntıları bastırma penceresi içinde sayılmaz.
+            if !isSuppressed, snapshot.distanceFromBottom >= Self.buttonVisibilityThreshold {
+                guard !awayFromBottom else { return }
+                awayFromBottom = true
+                pendingAwayFromBottom = true
+            }
             return
         }
 
@@ -149,6 +167,7 @@ final class ScrollFollowState {
         pendingAwayFromBottom = false
         lastAutoScrollTime = .distantPast
         lastOffsetY = nil
+        lastDistanceFromBottom = nil
         isUserPosition = false
         suppressOffsetDropUntil = Self.deadline(seconds: 0.6)
     }
@@ -171,6 +190,7 @@ final class ScrollFollowState {
         pendingActivePromptID = nil
         lastAutoScrollTime = .distantPast
         lastOffsetY = nil
+        lastDistanceFromBottom = nil
         isUserPosition = false
         // Yeni sohbetin ilk yerleşim adımları konumda sahte düşüşler üretir;
         // bastırılmazsa takip modu haksız yere kapanır ve dibe inilmez.
@@ -222,5 +242,31 @@ final class ScrollFollowState {
         pendingAwayFromBottom = nil
         pendingActivePromptID = nil
         return pending
+    }
+}
+
+/// Inspector açılıp kapanırken atılan gecikmeli sabitlemenin saf kararı.
+///
+/// Görünüm kodu (`ScrollViewProxy`) testlerde kurulamadığı için kural burada
+/// durur: olay anında dipte olmayan (tarihte okuyan) asla dibe çekilmez,
+/// ateş anında kullanıcı uzaklaşmışsa sabitleme iptal olur, ölçüm zaten
+/// dipteyse kör kayma atlanır (sistem çapası tutar), ölçüm uzaktaysa
+/// görünüm ıssızda kalmıştır ve iyileştirilir. Bayat `scrollTo` animasyon
+/// ortası geçici geometriye inerdi; sonuç kara bir transkript ve görünmeyen
+/// kurtarma düğmesiydi.
+struct TranscriptRepinPolicy {
+    @MainActor
+    static func shouldRepin(
+        wasFollowing: Bool,
+        isFollowingNow: Bool,
+        distanceFromBottom: CGFloat?
+    ) -> Bool {
+        guard wasFollowing, isFollowingNow else {
+            return false
+        }
+        guard let distance = distanceFromBottom else {
+            return true
+        }
+        return distance > ScrollFollowState.bottomThreshold
     }
 }

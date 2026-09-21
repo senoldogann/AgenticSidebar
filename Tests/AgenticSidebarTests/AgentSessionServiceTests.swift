@@ -476,6 +476,174 @@ final class AgentSessionServiceTests: XCTestCase {
             ]
         )
     }
+
+    /// Ayarlardan sağlayıcı seçimi tüm boşta sohbetlere yayılır.
+    func testSelectProviderBroadcastsToAllIdleSessions() async throws {
+        let service = AgentSessionService(
+            runtimes: [
+                makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast"),
+                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep"),
+            ]
+        )
+        await service.refreshCapabilities()
+        let secondID = service.createSession()
+
+        try service.selectProvider(ProviderID("beta"))
+
+        for session in service.sessions {
+            XCTAssertEqual(
+                session.state.configuration?.providerID,
+                ProviderID("beta"),
+                "Session \(session.id) must follow the Settings provider choice"
+            )
+        }
+        XCTAssertEqual(service.sessions.count, 2)
+        XCTAssertNotNil(service.session(for: secondID))
+    }
+
+    /// Yeni sohbet genel tercihle açılır, aktif sohbetin mirasıyla değil.
+    func testCreateSessionUsesPreferredProvider() async throws {
+        let service = AgentSessionService(
+            runtimes: [
+                makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast"),
+                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep"),
+            ]
+        )
+        await service.refreshCapabilities()
+        try service.selectProvider(ProviderID("beta"))
+
+        let freshID = service.createSession()
+
+        XCTAssertEqual(
+            service.session(for: freshID)?.state.configuration?.providerID,
+            ProviderID("beta")
+        )
+    }
+
+    /// Bilinmeyen sağlayıcı seçimi hata verir, tercih değişmez.
+    func testSelectProviderRejectsUnknownProvider() async {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        await service.refreshCapabilities()
+
+        XCTAssertThrowsError(try service.selectProvider(ProviderID("nope"))) { error in
+            XCTAssertEqual(error as? AgentSessionError, .unsupportedCapability)
+        }
+        XCTAssertNil(service.preferredProviderID)
+    }
+
+    /// Genel tercih yoksa ürün varsayılanı çalışır.
+    func testPreferredProviderFallsBackToProductDefault() async {
+        let service = AgentSessionService(
+            runtimes: [
+                makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast"),
+                makeRuntime(id: "beta", modelID: "beta-1", variantID: "deep"),
+            ]
+        )
+        await service.refreshCapabilities()
+
+        let resolved = ProviderSelectionPolicy.defaultConfiguration(
+            from: service.providers,
+            preferring: ProviderID("nope")
+        )
+
+        XCTAssertEqual(resolved?.providerID, ProviderID("alpha"))
+    }
+
+    /// `+ New session` sohbet oluşturmaz: liste ve kayıt değişmez, yalnız
+    /// bekleyen taslak anahtarı açılır ve görünür olur.
+    func testBeginPendingSessionCreatesNoSession() {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        let before = service.sessions.count
+
+        let pending = service.beginPendingSession()
+
+        XCTAssertEqual(service.sessions.count, before, "+ New session liste büyütmemeli")
+        XCTAssertTrue(service.sessionList.allSatisfy { $0.id != pending })
+        XCTAssertEqual(service.pendingSessionID, pending)
+        XCTAssertTrue(service.isPendingSessionVisible)
+        XCTAssertNotNil(service.session(for: pending), "Besteci taslağı çözülmeli")
+    }
+
+    /// İkinci `+` aynı anahtarı döner: yazılan taslak korunur, ikinci
+    /// oturum ya da ikinci anahtar doğmaz.
+    func testBeginPendingSessionReusesPending() {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        let first = service.beginPendingSession()
+        let second = service.beginPendingSession()
+
+        XCTAssertEqual(first, second)
+        XCTAssertTrue(service.sessions.allSatisfy { $0.id != first })
+    }
+
+    /// İlk gönderim aynı kimlikle gerçek oturum doğurur: başa eklenir, aktif
+    /// olur, bekleyen kapanır. Taslak anahtarı değişmez.
+    func testMaterializePendingSessionAdoptsSameID() {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        let pending = service.beginPendingSession()
+
+        service.materializePendingSession(pending)
+
+        XCTAssertNil(service.pendingSessionID)
+        XCTAssertFalse(service.isPendingSessionVisible)
+        XCTAssertEqual(service.activeSessionID, pending)
+        XCTAssertNotNil(service.session(for: pending))
+        XCTAssertEqual(service.sessions.first?.id, pending)
+        XCTAssertTrue(service.sessionList.contains { $0.id == pending })
+    }
+
+    /// Bilinmeyen kimliği dönüştürme yok sayılır.
+    func testMaterializeUnknownPendingIDIsNoop() {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        let pending = service.beginPendingSession()
+        let before = service.sessions.count
+
+        service.materializePendingSession(UUID())
+
+        XCTAssertEqual(service.sessions.count, before)
+        XCTAssertEqual(service.pendingSessionID, pending)
+    }
+
+    /// Sohbet seçimi bekleyeni gizler ama silmez: taslak anahtarı ve
+    /// çözünürlük durur, `+` ile geri dönülür.
+    func testSelectSessionHidesPendingKeepsDraft() {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        let existing = service.createSession()
+        let pending = service.beginPendingSession()
+        XCTAssertTrue(service.isPendingSessionVisible)
+
+        service.selectSession(existing)
+
+        XCTAssertFalse(service.isPendingSessionVisible)
+        XCTAssertEqual(service.pendingSessionID, pending)
+        XCTAssertNotNil(service.session(for: pending))
+        XCTAssertEqual(service.beginPendingSession(), pending, "+ aynı taslağa dönmeli")
+    }
+
+    /// Vazgeçme bekleyeni siler: kimlik ve görünürlük kapanır.
+    func testDiscardPendingSessionClears() {
+        let service = AgentSessionService(
+            runtimes: [makeRuntime(id: "alpha", modelID: "alpha-1", variantID: "fast")]
+        )
+        let pending = service.beginPendingSession()
+
+        service.discardPendingSession()
+
+        XCTAssertNil(service.pendingSessionID)
+        XCTAssertFalse(service.isPendingSessionVisible)
+        XCTAssertNil(service.session(for: pending))
+    }
 }
 
 private struct DelayedTodosRuntime: ProviderRuntime {

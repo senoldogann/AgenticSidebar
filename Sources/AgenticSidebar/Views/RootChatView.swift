@@ -32,6 +32,22 @@ struct RootChatView: View {
     @State private var projectRegistrationName = ""
     @State private var projectRegistrationFolder: URL?
     @State private var projectRegistrationMessage: String?
+    /// Proje yeniden adlandırma ve silme durumu; ret mesajı kayıt satırında
+    /// gösterilir, ayrı bir hata yüzeyi yoktur.
+    @State private var showsProjectRename = false
+    @State private var projectRenameName = ""
+    @State private var showsProjectDeleteConfirmation = false
+    /// Canlı gönderim durumu; pano alt bandı bu değere göre çizilir.
+    @State private var taskBoardLiveDispatchAvailable = true
+
+    /// Pano sayfasının boyutları: beş kolon 5 × 236 + 4 × 10 aralık + 2 × 10
+    /// iç boşluk = 1240 pt ister; varsayılan genişlik hepsini kaydırmasız
+    /// gösterir, en küçük boy dar ekranda kullanılabilirliği korur. Pano
+    /// kare görünmesin diye genişlik yüksekliğin belirgin üstündedir.
+    private static let taskBoardSheetMinWidth: CGFloat = 1080
+    private static let taskBoardSheetDefaultWidth: CGFloat = 1500
+    private static let taskBoardSheetMinHeight: CGFloat = 700
+    private static let taskBoardSheetDefaultHeight: CGFloat = 920
 
     @Environment(\.colorScheme) private var systemColorScheme
 
@@ -130,13 +146,28 @@ struct RootChatView: View {
         }
     }
 
-    /// Görev panosu sayfası: canlı yazma devre dışı ibaresi panonun altında
-    /// durur; başlatma yalnızca defter kaydı üretir, sağlayıcıya yazma gitmez.
+    /// Görev panosu sayfası: proje seçici, kayıt satırı ve canlı gönderim
+    /// durumunu dürüstçe söyleyen alt bant. Pano yalnızca enjekte edilen
+    /// mağazadan konuşur; sahte "devre dışı" ibaresi gösterilmez.
+    ///
+    /// Sayfa çekerek yeniden boyutlandırılabilir: `frame(min/ideal/max:
+    /// .infinity)` sayfayı esnek yapar, `presentationSizing(.fitted)` bilerek
+    /// kullanılmaz çünkü fitted sayfayı içeriğe kilitleyip sürükleyerek
+    /// büyütmeyi engeller. Varsayılan ölçü beş kolonu da kaydırmasız gösterir:
+    /// 5 × 236 kolon + aralıklar = 1240 pt, artı pay ile 1500 pt; yükseklik
+    /// 920 pt ile kart listesine nefes aldırır.
     @ViewBuilder
     private var taskBoardSheet: some View {
         if let taskBoardStore {
             VStack(spacing: 0) {
                 TaskBoardView(store: taskBoardStore, preset: currentTheme, isDark: isDarkMode)
+                    // Pano sayfanın aslan payını alır: proje satırları sabit,
+                    // kalan dikey alan kolonlara kalır.
+                    .frame(minHeight: 560, maxHeight: .infinity)
+
+                Divider().opacity(0.35)
+
+                projectPickerRow(store: taskBoardStore)
 
                 Divider().opacity(0.35)
 
@@ -145,20 +176,199 @@ struct RootChatView: View {
                 Divider().opacity(0.35)
 
                 HStack(spacing: 6) {
-                    Image(systemName: "pause.circle")
+                    Image(systemName: taskBoardLiveDispatchAvailable ? "bolt.circle" : "pause.circle")
                         .font(.system(size: 11, weight: .semibold))
-                    Text("Canlı yazma devre dışı: pano kaydı tutulur, sağlayıcıya yazma gönderilmez.")
-                        .font(.system(size: 11))
+                    Text(
+                        taskBoardLiveDispatchAvailable
+                            ? "Canlı koşu bağlı: Başlat, seçili sağlayıcıyla sahipli çalışma alanında koşar."
+                            : "Canlı koşu bağlı değil: pano kaydı tutulur, sağlayıcıya yazma gönderilmez."
+                    )
+                    .font(.system(size: 11))
                     Spacer(minLength: 0)
                 }
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             }
-            .frame(minWidth: 760, minHeight: 520)
+            .frame(
+                minWidth: Self.taskBoardSheetMinWidth,
+                idealWidth: Self.taskBoardSheetDefaultWidth,
+                maxWidth: .infinity,
+                minHeight: Self.taskBoardSheetMinHeight,
+                idealHeight: Self.taskBoardSheetDefaultHeight,
+                maxHeight: .infinity
+            )
             .background(currentTheme.background(isDark: isDarkMode))
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("Görev panosu, canlı yazma devre dışı")
+            .accessibilityLabel("Görev panosu")
+            .task {
+                taskBoardLiveDispatchAvailable = await taskBoardStore.liveDispatchAvailable()
+                await taskBoardStore.refreshProjects()
+            }
+        }
+    }
+
+    /// Kayıtlı projeler arasında geçiş; yeniden başlatma sonrası pano boş
+    /// kalmasın diye liste kalıcı depodan beslenir.
+    @ViewBuilder
+    private func projectPickerRow(store: TaskBoardStore) -> some View {
+        HStack(spacing: 8) {
+            Text("Proje")
+                .font(.system(size: 11, weight: .semibold))
+            if store.projects.isEmpty {
+                Text("Kayıtlı proje yok — aşağıdan ekleyin")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Kayıtlı proje yok")
+            } else {
+                Menu {
+                    ForEach(store.projects) { project in
+                        Button {
+                            store.selectProject(project.id)
+                            Task { await store.refresh() }
+                        } label: {
+                            Text(project.name)
+                        }
+                    }
+                } label: {
+                    Text(store.projects.first { $0.id == store.selectedProjectID }?.name ?? "Proje seçin")
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .controlSize(.small)
+                .help("Kayıtlı projeler arasından seç")
+                .accessibilityLabel("Proje seçin")
+                projectManagementButtons(store: store)
+            }
+            Spacer(minLength: 0)
+            Text("\(store.projects.count) proje")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .sheet(isPresented: $showsProjectRename) {
+            projectRenameSheet(store: store)
+        }
+        .confirmationDialog(
+            "Projeyi sil",
+            isPresented: $showsProjectDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Projeyi sil", role: .destructive) {
+                deleteSelectedProject(store: store)
+            }
+            Button("Vazgeç", role: .cancel) {}
+        } message: {
+            Text(projectDeleteConfirmationMessage(store: store))
+        }
+    }
+
+    /// Proje silme onay metni: seçili ad geçirilerek tek kaynaktan üretilir.
+    private func projectDeleteConfirmationMessage(store: TaskBoardStore) -> String {
+        guard let name = selectedProjectName(store: store) else {
+            return "Seçili proje ve altındaki tüm görevler kalıcı olarak silinir."
+        }
+        return "“\(name)” ve altındaki tüm görevler kalıcı olarak silinir. Bu işlem geri alınamaz."
+    }
+
+    /// Seçili projenin görünen adı; seçim yoksa nil.
+    private func selectedProjectName(store: TaskBoardStore) -> String? {
+        guard let selected = store.selectedProjectID else { return nil }
+        return store.projects.first { $0.id == selected }?.name
+    }
+
+    /// Proje satırındaki yeniden adlandır/sil düğmeleri; proje seçiliyken görünür.
+    @ViewBuilder
+    private func projectManagementButtons(store: TaskBoardStore) -> some View {
+        if store.selectedProjectID != nil {
+            Button {
+                projectRenameName = selectedProjectName(store: store) ?? ""
+                projectRegistrationMessage = nil
+                showsProjectRename = true
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .interactiveHoverCircle()
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("Projenin adını değiştir")
+            .accessibilityLabel("Projeyi yeniden adlandır")
+
+            Button {
+                showsProjectDeleteConfirmation = true
+            } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 22, height: 22)
+                    .interactiveHoverCircle()
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .foregroundStyle(.red.opacity(0.85))
+            .help("Projeyi ve görevlerini kalıcı olarak sil")
+            .accessibilityLabel("Projeyi sil")
+        }
+    }
+
+    /// Yeniden adlandırma sayfası: boş adla kaydetme kapalıdır, ret satırda söylenir.
+    @ViewBuilder
+    private func projectRenameSheet(store: TaskBoardStore) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Projeyi yeniden adlandır")
+                .font(.system(size: 14, weight: .semibold))
+            TextField("Proje adı", text: $projectRenameName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 280)
+                .accessibilityLabel("Proje adı")
+            HStack {
+                Spacer()
+                Button("Vazgeç") { showsProjectRename = false }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .pointingHandCursor()
+                Button("Kaydet") {
+                    renameSelectedProject(store: store)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(projectRenameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityLabel("Proje adını kaydet")
+            }
+        }
+        .padding(16)
+        .frame(width: 360)
+        .background(currentTheme.background(isDark: isDarkMode))
+    }
+
+    private func renameSelectedProject(store: TaskBoardStore) {
+        guard let selected = store.selectedProjectID else { return }
+        let name = projectRenameName
+        Task {
+            let result = await store.renameProject(id: selected, name: name)
+            switch result {
+            case .applied:
+                projectRegistrationMessage = nil
+                showsProjectRename = false
+            case .refused(let refusal):
+                projectRegistrationMessage = refusal.message
+                showsProjectRename = false
+            }
+        }
+    }
+
+    private func deleteSelectedProject(store: TaskBoardStore) {
+        guard let selected = store.selectedProjectID else { return }
+        Task {
+            let result = await store.deleteProject(id: selected)
+            switch result {
+            case .applied:
+                projectRegistrationMessage = nil
+            case .refused(let refusal):
+                projectRegistrationMessage = refusal.message
+            }
         }
     }
 
@@ -200,6 +410,9 @@ struct RootChatView: View {
                 )
                 .help("Seçilen klasörü Git deposu olarak panoya kaydet")
             }
+            Text("Projenizin Git klasörünü seçin — kodunuz kopyalanmaz; ajan ayrı bir çalışma alanında çalışır")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
             if let projectRegistrationMessage {
                 Text(projectRegistrationMessage)
                     .font(.system(size: 11))
@@ -390,16 +603,16 @@ struct RootChatView: View {
         } else {
             switch splitStore.layoutMode {
             case .single:
-                paneCell(scopes[0], activeID: activeID, showHeader: false, showSwap: false, showFocusRing: false)
+                paneCell(scopes[0], activeID: activeID, showHeader: false, showSwap: false)
                     .frame(width: total, height: height)
             case .dual:
                 let (first, second) = paneLength(total: total, fraction: splitStore.splitFraction)
                 HStack(spacing: 0) {
-                    paneCell(scopes[0], activeID: activeID, showHeader: true, showSwap: true, showFocusRing: true)
+                    paneCell(scopes[0], activeID: activeID, showHeader: true, showSwap: true)
                         .frame(width: first, height: height)
                     if scopes.count > 1 {
                         gridDivider(.dualSplit, total: total)
-                        paneCell(scopes[1], activeID: activeID, showHeader: true, showSwap: true, showFocusRing: true)
+                        paneCell(scopes[1], activeID: activeID, showHeader: true, showSwap: true)
                             .frame(width: second, height: height)
                     }
                 }
@@ -410,26 +623,26 @@ struct RootChatView: View {
                     let (top, bottom) = paneLength(total: height, fraction: splitStore.rowFraction)
                     VStack(spacing: 0) {
                         HStack(spacing: 0) {
-                            paneCell(scopes[0], activeID: activeID, showHeader: true, showSwap: false, showFocusRing: true)
+                            paneCell(scopes[0], activeID: activeID, showHeader: true, showSwap: false)
                                 .frame(width: left, height: top)
                             gridDivider(.gridColumn, total: total)
-                            paneCell(scopes[1], activeID: activeID, showHeader: true, showSwap: false, showFocusRing: true)
+                            paneCell(scopes[1], activeID: activeID, showHeader: true, showSwap: false)
                                 .frame(width: right, height: top)
                         }
                         .frame(width: total, height: top)
                         gridDivider(.gridRow, total: height)
                         HStack(spacing: 0) {
-                            paneCell(scopes[2], activeID: activeID, showHeader: true, showSwap: false, showFocusRing: true)
+                            paneCell(scopes[2], activeID: activeID, showHeader: true, showSwap: false)
                                 .frame(width: left, height: bottom)
                             gridDivider(.gridColumn, total: total)
-                            paneCell(scopes[3], activeID: activeID, showHeader: true, showSwap: false, showFocusRing: true)
+                            paneCell(scopes[3], activeID: activeID, showHeader: true, showSwap: false)
                                 .frame(width: right, height: bottom)
                         }
                         .frame(width: total, height: bottom)
                     }
                     .frame(width: total, height: height)
                 } else {
-                    paneCell(scopes[0], activeID: activeID, showHeader: false, showSwap: false, showFocusRing: false)
+                    paneCell(scopes[0], activeID: activeID, showHeader: false, showSwap: false)
                         .frame(width: total, height: height)
                 }
             }
@@ -458,21 +671,34 @@ struct RootChatView: View {
     /// sabitlenir; yoksa yuva değişiminde besteci taslağı ve kaydırma durumu
     /// düşerdi. Her tıklama yuvayı odaklar (HUD takibi); alt denetimler
     /// çalışmaya devam eder.
-    private func paneCell(_ scope: PaneScope, activeID: UUID, showHeader: Bool, showSwap: Bool, showFocusRing: Bool) -> some View {
+    private func paneCell(_ scope: PaneScope, activeID: UUID, showHeader: Bool, showSwap: Bool) -> some View {
         PaneWidthReader(
             content: VStack(spacing: 0) {
-                if scope.isPrimary {
-                    conversationPane(scope: scope, sessionID: activeID, activeID: activeID, showHeader: showHeader, showSwap: showSwap)
+                if scope.isPrimary, let pending = visiblePendingID {
+                    pendingPane(
+                        scope: scope,
+                        pendingID: pending,
+                        activeID: activeID,
+                        showHeader: showHeader,
+                        showSwap: showSwap
+                    )
+                } else if scope.isPrimary {
+                    conversationPane(
+                        scope: scope, sessionID: activeID, activeID: activeID, showHeader: showHeader, showSwap: showSwap, focusID: nil)
                 } else if let pinned = scope.sessionID,
                     sessionService.session(for: pinned) != nil
                 {
-                    conversationPane(scope: scope, sessionID: pinned, activeID: activeID, showHeader: showHeader, showSwap: showSwap)
+                    conversationPane(
+                        scope: scope, sessionID: pinned, activeID: activeID, showHeader: showHeader, showSwap: showSwap, focusID: pinned)
                 } else {
                     emptyPane(scope: scope, activeID: activeID)
                 }
             }
         )
         .id("pane-\(scope.slot.rawValue)")
+        // Bölme tıklaması mavi odak çerçevesi çizer: başlık ve içerik
+        // zaten odağı belli eder (başlık, meşgul noktası), sistem efekti kapalı.
+        .focusEffectDisabled()
         .onTapGesture {
             splitStore.focus(scope.slot)
         }
@@ -481,10 +707,6 @@ struct RootChatView: View {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .stroke(Color.accentColor.opacity(0.7), lineWidth: 2)
                     .padding(8)
-            } else if showFocusRing, splitStore.focusedSlot == scope.slot {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.accentColor.opacity(0.35), lineWidth: 1.5)
-                    .padding(4)
             }
         }
         .onDrop(of: SplitDropSupport.dropTypes, isTargeted: dropBinding(for: scope.slot)) { providers in
@@ -492,10 +714,65 @@ struct RootChatView: View {
         }
     }
 
+    /// Bekleyen taslak birincilde görünür mü: kimlik var, görünür işaretli
+    /// ve çözülüyor. Sohbet seçimi gizler (taslak durur), `+` yeniden gösterir.
+    private var visiblePendingID: UUID? {
+        guard sessionService.isPendingSessionVisible,
+            let pending = sessionService.pendingSessionID,
+            sessionService.session(for: pending) != nil
+        else {
+            return nil
+        }
+        return pending
+    }
+
+    /// Gönderilmemiş yeni sohbet: boş transkript + besteci; ilk gönderimde
+    /// aynı kimlikle gerçek oturum doğar. Sohbet listede yoktur.
+    private func pendingPane(scope: PaneScope, pendingID: UUID, activeID: UUID, showHeader: Bool, showSwap: Bool) -> some View {
+        VStack(spacing: 0) {
+            pendingHintRow
+            conversationPane(
+                scope: scope,
+                sessionID: pendingID,
+                activeID: activeID,
+                showHeader: showHeader,
+                showSwap: showSwap,
+                focusID: pendingID
+            )
+        }
+    }
+
+    /// Bekleyen taslak şeridi: ne olacağı tek cümle, vazgeçme tek düğme.
+    /// Vazgeçme oturum doğurmaz, taslak silinir.
+    private var pendingHintRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "plus.bubble")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("New session — sending the first message creates the chat.")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 4)
+            Button("Discard") {
+                sessionService.discardPendingSession()
+            }
+            .buttonStyle(.plain)
+            .controlSize(.small)
+            .foregroundStyle(.secondary)
+            .help("Discard this unsent draft (no session is created)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
     /// Yan yana iken pencere araç çubuğu başlığı kullanılmaz: bölmeler kendi
     /// başlığını gösterir, yoksa birincil bölmenin terminal simgesi pencerenin
     /// en sağına düşer ve sağdaki sohbete ait sanılır.
-    private func conversationPane(scope: PaneScope, sessionID: UUID, activeID: UUID, showHeader: Bool, showSwap: Bool) -> some View {
+    private func conversationPane(scope: PaneScope, sessionID: UUID, activeID: UUID, showHeader: Bool, showSwap: Bool, focusID: UUID?)
+        -> some View
+    {
         VStack(spacing: 0) {
             if showHeader {
                 SplitPaneHeader(
@@ -533,9 +810,10 @@ struct RootChatView: View {
                 sessionService: sessionService,
                 permissionApprovalCenter: permissionApprovalCenter,
                 collapseStore: collapseStore,
-                focusedSessionID: scope.isPrimary ? nil : sessionID,
+                focusedSessionID: focusID,
                 paneID: scope.paneID,
-                showsNavigationTitle: !showHeader
+                showsNavigationTitle: !showHeader,
+                isDenseLayout: splitStore.layoutMode != .single
             )
         }
     }

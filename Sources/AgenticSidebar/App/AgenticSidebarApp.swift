@@ -128,6 +128,11 @@ struct AgenticSidebarApp: App {
             // and the app starts clean instead of failing to open.
             archiveStore: SessionArchiveStore.live()
         )
+        // Ayarlardan seçilen genel sağlayıcı tercihi relaunch'ta da yaşar:
+        // yeni sohbetler bununla açılır.
+        if let storedProviderID = initialSettingsStore.defaultProviderID {
+            initialSessionService.preferredProviderID = ProviderID(storedProviderID)
+        }
 
         let notificationService = SessionNotificationService.shared
         notificationService.onSelectSession = { [weak initialSessionService] sessionID in
@@ -183,9 +188,9 @@ struct AgenticSidebarApp: App {
         initialScreenshotMonitor.composerPrefs = initialComposerPrefs
 
         // Görev panosu yığını süreç ömrü boyunca tek kez burada kurulur; pano
-        // yalnızca bu mağazadan konuşur. Canlı yazma gönderimi bu sürümde
-        // bağlı değildir: zamanlayıcının sağlayıcıya koşu gönderen bir çağrısı
-        // yoktur, bu yüzden panodaki başlatma yalnızca defter kaydı üretir.
+        // yalnızca bu mağazadan konuşur. Canlı yazma gönderimi bağlıdır:
+        // zamanlayıcının kapılarından geçen deneme, her koşu için çalışma
+        // alanına köklenmiş bir OpenCode sunucusu üzerinden sürülür.
         let taskBoardComposition = TaskBoardComposition.live(
             applicationSupportDirectory: FileManager.default.urls(
                 for: .applicationSupportDirectory,
@@ -219,7 +224,8 @@ struct AgenticSidebarApp: App {
                     rootPath: initialSettingsStore.chatgptSystemRootPath,
                     workingDirectoryURL: ManagedOpenCodeServerManager.managedWorkingDirectoryURL(),
                     environment: ProcessInfo.processInfo.environment,
-                    fileManager: .default
+                    fileManager: .default,
+                    bundlePath: Bundle.main.bundlePath
                 )
             }
         )
@@ -444,12 +450,18 @@ final class TaskBoardComposition {
     /// `register(projectID:)` ile ya da pano kayıt köprüsüyle beslenir.
     private(set) var knownProjectIDs: Set<UUID> = []
 
-    /// Canlı koşu gönderimi bu sürümde bağlıdır: `LiveOpenCodeTaskRunningPort`
-    /// gerçek `OpenCodeCodingAgentAdapter`'ı uygulamanın yönetilen sunucusu
-    /// üzerinden sürer ve `DisabledLiveDispatch*` portları yerini gerçek
-    /// sahiplik denetimine bırakır. Kurtarma portları asla `.stopped`/`.absent`
-    /// uydurmaz: kanıtlanamayan sahiplik `.unknown` olarak kalır ve kurtarma
-    /// koşan bir denemeyi serbest bırakmaz.
+    /// Üretim kablolamasında (`live`) kurulan çalışma alanı sunucusu fabrikası:
+    /// canlı OpenCode koşuları kendi sunucularını buradan alır. `make` ile
+    /// kurulan test kompozisyonlarında `nil` kalır ve port OpenCode yazma
+    /// koşusunu kapatır.
+    private(set) var workspaceServerFactory: OpenCodeWorkspaceServerFactory?
+
+    /// Canlı koşu gönderimi bağlıdır: `LiveOpenCodeTaskRunningPort` gerçek
+    /// `OpenCodeCodingAgentAdapter`'ı her koşu için sahipli çalışma alanına
+    /// köklenmiş ayrı bir sunucu üzerinden sürer; `DisabledLiveDispatch*`
+    /// portları yerini gerçek sahiplik denetimine bırakır. Kurtarma portları
+    /// asla `.stopped`/`.absent` uydurmaz: kanıtlanamayan sahiplik `.unknown`
+    /// olarak kalır ve kurtarma koşan bir denemeyi serbest bırakmaz.
     static let liveDispatchCapabilityPresent = true
 
     /// Canlı gönderim kablolamasının ön koşulunu doğrular: gönderim bağlıysa
@@ -500,7 +512,8 @@ final class TaskBoardComposition {
         clock: any TaskSchedulerClock,
         schedulerID: String,
         recoveryID: String,
-        requiredSteps: [String]
+        requiredSteps: [String],
+        verificationPreflight: (any TaskVerificationPreflightProviding)? = nil
     ) -> TaskBoardComposition {
         let scheduler = TaskScheduler(
             repository: repository,
@@ -529,7 +542,8 @@ final class TaskBoardComposition {
             executionFingerprints: executionFingerprints,
             clock: clock,
             requiredSteps: requiredSteps,
-            liveDispatchAvailable: dispatchPort != nil
+            liveDispatchAvailable: dispatchPort != nil,
+            verificationPreflight: verificationPreflight
         )
         return TaskBoardComposition(
             store: TaskBoardStore(service: service),
@@ -552,6 +566,18 @@ final class TaskBoardComposition {
         knownProjectIDs.insert(projectID)
     }
 
+    /// Kalıcı depodaki projeleri kayıt defterine geri yükler.
+    ///
+    /// Yeniden başlatma sonrası pano boş kalmasın diye açılış uzlaştırmasından
+    /// önce çağrılır; kayıt defteri artık yalnız bellek içi değildir.
+    func restoreKnownProjects() async {
+        guard let stored = try? await repository.listProjects() else { return }
+        for project in stored {
+            knownProjectIDs.insert(project.id)
+        }
+        await store.refreshProjects()
+    }
+
     /// Yeni kaydedilen projeyi kayıt defterine ekler ve hemen uzlaştırır.
     ///
     /// Kayıt akışından sonra çağrılır; taze bir projede tur boştur ama çağrı
@@ -570,6 +596,7 @@ final class TaskBoardComposition {
     /// zamanlayıcı turu istenmeden önce koşmalıdır. Projeler sıralı işlenir ve
     /// bir projenin hatası (`RecoveryReport.failure`) diğerlerini atlamaz.
     func reconcileKnownProjects() async -> [RecoveryReport] {
+        await restoreKnownProjects()
         var reports: [RecoveryReport] = []
         for projectID in knownProjectIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
             reports.append(await service.reconcile(projectID: projectID))
@@ -611,9 +638,13 @@ final class TaskBoardComposition {
         }
         // Bariyer mağaza kapanışından önce gelir: uçuştaki gönderim görevi
         // kapalı mağazaya yazamaz. Sıra kasıtlıdır — önce koşan denemeler
-        // durdurulur, sonra gönderim görevleri beklenir, en son mağaza kapanır.
-        // OpenCode sunucu yaşam döngüsü bu yola dahil değildir.
+        // durdurulur, sonra gönderim görevleri beklenir, sonra terminal
+        // tamamlanmadan sonra bırakma penceresinde kalmış olabilecek çalışma
+        // alanı sunucuları kapatılır, en son mağaza kapanır.
+        // Sohbet sunucusunun yaşam döngüsü bu yola dahil değildir; onu uygulama
+        // temsilcisi kendi kapanış adımında durdurur.
         await service.awaitDispatchedRuns()
+        _ = await workspaceServerFactory?.stopAll()
         await repository.close()
     }
 }
@@ -657,8 +688,21 @@ extension TaskBoardComposition {
             return nil
         }
 
+        // Her canlı OpenCode koşusu sahipli çalışma alanına köklenmiş kendi
+        // sunucusunu alır; durum ad alanı pano dizini altındadır ve sohbet
+        // sunucusunun defterinden ayrıdır.
+        let workspaceServerFactory = OpenCodeWorkspaceServerFactory.live(
+            credentialStore: credentialStore,
+            stateRootURL: boardDirectory.appendingPathComponent(
+                "opencode-workspaces",
+                isDirectory: true
+            )
+        )
+
         // Yetenek kaydı: kayıt, uygunluk sorusunu dürüstçe yanıtlar; canlı
-        // gönderim aynı adaptörü bu kayıt üzerinden çözer.
+        // gönderim aynı adaptörü bu kayıt üzerinden çözer. Yazma yeteneği
+        // koşu başına kökleme kablolandığı için açıkça bildirilir; adaptörün
+        // `start` kapsama denetimi yine kapalı kalır.
         let codingAgentRegistry = CodingAgentRegistry()
         let openCodeCodingAgentAdapter = OpenCodeCodingAgentAdapter(
             serverManager: openCodeServerManager,
@@ -674,7 +718,8 @@ extension TaskBoardComposition {
                     appSessionID: appSessionID
                 )
             },
-            auditLog: toolAuditLog
+            auditLog: toolAuditLog,
+            workspaceAccess: .rootedPerRun
         )
         codingAgentRegistry.register(runtime: openCodeCodingAgentAdapter)
         codingAgentRegistry.register(
@@ -734,7 +779,7 @@ extension TaskBoardComposition {
         // merkezi yalnızca yedek olarak kalır.
         let dispatchPort = LiveOpenCodeTaskRunningPort(
             registry: codingAgentRegistry,
-            serverManager: openCodeServerManager,
+            workspaceServerFactory: workspaceServerFactory,
             clientFactory: { connection in
                 OpenCodeClient(transport: openCodeTransport, connection: connection)
             }
@@ -743,6 +788,7 @@ extension TaskBoardComposition {
             workspaces: preflight,
             probe: WorkspaceFingerprintProbe(runner: verificationRunner)
         )
+        let verificationPreflight = LiveVerificationPreflightProvider(workspaces: preflight)
 
         let composition = make(
             repository: repository,
@@ -765,9 +811,11 @@ extension TaskBoardComposition {
             clock: SystemTaskSchedulerClock(),
             schedulerID: "taskboard-scheduler",
             recoveryID: "taskboard-recovery",
-            requiredSteps: AcceptanceGate.swiftPMRequiredSteps
+            requiredSteps: AcceptanceGate.swiftPMRequiredSteps,
+            verificationPreflight: verificationPreflight
         )
         serviceBox.install(composition.service)
+        composition.workspaceServerFactory = workspaceServerFactory
         return composition
     }
 }
@@ -791,14 +839,17 @@ private struct TaskBoardProjectResolver: WorkspaceProjectResolving {
 
     func resolveProject(id: UUID) async -> CodingProject? {
         guard let service = await service() else { return nil }
-        return await service.project(id: id)
+        if let cached = await service.project(id: id) {
+            return cached
+        }
+        return await service.projectFromStore(id: id)
     }
 }
 
 /// Sohbette seçili sağlayıcı/model ile yetenek kaydını uzlaştıran uygunluk
 /// portu. Eksik yetenekler olduğu gibi raporlanır; uygun olmayan sağlayıcı
 /// asla sessizce yedeklenmez.
-private struct LiveTaskProviderRegistry: TaskProviderRegistryPort {
+struct LiveTaskProviderRegistry: TaskProviderRegistryPort {
     let registry: CodingAgentRegistry
     let configuration: @MainActor @Sendable () -> SessionConfiguration?
 
@@ -880,13 +931,18 @@ struct ConservativeRecoveryProcesses: TaskProcessOwnershipInspecting {
 /// Canlı koşu portu: zamanlayıcıdan geçen denemeyi sağlayıcı kaydındaki gerçek
 /// adaptörle sürer ve akışı olduğu gibi (sınırlı kanalıyla) aktarır.
 ///
-/// Çalışma alanı sahipliği ve sağlayıcı uygunluğu zamanlayıcının kapılarında
-/// doğrulanmıştır; port yalnızca eşler, sunucunun ayakta olduğundan emin olur ve
-/// iptali adaptöre iletir. İzin yanıtları, koşuya özel deny-unless-safe
-/// çözücüsünden üretilir; adaptörün sohbet izin merkezi bu koşuda kullanılmaz.
+/// OpenCode koşuları sohbet sunucusunu kullanmaz: her koşu için sahipli çalışma
+/// alanına köklenmiş ayrı bir sunucu açılır (`workspaceServerFactory`), adaptör
+/// o sunucuya bağlanır ve sunucu terminal tamamlanma, iptal, hata ve kapanış
+/// yollarının hepsinde bırakılır. Sohbet sunucusunun yaşam döngüsü değişmez;
+/// port ona hiç dokunmaz. Fabrika yoksa OpenCode yazma koşusu kapalı kalır:
+/// sohbet kökünde çalıştırmak kapsama ihlali olurdu.
+///
+/// İzin yanıtları, koşuya özel deny-unless-safe çözücüsünden üretilir; adaptörün
+/// sohbet izin merkezi bu koşuda kullanılmaz.
 struct LiveOpenCodeTaskRunningPort: TaskRunningPort {
     let registry: CodingAgentRegistry
-    let serverManager: any OpenCodeServerManaging
+    let workspaceServerFactory: OpenCodeWorkspaceServerFactory?
     let clientFactory: @Sendable (OpenCodeServerConnection) -> any OpenCodeClientProtocol
 
     func start(
@@ -895,9 +951,6 @@ struct LiveOpenCodeTaskRunningPort: TaskRunningPort {
     ) async throws -> TaskRunSession {
         guard let runtime = registry.runtime(for: request.attempt.providerID) else {
             throw CodingAgentAdapterError.invalidProvider
-        }
-        if await serverManager.currentConnection() == nil {
-            _ = try await serverManager.start(computerUse: nil)
         }
 
         let configuration = SessionConfiguration(
@@ -920,14 +973,32 @@ struct LiveOpenCodeTaskRunningPort: TaskRunningPort {
             policySnapshot: [:]
         )
 
+        guard let openCodeAdapter = runtime as? OpenCodeCodingAgentAdapter else {
+            // Diğer çalıştırıcılar (ör. salt metin) protokolün kendi başlangıcını
+            // kullanır; yazma yetenekleri kayıt defterinde zaten kapıdadır.
+            let run = try await runtime.start(request: executionRequest)
+            return LiveOpenCodeTaskRunSession(events: run.events, cancelHandler: { await run.cancel() })
+        }
+
+        guard let workspaceServerFactory else {
+            throw OpenCodeWorkspaceServerError.rootingUnavailable(
+                workspacePath: request.workspace.workspacePath
+            )
+        }
+
+        let workspaceServer = try await workspaceServerFactory.acquire(
+            workspacePath: request.workspace.workspacePath
+        )
         let run: CodingAgentRun
-        if let openCodeAdapter = runtime as? OpenCodeCodingAgentAdapter {
+        do {
+            let rootAdapter = await openCodeAdapter.bound(to: workspaceServer.manager)
             let replyProvider: OpenCodeCodingAgentAdapter.PermissionReplyProvider = { permissionRequest in
                 let reply = await approvalResolver(
                     TaskRunApprovalRequest(
                         id: permissionRequest.id,
                         toolName: permissionRequest.toolName,
-                        patterns: permissionRequest.patterns
+                        patterns: permissionRequest.patterns,
+                        delegationTarget: permissionRequest.delegationTarget
                     )
                 )
                 switch reply {
@@ -937,16 +1008,45 @@ struct LiveOpenCodeTaskRunningPort: TaskRunningPort {
                     return .reject
                 }
             }
-            run = try await openCodeAdapter.start(
+            run = try await rootAdapter.start(
                 request: executionRequest,
                 permissionReplyProvider: replyProvider
             )
-        } else {
-            // Diğer çalıştırıcılar (ör. salt metin) protokolün kendi başlangıcını
-            // kullanır; yazma yetenekleri kayıt defterinde zaten kapıdadır.
-            run = try await runtime.start(request: executionRequest)
+        } catch {
+            // Başlatma hatası sunucuyu bırakır; süreç ve kira artığı kalmaz.
+            await workspaceServer.release()
+            throw error
         }
-        return LiveOpenCodeTaskRunSession(events: run.events, cancelHandler: { await run.cancel() })
+        return WorkspaceRootedTaskRunSession(run: run, releaseServer: workspaceServer.release)
+    }
+}
+
+/// Çalışma alanına köklenmiş koşu oturumu: adaptör akışını aynen taşır ve akış
+/// bittiğinde ya da iptal istendiğinde sunucuyu bırakır. Bırakma idempotenttir;
+/// terminal, iptal, hata ve kapanış yolları aynı garantiyi kullanır.
+struct WorkspaceRootedTaskRunSession: TaskRunSession {
+    let events: AsyncStream<CodingAgentEvent>
+    private let cancelHandler: @Sendable () async -> Void
+
+    init(run: CodingAgentRun, releaseServer: @escaping @Sendable () async -> Void) {
+        let (stream, continuation) = AsyncStream<CodingAgentEvent>.makeStream()
+        let pump = Task {
+            for await event in run.events {
+                continuation.yield(event)
+            }
+            continuation.finish()
+            await releaseServer()
+        }
+        self.events = stream
+        self.cancelHandler = { [pump] in
+            pump.cancel()
+            await run.cancel()
+            await releaseServer()
+        }
+    }
+
+    func cancel() async {
+        await cancelHandler()
     }
 }
 
@@ -983,6 +1083,28 @@ struct LiveExecutionFingerprintProvider: TaskExecutionFingerprintProviding {
             throw TaskExecutionFingerprintError.workspaceNotOwned(taskID: taskID, reason: reason)
         case .unavailable(let reason):
             throw TaskExecutionFingerprintError.workspaceNotOwned(taskID: taskID, reason: reason)
+        }
+    }
+}
+
+/// Gönderim öncesi doğrulama ön kontrolünün canlı karşılığı.
+///
+/// Sahipli çalışma alanı güvenilir tarifeye çözülemezse (`Package.swift`
+/// yoksa) Türkçe gerekçe döner; servis talebi geri çekip ajanı hiç
+/// başlatmaz. Sahiplik yokluğu parmak izi yolunda zaten reddedildiği için
+/// burası yalnız ham nedeni taşır.
+struct LiveVerificationPreflightProvider: TaskVerificationPreflightProviding {
+    let workspaces: any TaskWorkspacePreflightPort
+
+    func unresolvableReason(projectID: UUID, taskID: UUID) async -> String? {
+        switch await workspaces.preflight(projectID: projectID, taskID: taskID) {
+        case .owned(let workspace):
+            guard VerificationResolver.isResolvable(repository: URL(fileURLWithPath: workspace.workspacePath)) else {
+                return "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanında Package.swift yok — bu pano sürümü yalnız SwiftPM projelerini doğrular; ajan koşusu başlamadan reddedildi"
+            }
+            return nil
+        case .notOwned(let reason), .unavailable(let reason):
+            return reason
         }
     }
 }
@@ -1047,12 +1169,80 @@ struct RecipeTaskVerifier: TaskVerifying {
                     : "Required recipe steps failed, were skipped, or changed the workspace revision"
             )
         } catch {
+            // Başarısız çözümleme sıfır kanıt bırakırdı: kart `verificationFailed`
+            // derken detay "bağlı değil" derdi ve adli iz yoktu. Başarısızlık
+            // da kanıt satırı olarak yazılır (kartla detay aynı gerçeği söyler).
+            // Ham hata günlüğe aynen düşer (adli iz korunur); karta ve
+            // veritabanına iç tip adı ya da mutlak kullanıcı yolu yazılmaz.
+            AppLog.lifecycle.error(
+                "Recipe verification failed for task \(task.id.uuidString, privacy: .public): \(String(describing: error), privacy: .public)"
+            )
+            let failure = Self.sanitizedResolutionFailure(error)
+            let failed = VerificationEvidence(
+                taskID: task.id,
+                attemptID: attempt.id,
+                recipeName: "unresolved",
+                status: .failed,
+                detailsRedacted: failure.message,
+                blockedBy: failure.code,
+                recipeVersion: VerificationResolver.recipeVersion
+            )
+            try? await repository.recordEvidence(failed)
+            await ledger.record(
+                taskID: task.id,
+                attemptID: attempt.id,
+                workspacePath: workspace.workspacePath,
+                evidence: [failed]
+            )
             return TaskVerificationReport(
                 passed: false,
                 recipeName: "unresolved",
-                detailsRedacted: "Recipe resolution or execution failed: \(error)"
+                detailsRedacted: failure.message
             )
         }
+    }
+
+    /// Çözümleme hatasını karta yazılabilir kısa koda ve Türkçe eylemli mesaja
+    /// indirir. İç enum adı ve mutlak yol asla karta/veritabanına çıkmaz.
+    static func sanitizedResolutionFailure(_ error: Error) -> (code: String, message: String) {
+        if let resolverError = error as? VerificationResolverError {
+            switch resolverError {
+            case .unrecognizedProject:
+                return (
+                    "VERIFICATION_UNRECOGNIZED_PROJECT",
+                    "VERIFICATION_UNRECOGNIZED_PROJECT: Package.swift bulunamadı — bu pano sürümü yalnız SwiftPM projelerini doğrular; depo kökünde Package.swift olan bir proje seçin"
+                )
+            case .metadataUnreadable:
+                return (
+                    "VERIFICATION_METADATA_UNREADABLE",
+                    "VERIFICATION_METADATA_UNREADABLE: proje dosyası okunamadı; dosya izinlerini doğrulayıp tekrar deneyin"
+                )
+            case .requiredToolUnavailable(let step, _):
+                return (
+                    "VERIFICATION_TOOL_UNAVAILABLE",
+                    "VERIFICATION_TOOL_UNAVAILABLE: gerekli araç eksik, adım çalışmadı: \(step)"
+                )
+            case .invalidExecutable(let step, _, _):
+                return (
+                    "VERIFICATION_INVALID_EXECUTABLE",
+                    "VERIFICATION_INVALID_EXECUTABLE: adım çalıştırılamaz: \(step)"
+                )
+            case .pathEscape(let step, _):
+                return (
+                    "VERIFICATION_PATH_ESCAPE",
+                    "VERIFICATION_PATH_ESCAPE: adım çalışma alanından kaçıyor: \(step)"
+                )
+            case .nonStandardExecutionRequiresApproval(let recipe):
+                return (
+                    "VERIFICATION_APPROVAL_REQUIRED",
+                    "VERIFICATION_APPROVAL_REQUIRED: bu tarif açık onay ister: \(recipe)"
+                )
+            }
+        }
+        return (
+            "VERIFICATION_FAILED",
+            "VERIFICATION_FAILED: doğrulama çalıştırılamadı; ayrıntı için uygulama günlüğüne bakın"
+        )
     }
 }
 

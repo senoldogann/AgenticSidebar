@@ -15,6 +15,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
     case plan
     case review
     case exam
+    case ask
 
     var id: String { rawValue }
 
@@ -24,6 +25,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         case .plan: "Plan"
         case .review: "Review"
         case .exam: "Exam"
+        case .ask: "Ask"
         }
     }
 
@@ -33,6 +35,7 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         case .plan: "list.checklist"
         case .review: "checkmark.shield.fill"
         case .exam: "graduationcap.fill"
+        case .ask: "questionmark.circle.fill"
         }
     }
 
@@ -45,7 +48,9 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
         case .review:
             "Reviews code against security, bug, and quality standards, then proposes a plan"
         case .exam:
-            "Solves exam, test, and quiz questions with direct answers, mathematical derivations, and code"
+            "Solves any exam question (choice, written, math, code) with a direct answer first"
+        case .ask:
+            "Answers your question directly; reads code and searches the web, never changes files"
         }
     }
 
@@ -54,6 +59,13 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
     /// Shared with the markdown renderer, which turns that fence into a document
     /// card instead of a code block, so the model only has to emit ```plan.
     static let planFenceLanguage = "plan"
+
+    /// The fence language that marks an exam solution inside a reply.
+    ///
+    /// Same contract as the plan fence: the renderer turns it into a document
+    /// card with a single copy action, so the model only has to emit
+    /// ```solution.
+    static let solutionFenceLanguage = "solution"
 
     /// `nil` for the mode that needs no instruction — the provider's own default
     /// behaviour is already the build workflow.
@@ -95,18 +107,34 @@ enum AgentMode: String, CaseIterable, Codable, Identifiable, Sendable {
             EXAM & TEST SOLVER MODE: \
             You are an expert exam, test, and quiz solving assistant with rigorous domain mastery across mathematics, science, engineering, programming, logic, and general subjects. \
             STRICT READ-ONLY CONSTRAINT: Do not create, edit, or modify any project files. Answer the questions directly. \
+            First detect the question type (single-choice, multi-choice, true/false, numeric fill-in, open written, proof, code, SQL, or mixed) and the question language; always answer in the question language. \
+            If several numbered questions are visible, solve each one separately under its own heading. \
             When answering any question (from an image, screenshot, copied text, or problem description): \
-            1. DIRECT & DEFINITIVE ANSWER FIRST: \
-            State the clear, unambiguous final answer at the very beginning (e.g. "**Correct Answer: C**" or "**Final Answer: 42**"). \
-            2. STEP-BY-STEP SOLUTION & DERIVATION: \
-            Provide a structured, step-by-step mathematical proof, derivation, or reasoning explaining why this answer is correct. \
-            For multiple choice questions, explain why the chosen option is correct and why tricky alternative options are incorrect. \
-            3. MATHEMATICAL NOTATION & EQUATIONS: \
-            Format mathematical equations and formulas clearly using standard Unicode symbols (e.g., √, ∛, π, ∑, ∫, ±, ≠, ≤, ≥, ≈, ×, ÷, ·, ∞, ∈, ∉, ⊂, ∪, ∩, ∂, ∇, ², ³, ⁿ, ₁, ₂, ½) alongside clear LaTeX expressions ($...$ or $$...$$). \
-            4. CODE AND ALGORITHMS: \
-            Write all code, SQL, or algorithmic solutions in fenced code blocks with explicit language identifiers (e.g., ```python, ```swift, ```sql). \
-            5. THOROUGHNESS & PRECISION: \
-            Double-check arithmetic, signs, units, edge cases, and wording before concluding.
+            FORMAT (strict) — short verdict first, full solution in the card: \
+            1. Start with the net result only: the definitive final answer in 1-3 lines, \
+            no preamble and no derivation before it \
+            (single-choice "**Correct Answer: C**", multi-choice "**Correct Answers: A, C**", \
+            true/false "**Correct Answer: True**", numeric "**Final Answer: 42**", \
+            open written a 1-2 sentence bold verdict). \
+            2. Then put the FULL step-by-step solution in exactly one fenced ```\(Self.solutionFenceLanguage) block \
+            as Markdown: the derivation or reasoning, why tricky alternatives are wrong, \
+            complete runnable code in fenced blocks with language ids (never describe code \
+            without showing it), at most 2-3 $$...$$ display equations with Unicode symbols \
+            in prose (√, π, ∑, ∫, ±, ≤, ≥, ≈, ×, ÷). Keep written reasoning compact: \
+            3-6 key points, then the conclusion. \
+            Write nothing after that block except one plain copy-friendly line \
+            (e.g. "Cevap: A" or "Answer: 42"). \
+            Double-check arithmetic, signs, units, edge cases, and wording before concluding. \
+            If the image or text is unreadable, state your assumption explicitly before solving.
+            """
+        case .ask:
+            """
+            ASK MODE: Do not create, edit, delete or move any file, and do not run \
+            any command that changes state. Focus only on the user's question and \
+            answer it directly and correctly, with no extra prose. When the answer \
+            needs codebase or external facts, investigate first with read-only tools \
+            (read, glob, grep, list, lsp, websearch, webfetch). Keep the answer \
+            short: no implementation, no plan block, no file changes.
             """
         }
     }

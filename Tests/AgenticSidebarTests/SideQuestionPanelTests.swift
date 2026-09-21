@@ -45,6 +45,21 @@ final class SideQuestionPanelTests: XCTestCase {
         )
     }
 
+    /// Oturum kapsamı: servis bölme başına yaşar; kart yalnız sorunun
+    /// oturumu odaktayken çizilir, başka sohbete sızmaz.
+    func testPanelIsScopedToFocusedSession() throws {
+        let source = try panelSource()
+
+        XCTAssertTrue(
+            source.contains("let focusedSessionID: UUID"),
+            "Panel odaklı oturum kimliğini almalı"
+        )
+        XCTAssertTrue(
+            source.contains("current.sessionID == focusedSessionID"),
+            "Kart yalnız sorunun sohbetinde çizilmeli"
+        )
+    }
+
     // MARK: - Helpers
 
     private func panelSource() throws -> String {

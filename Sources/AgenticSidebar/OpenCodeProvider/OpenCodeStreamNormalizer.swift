@@ -67,6 +67,10 @@ struct OpenCodeStreamNormalizer: Sendable {
     private static let maximumBufferedPermissionsPerSession = 16
     /// Tura ait metin tamponu: kısmi `text` parçaları için en eski düşer.
     private static let maximumBufferedTextParts = 128
+    /// Tek bir parça için bayt bütçesi: tipi geç öğrenilen dev bir parça
+    /// tamponu sınırsız şişiriyordu (parça sayısı sınırlıydı ama parça
+    /// büyüklüğü değildi). Aşımda metin kesilir ve kesildiği işaretlenir.
+    private static let maximumBufferedTextBytesPerPart = 256 * 1024
     /// Yinelenen bitiş olaylarını eleyen küme; sıra, en eskiyi düşürmek için.
     private static let maximumFinishedToolParts = 256
     /// Yüzeye çıkan metin parçaları; sıra, en eskiyi düşürmek için.
@@ -86,9 +90,15 @@ struct OpenCodeStreamNormalizer: Sendable {
         self.onPermissionRequest = onPermissionRequest
     }
 
-    /// Malformed payloads fail the turn on purpose: silently dropping bytes would
-    /// present a truncated answer as a complete one. Unknown event types and SSE
-    /// control lines are ignored, which covers additive protocol changes.
+    /// Akış gürültüsü turu öldürmez: JSON olmayan `data:` satırı (sentinel,
+    /// nabız, sağlayıcı geçiş gürültüsü) atlanır. Tek bir bozuk satır 46
+    /// saniyelik gerçek işi (düşünme + araç sonuçları) çöpe atıyordu; tur
+    /// yine de `session.idle`/`session.error` ile kapanır ve gerçekten boş
+    /// kalan tur alt katmandaki boş-tur denetimine takılır. Bilinen sentinel
+    /// (`[DONE]`) OpenAI yoluyla aynı şekilde atlanır. İyi biçimli ama
+    /// oturuma ait `session.error` hâlâ fırlatılır: gerçek arka uç hatası
+    /// sessizce yutulmaz. Bilinmeyen olay türleri ve SSE denetim satırları
+    /// zaten yok sayılır, bu da ek protokol değişikliklerini kapsar.
     mutating func consume(line: String) throws -> [ProviderEvent] {
         guard line.hasPrefix("data:") else {
             return []
@@ -100,24 +110,16 @@ struct OpenCodeStreamNormalizer: Sendable {
         guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return []
         }
-        guard let data = payload.data(using: .utf8) else {
-            throw ProviderRuntimeError.unexpectedResponse
+        // Akış sonu sentineli: OpenAI yolundaki korumanın aynısı.
+        guard payload != "[DONE]" else {
+            return []
         }
-
-        let object: [String: Any]
-        do {
-            guard let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw ProviderRuntimeError.unexpectedResponse
-            }
-            object = decoded
-        } catch let error as ProviderRuntimeError {
-            throw error
-        } catch {
-            throw ProviderRuntimeError.unexpectedResponse
-        }
-
-        guard let type = object["type"] as? String else {
-            throw ProviderRuntimeError.unexpectedResponse
+        guard let data = payload.data(using: .utf8),
+            let decoded = try? JSONSerialization.jsonObject(with: data),
+            let object = decoded as? [String: Any],
+            let type = object["type"] as? String
+        else {
+            return []
         }
         let properties = object["properties"] as? [String: Any] ?? [:]
 
@@ -264,7 +266,10 @@ struct OpenCodeStreamNormalizer: Sendable {
                 }
                 bufferedPartOrder.append(partID)
             }
-            bufferedTextDeltas[partID, default: ""] += delta
+            bufferedTextDeltas[partID, default: ""] = Self.appendingBufferedDelta(
+                delta,
+                to: bufferedTextDeltas[partID, default: ""]
+            )
             return []
         }
     }
@@ -380,7 +385,7 @@ struct OpenCodeStreamNormalizer: Sendable {
 
             // Only the final part update carries a result, so the output and the
             // change preview travel with the terminal event.
-            let output = state["output"] as? String ?? state["error"] as? String
+            let output = Self.toolOutput(from: state)
             let diff = Self.fileChangePreview(tool: tool, input: input)
 
             switch status {
@@ -459,8 +464,134 @@ struct OpenCodeStreamNormalizer: Sendable {
 
         default:
             removeBufferedText(for: partID)
+            if let mediaEvents = mediaAttachmentEvents(partType: partType, part: part) {
+                return mediaEvents
+            }
             return []
         }
+    }
+
+    /// `file`/`image` parçası: ekran görüntüsü gibi araç ürünleri ayrı parça
+    /// olarak gelebilir. Tek bir computer aracı koşuyorsa başvuru onun
+    /// kartına işlenir; kime ait olduğu belli değilse düşer (yanlış karta
+    /// yazmaktansa göstermemek yeğdir).
+    private mutating func mediaAttachmentEvents(
+        partType: String,
+        part: [String: Any]
+    ) -> [ProviderEvent]? {
+        guard partType == "file" || partType == "image" else {
+            return nil
+        }
+        guard let reference = Self.mediaReference(in: part) else {
+            return nil
+        }
+        guard runningToolDescriptors.count == 1,
+            let (key, running) = runningToolDescriptors.first,
+            running.kind == .computer
+        else {
+            return nil
+        }
+        let merged = Self.appendingMediaReference(reference, to: running.output)
+        guard merged != running.output else {
+            return nil
+        }
+        let updated = ProviderActivityDescriptor(
+            id: running.id,
+            kind: running.kind,
+            title: running.title,
+            detail: running.detail,
+            output: merged,
+            diff: running.diff
+        )
+        guard updated != running else {
+            return nil
+        }
+        runningToolDescriptors[key] = updated
+        return [.activityUpdated(updated)]
+    }
+
+    /// Dosya/görsel parçasındaki başvuru: yol ya da adres, ilk dolu olan.
+    static func mediaReference(in part: [String: Any]) -> String? {
+        for key in ["url", "path", "filePath", "filename", "name"] {
+            if let ref = part[key] as? String,
+                !ref.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                return ref
+            }
+        }
+        if let file = part["file"] as? [String: Any] {
+            for key in ["url", "path", "filePath", "filename", "name"] {
+                if let ref = file[key] as? String,
+                    !ref.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                {
+                    return ref
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Başvuru zaten çıktıda varsa aynen bırakır (yinelenen parça
+    /// güncellemesi kartı şişirmez), yoksa yeni satır olarak ekler.
+    static func appendingMediaReference(_ reference: String, to output: String?) -> String? {
+        guard let output, !output.isEmpty else {
+            return reference
+        }
+        guard !output.contains(reference) else {
+            return output
+        }
+        return output + "\n" + reference
+    }
+
+    /// Araç çıktısı her zaman düz metin gelmez: `computer_screenshot` gibi
+    /// araçlar sözlük ya da içerik bloğu döndürebilir. Bilinen şekiller
+    /// okunur metne indirgenir; hiçbiri uymazsa `nil` döner.
+    static func toolOutput(from state: [String: Any]) -> String? {
+        if let output = state["output"], let text = readableToolOutput(output) {
+            return text
+        }
+        if let error = state["error"], let text = readableToolOutput(error) {
+            return text
+        }
+        return nil
+    }
+
+    /// Tek bir `output`/`error` değerini okunur metne indirir: düz metin
+    /// aynen, sözlükte `text`/`output`/`content` alanı, dizide metin
+    /// blokları, dosya başvurusunda (`path`/`url`) başvuru yolu.
+    static func readableToolOutput(_ value: Any) -> String? {
+        if let text = value as? String {
+            return text.isEmpty ? nil : text
+        }
+        if let dict = value as? [String: Any] {
+            for key in ["text", "output", "content", "result"] {
+                if let text = dict[key] as? String, !text.isEmpty {
+                    return text
+                }
+            }
+            for key in ["path", "filePath", "file", "url", "filename"] {
+                if let ref = dict[key] as? String, !ref.isEmpty {
+                    return ref
+                }
+            }
+            return nil
+        }
+        if let items = value as? [Any] {
+            let texts = items.compactMap { item -> String? in
+                if let text = item as? String, !text.isEmpty {
+                    return text
+                }
+                guard let block = item as? [String: Any] else {
+                    return nil
+                }
+                return readableToolOutput(block)
+            }
+            guard !texts.isEmpty else {
+                return nil
+            }
+            return texts.joined(separator: "\n")
+        }
+        return nil
     }
 
     /// Çocuk oturumdan gelen parça güncellemesi.
@@ -896,11 +1027,15 @@ struct OpenCodeStreamNormalizer: Sendable {
         }
 
         guard role == "user" else {
+            // Sunucu bilinmeyeni sıfır yazar: girdisi sıfır bildirilen tur
+            // "bildirilmedi" demektir, `%0` değil. Sıfırı geçerli saymak
+            // halkayı kalıcı `0%`'a kilitliyordu.
             guard
                 role == "assistant",
                 let tokens = info["tokens"] as? [String: Any],
                 let input = Self.tokenCount(tokens["input"]),
-                let output = Self.tokenCount(tokens["output"])
+                let output = Self.tokenCount(tokens["output"]),
+                input > 0
             else {
                 return []
             }
@@ -943,6 +1078,25 @@ struct OpenCodeStreamNormalizer: Sendable {
         }
 
         return text.isEmpty ? nil : text
+    }
+
+    /// Bayt bütçeli tampon ekleme: bütçe dolunca delta kesilir ve tek
+    /// seferlik kesilme işareti konur; sonraki deltalar düşer.
+    static func appendingBufferedDelta(_ delta: String, to buffered: String) -> String {
+        let marker = "\n… (buffered text truncated)"
+        guard !buffered.hasSuffix(marker) else {
+            return buffered
+        }
+        let remaining = maximumBufferedTextBytesPerPart - buffered.utf8.count
+        guard remaining > 0 else {
+            return buffered + marker
+        }
+        let deltaBytes = delta.utf8.count
+        guard deltaBytes > remaining else {
+            return buffered + delta
+        }
+        let fittingPrefix = String(decoding: delta.utf8.prefix(remaining), as: UTF8.self)
+        return buffered + fittingPrefix + marker
     }
 
     /// The `+`/`-` preview of a file-changing tool.

@@ -73,6 +73,11 @@ struct ExtensionRuntimeSnapshot: Equatable, Sendable {
 enum ManagedOpenCodeConfiguration {
     static let fileName = "managed-config.json"
     static let schemaURL = "https://opencode.ai/config.json"
+    /// Bu uygulamanın davranışını doğruladığı OpenCode sürümü: izin/araç
+    /// şeması bu sürümde sabitlendi (`debug config` ile doğrulandı). Çalışan
+    /// sürücü farklıysa başlatma engellenmez, yalnızca uyarı kaydedilir
+    /// (`validateRuntimeVersion`).
+    static let expectedOpenCodeVersion = "1.18.31"
     static let planAgentName = "agenticsidebar-readonly"
     /// Salt-okunur birincil ajanın analiz delegasyonu için tek hedefi:
     /// yazma yetkisi olmayan araştırma alt-ajanı.
@@ -85,6 +90,29 @@ enum ManagedOpenCodeConfiguration {
     /// ours is told apart from a server the user started themselves.
     static func fileURL(in directoryURL: URL) -> URL {
         directoryURL.appendingPathComponent(fileName)
+    }
+
+    /// Çalışan OpenCode sürücüsünün beklenen sürümle uyuşup uyuşmadığını
+    /// denetler. Uyuşmazlık yalnızca uyarı olarak kaydedilir: eski/yeni bir
+    /// sürücüyle açılışı engellemek, kullanıcıyı çalışamaz bırakır; ama
+    /// sessizce geçmek de şema kaymalarını teşhis edilemez yapar.
+    ///
+    /// - Returns: Sürümler uyuşuyorsa `true`.
+    @discardableResult
+    static func validateRuntimeVersion(_ actual: String?) -> Bool {
+        guard let actual, !actual.isEmpty else {
+            AppLog.openCode.error(
+                "OpenCode version is unreadable; expected \(expectedOpenCodeVersion, privacy: .public)"
+            )
+            return false
+        }
+        guard actual == expectedOpenCodeVersion else {
+            AppLog.openCode.warning(
+                "OpenCode version mismatch: expected \(expectedOpenCodeVersion, privacy: .public), running \(actual, privacy: .public)"
+            )
+            return false
+        }
+        return true
     }
 
     /// Builds the configuration OpenCode reads, with empty sections left out.
@@ -177,22 +205,24 @@ enum ManagedOpenCodeConfiguration {
             )
         }
 
-        // The plan/review/exam agent is a backend-enforced tool boundary, not just
+        // The plan/review/exam/ask agent is a backend-enforced tool boundary, not just
         // a prompt. A catch-all deny blocks file mutations, shell and computer
         // use: read-only modes must propose, inspect and research — never mutate,
         // not even through shell. `edit`/`write`/`patch`/`multiedit`/`bash` stay
         // denied via `*` on purpose.
-        // `task` is allowed so analysis can be delegated, but the primary agent's
-        // description names the read-only research subagent below as the sole
-        // delegation target, and that subagent itself denies `task`, so no chain
-        // can reach a writable agent. (OpenCode cannot scope `task` to one
-        // subagent at the config level; a model that disobeys the directive and
-        // spawns a writable subagent is a residual risk and is logged through the
-        // normal approval flow.)
+        // `task` asks so every delegation surfaces as an approval request: the
+        // primary agent's description names the read-only research subagent below
+        // as the sole delegation target, and the app auto-approves only that
+        // target — any other target (a model disobeying the directive and
+        // spawning a writable subagent) is rejected instead of running silently.
+        // That subagent itself denies `task`, so no chain can reach a writable
+        // agent. (OpenCode cannot scope `task` to one subagent at the config
+        // level; scoping is enforced by the app's approval layer, which sees
+        // the delegation target.)
         // `external_directory` is allowed so attachments and out-of-project
         // sources can be read during review; writes stay impossible because every
         // mutation tool above is denied.
-        var primaryMembers = readOnlyBaseMembers(taskRule: "allow")
+        var primaryMembers = readOnlyBaseMembers(taskRule: "ask")
         primaryMembers.append(skillMember(deniedSkills: extensions.deniedSkills))
         let readOnlyPermissions = JSONValue.object(primaryMembers)
         var researchMembers = readOnlyBaseMembers(taskRule: "deny")
@@ -208,7 +238,7 @@ enum ManagedOpenCodeConfiguration {
                             JSONValue.Member(
                                 "description",
                                 .string(
-                                    "Read-only planning, review and exam without file or host mutations; analysis may only be delegated to \(researchAgentName)"
+                                    "Read-only planning, review, exam and ask without file or host mutations; analysis may only be delegated to \(researchAgentName)"
                                 )),
                             JSONValue.Member("mode", .string("primary")),
                             JSONValue.Member("permission", readOnlyPermissions),
@@ -274,8 +304,9 @@ enum ManagedOpenCodeConfiguration {
     }
 
     /// The shared read-only tool boundary. Only `taskRule` differs: the primary
-    /// read-only agent may delegate (sole target: the research subagent), the
-    /// research subagent may not (no delegation chains into writable agents).
+    /// read-only agent asks on delegation (the app approves only the research
+    /// subagent below), the research subagent denies (no delegation chains into
+    /// writable agents).
     private static func readOnlyBaseMembers(taskRule: String) -> [JSONValue.Member] {
         [
             JSONValue.Member("*", .string("deny")),

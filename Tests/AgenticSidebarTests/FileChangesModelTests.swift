@@ -269,4 +269,58 @@ final class FileChangesModelTests: XCTestCase {
         XCTAssertEqual(summary.totalAdditions, 1)
         XCTAssertEqual(summary.totalDeletions, 1)
     }
+
+    func testSessionReviewSummaryMergesAnyChangedTurns() {
+        func editAct(id: String, detail: String, diff: String) -> AgentActivity {
+            AgentActivity(
+                id: ProviderActivityID(id),
+                kind: .edit,
+                phase: .completed,
+                title: "Edited file",
+                detail: detail,
+                output: "Done",
+                diff: diff,
+                startedAt: Date(),
+                completedAt: Date()
+            )
+        }
+        func commandGroup() -> AgentTurnActivityGroup {
+            AgentTurnActivityGroup(
+                id: UUID(),
+                anchorMessageID: UUID(),
+                activities: [
+                    AgentActivity(
+                        id: ProviderActivityID(UUID().uuidString),
+                        kind: .command,
+                        phase: .completed,
+                        title: "Running ls",
+                        detail: "ls",
+                        output: "ok",
+                        diff: nil,
+                        startedAt: Date(),
+                        completedAt: Date()
+                    )
+                ]
+            )
+        }
+        XCTAssertNil(TurnFileChangesSummary.sessionReviewSummary(from: []))
+        XCTAssertNil(TurnFileChangesSummary.sessionReviewSummary(from: [commandGroup()]))
+        let single = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [editAct(id: "s1", detail: "/workspace/A.swift", diff: "+ one")]
+        )
+        // Tek turun özeti de oturum bitince alta taşınır; satır içi kart gizlenir.
+        let singleSummary = TurnFileChangesSummary.sessionReviewSummary(from: [single, commandGroup()])
+        XCTAssertEqual(singleSummary?.fileCount, 1)
+        XCTAssertEqual(singleSummary?.files.map(\.fileName), ["A.swift"])
+        let second = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [editAct(id: "s2", detail: "/workspace/B.swift", diff: "+ two")]
+        )
+        let merged = TurnFileChangesSummary.sessionReviewSummary(from: [single, commandGroup(), second])
+        XCTAssertEqual(merged?.fileCount, 2)
+        XCTAssertEqual(merged?.files.map(\.fileName), ["A.swift", "B.swift"])
+    }
 }

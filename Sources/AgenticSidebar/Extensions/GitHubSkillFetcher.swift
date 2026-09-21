@@ -26,11 +26,23 @@ struct GitHubRepositoryReference: Equatable, Sendable {
 
     var slug: String { "\(owner)/\(repository)" }
 
+    /// Kabul edilen en uzun yapıştırılan girdi. Bellek şişmesini baştan keser.
+    static let maximumInputLength = 500
+    /// GitHub kullanıcı/organizasyon adı en fazla 39 karakter olur.
+    static let maximumOwnerLength = 39
+    /// Depo adı için üst sınır. Ortak denetim bu boya göre yapılır.
+    static let maximumRepositoryLength = 100
+
     /// Accepts what a user actually pastes: `owner/repo`, a repository URL, or a
     /// deep link into a folder of it.
     static func parse(_ input: String) -> GitHubRepositoryReference? {
+        // Baştaki/sondaki boşluklar kullanıcı yapıştırmasından gelir, içeriğe dahil değildir.
         var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
+            return nil
+        }
+        // Aşırı uzun girdi daha fazla işlenmeden elenir.
+        guard text.count <= maximumInputLength else {
             return nil
         }
 
@@ -45,6 +57,12 @@ struct GitHubRepositoryReference: Equatable, Sendable {
             text = String(text.dropLast(suffix.count))
         }
 
+        // Çift eğik çizgi geçerli bir referansta hiç olmaz; boş bileşenlerin
+        // `split` içinde sessizce yutulmasını engellemek için erken elenir.
+        guard !text.contains("//") else {
+            return nil
+        }
+
         let parts = text.split(separator: "/").map(String.init)
         guard parts.count >= 2 else {
             return nil
@@ -52,16 +70,88 @@ struct GitHubRepositoryReference: Equatable, Sendable {
 
         let owner = parts[0]
         let repository = parts[1]
-        guard !owner.isEmpty, !repository.isEmpty else {
+        // Karakter kümesi ve `..`/`.` denetimi yardımcıda toplanır.
+        guard isValidOwnerOrRepo(owner) else {
+            return nil
+        }
+        // Sahip adı depo adından daha kısadır, ayrıca sınırlandırılır.
+        guard owner.count <= maximumOwnerLength else {
+            return nil
+        }
+        guard isValidOwnerOrRepo(repository) else {
             return nil
         }
 
         let subpath = parts.count > 2 ? parts[2...].joined(separator: "/") : nil
+        if let subpath {
+            // Alt yol dizini dışına çıkamaz, boş bileşen taşıyamaz.
+            guard isValidSubpath(subpath) else {
+                return nil
+            }
+        }
         return GitHubRepositoryReference(
             owner: owner,
             repository: repository,
             subpath: subpath
         )
+    }
+
+    /// `owner`/`repo` bileşeni denetimi: GitHub kurallarına yakın karakter kümesi.
+    ///
+    /// Kabul edilen küme `^[A-Za-z0-9_.-]+$` desenine karşılık gelir; `.` ve `..`
+    /// tek başına yol bileşeni sayıldığı için ayrıca reddedilir.
+    static func isValidOwnerOrRepo(_ component: String) -> Bool {
+        // Boş ad ve depo üst sınırını aşan ad geçersizdir.
+        guard !component.isEmpty, component.count <= maximumRepositoryLength else {
+            return false
+        }
+        // Tek nokta ve çift nokta dizin dışına çıkma girişimidir.
+        guard component != ".", component != ".." else {
+            return false
+        }
+        // Satır sonu ve null bayt URL/denetim akışını bölebileceği için reddedilir.
+        guard !component.contains(where: { $0.isNewline || $0 == "\u{0}" }) else {
+            return false
+        }
+        // İzin verilen küme dışındaki her karakter girişi geçersiz kılar.
+        for scalar in component.unicodeScalars {
+            let value = scalar.value
+            let isLetterOrDigit =
+                (value >= 65 && value <= 90) || (value >= 97 && value <= 122)
+                || (value >= 48 && value <= 57)
+            let isAllowedSymbol = value == 45 || value == 46 || value == 95
+            guard isLetterOrDigit || isAllowedSymbol else {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Alt yol denetimi: boş bileşen, `//`, `.`/`..` ve kontrol karakteri yasaktır.
+    static func isValidSubpath(_ subpath: String) -> Bool {
+        // Boş alt yol çağrıcıda `nil` olmalıydı, buraya ulaşırsa geçersizdir.
+        guard !subpath.isEmpty else {
+            return false
+        }
+        // Çift eğik çizgi boş bileşen demektir, ayrıca denetlenir.
+        guard !subpath.contains("//") else {
+            return false
+        }
+        // Satır sonu ve null bayt yolun anlamını değiştirebileceği için reddedilir.
+        guard !subpath.contains(where: { $0.isNewline || $0 == "\u{0}" }) else {
+            return false
+        }
+        // Boş bileşenleri korumak için `omittingEmptySubsequences: false` kullanılır.
+        let components = subpath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        // Baştaki/sondaki eğik çizgi veya art arda eğik çizgi boş bileşen üretir.
+        guard !components.contains(where: { $0.isEmpty }) else {
+            return false
+        }
+        // Nokta bileşenler dizin dışına çıkma girişimidir.
+        guard !components.contains("."), !components.contains("..") else {
+            return false
+        }
+        return true
     }
 }
 
@@ -274,6 +364,9 @@ struct GitHubSkillFetcher: Sendable {
         }
 
         var headers = ExtensionHTTPHeaders.gitHubAPI
+        // Belirteç yalnızca api.github.com isteğine eklenir; ham içerik
+        // ana bilgisayarına asla taşınmaz. Taşıyıcı da API dışı hedefte
+        // `Authorization` başlığını ayrıca düşürür.
         if let token = ExtensionHTTPHeaders.gitHubToken {
             headers["Authorization"] = "Bearer \(token)"
         }
@@ -307,6 +400,9 @@ struct GitHubSkillFetcher: Sendable {
             throw ExtensionFetchError.badResponse
         }
 
+        // Ham dosyaya belirteç eklenmez: bu ana bilgisayar herkese açıktır ve
+        // `tree()` içindeki Authorization buraya taşınmaz. Dosya boyu üst
+        // sınırı `fetch()` içinde ayrıca denetlenir.
         return try await transport.get(url, headers: ExtensionHTTPHeaders.rawText).data
     }
 
@@ -362,6 +458,9 @@ struct GitHubSkillFetcher: Sendable {
 
     /// A repository-controlled segment as it goes *into* a URL builder.
     ///
+    /// `parse` girişi önceden doğrulamış olur; bu denetim yine de savunma
+    /// katmanı olarak korunur.
+    ///
     /// No percent-encoding happens here on purpose: `URLComponents` encodes the
     /// characters that are invalid in a path when it produces the URL, so a
     /// filename containing `?`, `#` or a space ends up requesting that filename
@@ -380,6 +479,8 @@ struct GitHubSkillFetcher: Sendable {
     }
 
     /// One path segment, fully percent-encoded — for building a URL *string*.
+    ///
+    /// `parse` girişi önceden doğrulamış olur; kodlama yine de korunur.
     static func encodedPathComponent(_ component: String) -> String? {
         guard !component.isEmpty else {
             return nil

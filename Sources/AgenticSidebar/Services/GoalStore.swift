@@ -42,18 +42,24 @@ struct GoalStoredRun: Equatable, Sendable, Codable {
     }
 }
 
-/// Aktif `/goal` koşusunun kalıcılığı: uygulama kapanıp açılsa hedef
+/// Aktif `/goal` koşularının kalıcılığı: uygulama kapanıp açılsa hedef
 /// kaybolmaz, panel kaldığı yerden devam etmeyi önerir. Saf yardımcıdır
 /// (G/Ç yalnız verilen URL'de), o yüzden penceresiz test edilir.
 ///
-/// Tek-aktif-hedef kuralı: dosya bir koşu tutar. İkinci bir bölme hedef
-/// başlatmak isterse depoda terminal-olmayan koşu görür ve reddedilir;
-/// bölmeler arası kilitlenmeye gerek kalmaz.
+/// Çoklu-goal kuralı: her sohbet kendi dosyasında koşar
+/// (`goal-run-<oturum>.json`). Farklı oturumlar birbirini engellemez; aynı
+/// oturumda ikinci koşu reddedilir (tek transkripte tek döngü). Bölmeler arası
+/// kilitlenmeye gerek kalmaz.
 enum GoalStore {
+    /// Miras tek-dosya adı: çoklu-goal öncesi sürümler tüm uygulamayı bu
+    /// dosyayla kilitliyordu. Artık oturum başına dosya kullanılır; bu ad
+    /// yalnız migration ve eski testler içindir.
     static let fileName = "goal-run.json"
-    /// Son başarılı hedef dizini: yönetilen dizinde `Package.swift` yoktur,
+    static let filePrefix = "goal-run"
+    static let fileExtension = "json"
+    /// Son başarılı hedef dizini: yönetilen dizinde proje işareti yoktur,
     /// o yüzden her `/goal` körü körüne orayı verirse görünmez retle düşer.
-    /// Kullanıcı bir kez paket klasörü seçince yolu burada durur, sonraki
+    /// Kullanıcı bir kez proje klasörü seçince yolu burada durur, sonraki
     /// başlatmalar (geçerliyse) orayı kullanır. Enjekte edilebilir
     /// `UserDefaults` ile test edilir.
     static let preferredDirectoryKey = "goalPackageDirectory"
@@ -73,8 +79,8 @@ enum GoalStore {
         defaults.set(path, forKey: preferredDirectoryKey)
     }
 
-    /// Üretimdeki dosya: taslakların yanına, uygulama desteğine.
-    static func liveFileURL(fileManager: FileManager = .default) -> URL? {
+    /// Üretim dizini: tüm goal dosyalarının (oturum başına) durduğu klasör.
+    static func directoryURL(fileManager: FileManager = .default) -> URL? {
         guard
             let directory = fileManager.urls(
                 for: .applicationSupportDirectory,
@@ -83,10 +89,111 @@ enum GoalStore {
         else {
             return nil
         }
-        return
-            directory
-            .appendingPathComponent(AppIdentity.name, isDirectory: true)
-            .appendingPathComponent(fileName)
+        return directory.appendingPathComponent(AppIdentity.name, isDirectory: true)
+    }
+
+    /// Oturum başına dosya adı: `goal-run-<oturum-uuid>.json`. Farklı
+    /// sohbetler/bölmeler birbirini kilitlemeden eşzamanlı goal koşar; aynı
+    /// sohbet hâlâ tek koşuyla sınırlıdır (aynı transkripte iki döngü yazılmaz).
+    static func fileName(for sessionID: UUID) -> String {
+        "\(filePrefix)-\(sessionID.uuidString.lowercased()).\(fileExtension)"
+    }
+
+    /// Üretimdeki oturum dosyası: her sohbet kendi koşusunu kendi dosyasında tutar.
+    static func liveFileURL(for sessionID: UUID, fileManager: FileManager = .default) -> URL? {
+        guard let directory = directoryURL(fileManager: fileManager) else {
+            return nil
+        }
+        return directory.appendingPathComponent(fileName(for: sessionID))
+    }
+
+    /// Miras tek-dosya yolu (`goal-run.json`): yeni kod yazmaz, yalnız
+    /// migration ve geriye uyumluluk için okur.
+    static func legacyFileURL(fileManager: FileManager = .default) -> URL? {
+        guard let directory = directoryURL(fileManager: fileManager) else {
+            return nil
+        }
+        return directory.appendingPathComponent(fileName)
+    }
+
+    /// Üretimdeki dosya: taslakların yanına, uygulama desteğine.
+    /// Miras yolu döner (`legacyFileURL` ile aynı); yeni başlatmalar
+    /// `liveFileURL(for:)` kullanmalıdır.
+    static func liveFileURL(fileManager: FileManager = .default) -> URL? {
+        legacyFileURL(fileManager: fileManager)
+    }
+
+    /// Miras tek-dosyayı oturum dosyasına taşır (bir kez): eski sürümden
+    /// kalan terminal-olmayan koşu yeni düzende sahibinin dosyasında yaşar,
+    /// miras dosya kalkar. Bozuk miras dosya kurtarmaya alınır (silinmez) ki
+    /// yeni `/goal`ların önü açılsın. Taşınan/hedef dosyanın URL'sini döner,
+    /// yapacak iş yoksa `nil`.
+    @discardableResult
+    static func migrateLegacyIfNeeded(fileManager: FileManager = .default) -> URL? {
+        guard let legacy = legacyFileURL(fileManager: fileManager) else {
+            return nil
+        }
+        guard fileManager.fileExists(atPath: legacy.path) else {
+            return nil
+        }
+        guard let stored = load(from: legacy, fileManager: fileManager) else {
+            moveAside(at: legacy, fileManager: fileManager)
+            return nil
+        }
+        guard let destination = liveFileURL(for: stored.sessionID, fileManager: fileManager) else {
+            return nil
+        }
+        if destination.path == legacy.path {
+            return destination
+        }
+        if fileManager.fileExists(atPath: destination.path) {
+            // Hedefte zaten koşu var: miras kopya silinir, hedef korunur.
+            try? fileManager.removeItem(at: legacy)
+            return destination
+        }
+        do {
+            try fileManager.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try fileManager.moveItem(at: legacy, to: destination)
+            return destination
+        } catch {
+            return nil
+        }
+    }
+
+    /// Dizindeki tüm goal dosyaları (miras + oturum dosyaları).
+    static func storeURLs(in directory: URL, fileManager: FileManager = .default) -> [URL] {
+        let contents =
+            (try? fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            )) ?? []
+        return contents.filter {
+            $0.lastPathComponent.hasPrefix(filePrefix)
+                && $0.pathExtension == fileExtension
+        }.sorted { $0.path < $1.path }
+    }
+
+    /// Dizindeki tüm okunabilir koşular (terminal dahil, kurtarma/teşhis için).
+    static func allStoredRuns(in directory: URL, fileManager: FileManager = .default) -> [GoalStoredRun] {
+        storeURLs(in: directory, fileManager: fileManager).compactMap {
+            load(from: $0, fileManager: fileManager)
+        }
+    }
+
+    /// Dizindeki terminal-olmayan (aktif) koşular: çoklu-goal tanılama özeti buradan beslenir.
+    static func activeStoredRuns(in directory: URL, fileManager: FileManager = .default) -> [GoalStoredRun] {
+        allStoredRuns(in: directory, fileManager: fileManager).filter { !$0.run.isTerminal }
+    }
+
+    /// Üretim dizinindeki aktif koşular (uygulama desteği).
+    static func activeStoredRunsLive(fileManager: FileManager = .default) -> [GoalStoredRun] {
+        guard let directory = directoryURL(fileManager: fileManager) else {
+            return []
+        }
+        return activeStoredRuns(in: directory, fileManager: fileManager)
     }
 
     static func save(_ stored: GoalStoredRun, to url: URL, fileManager: FileManager = .default) throws {

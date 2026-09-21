@@ -218,6 +218,26 @@ final class TaskRecoveryTests: XCTestCase {
             try await base.createTask(task)
         }
 
+        func updateTaskDetails(
+            taskID: UUID,
+            expectedVersion: Int,
+            title: String,
+            objective: String,
+            priority: Int
+        ) async throws -> CodingTask {
+            try await base.updateTaskDetails(
+                taskID: taskID,
+                expectedVersion: expectedVersion,
+                title: title,
+                objective: objective,
+                priority: priority
+            )
+        }
+
+        func deleteTask(taskID: UUID) async throws {
+            try await base.deleteTask(taskID: taskID)
+        }
+
         func addDependency(_ dependency: TaskDependency) async throws {
             try await base.addDependency(dependency)
         }
@@ -332,6 +352,26 @@ final class TaskRecoveryTests: XCTestCase {
 
         func saveAgentProfile(_ profile: AgentProfile) async throws {
             try await base.saveAgentProfile(profile)
+        }
+
+        func saveProject(_ project: CodingProject) async throws {
+            try await base.saveProject(project)
+        }
+
+        func renameProject(id: UUID, name: String) async throws -> CodingProject {
+            try await base.renameProject(id: id, name: name)
+        }
+
+        func deleteProject(id: UUID) async throws {
+            try await base.deleteProject(id: id)
+        }
+
+        func loadProject(id: UUID) async throws -> CodingProject? {
+            try await base.loadProject(id: id)
+        }
+
+        func listProjects() async throws -> [CodingProject] {
+            try await base.listProjects()
         }
 
         func loadAgentProfile(id: UUID) async throws -> AgentProfile? {

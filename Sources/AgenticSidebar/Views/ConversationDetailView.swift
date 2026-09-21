@@ -9,6 +9,10 @@ struct ConversationDetailView: View {
     let focusedSessionID: UUID?
     let paneID: String?
     let showsNavigationTitle: Bool
+    /// 2'li ve 4'lü düzende dikey alan bölünür: genişliğe bakılmaksızın
+    /// besteci minimal çizilir, yoksa geniş pencerede 4 tam boy besteci
+    /// transkripti ezer.
+    let isDenseLayout: Bool
 
     init(
         sessionService: any AgentSessionServiceProtocol,
@@ -16,7 +20,8 @@ struct ConversationDetailView: View {
         collapseStore: TimelineCollapseStore,
         focusedSessionID: UUID?,
         paneID: String?,
-        showsNavigationTitle: Bool
+        showsNavigationTitle: Bool,
+        isDenseLayout: Bool
     ) {
         self.sessionService = sessionService
         self.permissionApprovalCenter = permissionApprovalCenter
@@ -24,6 +29,7 @@ struct ConversationDetailView: View {
         self.focusedSessionID = focusedSessionID
         self.paneID = paneID
         self.showsNavigationTitle = showsNavigationTitle
+        self.isDenseLayout = isDenseLayout
     }
 
     private var focusedSession: AgentSession {
@@ -85,14 +91,32 @@ struct ConversationDetailView: View {
     /// göre tutulur. Pane-scope seçimi `focusedSession.id` üzerinden yapılır,
     /// o yüzden bölmeler birbirinin sorusunu görmez.
     @State private var sideQuestionService = SideQuestionService()
-    /// Hedef (`/goal`) orkestratörü: bölme başına yaşar, diskteki tek koşu
-    /// kuralıyla ikinci bölme çalışırken başlatmayı reddeder.
+    /// Tek-tık prompt iyileştirme servisi: bölme başına yaşar, transkripte
+    /// yazmaz, turn makinesine girmez. Bitmiş iyileştirme besteci taslağının
+    /// yerine geçer; hata taslağı değiştirmez, bildirim gösterir.
+    @State private var promptEnhanceService = PromptEnhanceService()
+    /// Son uygulanan iyileştirmenin geri alma kaydı: oturum başına tek kayıt.
+    /// `enhanced` hâlâ taslaktaysa `original`a dönülür; kullanıcı sonrası
+    /// yazdıysa kayıt bayatlar ve geri alma sunulmaz (yazı ezilmez).
+    @State private var lastEnhanceUndo: EnhanceUndo?
+    /// Hedef (`/goal`) orkestratörü: bölme başına yaşar, oturum başına tek
+    /// koşu kuralıyla aynı sohbette ikinci başlatmayı reddeder; farklı
+    /// sohbetler eşzamanlı goal koşar.
     @State private var goalOrchestrator = GoalOrchestrator()
     @Environment(ComposerDraftMemory.self) private var draftMemory: ComposerDraftMemory?
 
     private let contentMaxWidth: CGFloat = 820
 
     private static let transcriptSpace = "transcript"
+
+    /// Geri alınabilir iyileştirme kaydı: istek anındaki taslak ve onun yerine
+    /// geçen iyileşmiş metin. Geri alma yalnız taslak hâlâ `enhanced` ise
+    /// yapılır, böylece sonradan yazılan metin ezilmez.
+    private struct EnhanceUndo: Equatable {
+        let sessionID: UUID
+        let original: String
+        let enhanced: String
+    }
 
     var body: some View {
         let preset = settingsStore.currentThemePreset
@@ -163,10 +187,14 @@ struct ConversationDetailView: View {
 
                     SideQuestionPanelView(
                         service: sideQuestionService,
+                        focusedSessionID: focusedSession.id,
                         onInsertToComposer: { insertSideAnswerToComposer($0) },
                         onClose: { sideQuestionService.dismiss() }
                     )
-                    GoalPanelView(orchestrator: goalOrchestrator)
+                    GoalPanelView(
+                        orchestrator: goalOrchestrator,
+                        focusedSessionID: focusedSession.id
+                    )
 
                     ComposerView(
                         sessionService: sessionService,
@@ -178,17 +206,47 @@ struct ConversationDetailView: View {
                         onSideQuestion: { question, speedMode, mode in
                             askSideQuestion(question, speedMode: speedMode, mode: mode)
                         },
-                        onStartGoal: { objective, speedMode, mode in
-                            startGoalObjective(objective, speedMode: speedMode, mode: mode)
+                        onStartGoal: { objective, speedMode, mode, attachmentPaths in
+                            startGoalObjective(
+                                objective,
+                                speedMode: speedMode,
+                                mode: mode,
+                                attachmentPaths: attachmentPaths
+                            )
                         },
-                        onCompactSession: {
-                            focusedSession.requestCompaction()
+                        fileManager: .default,
+                        isDenseLayout: isDenseLayout,
+                        onEnhancePrompt: { draft, speedMode, mode, tagNames, attachmentNames in
+                            enhancePrompt(
+                                draft,
+                                speedMode: speedMode,
+                                mode: mode,
+                                tagNames: tagNames,
+                                attachmentNames: attachmentNames
+                            )
                         },
-                        fileManager: .default
+                        isEnhancePromptAvailable: focusedSession.configuration != nil,
+                        isEnhancingPrompt: isEnhancingPromptForFocusedSession,
+                        onCancelEnhancePrompt: {
+                            promptEnhanceService.cancelStreaming()
+                        },
+                        onUndoEnhancePrompt: {
+                            undoPromptEnhancement()
+                        },
+                        isUndoEnhanceAvailable: isUndoEnhanceAvailableForFocusedSession
                     )
+                    .onChange(of: promptEnhanceService.active) { _, current in
+                        consumePromptEnhancement(current)
+                    }
                 }
                 .frame(
-                    minWidth: isInspectorExpanded ? 0 : 360,
+                    // Yan panel açıkken sohbet sütunu kalan alana iner: sabit
+                    // 360 tabanı dar bölmede panelin üstüne binerdi. Kapalıyken
+                    // eski taban korunur.
+                    minWidth: isInspectorExpanded
+                        ? 0
+                        : (inspectorTabs.isEmpty
+                            ? 360 : max(0, paneWidth - fittedInspectorWidth - 6)),
                     maxWidth: isInspectorExpanded ? 0 : .infinity,
                     maxHeight: .infinity
                 )
@@ -236,9 +294,12 @@ struct ConversationDetailView: View {
                         }
                     )
                     .frame(
-                        minWidth: isInspectorExpanded ? 400 : 380,
-                        idealWidth: isInspectorExpanded ? nil : inspectorWidth,
-                        maxWidth: isInspectorExpanded ? .infinity : inspectorWidth
+                        // Dar bölmede ham genişlik transkripti ezerdi: kapak,
+                        // kullanılabilir genişliğe göre hesaplanır (en az
+                        // 280, bölmeyi en çok 32 pt daraltır).
+                        minWidth: isInspectorExpanded ? 400 : min(380, fittedInspectorWidth),
+                        idealWidth: isInspectorExpanded ? nil : fittedInspectorWidth,
+                        maxWidth: isInspectorExpanded ? .infinity : fittedInspectorWidth
                     )
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
@@ -255,10 +316,10 @@ struct ConversationDetailView: View {
         }
         .onAppear {
             // Yarım kalan hedef varsa panel devam etmeyi önerir (otomatik
-            // başlamaz). Koşu yoksa veya bu bölmede zaten aktifse sessizdir.
-            if let storeURL = GoalStore.liveFileURL() {
-                goalOrchestrator.noticeStoredRun(storeURL: storeURL, bridge: goalBridge())
-            }
+            // başlamaz). Her sohbet kendi dosyasını okur, o yüzden farklı
+            // sohbetlerin goal koşuları birbirini engellemez. Eski tek-dosya
+            // sürümünden kalan miras kayıt önce sahibinin dosyasına taşınır.
+            noticeGoalForFocusedSession()
         }
         .task {
             // Kaydırma ölçümlerini ekran döngüsünün dışında yayınlar. Ölçümü
@@ -279,6 +340,10 @@ struct ConversationDetailView: View {
             inspectorPinTask?.cancel()
             inspectorPinTask = nil
             switchInspectorState(from: oldID, to: newID)
+            // Aynı bölme örneği başka sohbete döner: yeni sohbetin yarım
+            // kalmış goal kaydı varsa panele taşınır (tekli kipte sohbet
+            // değişiminde goal kartının kaybolması buydu).
+            noticeGoalForFocusedSession()
         }
         .onChange(of: paneWidth) { _, _ in
             handlePaneWidthChange()
@@ -384,6 +449,7 @@ struct ConversationDetailView: View {
         index: TranscriptIndex,
         isBusy: Bool,
         hasPendingApprovalForActiveSession: Bool,
+        hidesInlineFileCard: Bool,
         onCollapse: ((UUID) -> Void)? = nil
     ) -> some View {
         let isVisibleUser = message.role == .user
@@ -455,6 +521,7 @@ struct ConversationDetailView: View {
                     onOpenReview: { summary, file in
                         openReviewInInspector(summary: summary, initialFile: file)
                     },
+                    suppressesInlineFileCard: hidesInlineFileCard,
                     onCollapseChange: {
                         onCollapse?(message.id)
                     }
@@ -488,9 +555,11 @@ struct ConversationDetailView: View {
 
         VStack(alignment: .leading, spacing: 4) {
             if isCurrentBusyTurn {
-                TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                // Bölme başına `TimelineView` yerine paylaşılan saniye saati:
+                // 4 bölme = 4 ayrı 1Hz zamanlayıcı yerine tek saat çalışır.
+                SecondTick { date in
                     let start = focusedSession.state.startedAt ?? Date()
-                    let duration = formatTurnDuration(startedAt: start, endedAt: context.date)
+                    let duration = formatTurnDuration(startedAt: start, endedAt: date)
                     Text("Working for \(duration)")
                         .font(.system(size: 13, weight: .regular))
                         .foregroundStyle(.secondary)
@@ -565,9 +634,124 @@ struct ConversationDetailView: View {
         )
     }
 
-    /// Yan cevabı besteci taslağına ekler (metin korunur, altına eklenir).
-    private func insertSideAnswerToComposer(_ text: String) {
+    /// Tek-tık prompt iyileştirme: besteci kancası servise taşınır. Bağlam bu
+    /// bölmenin oturumundan kurulur; transkripte ve turn makinesine
+    /// dokunulmaz. Bağlam yoksa (sağlayıcısız oturum) bildirim gösterilir,
+    /// taslak aynen durur. Yeni istek oturumun eski geri alma kaydını düşürür.
+    private func enhancePrompt(
+        _ draft: String,
+        speedMode: ResponseSpeedMode,
+        mode: AgentMode,
+        tagNames: [String],
+        attachmentNames: [String]
+    ) {
+        guard let context = sessionService.sideQuestionContext(for: focusedSession.id) else {
+            focusedSession.presentNotice(.promptEnhancementFailed, autoDismissAfter: .seconds(6))
+            return
+        }
+        if lastEnhanceUndo?.sessionID == focusedSession.id {
+            lastEnhanceUndo = nil
+        }
+        promptEnhanceService.enhance(
+            context: context,
+            sessionID: focusedSession.id,
+            draft: draft,
+            speedMode: speedMode,
+            mode: mode,
+            tagNames: tagNames,
+            attachmentNames: attachmentNames
+        )
+    }
+
+    /// Bu bölmenin gösterdiği oturumda iyileştirme akıyor mu: servis bölme
+    /// başına yaşadığı için başka oturumun akışı bu bestecide gösterilmez;
+    /// o akış kendi oturumunun taslağına sessizce uygulanır.
+    private var isEnhancingPromptForFocusedSession: Bool {
+        promptEnhanceService.active?.sessionID == focusedSession.id
+            && promptEnhanceService.isEnhancing
+    }
+
+    /// Geri alma düğmesi yalnız bu oturumun kaydı varken ve taslak hâlâ
+    /// iyileşmiş metinken görünür: sonrası yazı ya da gönderim kaydı bayatlatır.
+    private var isUndoEnhanceAvailableForFocusedSession: Bool {
+        guard let undo = lastEnhanceUndo, undo.sessionID == focusedSession.id else {
+            return false
+        }
+        let current = draftMemory?.drafts[focusedSession.id]?.text ?? ""
+        return PromptEnhancer.shouldApplyEnhancement(currentDraft: current, originalDraft: undo.enhanced)
+    }
+
+    /// Kaydedilen iyileştirme öncesine döner: taslak `original`a yazılır.
+    /// Taslak arada değiştiyse dokunulmaz, kayıt yine düşer (bayattır).
+    private func undoPromptEnhancement() {
+        guard let undo = lastEnhanceUndo, undo.sessionID == focusedSession.id else {
+            return
+        }
+        lastEnhanceUndo = nil
+        guard let draftMemory else {
+            return
+        }
+        let current = draftMemory.drafts[focusedSession.id]?.text ?? ""
+        guard PromptEnhancer.shouldApplyEnhancement(currentDraft: current, originalDraft: undo.enhanced) else {
+            return
+        }
+        var drafts = draftMemory.drafts
+        var draft = drafts[focusedSession.id, default: .empty]
+        draft.text = undo.original
+        drafts[focusedSession.id] = draft
+        draftMemory.drafts = drafts
+    }
+
+    /// Bitmiş ya da düşmüş iyileştirmeyi tüketir: başarıda iyileşmiş metin,
+    /// istek anından beri taslak değişmediyse isteğin açıldığı oturumun
+    /// taslağının yerine geçer (ekler ve etiketler aynen kalır) ve geri alma
+    /// kaydı tutulur. Taslak arada değiştiyse iyileştirme atılır, yazı korunur
+    /// ve bildirim gösterilir. Hatada taslak değişmez, bildirim gösterilir.
+    private func consumePromptEnhancement(_ current: PromptEnhanceService.ActiveEnhancement?) {
+        guard let current else {
+            return
+        }
+        switch current.phase {
+        case .streaming, .cancelled:
+            break
+        case .done:
+            if let text = promptEnhanceService.consumeDone() {
+                applyEnhancedPrompt(text, sessionID: current.sessionID, originalDraft: current.originalDraft)
+            }
+        case .failed:
+            promptEnhanceService.dismiss()
+            sessionService.session(for: current.sessionID)?.presentNotice(
+                .promptEnhancementFailed,
+                autoDismissAfter: .seconds(6)
+            )
+        }
+    }
+
+    /// İyileşmiş metni oturumun taslağına yazar (üzerine yazar, eklemez) ve
+    /// geri alma kaydını tutar. Taslak istek anından beri değiştiyse yazmaz.
+    private func applyEnhancedPrompt(_ text: String, sessionID: UUID, originalDraft: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let draftMemory else {
+            return
+        }
+        let current = draftMemory.drafts[sessionID]?.text ?? ""
+        guard PromptEnhancer.shouldApplyEnhancement(currentDraft: current, originalDraft: originalDraft) else {
+            sessionService.session(for: sessionID)?.presentNotice(
+                .promptEnhancementSuperseded,
+                autoDismissAfter: .seconds(6)
+            )
+            return
+        }
+        var drafts = draftMemory.drafts
+        var draft = drafts[sessionID, default: .empty]
+        draft.text = trimmed
+        drafts[sessionID] = draft
+        draftMemory.drafts = drafts
+        lastEnhanceUndo = EnhanceUndo(sessionID: sessionID, original: originalDraft, enhanced: trimmed)
+    }
+
+    /// Yan cevabı besteci taslağına ekler (metin korunur, altına eklenir).
+    private func insertSideAnswerToComposer(_ text: String) {        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let draftMemory else {
             return
         }
@@ -580,12 +764,68 @@ struct ConversationDetailView: View {
     }
 
     /// Hedef (`/goal`): besteci kancası orkestratöre taşınır. Doğrulama
-    /// dizini ajanın çalışma dizinidir; diskteki tek-koşu kuralı ikinci
-    /// bölmenin aynı anda başlatmasını engeller. Başarıyı döner: besteci
-    /// taslağı yalnız kabulde temizler, rette metin alanda kalır.
+    /// dizini önce sinyallerden bulunur (kayıtlı tercih, önceki koşu,
+    /// oturumdaki dosya yolları, bestecideki ekler); hiçbir sinyal paket
+    /// vermezse klasör hemen sorulur (yaz → seç → başla, tek akış).
+    /// Her sohbet kendi goal dosyasında koşar, farklı sohbetler eşzamanlı
+    /// goal çalıştırır (çoklu-goal serbest); aynı sohbette ikinci koşu
+    /// reddedilir. Başarıyı döner: besteci taslağı yalnız kabulde temizler,
+    /// rette metin alanda kalır. Meşgul kuyruğu da kabuldür: istek panelde
+    /// "Goal queued" olarak durur, tur bitince kendiliğinden başlar.
     @discardableResult
-    private func startGoalObjective(_ objective: String, speedMode: ResponseSpeedMode, mode: AgentMode) -> Bool {
-        let directory = resolvedGoalDirectory()
+    private func startGoalObjective(
+        _ objective: String,
+        speedMode: ResponseSpeedMode,
+        mode: AgentMode,
+        attachmentPaths: [String]
+    ) -> Bool {
+        if let directory = resolvedGoalDirectory(extraSeeds: attachmentPaths) {
+            return startGoal(
+                in: directory,
+                objective: objective,
+                speedMode: speedMode,
+                mode: mode
+            )
+        }
+        // Hiçbir sinyal proje vermedi: klasörü hemen sor. Vazgeçilirse ret
+        // kartı yolu açılır ki hedef + kopyalama kaybolmasın. Bu seçimde
+        // ret alınırsa ikinci pencere açılmaz, kart gösterilir.
+        if let picked = promptPackageFolder() {
+            // Seçilen klasörün kullanılabilir hâli: kendisi projeseyse
+            // kendisi, tek bir alt dizini projeseyse o alt dizin (klasik
+            // "bir üstü seçme" hatası sessizce düzelir). Desteklenmeyen
+            // seçim ham hâliyle başlatmaya girer ki ret kartı doğru
+            // iletiyle açılsın ve "Choose project folder…" yolu çalışsın.
+            let usable = GoalRunners.usableProjectDirectory(at: picked) ?? picked
+            return startGoal(
+                in: usable,
+                objective: objective,
+                speedMode: speedMode,
+                mode: mode,
+                promptOnRefusal: false
+            )
+        }
+        _ = startGoal(
+            in: ManagedOpenCodeServerManager.managedWorkingDirectoryURL(),
+            objective: objective,
+            speedMode: speedMode,
+            mode: mode
+        )
+        return false
+    }
+
+    /// Tek dizinde başlatmayı dener. Bu çağrıda klasör zaten sorulduysa
+    /// (`promptOnRefusal == false`) rette ikinci kez sorulmaz; ret kartı
+    /// kendi "Choose project folder…" düğmesiyle yolu açar. Art arda iki
+    /// pencere, "seçtim ama çalışmıyor" hissinin ta kendisiydi.
+    @discardableResult
+    private func startGoal(
+        in directory: URL,
+        objective: String,
+        speedMode: ResponseSpeedMode,
+        mode: AgentMode,
+        promptOnRefusal: Bool = true
+    ) -> Bool {
         let started = goalOrchestrator.start(
             objective: objective,
             sessionID: focusedSession.id,
@@ -593,32 +833,76 @@ struct ConversationDetailView: View {
             mode: mode,
             workingDirectory: directory,
             bridge: goalBridge(),
-            storeURL: GoalStore.liveFileURL()
+            storeURL: GoalStore.liveFileURL(for: focusedSession.id)
         )
         if started {
             GoalStore.savePreferredPackageDirectory(directory.path)
+            return true
         }
-        return started
+        if goalOrchestrator.failedRequest?.autoStart == true {
+            return true
+        }
+        guard isPackageRefusal else {
+            return false
+        }
+        guard promptOnRefusal, let picked = promptPackageFolder() else {
+            return false
+        }
+        guard let usable = GoalRunners.usableProjectDirectory(at: picked) else {
+            return false
+        }
+        if goalOrchestrator.retryFailedGoal(in: usable) {
+            GoalStore.savePreferredPackageDirectory(usable.path)
+            return true
+        }
+        return false
+    }
+
+    /// Son ret proje-dizin yokluğundan mı: kart zaten çizilir.
+    private var isPackageRefusal: Bool {
+        guard goalOrchestrator.engine == nil, goalOrchestrator.failedRequest != nil else {
+            return false
+        }
+        return (goalOrchestrator.message ?? "").contains("not a SwiftPM package or Xcode project")
+    }
+
+    /// Proje klasörü sorar (`nil` = vazgeçildi). Tek alt dizin projeyse
+    /// orası kullanılır ("bir üstü seçme" hatası); geçersiz seçim ret
+    /// kartına düşer, ikinci pencere açılmaz.
+    private func promptPackageFolder() -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Choose"
+        panel.message = "Choose the project folder (SwiftPM package or Xcode project) where build and tests will run."
+        guard panel.runModal() == .OK, let url = panel.url else {
+            return nil
+        }
+        return url
     }
 
     /// Hedef doğrulamanın koşacağı dizin: önce bu bölmenin bilinen dizini
     /// (koşan/biten koşudan), sonra kayıtlı tercih (geçerliyse), sonra
-    /// oturumdaki dosya sinyallerinden türetilen paket dizini (ekler,
-    /// aktivite yoları). Yönetilen dizinde `Package.swift` yoktur; körü
-    /// körüne orayı vermek her `/goal`u retle düşürüyordu. Hiçbir sinyal
-    /// paket vermezse yönetilen dizin döner ve orkestratör reddeder.
-    private func resolvedGoalDirectory() -> URL {
-        let known = [goalOrchestrator.workingDirectoryPath, GoalStore.preferredPackageDirectory() ?? ""]
-        if let found = GoalRunners.resolvePackageDirectory(
-            knownPaths: known,
-            seedPaths: Self.goalDirectorySeeds(
-                messages: focusedSession.state.messages,
-                groups: focusedSession.state.activityGroups
-            )
-        ) {
-            return found
-        }
-        return ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+    /// oturumdaki dosya sinyallerinden türetilen proje dizini (ekler,
+    /// aktivite yolları, bestecideki bekleyen ekler). `nil` = hiçbir aday
+    /// desteklenen proje değildir; çağıran klasör sorar.
+    private func resolvedGoalDirectory(extraSeeds: [String] = []) -> URL? {
+        // Reddedilen isteğin dizini de adaydır: kullanıcı klasörü seçip
+        // ret aldıysa (ör. tek alt dizin projesi) bir sonraki `/goal`
+        // aynı seçimi hatırlasın, yeniden klasör sormasın.
+        let known = [
+            goalOrchestrator.workingDirectoryPath,
+            goalOrchestrator.failedRequest?.workingDirectoryPath ?? "",
+            GoalStore.preferredPackageDirectory() ?? "",
+        ]
+        var seeds = Self.goalDirectorySeeds(
+            messages: focusedSession.state.messages,
+            groups: focusedSession.state.activityGroups
+        )
+        seeds.append(contentsOf: extraSeeds)
+        return GoalRunners.resolvePackageDirectory(knownPaths: known, seedPaths: seeds)
     }
 
     /// Oturumdaki dosya sinyalleri (en yeniden en eskiye, üst sınırlı):
@@ -652,6 +936,25 @@ struct ConversationDetailView: View {
         return seeds
     }
 
+    /// Bölmenin goal orkestratörünü odaktaki sohbetin dosyasına bağlar.
+    /// Birincil bölme tekli↔çoklu geçişte ve sohbet değişiminde aynı görünüm
+    /// örneği yaşar (`pane-primary` kimliği sabittir), o yüzden `onAppear`
+    /// yetmez: odak değişince de bu sohbetin yarım kalmış koşusu panele
+    /// taşınır. Başka sohbette koşan hedef ezilmez (arka planda sürer, panel
+    /// oturuma göre kapılar).
+    private func noticeGoalForFocusedSession() {
+        GoalStore.migrateLegacyIfNeeded()
+        guard let storeURL = GoalStore.liveFileURL(for: focusedSession.id) else {
+            return
+        }
+        if let current = goalOrchestrator.sessionID, current != focusedSession.id,
+            goalOrchestrator.engine != nil
+        {
+            return
+        }
+        goalOrchestrator.noticeStoredRun(storeURL: storeURL, bridge: goalBridge())
+    }
+
     private func goalBridge() -> GoalOrchestrator.Bridge {
         GoalOrchestrator.Bridge(
             isBusy: { [sessionService] id in
@@ -671,6 +974,18 @@ struct ConversationDetailView: View {
             },
             turnError: { [sessionService] id in
                 sessionService.session(for: id)?.state.error
+            },
+            lastAssistantText: { [sessionService] id in
+                sessionService.session(for: id)?.state.messages.last(where: { $0.role == .assistant })?.text
+            },
+            cancel: { [sessionService] id in
+                Task { await sessionService.session(for: id)?.cancel() }
+            },
+            isWaitingForUser: { [sessionService, permissionApprovalCenter] id in
+                if sessionService.session(for: id)?.state.activeQuestion != nil {
+                    return true
+                }
+                return !permissionApprovalCenter.pendingRequests(for: id).isEmpty
             }
         )
     }
@@ -711,6 +1026,32 @@ struct ConversationDetailView: View {
                 inspectorTabs.append(tab)
             }
             selectedInspectorTabID = tab.id
+        }
+    }
+
+    /// Oturum sonu toplu dosya kartı: tüm turlardaki dosya değişiklikleri
+    /// tek özette, transkriptin en altında. Oturum boşta ve herhangi bir dosya
+    /// değişikliği varsa çizilir; çizildiğinde satır içi tur kartlarının tamamı
+    /// gizlenir, yoksa aynı dosyalar üstte/ortada ve altta iki kez durur.
+    /// Koşarken çizilmez: liste canlı uzar, kartın sayıları yalan olur.
+    @ViewBuilder
+    private func sessionReviewCard(summary: TurnFileChangesSummary?, sessionID: UUID) -> some View {
+        if let summary {
+            FileChangesSummaryCard(
+                summary: summary,
+                isExpanded: Binding(
+                    get: {
+                        collapseStore.isSessionFilesExpanded(sessionID: sessionID)
+                    },
+                    set: { expanded in
+                        collapseStore.setSessionFilesExpanded(expanded, sessionID: sessionID)
+                    }
+                ),
+                onOpenReview: { summary, file in
+                    openReviewInInspector(summary: summary, initialFile: file)
+                }
+            )
+            .padding(.top, 4)
         }
     }
 
@@ -761,6 +1102,16 @@ struct ConversationDetailView: View {
                 }
             }
         }
+    }
+
+    /// Yan panelin bölmeye sığan genişliği: istenen genişlik, kullanılabilir
+    /// alana göre kapaklanır. Saf hesap, durum tutulmaz.
+    private var fittedInspectorWidth: CGFloat {
+        PaneResponsive.inspectorWidth(
+            requested: inspectorWidth,
+            available: paneWidth,
+            isExpanded: false
+        )
     }
 
     private var inspectorResizeSplitter: some View {
@@ -1225,6 +1576,16 @@ struct ConversationDetailView: View {
         let index = transcriptIndex
         let isBusy = focusedSession.isBusy
         let sessionID = focusedSession.id
+        // Oturum toplu özeti bir kez hesaplanır: hem alttaki kart hem de
+        // satır içi tur kartlarının gizlenme kararı aynı değerden beslenir.
+        // Meşgulken toplu kart çizilmez, bitmiş turların kartı durur; oturum
+        // bitince özet alta taşınır ve satır içi kartların tamamı gizlenir.
+        let sessionSummary =
+            isBusy
+            ? nil
+            : TurnFileChangesSummary.sessionReviewSummary(
+                from: focusedSession.state.activityGroups
+            )
         let hasPendingForActiveSession = permissionApprovalCenter.pending.contains { request in
             request.appSessionID == sessionID
         }
@@ -1240,11 +1601,14 @@ struct ConversationDetailView: View {
                             index: index,
                             isBusy: isBusy,
                             hasPendingApprovalForActiveSession: hasPendingForActiveSession,
+                            hidesInlineFileCard: sessionSummary != nil,
                             onCollapse: { messageID in
                                 handleTimelineCollapse(messageID: messageID, proxy: proxy)
                             }
                         )
                     }
+
+                    sessionReviewCard(summary: sessionSummary, sessionID: sessionID)
 
                     Color.clear
                         .frame(height: 1)
@@ -1393,15 +1757,41 @@ struct ConversationDetailView: View {
     /// O sırada ölçülen sahte düşüşler kullanıcı jesti sanılıp takip modu
     /// ölürdü (`suppressTransientDrop` onu engeller); yerleşim bitince dip
     /// yeniden tutturulur.
+    ///
+    /// Neden ölçülü: 350 ms'de ateşlenen kör `scrollTo`, spring (response
+    /// 0.30) daha yerleşmeden geçici geometriye iner, görünümü ıssız bir
+    /// bölgeye bırakırdı — programatik kayma kullanıcı konumu sayılmadığı
+    /// için kurtarma düğmesi de belirmez, transkript kara kalırdı (Review
+    /// sonrası kaybolan sohbet buydu). O yüzden ateş anında canlı durum
+    /// yeniden sorulur ve zaten dipteyse kayma atlanır; kural
+    /// `TranscriptRepinPolicy` içindedir, saf ve test edilebilir.
     private func handleInspectorLayoutChange(proxy: ScrollViewProxy) {
         followState.suppressTransientDrop()
-        guard !isUserScrolledUp, !followState.isUserScrolling else {
+        // Karar anındaki canlı durum: `@State` kopyası (`isUserScrolledUp`)
+        // 90 ms gecikmeli yayınlanır; bayat "dipte" değeri tarihte okuyanı
+        // dibe çekerdi.
+        let wasFollowing = followState.isFollowing
+        guard wasFollowing else {
+            inspectorPinTask?.cancel()
+            inspectorPinTask = nil
             return
         }
         inspectorPinTask?.cancel()
         inspectorPinTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(350))
-            guard !Task.isCancelled, followState.shouldAutoFollow(now: Date()) else {
+            // Spring yerleşimi bitsin diye ateş gecikir (response 0.30'un
+            // yaklaşık iki katı); arada kullanıcı dokunursa görev iptal olur.
+            try? await Task.sleep(for: .milliseconds(600))
+            guard !Task.isCancelled else {
+                return
+            }
+            guard
+                TranscriptRepinPolicy.shouldRepin(
+                    wasFollowing: wasFollowing,
+                    isFollowingNow: followState.isFollowing,
+                    distanceFromBottom: followState.lastDistanceFromBottom
+                ),
+                followState.shouldAutoFollow(now: Date())
+            else {
                 return
             }
             proxy.scrollTo("bottom_anchor", anchor: .bottom)

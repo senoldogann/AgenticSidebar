@@ -566,7 +566,7 @@ final class TaskBoardStoreTests: XCTestCase {
     // MARK: - Proje kaydı
 
     /// En iyi çaba klasör denetiminden geçen geçici bir Git deposu klasörü:
-    /// dizin ve içinde bir `.git` girdisi.
+    /// dizin, içinde bir `.git` girdisi ve SwiftPM işareti (`Package.swift`).
     private func makeRepositoryFolder(name: String) throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(
             "agentic-sidebar-store-\(name)-\(UUID().uuidString)",
@@ -575,6 +575,11 @@ final class TaskBoardStoreTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: url.appendingPathComponent(".git", isDirectory: true),
             withIntermediateDirectories: true
+        )
+        try "// swift-tools-version: 5.9\n".write(
+            to: url.appendingPathComponent("Package.swift"),
+            atomically: true,
+            encoding: .utf8
         )
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url
@@ -668,6 +673,38 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertTrue(folderRefusal.message.contains("Git"))
         XCTAssertEqual(store.lastFailure, folderRefusal.message)
         XCTAssertNil(store.selectedProjectID)
+    }
+
+    /// M1: Git deposu olup `Package.swift` barındırmayan klasör kayıt anında
+    /// reddedilir; ret servise hiç ulaşmaz ve kayıt defterine yazılmaz.
+    func testCreateProjectRefusesNonSwiftPMFolderWithoutCallingService() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let store = TaskBoardStore(service: service)
+        var registeredProjectIDs: [UUID] = []
+        store.onProjectRegistered = { registeredProjectIDs.append($0) }
+        let gitOnly = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "agentic-sidebar-git-only-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: gitOnly.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: gitOnly) }
+
+        let result = await store.createProject(name: "Git only", repositoryURL: gitOnly)
+
+        guard case .refused(let refusal) = result else {
+            XCTFail("A folder without Package.swift must be refused, got \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        XCTAssertTrue(refusal.message.contains("Package.swift"))
+        XCTAssertEqual(store.lastFailure, refusal.message)
+        XCTAssertNil(store.selectedProjectID)
+        XCTAssertEqual(store.phase, .idle)
+        XCTAssertTrue(registeredProjectIDs.isEmpty, "A refused registration must never reach the registry")
     }
 
     func testProjectRegistrationPresenterDisablesSubmitUntilReady() {
@@ -830,5 +867,274 @@ final class TaskBoardStoreTests: XCTestCase {
         store.selectProject(project.id)
         await store.refresh()
         return (store, repository)
+    }
+
+    func testSelectTaskLoadsInspectorEvidenceFindingsAndFingerprint() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        harness.acceptanceEvidence = [
+            VerificationEvidence(recipeName: "swiftpm:Fixture", status: .passed, detailsRedacted: "build ok")
+        ]
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Inspected", priority: 1, criteria: [])
+        let finding = ReviewFinding(taskID: task.id, severity: .high, summary: "Kritik bulgu")
+        try await harness.store.recordFinding(finding)
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        await store.selectTask(task.id)
+
+        XCTAssertEqual(store.selectedInspectorTaskID, task.id)
+        XCTAssertEqual(store.selectedTaskEvidence?.count, 1)
+        XCTAssertEqual(store.selectedTaskEvidence?.first?.recipeName, "swiftpm:Fixture")
+        XCTAssertEqual(store.selectedTaskFingerprint, "fingerprint-1")
+        XCTAssertEqual(store.selectedTaskFindings?.map(\.id), [finding.id])
+    }
+
+    func testReselectingTaskReloadsInspectorForNewTask() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let first = try await seedTask(harness: harness, projectID: project.id, title: "First", priority: 1, criteria: [])
+        let second = try await seedTask(harness: harness, projectID: project.id, title: "Second", priority: 1, criteria: [])
+        try await harness.store.recordFinding(
+            ReviewFinding(taskID: first.id, severity: .medium, summary: "Yalnız ilk görevde")
+        )
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        await store.selectTask(first.id)
+        XCTAssertEqual(store.selectedTaskFindings?.count, 1)
+
+        await store.selectTask(second.id)
+        XCTAssertEqual(store.selectedInspectorTaskID, second.id)
+        XCTAssertEqual(store.selectedTaskFindings?.count, 0)
+    }
+
+    func testDeselectingTaskClearsDetailAndInspector() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Selected", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        await store.selectTask(task.id)
+        XCTAssertNotNil(store.detail)
+
+        await store.selectTask(nil)
+        XCTAssertNil(store.selectedTaskID)
+        XCTAssertNil(store.detail)
+        XCTAssertNil(store.selectedInspectorTaskID)
+        XCTAssertNil(store.selectedTaskEvidence)
+        XCTAssertNil(store.selectedTaskFindings)
+        XCTAssertFalse(store.cards.isEmpty, "seçim temizliği panoyu boşaltmamalı")
+    }
+
+    // MARK: - Üstveri düzenleme ve silme
+
+    func testUpdateTaskAppliesNewMetadataAndBumpsVersion() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Eski", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        let result = await store.updateTask(
+            taskID: task.id,
+            title: "Yeni başlık",
+            objective: "Yeni amaç",
+            priority: 2
+        )
+        guard case .applied = result else {
+            XCTFail("Geçerli üstveri güncellemesi uygulanmalı, sonuç: \(result)")
+            return
+        }
+        let card = try XCTUnwrap(store.cards.first { $0.id == task.id })
+        XCTAssertEqual(card.title, "Yeni başlık")
+        XCTAssertEqual(card.objective, "Yeni amaç")
+        XCTAssertEqual(card.priority, 2)
+        XCTAssertEqual(card.version, 2)
+        XCTAssertEqual(card.status, .backlog, "üstveri güncellemesi durumu oynatmamalı")
+    }
+
+    func testUpdateTaskRefusesBlankTitleAndKeepsBoard() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Sabit", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+
+        let result = await store.updateTask(taskID: task.id, title: "  ", objective: "Amaç", priority: 1)
+        guard case .refused(let refusal) = result else {
+            XCTFail("Boş başlık reddedilmeli, sonuç: \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        let card = try XCTUnwrap(store.cards.first { $0.id == task.id })
+        XCTAssertEqual(card.title, "Sabit")
+        XCTAssertEqual(card.version, 1)
+    }
+
+    func testDeleteTaskRemovesCardEdgesAndClosesSelection() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let prerequisite = try await seedTask(harness: harness, projectID: project.id, title: "Önkoşul", priority: 1, criteria: [])
+        let dependent = try await seedTask(harness: harness, projectID: project.id, title: "Bağımlı", priority: 1, criteria: [])
+        try await harness.store.addDependency(
+            TaskDependency(projectID: project.id, prerequisiteTaskID: prerequisite.id, dependentTaskID: dependent.id)
+        )
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        await store.selectTask(prerequisite.id)
+
+        let result = await store.deleteTask(taskID: prerequisite.id)
+        guard case .applied = result else {
+            XCTFail("Silme uygulanmalı, sonuç: \(result)")
+            return
+        }
+        XCTAssertNil(store.cards.first { $0.id == prerequisite.id })
+        XCTAssertNotNil(store.cards.first { $0.id == dependent.id })
+        XCTAssertNil(store.selectedTaskID, "silinen görevin seçimi düşmeli")
+        XCTAssertNil(store.detail)
+        let snapshot = try await service.snapshot(projectID: project.id)
+        XCTAssertTrue(snapshot.dependencies.isEmpty, "silinen görevin kenarları kalmamalı")
+        let reloadedDeletedTask = try await harness.store.task(id: prerequisite.id)
+        XCTAssertNil(reloadedDeletedTask)
+    }
+
+    func testDeleteRunningTaskIsRefused() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Koşan", priority: 1, criteria: [])
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: 1,
+            action: .markReady,
+            context: TaskTransitionContext(fingerprint: "fixture", actor: "fixture")
+        )
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: 2,
+            action: .startAttempt(attemptID: UUID(), role: .developer),
+            context: TaskTransitionContext(fingerprint: "fixture", actor: "fixture")
+        )
+
+        let store = TaskBoardStore(service: service)
+        store.selectProject(project.id)
+        await store.refresh()
+        XCTAssertEqual(store.cards.first?.status, .running)
+
+        let result = await store.deleteTask(taskID: task.id)
+        guard case .refused(let refusal) = result else {
+            XCTFail("Koşan görev silinmemeli, sonuç: \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        XCTAssertNotNil(store.cards.first { $0.id == task.id }, "reddedilen silme kartı korumalı")
+    }
+
+    // MARK: - Proje yeniden adlandırma ve silme
+
+    func testRenameProjectAppliesAndRefreshesList() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+
+        let store = TaskBoardStore(service: service)
+        await store.refreshProjects()
+
+        let result = await store.renameProject(id: project.id, name: "Yeni Ad")
+        guard case .applied = result else {
+            XCTFail("Yeniden adlandırma uygulanmalı, sonuç: \(result)")
+            return
+        }
+        XCTAssertEqual(store.projects.first { $0.id == project.id }?.name, "Yeni Ad")
+    }
+
+    func testRenameProjectRefusesBlankName() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+
+        let store = TaskBoardStore(service: service)
+        await store.refreshProjects()
+
+        let result = await store.renameProject(id: project.id, name: "   ")
+        guard case .refused(let refusal) = result else {
+            XCTFail("Boş proje adı reddedilmeli, sonuç: \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        XCTAssertEqual(store.projects.first { $0.id == project.id }?.name, "Board")
+    }
+
+    func testDeleteProjectRemovesProjectTasksAndSelection() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Yetim kalmamalı", priority: 1, criteria: [])
+
+        let store = TaskBoardStore(service: service)
+        await store.refreshProjects()
+        store.selectProject(project.id)
+        await store.refresh()
+        XCTAssertFalse(store.cards.isEmpty)
+
+        let result = await store.deleteProject(id: project.id)
+        guard case .applied = result else {
+            XCTFail("Proje silme uygulanmalı, sonuç: \(result)")
+            return
+        }
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertNil(store.selectedProjectID)
+        XCTAssertTrue(store.cards.isEmpty)
+        let reloadedTaskAfterProjectDelete = try await harness.store.task(id: task.id)
+        XCTAssertNil(reloadedTaskAfterProjectDelete, "proje silinince görevleri kalmamalı")
+        let reloadedProjectAfterDelete = try await harness.store.loadProject(id: project.id)
+        XCTAssertNil(reloadedProjectAfterDelete)
+    }
+
+    func testDeleteProjectRefusesWhileTaskRunning() async throws {
+        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+        let service = harness.makeService()
+        let project = try await makeProject(service: service)
+        let task = try await seedTask(harness: harness, projectID: project.id, title: "Koşan", priority: 1, criteria: [])
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: 1,
+            action: .markReady,
+            context: TaskTransitionContext(fingerprint: "fixture", actor: "fixture")
+        )
+        _ = try await harness.store.transition(
+            taskID: task.id,
+            expectedVersion: 2,
+            action: .startAttempt(attemptID: UUID(), role: .developer),
+            context: TaskTransitionContext(fingerprint: "fixture", actor: "fixture")
+        )
+
+        let store = TaskBoardStore(service: service)
+        await store.refreshProjects()
+
+        let result = await store.deleteProject(id: project.id)
+        guard case .refused(let refusal) = result else {
+            XCTFail("Koşan görev varken proje silinmemeli, sonuç: \(result)")
+            return
+        }
+        XCTAssertEqual(refusal.kind, .rejected)
+        XCTAssertFalse(store.projects.isEmpty, "reddedilen silme projeyi korumalı")
     }
 }

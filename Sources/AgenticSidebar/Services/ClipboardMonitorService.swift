@@ -174,7 +174,7 @@ final class ClipboardMonitorService {
             let promptText: String
             if next.mode == .exam {
                 promptText = """
-                    EXAM SOLVER: Please solve the following question. State the direct answer first, followed by a step-by-step derivation:
+                    EXAM SOLVER: Detect the question type (choice, true/false, numeric, written, code/SQL) and language; answer in that language. State the direct answer first, followed by the step-by-step derivation, reasoning, or complete code solution:
 
                     \(next.text)
                     """

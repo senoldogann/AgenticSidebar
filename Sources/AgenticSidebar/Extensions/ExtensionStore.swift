@@ -313,16 +313,46 @@ final class ExtensionStore {
             status = .failure("A plugin needs an npm module name or a file path.")
             return false
         }
+        // npm kayıt limiti: daha uzunu ne ad olur ne yol taşınır.
+        guard trimmed.count <= Self.maximumPluginModuleLength else {
+            status = .failure("“\(trimmed)” is too long for a plugin.")
+            return false
+        }
+        // Satır/null enjeksiyonu her iki dalda da yasaktır.
+        guard !trimmed.contains("\0"), !trimmed.contains("\n"), !trimmed.contains("\r") else {
+            status = .failure("“\(trimmed)” is not a valid plugin module.")
+            return false
+        }
+
+        let isFilePath =
+            trimmed.hasPrefix("/") || trimmed.hasPrefix("./") || trimmed.hasPrefix("../")
+            || trimmed.hasPrefix("~")
+        if isFilePath {
+            // Yerel yol üst dizine kaçamaz.
+            guard !trimmed.contains("..") else {
+                status = .failure("“\(trimmed)” is not a valid plugin path.")
+                return false
+            }
+        } else {
+            // npm adı: isteğe bağlı kapsam + sıkı sürüm pini.
+            guard
+                trimmed.range(of: Self.npmPluginPattern, options: .regularExpression) != nil
+            else {
+                status = .failure("“\(trimmed)” is not a valid npm module name.")
+                return false
+            }
+        }
 
         guard !registry.plugins.contains(where: { $0.module == trimmed }) else {
             status = .failure("“\(trimmed)” is already installed.")
             return false
         }
 
+        // Eklenti kod çalıştırır: varsayılan kapalı, güven onayı bekler.
         registry.upsert(
             plugin: PluginRecord(
                 module: trimmed,
-                isEnabled: true,
+                isEnabled: false,
                 source: source,
                 installedAt: Date(),
                 requiresTrust: true
@@ -332,7 +362,12 @@ final class ExtensionStore {
         Task {
             await applyToAgent()
         }
-        status = .info("“\(trimmed)” added. Restart the agent to load it.")
+        var message =
+            "“\(trimmed)” eklendi; güven onayı bekliyor. Etkinleştirmeden ajana yüklenmez."
+        if !isFilePath, !Self.hasVersionPin(trimmed) {
+            message += " Uyarı: sürüm sabitlenmedi, en son sürüm kurulacak."
+        }
+        status = .info(message)
         return true
     }
 
@@ -423,11 +458,26 @@ final class ExtensionStore {
 
     /// Installs the skill a skills.sh entry points at.
     func installSkill(entry: SkillsShEntry) async {
+        // Dizin girdisi ağa çıkmadan doğrulanır.
+        guard
+            Self.isSafeSkillsShField(entry.id),
+            Self.isSafeSkillsShField(entry.source),
+            Self.isSafeSkillsShField(entry.skillID)
+        else {
+            status = .failure("skills.sh entry “\(entry.id)” could not be read.")
+            return
+        }
+
         let parts = entry.id.split(separator: "/").map(String.init)
         let repository: String
         let subpath: String?
 
         if parts.count >= 3 {
+            // `owner/repo` biçimine uymayan girdi kurulumu durdurur.
+            guard Self.isValidOwnerRepo(owner: parts[0], repo: parts[1]) else {
+                status = .failure("skills.sh entry “\(entry.id)” could not be read.")
+                return
+            }
             repository = parts[0] + "/" + parts[1]
             let folder = parts[2...].joined(separator: "/")
             subpath = folder + "/" + entry.skillID
@@ -546,6 +596,46 @@ final class ExtensionStore {
 
     private func currentClient() async -> (any OpenCodeClientProtocol)? {
         await clientProvider()
+    }
+}
+
+// MARK: - Tedarik zinciri doğrulaması
+
+extension ExtensionStore {
+    /// npm paket adı üst sınırı.
+    private static let maximumPluginModuleLength = 214
+    /// Kapsamlı/kapsamsız ad + isteğe bağlı sıkı `X.Y.Z[-önsürüm]` pini.
+    private static let npmPluginPattern =
+        #"^(@[a-z0-9-~][a-z0-9-._~]*/)?[a-z0-9-~][a-z0-9-._~]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?$"#
+
+    /// Sondaki `@X.Y.Z` pini var mı (baştaki kapsam `@`i sayılmaz).
+    private static func hasVersionPin(_ module: String) -> Bool {
+        guard let at = module.lastIndex(of: "@"), at != module.startIndex else {
+            return false
+        }
+        return true
+    }
+
+    /// skills.sh girdisi ağa çıkmadan elenir: boşluk/newline/null/`..` yasaktır.
+    private static func isSafeSkillsShField(_ value: String) -> Bool {
+        guard !value.isEmpty else {
+            return false
+        }
+        return !value.contains("\0") && !value.contains("\n") && !value.contains("\r")
+            && !value.contains(" ") && !value.contains("\t") && !value.contains("..")
+    }
+
+    /// `owner/repo` biçimi: boş ve nokta-dizin değil, dar karakter kümesi.
+    private static func isValidOwnerRepo(owner: String, repo: String) -> Bool {
+        guard !owner.isEmpty, !repo.isEmpty else {
+            return false
+        }
+        guard owner != ".", owner != "..", repo != ".", repo != ".." else {
+            return false
+        }
+        let pattern = #"^[A-Za-z0-9_.-]+$"#
+        return owner.range(of: pattern, options: .regularExpression) != nil
+            && repo.range(of: pattern, options: .regularExpression) != nil
     }
 }
 

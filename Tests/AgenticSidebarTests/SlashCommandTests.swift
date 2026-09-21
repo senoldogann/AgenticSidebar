@@ -7,8 +7,8 @@ import XCTest
 /// Bestecideki `/` paneli bu tipten beslenir; liste boşsa kullanıcı komutları
 /// hiç keşfedemez.
 final class SlashCommandTests: XCTestCase {
-    func testAllListsGoalBeforeBtwBeforeCompact() {
-        XCTAssertEqual(SlashCommand.all.map(\.name), ["goal", "btw", "compact"])
+    func testAllListsGoalBeforeBtw() {
+        XCTAssertEqual(SlashCommand.all.map(\.name), ["goal", "btw"])
     }
 
     func testMatchingEmptyQueryReturnsAll() {
@@ -45,21 +45,5 @@ final class SlashCommandTests: XCTestCase {
 
     func testParseGoalIsCaseInsensitive() {
         XCTAssertEqual(SlashCommand.parseGoal(from: "/GOAL Do it"), "Do it")
-    }
-
-    func testIsCompactCommandMatchesBareCommand() {
-        XCTAssertTrue(SlashCommand.isCompactCommand("/compact"))
-        XCTAssertTrue(SlashCommand.isCompactCommand("  /COMPACT  "))
-    }
-
-    func testIsCompactCommandRejectsTailedText() {
-        XCTAssertFalse(SlashCommand.isCompactCommand("/compact now"))
-        XCTAssertFalse(SlashCommand.isCompactCommand("/compactx"))
-        XCTAssertFalse(SlashCommand.isCompactCommand("compact"))
-        XCTAssertFalse(SlashCommand.isCompactCommand(""))
-    }
-
-    func testMatchingFindsCompact() {
-        XCTAssertEqual(SlashCommand.matching(query: "comp"), [.compact])
     }
 }

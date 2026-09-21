@@ -120,6 +120,10 @@ enum VerificationOutputRedactor {
 actor VerificationRunner {
     private static let pollInterval: TimeInterval = 0.05
     private static let fingerprintTimeout: TimeInterval = 10
+    /// Adım başı süreler ne olursa olsun tek koşunun üst sınırı: takılan bir
+    /// süreç zinciri koşuyu süresiz uzatamaz. Aşımda kalan adımlar `skipped`
+    /// yazılır (`blockedBy=runDeadlineExceeded`).
+    private static let maximumRunDuration: TimeInterval = 600
     /// Chunk size used while streaming an untracked file through SHA-256.
     private static let untrackedFileChunkBytes = 1_048_576
 
@@ -270,10 +274,16 @@ actor VerificationRunner {
         var recordedFingerprint = initialFingerprint
         var blocker: String?
         var lastExecutedIndex: Int?
+        let runDeadline = Date().addingTimeInterval(Self.maximumRunDuration)
 
         for step in recipe.steps {
             if cancellation.isCancelled, blocker == nil {
                 blocker = "cancellation"
+            }
+            // Üst süre denetimi: iptal gibi yapışkan değil, yalnızca bu koşunun
+            // kalan adımlarını atlatır.
+            if blocker == nil, Date() >= runDeadline {
+                blocker = "runDeadlineExceeded"
             }
             if let blocker {
                 entries.append(
@@ -659,13 +669,15 @@ actor VerificationRunner {
     }
 
     private func resolveWorkingDirectory(_ relativePath: String, in workspace: URL) -> URL? {
+        // Kaçış denetimi çözümleyiciyle paylaşılır ve sembolik bağ çözer:
+        // çalışma alanı içindeki bir bağ (`sub/evil` → `/etc`) öneki
+        // tutturur ama diske dışarıyı yazardı.
+        guard !WorkspacePathContainment.relativePath(relativePath, escapesWorkspace: workspace) else {
+            return nil
+        }
         let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.hasPrefix("/") else { return nil }
-        let components = trimmed.split(separator: "/", omittingEmptySubsequences: true)
-        guard !components.contains("..") else { return nil }
-        let resolved = workspace.appendingPathComponent(trimmed.isEmpty ? "." : trimmed).standardizedFileURL
-        let root = workspace.standardizedFileURL.path
-        guard resolved.path == root || resolved.path.hasPrefix(root + "/") else { return nil }
+        let resolved = workspace.appendingPathComponent(trimmed.isEmpty ? "." : trimmed)
+            .resolvingSymlinksInPath().standardized
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             return nil

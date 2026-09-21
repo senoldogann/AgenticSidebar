@@ -30,6 +30,20 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     @discardableResult
     func createSession() -> UUID
     func selectSession(_ id: UUID)
+    /// Gönderilmemiş yeni-sohbet taslağının kimliği (`nil` = bekleyen yok).
+    /// Liste/arşiv dışıdır: `+ New session` sohbet oluşturmaz.
+    var pendingSessionID: UUID? { get }
+    /// Bekleyen taslak birincil bölmede görünür mü.
+    var isPendingSessionVisible: Bool { get }
+    /// Bekleyen taslağı açar (yoksa kurar), kimliğini döner.
+    @discardableResult
+    func beginPendingSession() -> UUID
+    /// Bekleyen taslağı aynı kimlikle gerçek oturuma dönüştürür.
+    func materializePendingSession(_ id: UUID)
+    /// Gönderilmemiş taslağı siler.
+    func discardPendingSession()
+    /// Bekleyen taslağın görünürlüğü (sohbet seçimi gizler, taslağı silmez).
+    func setPendingSessionVisible(_ visible: Bool)
     func deleteSession(_ id: UUID)
     func deleteSessions(_ ids: Set<UUID>)
     @discardableResult
@@ -81,6 +95,13 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
 
 extension AgentSessionServiceProtocol {
     func sideQuestionContext(for id: UUID) -> SideQuestionContext? { nil }
+    var pendingSessionID: UUID? { nil }
+    var isPendingSessionVisible: Bool { false }
+    @discardableResult
+    func beginPendingSession() -> UUID { UUID() }
+    func materializePendingSession(_ id: UUID) {}
+    func discardPendingSession() {}
+    func setPendingSessionVisible(_ visible: Bool) {}
 }
 
 extension AgentSessionService: AgentSessionServiceProtocol {}

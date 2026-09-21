@@ -140,12 +140,40 @@ final class AgentModeTests: XCTestCase {
         let instruction = try XCTUnwrap(AgentMode.exam.instruction)
 
         XCTAssertTrue(instruction.contains("EXAM & TEST SOLVER MODE"))
-        XCTAssertTrue(instruction.contains("DIRECT & DEFINITIVE ANSWER FIRST"))
-        XCTAssertTrue(instruction.contains("STEP-BY-STEP SOLUTION & DERIVATION"))
-        XCTAssertTrue(instruction.contains("MATHEMATICAL NOTATION & EQUATIONS"))
-        XCTAssertTrue(instruction.contains("CODE AND ALGORITHMS"))
+        XCTAssertTrue(
+            instruction.contains("```\(AgentMode.solutionFenceLanguage)"),
+            "Exam mode must put the full solution in a solution document"
+        )
+        XCTAssertTrue(
+            instruction.lowercased().contains("net result"),
+            "Exam mode must answer with the short verdict first"
+        )
+        XCTAssertTrue(
+            instruction.contains("exactly one fenced"),
+            "Exam mode must emit a single solution document"
+        )
+        XCTAssertTrue(
+            instruction.contains("copy-friendly"),
+            "Exam mode must end with a copy-friendly answer line"
+        )
         XCTAssertEqual(AgentMode.exam.displayName, "Exam")
         XCTAssertEqual(AgentMode.exam.symbolName, "graduationcap.fill")
+    }
+
+    func testAskModeIsReadOnlyAndAnswersDirectly() throws {
+        let instruction = try XCTUnwrap(AgentMode.ask.instruction)
+
+        XCTAssertTrue(instruction.contains("ASK MODE"))
+        XCTAssertTrue(
+            instruction.lowercased().contains("do not create, edit, delete"),
+            "Ask mode must never change files"
+        )
+        XCTAssertTrue(
+            instruction.contains("read-only tools"),
+            "Ask mode must investigate with read-only tools"
+        )
+        XCTAssertEqual(AgentMode.ask.displayName, "Ask")
+        XCTAssertEqual(AgentMode.ask.symbolName, "questionmark.circle.fill")
     }
 
     private func makeProviderRequest(mode: AgentMode) -> ProviderRequest {

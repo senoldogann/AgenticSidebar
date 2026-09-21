@@ -61,7 +61,7 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
         case .approveSafe:
             "Only potentially unsafe actions ask: outside paths, unrecognised shell commands, URL fetches, and computer use."
         case .fullAccess:
-            "Shell, edits and fetches run without a prompt. Computer use actions and the authority lease still ask."
+            "Shell, edits, fetches, computer use actions and the authority lease run without a prompt. Full-host JavaScript (computer_run_js) stays denied."
         }
     }
 
@@ -73,7 +73,7 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
         case .approveSafe:
             "Reads, in-folder edits, a limited set of exact inspection commands (git status, git diff, ls, pwd) and exact build and test commands run unattended. Everything else — external paths, other shell commands, webfetch, the authority lease for computer use — asks. A running turn keeps the level it started with; a change applies from the next turn."
         case .fullAccess:
-            "No approval is requested for shell commands, edits and fetches, including paths outside this folder. Computer use actions and the authority lease still ask. This answers the requests the agent raises; a `deny` in your own `~/.config/opencode/opencode.json`, and the app's own `deny` for the computer-use file, git, terminal and JavaScript tools, still apply — a denied tool is never asked about, so no level can allow it. A running turn keeps the level it started with; a change applies from the next turn."
+            "No approval is requested for shell commands, edits and fetches, including paths outside this folder — and none for computer use actions or the authority lease either. This answers the requests the agent raises; a `deny` in your own `~/.config/opencode/opencode.json`, and the app's own `deny` for the computer-use file, git, terminal and full-host JavaScript (computer_run_js) tools, still apply — a denied tool is never asked about, so no level can allow it. A running turn keeps the level it started with; a change applies from the next turn."
         }
     }
 
@@ -104,6 +104,16 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
     }
 
     // MARK: - Runtime answer
+
+    /// Plan aşaması delegasyon yaptırımının tek meşru hedefi: salt-okunur
+    /// araştırma alt-ajanı.
+    ///
+    /// Karşılaştırma birebirdir; büyük-küçük harf ya da boşluk farkı hedefsizlik
+    /// gibi işlem görür (fail-closed). Ayrıştırma (`trim`, boşsa `nil`)
+    /// istek yapısındadır; burası yalnızca ad eşitliğine bakar.
+    static func isResearchDelegationTarget(_ target: String?) -> Bool {
+        target == ManagedOpenCodeConfiguration.researchAgentName
+    }
 
     /// The reply for an approval request that reached the app, or `nil` to defer
     /// it to the user.
@@ -147,9 +157,12 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
             }
             return .once
         case .fullAccess:
-            // Bilgisayar kullanımı her seviyede sorar: imleç/klavye ve yetki
-            // kirası gözetimsiz çalışamaz.
-            if Self.isComputerUseTool(toolName) {
+            // Tam erişimde bilgisayar kullanımı gözetimsiz çalışır: imleç/klavye
+            // ve yetki kirası otomatik onaylanır. Tek istisna tam-host
+            // JavaScript'tir (`computer_run_js`): yapılandırmada `deny`
+            // olduğu için merkeze hiç ulaşmaz, ama savunma derinliği için
+            // burada da sorulur.
+            if Self.isBlockedComputerTool(toolName) {
                 return nil
             }
             return .once
@@ -274,8 +287,8 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
 
     /// Whether the tool drives computer use or its authority lease.
     ///
-    /// Bu araçlar her seviyede sorar: imleç/klavye girişi ve yetki kirası
-    /// gözetimsiz çalışamaz.
+    /// Bu araçlar `ask` ve `approveSafe` seviyelerinde sorar; `fullAccess`
+    /// seviyesinde otomatik onaylanır (hariç: `isBlockedComputerTool`).
     static func isComputerUseTool(_ toolName: String) -> Bool {
         let name = toolName.lowercased()
         if name.hasPrefix("chatgpt-system_") {
@@ -288,6 +301,17 @@ enum ToolApprovalPolicy: String, CaseIterable, Identifiable, Codable, Sendable {
             return true
         }
         return false
+    }
+
+    /// Tam erişimde bile otomatik onaylanmayan bilgisayar araçları.
+    ///
+    /// `computer_run_js` tam-host JavaScript çalıştırır: yapılandırma
+    /// `deny` ile kapatır, bu denetim ikinci kilittir.
+    static func isBlockedComputerTool(_ toolName: String) -> Bool {
+        let name = toolName.lowercased()
+        return name == "computer_run_js"
+            || name == "chatgpt-system_computer_run_js"
+            || name.hasSuffix("_computer_run_js")
     }
 
     /// Whether the tool mutates files by nature (`edit` and its aliases).

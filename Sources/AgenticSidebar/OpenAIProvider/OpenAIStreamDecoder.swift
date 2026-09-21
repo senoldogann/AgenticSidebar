@@ -66,14 +66,16 @@ enum OpenAIStreamDecoder {
 
     /// `response.completed` gövdesindeki `response.usage`:
     /// `{input_tokens, output_tokens, total_tokens}`. Sayılar tam ya da
-    /// ondalık gelebilir; eksik ya da geçersizse `nil` (olay üretilmez).
+    /// ondalık gelebilir; eksik, geçersiz ya da girdisi sıfırsa `nil` (olay
+    /// üretilmez). Sıfır girdi "bildirilmedi" demektir, `%0` değil.
     private static func usage(from data: Data) -> TurnTokenUsage? {
         guard
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let response = object["response"] as? [String: Any],
             let usage = response["usage"] as? [String: Any],
             let input = Self.tokenCount(usage["input_tokens"]),
-            let output = Self.tokenCount(usage["output_tokens"])
+            let output = Self.tokenCount(usage["output_tokens"]),
+            input > 0
         else {
             return nil
         }

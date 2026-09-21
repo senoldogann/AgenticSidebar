@@ -52,15 +52,17 @@ enum ContextCompactor {
         for message in staleMessages {
             let speaker = message.role == .user ? "User" : "Assistant"
             var text = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if text.count > maximumStaleMessageCharacters {
+            // Boy ölçümleri `utf8.count` ile: grapheme sayımı her özet turunda
+            // bütün ön eki dolaşırdı. Kesme karakter sınırında yapılır.
+            if text.utf8.count > maximumStaleMessageCharacters {
                 text = String(text.prefix(maximumStaleMessageCharacters)) + "…"
             }
             let line = "\(speaker): \(text)"
-            guard used + line.count <= maximumStaleInputCharacters else {
+            guard used + line.utf8.count <= maximumStaleInputCharacters else {
                 break
             }
             lines.append(line)
-            used += line.count
+            used += line.utf8.count
         }
         var sections = [
             """
@@ -99,7 +101,7 @@ enum ContextCompactor {
     /// Ham özet yanıtını boyuna indirir: model taştığında blok büyümez.
     static func boundSummary(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count > maximumSummaryCharacters else {
+        guard trimmed.utf8.count > maximumSummaryCharacters else {
             return trimmed
         }
         return String(trimmed.prefix(maximumSummaryCharacters)) + "…"

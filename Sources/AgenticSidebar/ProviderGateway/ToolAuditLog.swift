@@ -125,6 +125,131 @@ actor ToolAuditLog {
         )
     }
 
+    /// Sır taşıması muhtemel anahtarlar: regex yok, küçük harfli alt-string
+    /// listesi. Değer maskelenir, satırın JSON yapısı korunur.
+    static let sensitiveKeys = [
+        "token",
+        "api_key",
+        "api-key",
+        "apikey",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "bearer",
+        "cookie",
+        "private_key",
+        "privatekey",
+        "client_secret",
+        "access_key",
+    ]
+
+    static let redactedPlaceholder = "[REDACTED]"
+
+    /// Anahtar-değer biçimindeki sırları maskeler: anahtar bulunduktan sonra
+    /// `:`/`=` ayracı aranır, ayraç yoksa dokunulmaz (düz metindeki "token"
+    /// gibi sözcükler yanlış pozitif vermez). `Bearer`/`Basic` öneki atlanıp
+    /// asıl jeton maskelenir; tırnaklı değerde tırnaklar korunur.
+    static func redact(_ text: String) -> String {
+        var result = text
+        // Büyük/küçük harf duyarsız arama doğrudan özgün metinde yapılır:
+        // `lowercased()` kopyası üzerinden ofset taşımak bazı Unicode
+        // karakterlerde kayma yapardı.
+        var matches: [Range<String.Index>] = []
+        for key in sensitiveKeys {
+            var searchFrom = result.startIndex
+            while searchFrom < result.endIndex,
+                let found = result.range(
+                    of: key,
+                    options: .caseInsensitive,
+                    range: searchFrom..<result.endIndex
+                )
+            {
+                matches.append(found)
+                searchFrom = found.upperBound
+            }
+        }
+        // Örtüşen eşleşmelerden (`client_secret` + `secret`) ilki (en uzun
+        // başlangıç) yaşar; uygulama sondan başa yapılır ki erken
+        // değişiklikler sonraki aralıkları kaydırmasın.
+        matches.sort {
+            if $0.lowerBound != $1.lowerBound {
+                return $0.lowerBound < $1.lowerBound
+            }
+            return $0.upperBound > $1.upperBound
+        }
+        var kept: [Range<String.Index>] = []
+        for match in matches {
+            if let last = kept.last, match.lowerBound < last.upperBound {
+                continue
+            }
+            kept.append(match)
+        }
+        for match in kept.reversed() {
+            maskValue(after: match.upperBound, in: &result)
+        }
+        return result
+    }
+
+    /// Anahtarın sonrasındaki ilk değeri `[REDACTED]` ile değiştirir. Ayraç
+    /// (`:`/`=`) yoksa hiçbir şey yapmaz.
+    private static func maskValue(after keyEnd: String.Index, in text: inout String) {
+        var cursor = keyEnd
+        // Kapanış tırnağı + boşluklar atlanır: `"password" : "x"`.
+        while cursor < text.endIndex, text[cursor] == "\"" || text[cursor] == "'" || text[cursor] == " " || text[cursor] == "\t" {
+            cursor = text.index(after: cursor)
+        }
+        guard cursor < text.endIndex, text[cursor] == ":" || text[cursor] == "=" else {
+            return
+        }
+        cursor = text.index(after: cursor)
+        while cursor < text.endIndex, text[cursor] == " " || text[cursor] == "\t" {
+            cursor = text.index(after: cursor)
+        }
+        guard cursor < text.endIndex else {
+            return
+        }
+        // `Bearer <jeton>` / `Basic <jeton>`: şema sözcüğü atlanır, jeton maskelenir.
+        for scheme in ["Bearer ", "Basic ", "bearer ", "basic "] {
+            if text[cursor...].hasPrefix(scheme) {
+                cursor = text.index(cursor, offsetBy: scheme.count)
+                while cursor < text.endIndex, text[cursor] == " " || text[cursor] == "\t" {
+                    cursor = text.index(after: cursor)
+                }
+                break
+            }
+        }
+        guard cursor < text.endIndex else {
+            return
+        }
+        if text[cursor] == "\"" || text[cursor] == "'" {
+            let quote = text[cursor]
+            var valueEnd = text.index(after: cursor)
+            while valueEnd < text.endIndex, text[valueEnd] != quote {
+                valueEnd = text.index(after: valueEnd)
+            }
+            let valueStart = text.index(after: cursor)
+            text.replaceSubrange(valueStart..<valueEnd, with: redactedPlaceholder)
+        } else {
+            var valueEnd = cursor
+            while valueEnd < text.endIndex,
+                text[valueEnd] != " ",
+                text[valueEnd] != "\t",
+                text[valueEnd] != "\n",
+                text[valueEnd] != ",",
+                text[valueEnd] != "}",
+                text[valueEnd] != "]",
+                // Tırnak sınırdır: JSON satırındaki `"anahtar=değer"` biçiminde
+                // kapanış tırnağını yutmak satırı çözülemez yapardı.
+                text[valueEnd] != "\"",
+                text[valueEnd] != "'"
+            {
+                valueEnd = text.index(after: valueEnd)
+            }
+            text.replaceSubrange(cursor..<valueEnd, with: redactedPlaceholder)
+        }
+    }
+
     func record(_ record: Record) {
         append(record)
     }
@@ -143,6 +268,13 @@ actor ToolAuditLog {
 
             var line = try Self.encoder.encode(record)
             line.append(0x0A)
+            // Dosyaya inmeden son redaksiyon: kodlanan satırın tamamı taranır,
+            // başlık/komut/örüntü alanlarındaki sırlar maskelenir.
+            if let text = String(data: line, encoding: .utf8),
+                let redacted = Self.redact(text).data(using: .utf8)
+            {
+                line = redacted
+            }
 
             try rotateIfNeeded(adding: line.count)
 

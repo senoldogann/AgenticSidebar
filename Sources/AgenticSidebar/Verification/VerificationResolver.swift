@@ -10,27 +10,63 @@ struct VerificationToolchain: Sendable, Equatable {
     let installedSwiftFormatVersion: String?
 
     /// Detects the toolchain of the current host without interpreting a shell.
+    ///
+    /// Sabit adaylar önce denenir (deterministik sıra), bulunamazsa `PATH`
+    /// taranır: Nix, swiftenv ya da Homebrew'suz bir makinede sabit
+    /// `/opt/homebrew` yolu tek başına kördür.
     static func detected() -> VerificationToolchain {
-        let swiftCandidates = ["/usr/bin/swift", "/opt/homebrew/bin/swift"]
+        let swiftCandidates = [
+            "/usr/bin/swift",
+            "/opt/homebrew/bin/swift",
+            "/usr/local/bin/swift",
+            "/opt/local/bin/swift",
+        ]
         let swiftExecutable =
             swiftCandidates
             .first { FileManager.default.isExecutableFile(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
+            ?? executableInPath("swift").map { URL(fileURLWithPath: $0) }
             ?? URL(fileURLWithPath: "/usr/bin/swift")
-        let formatter = URL(fileURLWithPath: "/opt/homebrew/bin/swift-format")
+        let homebrewFormatter = URL(fileURLWithPath: "/opt/homebrew/bin/swift-format")
+        let formatterPath =
+            FileManager.default.isExecutableFile(atPath: homebrewFormatter.path)
+            ? homebrewFormatter.path
+            : executableInPath("swift-format")
+        let formatter = formatterPath.map { URL(fileURLWithPath: $0) }
         let installedVersion =
-            FileManager.default.isExecutableFile(atPath: formatter.path)
-            ? VerificationToolProbe.version(
-                of: formatter,
-                timeout: VerificationToolProbe.probeTimeout,
-                drainGrace: VerificationToolProbe.probeDrainGrace
-            )
-            : nil
+            formatter
+            .flatMap {
+                FileManager.default.isExecutableFile(atPath: $0.path)
+                    ? VerificationToolProbe.version(
+                        of: $0,
+                        timeout: VerificationToolProbe.probeTimeout,
+                        drainGrace: VerificationToolProbe.probeDrainGrace
+                    )
+                    : nil
+            }
         return VerificationToolchain(
             swiftExecutable: swiftExecutable,
-            swiftFormatExecutable: FileManager.default.isExecutableFile(atPath: formatter.path) ? formatter : nil,
+            swiftFormatExecutable: formatter,
             installedSwiftFormatVersion: installedVersion
         )
+    }
+
+    /// `PATH` içindeki ilk çalıştırılabilir eşleşmenin tam yolu; kabuk yok,
+    /// yalnızca dizin taraması. `detected()` içindeki sabit adaylar
+    /// tutmazsa taşınabilirlik ağıdır.
+    static func executableInPath(_ name: String) -> String? {
+        guard !name.isEmpty, !name.contains("/") else { return nil }
+        let directories = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        for directory in directories {
+            let candidate = (directory as NSString).appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
     }
 }
 
@@ -182,6 +218,30 @@ struct VerificationResolver: Sendable {
 
     let toolchain: VerificationToolchain
 
+    /// Gönderim öncesi hafif ön kontrol: ajan koşmadan deponun güvenilir
+    /// tarifeye çözülebileceğini söyler.
+    ///
+    /// `resolve` ile aynı kilitleri paylaşır (dizin + `Package.swift` +
+    /// çalıştırılabilir ürün bildirimi) ama araç zinciri yoklamaz ve reçete
+    /// üretmez; dosya sistemi okuması dışında maliyeti yoktur. Arada dosya
+    /// silinirse (TOCTOU) doğrulayıcının `catch` yolu yine tutarlı kanıt
+    /// yazar, o yüzden burası yalnızca israfı önleyen hızlı kapıdır.
+    static func isResolvable(repository: URL) -> Bool {
+        let repositoryURL = repository.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: repositoryURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return false
+        }
+        let packageURL = repositoryURL.appendingPathComponent("Package.swift", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: packageURL.path) else {
+            return false
+        }
+        guard let packageSource = try? String(contentsOf: packageURL, encoding: .utf8) else {
+            return false
+        }
+        return firstExecutableProduct(in: packageSource) != nil
+    }
+
     func resolve(repository: URL) async throws -> VerificationRecipe {
         let repositoryURL = repository.standardizedFileURL
         var isDirectory: ObjCBool = false
@@ -332,14 +392,11 @@ struct VerificationResolver: Sendable {
     }
 
     /// True when a relative working directory is absolute or resolves outside the workspace.
+    ///
+    /// Denetim `WorkspacePathContainment` içindedir (çalıştırıcıyla paylaşılır
+    /// ve sembolik bağ çözer); burası yalnız eski çağrı noktasını korur.
     private static func relativePathEscapesWorkspace(_ path: String, workspace: URL) -> Bool {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.hasPrefix("/") else { return true }
-        let components = trimmed.split(separator: "/", omittingEmptySubsequences: true)
-        guard !components.contains("..") else { return true }
-        let resolved = workspace.appendingPathComponent(trimmed.isEmpty ? "." : trimmed).standardizedFileURL.path
-        let root = workspace.standardizedFileURL.path
-        return resolved != root && !resolved.hasPrefix(root + "/")
+        WorkspacePathContainment.relativePath(path, escapesWorkspace: workspace)
     }
 
     /// First `.executable(name: "...")` product declaration, in file order.

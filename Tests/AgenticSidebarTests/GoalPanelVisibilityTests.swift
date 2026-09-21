@@ -90,6 +90,26 @@ final class GoalPanelVisibilityTests: XCTestCase {
         )
     }
 
+    /// Oturum kapsamı: orkestratör bölme başına yaşar; kart yalnız koşunun,
+    /// devam önerisinin ya da retin oturumu odaktayken çizilir. Başka
+    /// sohbetteki hata ya da koşu bu sohbete sızmamalı.
+    func testPanelBodyIsScopedToFocusedSession() throws {
+        let source = try panelSource()
+
+        XCTAssertTrue(
+            source.contains("let focusedSessionID: UUID"),
+            "Panel odaklı oturum kimliğini almalı"
+        )
+        XCTAssertTrue(
+            source.contains("orchestrator.sessionID == focusedSessionID"),
+            "Koşu/devam kartı oturuma göre kapılanmalı"
+        )
+        XCTAssertTrue(
+            source.contains("failed.sessionID == focusedSessionID"),
+            "Ret kartı yalnız reddedilen sohbette çizilmeli"
+        )
+    }
+
     // MARK: - Helpers
 
     private func packageDirectory() -> URL {

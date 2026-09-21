@@ -30,7 +30,7 @@ extension SettingsView {
                 computerUseReadinessBanner
 
                 Text(
-                    "The managed OpenCode server registers `chatgpt-system` as a local MCP server. computer_* tools observe the screen (accessibility tree + screenshots) and post pointer/keyboard input. Every action asks for your approval first; authority is an Admin lease with a one-hour maximum that the agent must renew."
+                    "The managed OpenCode server registers `chatgpt-system` as a local MCP server. computer_* tools observe the screen (accessibility tree + screenshots) and post pointer/keyboard input. Ask and Approve for me approve each action first; Full access runs computer actions and the authority lease unattended. Authority is an Admin lease with a one-hour maximum that the agent must renew."
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -619,7 +619,7 @@ extension SettingsView {
                     "Only computer_* and session_authority_* tools are exposed; filesystem, git, terminal and browser tools of the MCP server are denied by policy."
                 )
                 computerUseSafetyBullet(
-                    "Full-host JavaScript (computer_run_js) stays disabled; the server is started with --personal-admin and --enable-computer-use only."
+                    "Full-host JavaScript (computer_run_js) stays disabled at every level, including Full access; the server is started with --personal-admin and --enable-computer-use only."
                 )
                 computerUseSafetyBullet(approvalSafetyText)
                 computerUseSafetyBullet(
@@ -646,7 +646,7 @@ extension SettingsView {
         case .approveSafe:
             "Screen observation runs unattended; anything that moves the pointer, types, presses a key, runs a program or mints the Admin authority lease waits for you."
         case .fullAccess:
-            "Full access is on: shell, edits and fetches run unattended, but computer actions and the authority lease still wait for you."
+            "Full access is on: shell, edits, fetches, computer actions and the authority lease run unattended. Full-host JavaScript (computer_run_js) stays disabled."
         }
     }
 
@@ -703,7 +703,8 @@ extension SettingsView {
             return ComputerUseConfiguration.locateNode(
                 environment: ProcessInfo.processInfo.environment,
                 fileManager: .default,
-                candidatePaths: ComputerUseConfiguration.nodeExecutableCandidates
+                candidatePaths: ComputerUseConfiguration.nodeExecutableCandidates,
+                bundlePath: Bundle.main.bundlePath
             )?.path ?? "Not found"
         case .invalid(let message):
             return message.contains("Node.js") ? message : "Found"
@@ -722,7 +723,8 @@ extension SettingsView {
             return ComputerUseConfiguration.locateNode(
                 environment: ProcessInfo.processInfo.environment,
                 fileManager: .default,
-                candidatePaths: ComputerUseConfiguration.nodeExecutableCandidates
+                candidatePaths: ComputerUseConfiguration.nodeExecutableCandidates,
+                bundlePath: Bundle.main.bundlePath
             ) != nil
         case .invalid(let message):
             return !message.contains("Node.js")

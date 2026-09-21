@@ -50,6 +50,8 @@ enum WorkspaceGuardError: LocalizedError, Equatable, Sendable {
     /// The source repository has tracked or untracked changes.
     case worktreeDirty(path: String, status: String)
     /// The source repository is checked out on a protected branch.
+    /// Artık uygulanmaz (çalışma alanı `--detach` kurulduğu için temiz
+    /// korumalı checkout engel değildir); eski kayıtlarla uyumluluk için tutulur.
     case protectedBranch(branch: String)
     /// A symbolic link would carry the workspace outside its authorized root.
     case symlinkEscape(path: String)

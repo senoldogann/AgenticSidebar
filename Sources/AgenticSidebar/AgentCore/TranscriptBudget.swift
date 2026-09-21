@@ -11,6 +11,10 @@ import Foundation
 struct TranscriptBudget: Equatable, Sendable {
     static let charactersPerToken = 4
     static let defaultCharacterBudget = 96_000
+    /// Kayan pencerenin sert tavanı: bütçe ne derse desin istekte en yeni
+    /// `maximumKeptMessages` mesajdan fazlası taşınmaz. Binlerce minik
+    /// mesajın bütçeyi baypas edip isteği şişirmesini engeller.
+    static let maximumKeptMessages = 500
 
     struct Selection: Equatable, Sendable {
         let messages: [ChatMessage]
@@ -24,7 +28,9 @@ struct TranscriptBudget: Equatable, Sendable {
     }
 
     static func approximateTokenCount(for text: String) -> Int {
-        (text.count + charactersPerToken - 1) / charactersPerToken
+        // `count` yerine `utf8.count`: grapheme sayımı bütün metni dolaşır,
+        // bayt sayımı ise eşik ön elemesi için yeterli ve ucuzdur.
+        (text.utf8.count + charactersPerToken - 1) / charactersPerToken
     }
 
     /// Keeps the newest messages that fit, dropping whole messages from the
@@ -52,6 +58,12 @@ struct TranscriptBudget: Equatable, Sendable {
 
         kept.reverse()
 
+        // Sert kayan pencere: bütçe sığdırsa bile en yeni N mesaj tutulur,
+        // ön ek düşer. En yeni mesaj sondadır, `removeFirst` ona dokunmaz.
+        if kept.count > Self.maximumKeptMessages {
+            kept.removeFirst(kept.count - Self.maximumKeptMessages)
+        }
+
         // Start the window on a user turn when possible: an assistant reply with
         // no question in front of it reads like a stray assertion to the model.
         while kept.count > 1, kept.first?.role == .assistant {
@@ -65,8 +77,8 @@ struct TranscriptBudget: Equatable, Sendable {
     }
 
     static func approximateCharacters(of message: ChatMessage) -> Int {
-        message.text.count
-            + message.attachmentPaths.reduce(0) { $0 + $1.count }
+        message.text.utf8.count
+            + message.attachmentPaths.reduce(0) { $0 + $1.utf8.count }
             + 16
     }
 }

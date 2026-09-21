@@ -441,9 +441,9 @@ struct ComputerUseHelperStatus: Equatable, Sendable {
     }
 }
 
-/// `/usr/bin/codesign -dv` is read-only inspection of a bundle the user owns;
-/// `codesign --verify` would write nothing either, but the display output is
-/// enough to tell a real identity from an ad-hoc one.
+/// Önce `/usr/bin/codesign --verify` (imza geçerli mi), sonra `-dv` (kimlik
+/// ne): doğrulanmamış bir paketin gösterdiği Authority satırı güven vermez.
+/// İkisi de paketin sahibinin dosyasına salt-okunur bakıştır, hiçbir şey yazılmaz.
 struct SystemComputerUseSignatureReader: ComputerUseSignatureReading {
     func signingStatus(bundleURL: URL) async -> ComputerUseSigningStatus {
         // Off the caller's executor: `codesign` is a process launch followed by
@@ -451,6 +451,12 @@ struct SystemComputerUseSignatureReader: ComputerUseSignatureReading {
         await withTaskGroup(of: ComputerUseSigningStatus.self, returning: ComputerUseSigningStatus.self) { group in
             group.addTask(priority: .utility) {
                 await Task.detached(priority: .utility) { () -> ComputerUseSigningStatus in
+                    guard Self.verify(bundleURL: bundleURL) else {
+                        AppLog.automation.error(
+                            "Computer-use helper failed codesign verification and is treated as unsigned"
+                        )
+                        return .unknown
+                    }
                     let lines = Self.displayLines(bundleURL: bundleURL)
                     guard !lines.isEmpty else {
                         return .unknown
@@ -480,6 +486,24 @@ struct SystemComputerUseSignatureReader: ComputerUseSignatureReading {
             }
             return .unknown
         }
+    }
+
+    /// İmza doğrulaması: çıkış kodu 0 değilse paket bozuk, oynanmış ya da
+    /// imzasızdır; kimlik satırına bakılmadan `.unknown` sayılır.
+    private static func verify(bundleURL: URL) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["--verify", bundleURL.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
     }
 
     private static func displayLines(bundleURL: URL) -> [String] {

@@ -31,9 +31,22 @@ final class AgentSessionService {
     /// while structure changes (create/select/delete) save immediately.
     private static let saveDebounce = Duration.seconds(2)
 
+    /// Bekleyen uzak-temizlik işlerinin tavanı: `Task {}` yapısal olmadığından
+    /// referansı düşürmek işi iptal etmez, yalnızca kapanıştaki
+    /// `flushPendingSave` beklemesinden çıkarır; temizliğin kendisi arkada
+    /// bitmeye devam eder. Tavan olmasa her silinen oturum burada bir iş
+    /// bırakırdı.
+    private static let maximumPendingCleanupTasks = 32
+
     private(set) var providers: [ProviderCapabilities] = []
     private(set) var sessions: [AgentSession] = []
     private(set) var activeSessionID: UUID
+
+    /// Ayarlardan seçilen genel sağlayıcı tercihi. `selectProvider` yazar,
+    /// yeni oturumlar bununla açılır. Servis yeniden kurulduğunda uygulama
+    /// `SettingsStore.defaultProviderID` değerinden besler.
+    @ObservationIgnored
+    var preferredProviderID: ProviderID?
 
     /// Hook for notifications or observers when any session finishes a turn.
     var onSessionTurnCompleted:
@@ -118,8 +131,12 @@ final class AgentSessionService {
 
     /// Kimliğe göre oturum: yan yana görünümün ikincil bölmesi aktif olmayan
     /// oturumu doğrudan buradan çözer, görünüm `activeSessionID` değiştirmez.
+    /// Bekleyen taslak da buradan çözülür (listede yoktur).
     func session(for id: UUID) -> AgentSession? {
-        sessions.first { $0.id == id }
+        if pendingSessionID == id {
+            return pendingSession
+        }
+        return sessions.first { $0.id == id }
     }
 
     /// Yan soru (`/btw`) anlık görüntüsü: soru anındaki runtime,
@@ -213,11 +230,27 @@ final class AgentSessionService {
 
     // MARK: - Session management
 
+    /// Yeni oturumun yapılandırması: genel tercih varsa ve sağlayıcı
+    /// geçerliyse o (tercih edilen modeliyle), yoksa aktif sohbetin
+    /// yapılandırması miras kalır.
+    private func initialConfigurationForNewSession() -> SessionConfiguration? {
+        if let preferred = preferredProviderID,
+            let resolved = ProviderSelectionPolicy.defaultConfiguration(
+                from: providers,
+                preferring: preferred
+            ),
+            resolved.providerID == preferred
+        {
+            return resolved
+        }
+        return activeSession.state.configuration
+    }
+
     @discardableResult
     func createSession() -> UUID {
         let session = AgentSession(
             runtimes: runtimes,
-            state: AgentSessionState(configuration: activeSession.state.configuration)
+            state: AgentSessionState(configuration: initialConfigurationForNewSession())
         )
         adopt(session)
         // Normalizing with no known capabilities yet would throw away the
@@ -230,7 +263,72 @@ final class AgentSessionService {
         return session.id
     }
 
+    /// Gönderilmemiş yeni-sohbet taslağının oturumu: listede, arşivde ve
+    /// kayıtta yoktur. `+ New session` sohbet oluşturmaz, yalnız bu taslağı
+    /// açar; ilk gönderimde aynı kimlikle gerçek oturum doğar, o yüzden
+    /// besteci taslağı anahtar değiştirmez.
+    private(set) var pendingSessionID: UUID?
+    private var pendingSession: AgentSession?
+    /// Bekleyen taslak birincil bölmede görünür mü: sohbet seçimi gizler
+    /// (taslak durur, `+` yeniden gösterir), gönderim ve vazgeçme kapatır.
+    private(set) var isPendingSessionVisible = false
+
+    /// Bekleyen taslağı açar (yoksa kurar) ve kimliğini döner: oturum
+    /// açılmadı, liste değişmedi, kayıt yazılmadı. Taslak varsa aynı kimlik
+    /// döner, yazılan metin korunur.
+    @discardableResult
+    func beginPendingSession() -> UUID {
+        if let pendingSessionID, pendingSession != nil {
+            isPendingSessionVisible = true
+            return pendingSessionID
+        }
+        let session = AgentSession(
+            runtimes: runtimes,
+            state: AgentSessionState(configuration: initialConfigurationForNewSession())
+        )
+        adopt(session)
+        session.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
+        pendingSessionID = session.id
+        pendingSession = session
+        isPendingSessionVisible = true
+        return session.id
+    }
+
+    /// Bekleyen taslağı aynı kimlikle gerçek oturuma dönüştürür: listenin
+    /// başına eklenir, aktif olur, kaydedilir. Taslak anahtarı değişmediği
+    /// için bestecideki metin/ek olduğu gibi kalır.
+    func materializePendingSession(_ id: UUID) {
+        guard let pendingSession, pendingSessionID == id else {
+            return
+        }
+        sessions.insert(pendingSession, at: 0)
+        activeSessionID = pendingSession.id
+        self.pendingSession = nil
+        pendingSessionID = nil
+        isPendingSessionVisible = false
+        refreshSessionList()
+        saveImmediately()
+    }
+
+    /// Gönderilmemiş taslağı siler: oturum hiç doğmamış sayılır.
+    func discardPendingSession() {
+        pendingSession = nil
+        pendingSessionID = nil
+        isPendingSessionVisible = false
+    }
+
+    /// Bekleyen taslağın görünürlüğü: sohbet seçimi gizler, taslağı silmez.
+    func setPendingSessionVisible(_ visible: Bool) {
+        guard pendingSessionID != nil else {
+            return
+        }
+        isPendingSessionVisible = visible
+    }
+
     func selectSession(_ id: UUID) {
+        // Gerçek sohbet seçimi bekleyen taslağı gizler; taslak bellekte durur,
+        // `+ New session` ile geri dönülür.
+        isPendingSessionVisible = false
         guard sessions.contains(where: { $0.id == id }), activeSessionID != id else {
             return
         }
@@ -264,10 +362,13 @@ final class AgentSessionService {
                 await runtime.releaseSession(id)
             }
         }
-        pendingCleanupTasks.append(cleanup)
+        trackCleanup(cleanup)
 
         guard !sessions.isEmpty else {
-            let replacement = AgentSession(runtimes: runtimes)
+            let replacement = AgentSession(
+                runtimes: runtimes,
+                state: AgentSessionState(configuration: initialConfigurationForNewSession())
+            )
             adopt(replacement)
             replacement.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
             sessions = [replacement]
@@ -343,11 +444,14 @@ final class AgentSessionService {
                     await runtime.releaseSession(session.id)
                 }
             }
-            pendingCleanupTasks.append(cleanup)
+            trackCleanup(cleanup)
         }
 
         guard !sessions.isEmpty else {
-            let replacement = AgentSession(runtimes: runtimes)
+            let replacement = AgentSession(
+                runtimes: runtimes,
+                state: AgentSessionState(configuration: initialConfigurationForNewSession())
+            )
             adopt(replacement)
             replacement.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
             sessions = [replacement]
@@ -426,7 +530,18 @@ final class AgentSessionService {
     // MARK: - Configuration
 
     func selectProvider(_ providerID: ProviderID) throws {
-        try activeSession.selectProvider(providerID)
+        guard providers.contains(where: { $0.id == providerID }) else {
+            throw AgentSessionError.unsupportedCapability
+        }
+        // Genel tercih: yalnız aktif sohbet değil, boşta duran her sohbet
+        // buna geçer. Koşan tur yapılandırmayı tur başında kopyaladığı için
+        // meşgul oturuma dokunulmaz; besteciden tekil model seçimi de yalnız
+        // o sohbeti etkiler.
+        preferredProviderID = providerID
+        for session in sessions where !session.isBusy {
+            try? session.selectProvider(providerID)
+        }
+        saveImmediately()
     }
 
     func selectModel(_ modelID: ProviderModelID) throws {
@@ -465,6 +580,13 @@ final class AgentSessionService {
                 loadedProviders,
                 normalizeConfiguration: !session.isBusy
             )
+        }
+        // Yapılandırmasız kalan boşta oturum genel tercihle açılır; açık
+        // seçimi olan oturuma dokunulmaz, koşan tura hiç dokunulmaz.
+        if let preferred = preferredProviderID {
+            for session in sessions where !session.isBusy && session.state.configuration == nil {
+                try? session.selectProvider(preferred)
+            }
         }
 
         if !capabilityErrors.isEmpty {
@@ -653,6 +775,17 @@ final class AgentSessionService {
     private func saveImmediately() {
         Task { @MainActor [weak self] in
             await self?.saveNow()
+        }
+    }
+
+    /// Temizlik işini tavanlı listeye ekler; taşan en eskilerin referansı
+    /// düşer (işler iptal olmaz, yalnızca kapanışta beklenmez).
+    private func trackCleanup(_ task: Task<Void, Never>) {
+        pendingCleanupTasks.append(task)
+        if pendingCleanupTasks.count > Self.maximumPendingCleanupTasks {
+            pendingCleanupTasks.removeFirst(
+                pendingCleanupTasks.count - Self.maximumPendingCleanupTasks
+            )
         }
     }
 

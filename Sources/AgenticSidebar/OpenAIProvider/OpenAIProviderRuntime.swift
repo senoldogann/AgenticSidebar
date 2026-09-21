@@ -10,7 +10,12 @@ struct OpenAIProviderRuntime: ProviderRuntime {
     init(
         transport: any OpenAITransport,
         credentialStore: any CredentialStore,
-        baseURL: URL = URL(string: "https://api.openai.com/v1")!
+        baseURL: URL = {
+            guard let url = URL(string: "https://api.openai.com/v1") else {
+                preconditionFailure("OpenAI base URL sabiti geçersiz")
+            }
+            return url
+        }()
     ) {
         self.transport = transport
         self.credentialStore = credentialStore

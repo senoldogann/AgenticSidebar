@@ -14,13 +14,34 @@ struct ComposerView: View {
     let onInspectFile: ((URL) -> Void)?
     /// Hook for side questions (`/btw`).
     let onSideQuestion: ((String, ResponseSpeedMode, AgentMode) -> Void)?
+    /// Hook for one-tap prompt enhancement: the current draft plus the tag and
+    /// attachment names visible in the composer. The hook owns the enhancement
+    /// run and writes the improved text back into the draft.
+    let onEnhancePrompt: ((String, ResponseSpeedMode, AgentMode, [String], [String]) -> Void)?
+    /// Hook for cancelling a running enhancement (the wand button becomes a
+    /// cancel target while streaming, so a stuck or unwanted run is stoppable).
+    let onCancelEnhancePrompt: (() -> Void)?
+    /// Hook for undoing the last applied enhancement: restores the draft text
+    /// from before the improvement. Attachments and tags are untouched.
+    let onUndoEnhancePrompt: (() -> Void)?
+    /// Enhancement availability (provider context exists) and run state. Both
+    /// default off so previews and tests keep compiling without the feature.
+    let isEnhancePromptAvailable: Bool
+    let isEnhancingPrompt: Bool
+    /// Whether an undoable enhancement exists for the focused session. Shown
+    /// as a separate button so the improved text stays reviewable and
+    /// revertible before submission (Qoder parity: undo or submit).
+    let isUndoEnhanceAvailable: Bool
     /// Hook for goals (`/goal`). Başarıyı döner: `true` ise taslak
     /// temizlenir, `false` ise metin alanda kalır (ret panelde görünür).
-    let onStartGoal: ((String, ResponseSpeedMode, AgentMode) -> Bool)?
-    /// Hook for manual context compaction (`/compact`).
-    let onCompactSession: (() -> Void)?
+    /// Son parametre bestecideki bekleyen eklerin yollarıdır; hedef dizin
+    /// çözümlemesinde tohum sayılır.
+    let onStartGoal: ((String, ResponseSpeedMode, AgentMode, [String]) -> Bool)?
     /// File manager injected for path filtering.
     let fileManager: FileManager
+    /// 2'li ve 4'lü düzende dikey alan bölünür: bölme genişliği tekli
+    /// düzeni andırsa bile besteci minimal çizilir.
+    let isDenseLayout: Bool
 
     init(
         sessionService: any AgentSessionServiceProtocol,
@@ -28,9 +49,15 @@ struct ComposerView: View {
         focusedSessionID: UUID?,
         onInspectFile: ((URL) -> Void)?,
         onSideQuestion: ((String, ResponseSpeedMode, AgentMode) -> Void)?,
-        onStartGoal: ((String, ResponseSpeedMode, AgentMode) -> Bool)?,
-        onCompactSession: (() -> Void)? = nil,
-        fileManager: FileManager
+        onStartGoal: ((String, ResponseSpeedMode, AgentMode, [String]) -> Bool)?,
+        fileManager: FileManager,
+        isDenseLayout: Bool,
+        onEnhancePrompt: ((String, ResponseSpeedMode, AgentMode, [String], [String]) -> Void)? = nil,
+        isEnhancePromptAvailable: Bool = false,
+        isEnhancingPrompt: Bool = false,
+        onCancelEnhancePrompt: (() -> Void)? = nil,
+        onUndoEnhancePrompt: (() -> Void)? = nil,
+        isUndoEnhanceAvailable: Bool = false
     ) {
         self.sessionService = sessionService
         self.permissionApprovalCenter = permissionApprovalCenter
@@ -38,8 +65,14 @@ struct ComposerView: View {
         self.onInspectFile = onInspectFile
         self.onSideQuestion = onSideQuestion
         self.onStartGoal = onStartGoal
-        self.onCompactSession = onCompactSession
         self.fileManager = fileManager
+        self.isDenseLayout = isDenseLayout
+        self.onEnhancePrompt = onEnhancePrompt
+        self.isEnhancePromptAvailable = isEnhancePromptAvailable
+        self.isEnhancingPrompt = isEnhancingPrompt
+        self.onCancelEnhancePrompt = onCancelEnhancePrompt
+        self.onUndoEnhancePrompt = onUndoEnhancePrompt
+        self.isUndoEnhanceAvailable = isUndoEnhanceAvailable
     }
 
     @Environment(SettingsStore.self) private var settingsStore
@@ -173,9 +206,13 @@ struct ComposerView: View {
         )
     }
 
-    /// Silinen sohbetlerin taslakları tutulmaz.
+    /// Silinen sohbetlerin taslakları tutulmaz. Bekleyen yeni-sohbet taslağı
+    /// listede olmadığı halde yaşar: anahtarı korunur, gönderimde oturuma dönüşür.
     private func discardDraftsOfRemovedSessions() {
-        let liveIDs = Set(sessionService.sessions.map(\.id))
+        var liveIDs = Set(sessionService.sessions.map(\.id))
+        if let pending = sessionService.pendingSessionID {
+            liveIDs.insert(pending)
+        }
         draftsBySession = draftsBySession.filter { liveIDs.contains($0.key) }
     }
 
@@ -187,17 +224,72 @@ struct ComposerView: View {
         settingsStore.currentThemePreset
     }
 
-    /// Dar bölmede denetimler simgeye iner; satır sayısı değişmez, hap kayar.
+    /// 2'li ve 4'lü düzen minimal besteci kullanır; tekli düzen etkilenmez.
+    /// Yoğun düzende genişlik tekliyi andırsa bile dikey alan bölünmüştür,
+    /// o yüzden genişliğe bakılmaksızın minimal çizilir.
+    private var isMinimalComposer: Bool {
+        isDenseLayout || PaneResponsive.isMinimalComposer(width: paneWidth)
+    }
+
+    /// Dar bölmede denetimler simgeye iner; 2'li ve 4'lü düzende minimaldir.
     private var isCompactPane: Bool {
-        PaneResponsive.isCompact(width: paneWidth)
+        isMinimalComposer
     }
 
-    private var composerOuterPadding: CGFloat {
-        PaneResponsive.outerPadding(forWidth: paneWidth)
+    private var composerOuterHorizontal: CGFloat {
+        PaneResponsive.composerOuterHorizontal(forWidth: paneWidth)
     }
 
-    private var composerBoxPadding: CGFloat {
-        PaneResponsive.innerPadding(forWidth: paneWidth)
+    private var composerOuterVertical: CGFloat {
+        PaneResponsive.composerOuterVertical(forWidth: paneWidth)
+    }
+
+    private var composerBoxHorizontal: CGFloat {
+        PaneResponsive.composerBoxHorizontal(forWidth: paneWidth)
+    }
+
+    private var composerBoxVertical: CGFloat {
+        PaneResponsive.composerBoxVertical(forWidth: paneWidth)
+    }
+
+    private var composerStackSpacing: CGFloat {
+        PaneResponsive.composerStackSpacing(forWidth: paneWidth)
+    }
+
+    private var composerBoxSpacing: CGFloat {
+        PaneResponsive.composerBoxSpacing(forWidth: paneWidth)
+    }
+
+    private var composerEditorMinHeight: CGFloat {
+        PaneResponsive.composerEditorMinHeight(forWidth: paneWidth)
+    }
+
+    private var composerEditorMaxHeight: CGFloat {
+        PaneResponsive.composerEditorMaxHeight(forWidth: paneWidth)
+    }
+
+    private var composerCornerRadius: CGFloat {
+        PaneResponsive.composerCornerRadius(forWidth: paneWidth)
+    }
+
+    private var composerButtonSize: CGFloat {
+        PaneResponsive.composerControlButtonSize(forWidth: paneWidth)
+    }
+
+    private var composerPillHorizontal: CGFloat {
+        PaneResponsive.composerPillHorizontal(forWidth: paneWidth)
+    }
+
+    private var composerPillVertical: CGFloat {
+        PaneResponsive.composerPillVertical(forWidth: paneWidth)
+    }
+
+    private var composerControlSpacing: CGFloat {
+        PaneResponsive.composerControlSpacing(forWidth: paneWidth)
+    }
+
+    private var composerControlTop: CGFloat {
+        PaneResponsive.composerControlTopPadding(forWidth: paneWidth)
     }
 
     var body: some View {
@@ -207,7 +299,7 @@ struct ComposerView: View {
         // there is no shared edge, no shared background and nothing of the input
         // underneath them. They also have their own surface, border and shadow, so
         // each reads as a panel of its own rather than a part of the field.
-        VStack(spacing: 8) {
+        VStack(spacing: composerStackSpacing) {
             if !focusedSession.queuedPrompts.isEmpty {
                 floatingPanel {
                     queuedPromptsStrip
@@ -253,8 +345,8 @@ struct ComposerView: View {
             )
         }
         .frame(maxWidth: 820)
-        .padding(.horizontal, composerOuterPadding)
-        .padding(.vertical, 6)
+        .padding(.horizontal, composerOuterHorizontal)
+        .padding(.vertical, composerOuterVertical)
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
@@ -283,7 +375,7 @@ struct ComposerView: View {
     /// Nothing that merely *reports* something lives in here: the queue and the
     /// suggestions are panels above the box, and the box keeps one job.
     private var composerBox: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: composerBoxSpacing) {
             if !selectedTags.isEmpty {
                 selectedTagsRow
             }
@@ -296,15 +388,15 @@ struct ComposerView: View {
 
             composerControlRow
         }
-        .padding(.horizontal, composerBoxPadding)
-        .padding(.vertical, 8)
+        .padding(.horizontal, composerBoxHorizontal)
+        .padding(.vertical, composerBoxVertical)
         .background(
             currentTheme.composerBackground(isDark: isDarkMode)
                 .opacity(settingsStore.glassOpacity),
-            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+            in: RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous)
                 .stroke(
                     isTargetedForDrop
                         ? (currentTheme.accentGradient.first ?? .accentColor)
@@ -420,44 +512,55 @@ struct ComposerView: View {
                             : Color.black.opacity(0.40)
                     )
                     .padding(.top, 2)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
         }
-        .frame(minHeight: 26, maxHeight: 96)
-        .padding(.horizontal, 2)
+        .frame(minHeight: composerEditorMinHeight, maxHeight: composerEditorMaxHeight)
+        .padding(.horizontal, isMinimalComposer ? 0 : 2)
     }
 
     /// Denetim satırı her genişlikte tek satırdır: hap sığmadığında yatay
-    /// kayar, işlem düğmeleri (ses/ek/gönder) sabit durur. Dar bölmede hap
-    /// zaten simgeye iner (`isCompactPane`), o yüzden kaydırma yalnız en dar
-    /// ızgaralarda devreye girer; besteci yüksekliği bölme sayısıyla büyümez.
+    /// kayar, işlem düğmeleri (ses/ek/gönder) sabit durur. 2'li ve 4'lü
+    /// düzende hap zaten simgeye iner (`isMinimalComposer`), o yüzden
+    /// kaydırma yalnız en dar ızgaralarda devreye girer; besteci yüksekliği
+    /// bölme sayısıyla büyümez.
     private var composerControlRow: some View {
-        HStack(alignment: .center, spacing: 6) {
+        HStack(alignment: .center, spacing: composerControlSpacing) {
             ScrollView(.horizontal, showsIndicators: false) {
                 composerControlPill
             }
+            // Hap taşarsa düğmelerin üstüne boyar: kayma görünümü kendi
+            // sınırında kırpılır, simgeler her zaman temiz kalır.
+            .clipped()
 
             ComposerDictationButton(
                 isRecording: isDictating,
+                size: composerButtonSize,
                 onToggle: { toggleDictation() }
             )
 
             attachmentButton
 
+            enhancePromptButton
+
+            undoEnhanceButton
+
             submitButton
         }
-        .padding(.top, 2)
+        .padding(.top, composerControlTop)
     }
 
     /// Sürükleme geri bildirimi: hedefin üstünü örten kesikli çerçeve.
     @ViewBuilder
     private var dropTargetOverlay: some View {
         if isTargetedForDrop {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous)
                 .fill(currentTheme.composerBackground(isDark: isDarkMode).opacity(0.95))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    RoundedRectangle(cornerRadius: composerCornerRadius, style: .continuous)
                         .strokeBorder(
                             LinearGradient(
                                 colors: currentTheme.accentGradient,
@@ -634,18 +737,13 @@ struct ComposerView: View {
     /// is the one setting a user changes *while* watching the agent work.
     private var composerControlPill: some View {
         HStack(spacing: 0) {
-            // Bağlam halkası: sonraki turun pencere doluluğu, turda gerçek
-            // zamanlı büyür, tur sonunda sağlayıcı sayımına oturur.
-            contextRingSection
-
             // Model section
             if !focusedSession.availableModels.isEmpty {
-                pillDivider
                 modelMenuSection
+                pillDivider
             }
 
             // Reasoning effort and fast mode, in one control
-            pillDivider
             effortMenuSection
 
             // Agent mode section (Build / Plan)
@@ -685,6 +783,7 @@ struct ComposerView: View {
                         Text(policy.compactName)
                             .font(.system(size: 12, weight: .medium))
                             .lineLimit(1)
+                            .truncationMode(.tail)
                     }
 
                     if pendingCount > 0 {
@@ -703,8 +802,8 @@ struct ComposerView: View {
                     }
                 }
                 .foregroundStyle(policy.isUnrestricted ? Color.orange : .secondary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5)
+                .padding(.horizontal, composerPillHorizontal)
+                .padding(.vertical, composerPillVertical)
                 .interactiveHoverPill(cornerRadius: 6)
             } content: {
                 ForEach(ToolApprovalPolicy.allCases) { candidate in
@@ -763,6 +862,8 @@ struct ComposerView: View {
                     Text(mode.displayName)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
 
                 if !isCompactPane {
@@ -771,8 +872,8 @@ struct ComposerView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
+            .padding(.horizontal, composerPillHorizontal)
+            .padding(.vertical, composerPillVertical)
             .interactiveHoverPill(cornerRadius: 6)
         } content: {
             ForEach(AgentMode.allCases) { candidate in
@@ -860,23 +961,16 @@ struct ComposerView: View {
             return "Ask to review changes, branch, or target project using Alibaba OCR…"
         case .exam:
             return "Ask an exam question, paste a problem, or take a screenshot to solve…"
+        case .ask:
+            return "Ask a question — answered directly, files are never changed…"
         }
     }
 
     private var pillDivider: some View {
         Rectangle()
             .fill(Color.primary.opacity(isDarkMode ? 0.12 : 0.10))
-            .frame(width: 1, height: 14)
-            .padding(.horizontal, 2)
-    }
-
-    private var contextRingSection: some View {
-        ContextRingView(
-            usage: focusedSession.contextUsage,
-            totalProcessedTokens: focusedSession.totalProcessedTokens,
-            compactionBlocker: focusedSession.compactionBlocker,
-            onCompact: { onCompactSession?() }
-        )
+            .frame(width: 1, height: isMinimalComposer ? 12 : 14)
+            .padding(.horizontal, isMinimalComposer ? 1 : 2)
     }
 
     /// Sonraki turun modeli: tur ortasında değişim koşan turu etkilemez —
@@ -928,8 +1022,8 @@ struct ComposerView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
+            .padding(.horizontal, composerPillHorizontal)
+            .padding(.vertical, composerPillVertical)
             .interactiveHoverPill(cornerRadius: 6)
         } content: {
             if filteredModels.isEmpty {
@@ -986,6 +1080,7 @@ struct ComposerView: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
                 }
 
                 if !isCompactPane {
@@ -994,8 +1089,8 @@ struct ComposerView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
+            .padding(.horizontal, composerPillHorizontal)
+            .padding(.vertical, composerPillVertical)
             .interactiveHoverPill(cornerRadius: 6)
         } content: {
             ComposerDropdownSectionHeader(title: "Reasoning")
@@ -1071,7 +1166,7 @@ struct ComposerView: View {
             Image(systemName: "paperclip")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
-                .frame(width: 28, height: 28)
+                .frame(width: composerButtonSize, height: composerButtonSize)
                 .interactiveHoverCircle()
         }
         .buttonStyle(.plain)
@@ -1080,9 +1175,106 @@ struct ComposerView: View {
         .accessibilityLabel("Attach files")
     }
 
+    /// Tek-tık prompt iyileştirme düğmesi: taslağı sağlayıcıdaki modelle
+    /// düzelttirir, sonuç taslağın yerine geçer. Komut önekleri (`/…`) ve
+    /// boş taslakta kapalıdır. Akış sürerken düğme iptale döner, böylece
+    /// istenmeyen ya da takılan koşu durdurulabilir. Ekler ve etiketler
+    /// aynen durur, yalnız metin değişir.
+    private var enhancePromptButton: some View {
+        Button {
+            if isEnhancingPrompt {
+                onCancelEnhancePrompt?()
+            } else {
+                requestPromptEnhancement()
+            }
+        } label: {
+            if isEnhancingPrompt {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: composerButtonSize, height: composerButtonSize)
+            } else {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: composerButtonSize, height: composerButtonSize)
+                    .interactiveHoverCircle()
+            }
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor()
+        .disabled(!isEnhanceButtonEnabled)
+        .help(enhancePromptHelp)
+        .accessibilityLabel(isEnhancingPrompt ? "Cancel prompt improvement" : "Improve prompt")
+    }
+
+    /// Son uygulanan iyileştirmeyi geri alır: taslak, iyileştirme öncesi
+    /// metne döner. Yalnız ilgili oturumda, akış yokken ve geri alınacak
+    /// metin varken görünür ve etkindir.
+    private var undoEnhanceButton: some View {
+        Group {
+            if isUndoEnhanceAvailable && !isEnhancingPrompt {
+                Button {
+                    onUndoEnhancePrompt?()
+                } label: {
+                    Image(systemName: "arrow.uturn.backward")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: composerButtonSize, height: composerButtonSize)
+                        .interactiveHoverCircle()
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .disabled(onUndoEnhancePrompt == nil)
+                .help("Undo prompt improvement")
+                .accessibilityLabel("Undo prompt improvement")
+            }
+        }
+    }
+
+    private var isEnhanceButtonEnabled: Bool {
+        if isEnhancingPrompt {
+            return onCancelEnhancePrompt != nil
+        }
+        return isEnhanceActionEnabled
+    }
+
+    private var isEnhanceActionEnabled: Bool {
+        isEnhancePromptAvailable && !isEnhancingPrompt && onEnhancePrompt != nil
+            && PromptEnhancer.isEnhanceable(draft)
+    }
+
+    private var enhancePromptHelp: String {
+        if isEnhancingPrompt {
+            return "Improving the prompt… Click to cancel."
+        }
+        if !isEnhancePromptAvailable {
+            return "Improving needs a provider context"
+        }
+        if !PromptEnhancer.isEnhanceable(draft) {
+            return "Write a prompt first — commands starting with / are sent as-is"
+        }
+        return "Improve this prompt with the current model"
+    }
+
+    /// İyileştirme isteği: o anki taslak ve görünür bağlam (etiket, ek adı)
+    /// kancaya taşınır. Taslak korunur; iyileşmiş metin dönünce onun yerine
+    /// geçer, ekler ve etiketler aynen kalır.
+    private func requestPromptEnhancement() {
+        guard isEnhanceActionEnabled, let onEnhancePrompt else {
+            return
+        }
+        let promptText = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        onEnhancePrompt(
+            promptText,
+            speedMode,
+            agentMode,
+            selectedTags.map(\.name),
+            attachedURLs.map(\.lastPathComponent)
+        )
+    }
+
     @ViewBuilder
-    private var submitButton: some View {
-        HStack(spacing: 6) {
+    private var submitButton: some View {        HStack(spacing: composerControlSpacing) {
             sendOrQueueButton
 
             if focusedSession.isBusy {
@@ -1116,7 +1308,7 @@ struct ComposerView: View {
                                 endPoint: .bottomTrailing
                             )
                     )
-                    .frame(width: 28, height: 28)
+                    .frame(width: composerButtonSize, height: composerButtonSize)
 
                 Image(systemName: "arrow.up")
                     .font(.system(size: 12, weight: .bold))
@@ -1159,7 +1351,7 @@ struct ComposerView: View {
             ZStack {
                 Circle()
                     .fill(Color.red.opacity(0.85))
-                    .frame(width: 28, height: 28)
+                    .frame(width: composerButtonSize, height: composerButtonSize)
 
                 Image(systemName: "stop.fill")
                     .font(.system(size: 10, weight: .bold))
@@ -1270,6 +1462,13 @@ struct ComposerView: View {
             effectivePrompt = promptText
         }
 
+        // Bekleyen taslaktan gönderim: sohbet bu anda, aynı kimlikle doğar;
+        // taslak anahtarı değişmediği için metin/ek/etiket korunur. Sonrası
+        // normal akıştır (yan soru/hedef/düz gönderim).
+        if let pending = sessionService.pendingSessionID, draftSessionID == pending {
+            sessionService.materializePendingSession(pending)
+        }
+
         // Yan soru önek yakalama: `/btw` normal kuyruğa girmez, panele gider.
         // Meşgul oturumdan da sorulabilir; transkript kirlenmez.
         if let sideQuestion = Self.sideQuestion(from: effectivePrompt),
@@ -1286,23 +1485,13 @@ struct ComposerView: View {
         // Hedef önek yakalama: `/goal` normal kuyruğa girmez, hedef
         // paneline gider. Ret panelde görünür, taslak korunur: yazı ne
         // sohbete ne boşluğa düşer. Kanca yoksa düz metin gibi gönderilir.
+        // Bekleyen ekler dizin çözümlemesine tohum olarak taşınır.
         if let objective = SlashCommand.parseGoal(from: effectivePrompt),
             let onStartGoal
         {
-            guard onStartGoal(objective, speedMode, agentMode) else {
+            guard onStartGoal(objective, speedMode, agentMode, attachedURLs.map(\.path)) else {
                 return
             }
-            draft = ""
-            attachedURLs = []
-            selectedTags = []
-            draftStore?.clear(sessionID: focusedSession.id)
-            return
-        }
-
-        // Sıkıştırma önek yakalama: `/compact` normal kuyruğa girmez,
-        // oturumun özet turunu başlatır. Kanca yoksa düz metin gider.
-        if SlashCommand.isCompactCommand(effectivePrompt), let onCompactSession {
-            onCompactSession()
             draft = ""
             attachedURLs = []
             selectedTags = []

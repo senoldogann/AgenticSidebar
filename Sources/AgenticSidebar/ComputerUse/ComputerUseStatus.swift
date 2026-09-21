@@ -57,6 +57,11 @@ final class ComputerUseStatus {
     @ObservationIgnored
     private let environment: [String: String]
 
+    /// PATH allowlist'inin paket ayağı: node araması sistem dizinleri dışında
+    /// yalnızca bunun altında yapılır. Testlerde fixture kökü verilir.
+    @ObservationIgnored
+    private let bundlePath: String
+
     @ObservationIgnored
     private let permissionProbeTimeout: Duration
 
@@ -84,6 +89,7 @@ final class ComputerUseStatus {
         fileManager: FileManager = .default,
         homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser,
         environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundlePath: String = Bundle.main.bundlePath,
         permissionProbeTimeout: Duration = .seconds(6)
     ) {
         self.permissionProbe = permissionProbe
@@ -93,6 +99,7 @@ final class ComputerUseStatus {
         self.fileManager = fileManager
         self.homeDirectoryURL = homeDirectoryURL
         self.environment = environment
+        self.bundlePath = bundlePath
         self.permissionProbeTimeout = permissionProbeTimeout
     }
 
@@ -143,7 +150,8 @@ final class ComputerUseStatus {
             rootPath: request.rootPath,
             workingDirectoryURL: ManagedOpenCodeServerManager.managedWorkingDirectoryURL(),
             environment: environment,
-            fileManager: fileManager
+            fileManager: fileManager,
+            bundlePath: bundlePath
         )
 
         // Two steps on purpose: the filesystem check is cheap, and the signing

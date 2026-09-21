@@ -17,18 +17,19 @@ enum ComputerUseFiles {
     /// OpenCode, izin kurallarında **son eşleşen** kuralı uygular; bu yüzden
     /// sıra anlamlıdır: önce genel `deny`, sonra özel `ask`/`allow`/`deny`.
     /// `chatgpt-system_*` deny kuralı dosya/git/terminal araçlarını modelin
-    /// görmesini engeller; `computer_*` ve yetki araçları kullanıcı onayına
-    /// bağlanır. `computer_run_js` (full-host JS) bilinçli olarak kapalıdır.
+    /// görmesini engeller; `computer_*` ve yetki araçları merkeze yönlendirilir
+    /// (`ask`). `computer_run_js` (full-host JS) bilinçli olarak kapalıdır.
     ///
     /// Bu kurallar uygulamanın yönlendirme kurallarından
     /// (``ToolApprovalPolicy/routedPermissionRules``) **sonra** yazılır ve onları
     /// geçersiz kılar: `Tam erişim` seviyesi bile bu sunucunun JS aracını ya da
-    /// dosya/git araçlarını açmaz. `computer_*` kurallarının `ask` kalması
-    /// kullanıcıya sorulacağı anlamına gelmez — `Tam erişim` seviyesinde uygulama
-    /// gelen isteği otomatik onaylar — ama `Onay iste` ve `Benim için onayla`
-    /// seviyelerinde karar kullanıcıya gelir. Kuralların seviyeye bağlı olmaması
-    /// bilinçli: karar her istekte uygulama tarafında verilir (koşan turun
-    /// anlık görüntüsüyle), dosya seviyeden bağımsız kalır.
+    /// dosya/git araçlarını açmaz. `computer_*` kurallarının `ask` kalması her
+    /// seviyede sorulacağı anlamına gelmez — `Tam erişim` seviyesinde uygulama
+    /// gelen bilgisayar isteğini otomatik onaylar (`ToolApprovalPolicy`
+    /// `fullAccess` yanıtı), `Onay iste` ve `Benim için onayla` seviyelerinde
+    /// karar kullanıcıya gelir. Kuralların seviyeye bağlı olmaması bilinçli:
+    /// karar her istekte uygulama tarafında verilir (koşan turun anlık
+    /// görüntüsüyle), dosya seviyeden bağımsız kalır.
     static let permissionRules: [(permission: String, action: String)] = [
         ("chatgpt-system_*", "deny"),
         ("chatgpt-system_computer_*", "ask"),

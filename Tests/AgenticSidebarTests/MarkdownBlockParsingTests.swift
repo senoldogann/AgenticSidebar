@@ -310,6 +310,39 @@ final class MarkdownBlockParsingTests: XCTestCase {
         XCTAssertTrue(formula.contains("x^2"))
     }
 
+    func testSolutionFenceParsesAsSolutionDocument() {
+        let blocks = parseMarkdownBlocks(
+            from: "**Correct Answer: C**\n\n```solution\nStep 1: reason\n```"
+        )
+
+        XCTAssertEqual(blocks.count, 2)
+        guard case .solution(_, let content) = blocks.last else {
+            XCTFail("```solution must parse as a solution document, like ```plan")
+            return
+        }
+        XCTAssertTrue(content.contains("Step 1"))
+    }
+
+    func testSolutionFenceAcceptsTrailingParametersAndCase() {
+        XCTAssertTrue(isSolutionFenceLanguage("solution"))
+        XCTAssertTrue(isSolutionFenceLanguage("Solution full"))
+        XCTAssertFalse(isSolutionFenceLanguage("plan"))
+        XCTAssertFalse(isSolutionFenceLanguage("swift"))
+    }
+
+    func testSolutionFenceStaysCodeWhenDocumentsDisabled() {
+        let blocks = parseMarkdownBlocks(
+            from: "```solution\nStep 1\n```",
+            allowsPlanDocuments: false
+        )
+
+        guard case .code(_, let language, _) = blocks.first else {
+            XCTFail("A solution fence must stay a code block when documents are disabled")
+            return
+        }
+        XCTAssertEqual(language, "solution")
+    }
+
     private func numberedItem(from block: MarkdownBlock) -> String? {
         guard case .numberedItem(_, let number, _) = block else {
             return nil

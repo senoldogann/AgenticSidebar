@@ -6,6 +6,7 @@ import SwiftUI
 /// `SpeechDictationService` tarafındadır, `ComposerView` besler.
 struct ComposerDictationButton: View {
     let isRecording: Bool
+    let size: CGFloat
     let onToggle: () -> Void
 
     var body: some View {
@@ -13,9 +14,9 @@ struct ComposerDictationButton: View {
             onToggle()
         } label: {
             Image(systemName: isRecording ? "mic.fill" : "mic")
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: size <= 22 ? 11 : 12, weight: .medium))
                 .foregroundStyle(isRecording ? .red : .secondary)
-                .frame(width: 26, height: 26)
+                .frame(width: size, height: size)
                 .interactiveHoverCircle()
         }
         .buttonStyle(.plain)

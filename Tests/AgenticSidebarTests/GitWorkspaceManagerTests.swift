@@ -322,7 +322,9 @@ final class GitWorkspaceManagerTests: XCTestCase {
         assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_DIRTY")
     }
 
-    func testPreflightRefusesProtectedBranch() async throws {
+    /// Korumalı dalda açık temiz kaynak, oluşturmayı engellemez: çalışma alanı
+    /// açık committe `--detach` kurulur, kaynak checkout'a hiç dokunulmaz.
+    func testPreflightIgnoresCheckedOutProtectedBranch() async throws {
         let fixture = try makeCleanFixture(name: "protected-branch")
         let project = makeProject(fixture: fixture)
         let task = makeTask(projectID: project.id)
@@ -330,7 +332,38 @@ final class GitWorkspaceManagerTests: XCTestCase {
 
         try runGit(["switch", "main"], in: fixture.repositoryURL)
 
-        assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_PROTECTED_BRANCH")
+        guard case .notOwned = await manager.preflight(project: project, task: task) else {
+            XCTFail("expected notOwned on a clean protected checkout")
+            return
+        }
+    }
+
+    /// Korumalı dalda açık kaynaktan kurulum: kaynak dalda ve kirlenmeden
+    /// kalır, çalışma alanı taban committte ayrık kurulur.
+    func testCreateOwnedWorkspaceFromProtectedCheckoutLeavesSourceUntouched() async throws {
+        let fixture = try makeCleanFixture(name: "protected-create")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+
+        try runGit(["switch", "main"], in: fixture.repositoryURL)
+
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+
+        XCTAssertEqual(record.baseSHA, fixture.baseSHA)
+        let worktreeHead = try runGit(["rev-parse", "HEAD"], in: URL(fileURLWithPath: record.workspacePath))
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(worktreeHead, fixture.baseSHA)
+        let branchAfter = try runGit(["rev-parse", "--abbrev-ref", "HEAD"], in: fixture.repositoryURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(branchAfter, "main", "kaynak checkout dal değiştirmemeli")
+        let sourceStatus = try runGit(["status", "--porcelain=v1", "--untracked-files=all"], in: fixture.repositoryURL).stdout
+        XCTAssertTrue(sourceStatus.isEmpty, "source repository became dirty: \(sourceStatus)")
     }
 
     func testPreflightRefusesSymlinkEscapeInWorkspaceTarget() async throws {

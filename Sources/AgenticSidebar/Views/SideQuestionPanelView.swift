@@ -7,6 +7,9 @@ import SwiftUI
 /// (akan soruyu da iptal eder). Soru/cevap transkripte yazılmaz.
 struct SideQuestionPanelView: View {
     @Bindable var service: SideQuestionService
+    /// Oturum kapsamı: servis bölme başına yaşar, o yüzden kart yalnız sorunun
+    /// oturumu odaktayken çizilir; başka sohbetteki soru buraya sızmaz.
+    let focusedSessionID: UUID
     var onInsertToComposer: (String) -> Void
     var onClose: () -> Void
 
@@ -28,7 +31,7 @@ struct SideQuestionPanelView: View {
     }
 
     var body: some View {
-        if let current = service.active {
+        if let current = service.active, current.sessionID == focusedSessionID {
             VStack(alignment: .leading, spacing: 8) {
                 headerRow(for: current)
                 questionRow(for: current)

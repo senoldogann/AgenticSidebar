@@ -58,13 +58,17 @@ struct KeychainCredentialStore: CredentialStore {
         switch status {
         case errSecSuccess:
             // Güncelleme erişilebilirlik sınıfını değiştirmez: zayıf kalmış
-            // eski öğeyi güçlendir. En iyi çabadır, yazımı bozmaz; hata
-            // yalnız hata ayıklamada yakalanır.
+            // eski öğeyi güçlendir. En iyi çabadır, yazımı bozmaz; başarısızlık
+            // release'de de günlüğe düşer (assert yalnız debug'da çalışırdı).
             let hardening = SecItemUpdate(
                 baseQuery(for: key) as CFDictionary,
                 [kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly] as CFDictionary
             )
-            assert(hardening == errSecSuccess, "Keychain accessibility hardening failed")
+            if hardening != errSecSuccess {
+                AppLog.credentials.error(
+                    "Keychain accessibility hardening failed with status \(hardening, privacy: .public)"
+                )
+            }
             return
         case errSecItemNotFound:
             var item = baseQuery(for: key)

@@ -24,9 +24,11 @@ final class SettingsStore {
         static let lineSpacing = "settings.lineSpacing"
         static let responseSpeedMode = "settings.responseSpeedMode"
         static let agentMode = "settings.agentMode"
+        static let defaultProviderID = "settings.defaultProviderID"
         static let computerUseEnabled = "settings.computerUseEnabled"
         static let chatgptSystemRootPath = "settings.chatgptSystemRootPath"
         static let toolApprovalPolicy = "settings.toolApprovalPolicy"
+        static let autonomyNoticeAcknowledged = "settings.autonomyNoticeAcknowledged"
         static let stealthModeEnabled = "settings.stealthModeEnabled"
         static let menuBarIconChoice = "settings.menuBarIconChoice"
         static let sessionNotificationsEnabled = "settings.sessionNotificationsEnabled"
@@ -175,6 +177,15 @@ final class SettingsStore {
         }
     }
 
+    /// Ayarlardan seçilen sağlayıcı tüm sohbetlerde geçerlidir: yeni oturum
+    /// bununla açılır, seçim değişince boşta duran oturumlar da buna geçer.
+    /// `nil` = kullanıcı seçmedi, oturum çekirdeğinin ürün varsayılanı çalışır.
+    var defaultProviderID: String? {
+        didSet {
+            defaults.set(defaultProviderID, forKey: Key.defaultProviderID)
+        }
+    }
+
     /// chatgpt-system MCP sunucusu üzerinden bilgisayar kontrolü açık mı.
     var computerUseEnabled: Bool {
         didSet {
@@ -199,6 +210,16 @@ final class SettingsStore {
     var toolApprovalPolicy: ToolApprovalPolicy {
         didSet {
             defaults.set(toolApprovalPolicy.rawValue, forKey: Key.toolApprovalPolicy)
+        }
+    }
+
+    /// Fresh install tam erişimle açıldığı için kullanıcıdan açık kabul
+    /// alınır: bu bayrak `true` olana dek Ayarlar'daki onay kartı kabul
+    /// şeridini gösterir. Kapatma düğmesi yoktur; görmezden gelmek
+    /// kabul sayılmaz, şerit yeniden gösterilir.
+    var autonomyNoticeAcknowledged: Bool {
+        didSet {
+            defaults.set(autonomyNoticeAcknowledged, forKey: Key.autonomyNoticeAcknowledged)
         }
     }
 
@@ -301,6 +322,12 @@ final class SettingsStore {
         case "fullAccess": .fullAccess
         default: nil
         }
+    }
+
+    /// Kabul şeridi görünsün mü: seviye tam erişimken ve kullanıcı henüz
+    /// açık seçim yapmamışken `true`. Saf fonksiyondur, doğrudan sınanır.
+    static func shouldShowAutonomyNotice(policy: ToolApprovalPolicy, acknowledged: Bool) -> Bool {
+        policy == .fullAccess && !acknowledged
     }
 
     /// Whether the app should render dark.
@@ -434,7 +461,9 @@ final class SettingsStore {
         {
             responseSpeedMode = speedMode
         } else {
-            responseSpeedMode = .normal
+            // Otonomi varsayılanı: hızlı aksiyon. Kullanıcı isterse Normal'e
+            // tek tıkla döner; kayıtlı seçim her zaman kazanır.
+            responseSpeedMode = .fast
         }
 
         if let rawAgentMode = defaults.string(forKey: Key.agentMode),
@@ -444,6 +473,8 @@ final class SettingsStore {
         } else {
             agentMode = .build
         }
+
+        defaultProviderID = defaults.string(forKey: Key.defaultProviderID)
 
         if defaults.object(forKey: Key.computerUseEnabled) == nil {
             computerUseEnabled = false
@@ -467,12 +498,14 @@ final class SettingsStore {
             toolApprovalPolicy = migrated
             defaults.set(migrated.rawValue, forKey: Key.toolApprovalPolicy)
         } else {
-            // Varsayılan, kullanıcıyı boğmadan güvenli duruştur: okuma ve
-            // klasör-içi düzenlemeler sorulmadan çalışır, shell komutları,
-            // klasör-dışı yollar, ağ erişimi ve bilgisayar kullanımı sorulur.
-            // Daha gevşek seviye Ayarlar'da tek tık uzaklıkta.
-            toolApprovalPolicy = .approveSafe
+            // Otonomi varsayılanı: tam erişim. Kabuk, düzenleme, ağ ve
+            // bilgisayar kullanımı gözetimsiz çalışır; tam-host JavaScript
+            // (`computer_run_js`) yapılandırmada `deny` olduğu için kapalı
+            // kalır. Daha sıkı seviye Ayarlar'da tek tık uzaklıkta.
+            toolApprovalPolicy = .fullAccess
         }
+
+        autonomyNoticeAcknowledged = defaults.bool(forKey: Key.autonomyNoticeAcknowledged)
 
         if defaults.object(forKey: Key.stealthModeEnabled) == nil {
             stealthModeEnabled = true

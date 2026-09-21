@@ -18,13 +18,21 @@ struct PluginCatalogEntry: Identifiable, Equatable, Sendable {
 /// OpenCode. Nothing here installs: `ExtensionStore.addPlugin` records the module
 /// and the agent loads it at its next start, which keeps this client read-only.
 struct NPMRegistryClient: Sendable {
-    static let searchEndpoint = URL(string: "https://registry.npmjs.org/-/v1/search")!
+    static let searchEndpoint: URL = {
+        guard let url = URL(string: "https://registry.npmjs.org/-/v1/search") else {
+            preconditionFailure("npm arama uç noktası geçersiz")
+        }
+        return url
+    }()
 
     /// What the screen shows before the user types anything: the modules the
     /// OpenCode ecosystem actually publishes under.
     static let defaultQuery = "opencode plugin"
 
     static let pageSize = 20
+
+    /// Katalog yanıtı üst sınırı: üstü çözümlenmez, reddedilir.
+    static let maximumResponseBytes = 1_048_576
 
     let transport: any ExtensionHTTPTransport
 
@@ -60,6 +68,10 @@ struct NPMRegistryClient: Sendable {
 
     /// Split out so the payload can be tested without a network.
     static func decode(_ data: Data) throws -> [PluginCatalogEntry] {
+        // Bellek şişmesine karşı çözümlemeden önce bayt sınırı.
+        guard data.count <= maximumResponseBytes else {
+            throw ExtensionFetchError.tooLarge
+        }
         struct Response: Decodable {
             struct Object: Decodable {
                 struct Package: Decodable {

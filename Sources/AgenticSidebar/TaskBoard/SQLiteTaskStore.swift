@@ -57,17 +57,38 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         try TaskStoreMigrations.execute("PRAGMA busy_timeout = 5000;", on: db)
     }
 
+    /// Eşzamanlı kapatma: çağıran iş parçacığını kuyruk boşalana kadar tutar.
+    ///
+    /// `deinit` bu yolu kullanır; kuyrukta kısa txn işleri koştuğu için tutma
+    /// sınırlıdır, kilitlenme yapmaz (kuyruk işleri `self`'i tutmaz, o yüzden
+    /// `deinit` kuyruk üstünde koşamaz). Yine de yanlışlıkla kuyruk üstünden
+    /// çağrı `dispatchPrecondition` ile gürültülü patlar (sessiz deadlock
+    /// yerine). Eşzamansız bağlamda `close()` kullanılır, bu değil.
     public func closeSync() {
+        dispatchPrecondition(condition: .notOnQueue(queue))
         queue.sync {
-            guard !isClosed, let db = self.db else { return }
-            sqlite3_close(db)
-            self.db = nil
-            self.isClosed = true
+            closeAssumingOnQueue()
         }
     }
 
     public func close() async {
-        closeSync()
+        // `closeSync` buradan çağrılmaz: kuyruk üstünde koşan blok
+        // `notOnQueue` önkoşuluna takılırdı. Kuyruğa eşzamansız verilir,
+        // çağıran askıda bekler, iş parçacığı tutulmaz.
+        await withCheckedContinuation { continuation in
+            queue.async {
+                self.closeAssumingOnQueue()
+                continuation.resume()
+            }
+        }
+    }
+
+    /// Kuyruk üstünde varsayar; çağıran `queue.sync/async` içinden çağırmalıdır.
+    private func closeAssumingOnQueue() {
+        guard !isClosed, let db = self.db else { return }
+        sqlite3_close(db)
+        self.db = nil
+        self.isClosed = true
     }
 
     public func currentSchemaVersionSync() -> Int {
@@ -78,6 +99,62 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
     }
 
     // MARK: - CodingTaskRepository
+
+    public func saveProject(_ project: CodingProject) async throws {
+        try queue.sync {
+            try checkOpen()
+            try executeTransaction {
+                let refsData = try JSONEncoder().encode(project.protectedRefs)
+                let refsString = String(data: refsData, encoding: .utf8) ?? "[]"
+                let sql = """
+                    INSERT INTO projects (id, name, repository_path, git_identity, protected_refs, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        repository_path = excluded.repository_path,
+                        git_identity = excluded.git_identity,
+                        protected_refs = excluded.protected_refs;
+                    """
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, project.id.uuidString)
+                bindText(stmt, 2, project.name)
+                bindText(stmt, 3, project.repositoryPath)
+                bindText(stmt, 4, project.gitIdentity)
+                bindText(stmt, 5, refsString)
+                sqlite3_bind_double(stmt, 6, project.createdAt.timeIntervalSince1970)
+                try stepDone(stmt)
+            }
+        }
+    }
+
+    public func loadProject(id: UUID) async throws -> CodingProject? {
+        try queue.sync {
+            try checkOpen()
+            return try loadProjectRow(id: id)
+        }
+    }
+
+    public func listProjects() async throws -> [CodingProject] {
+        try queue.sync {
+            try checkOpen()
+            let sql = "SELECT id, name, repository_path, git_identity, protected_refs, created_at FROM projects ORDER BY created_at ASC;"
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            try prepare(sql, &stmt)
+            var projects: [CodingProject] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let stmt else {
+                    throw TaskRepositoryError.storeCorrupt("Project row is unreadable: missing statement")
+                }
+                if let project = try parseProject(from: stmt) {
+                    projects.append(project)
+                }
+            }
+            return projects
+        }
+    }
 
     public func snapshot(projectID: UUID) async throws -> CodingBoardSnapshot {
         try queue.sync {
@@ -106,10 +183,112 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
     }
 
+    public func updateTaskDetails(
+        taskID: UUID,
+        expectedVersion: Int,
+        title: String,
+        objective: String,
+        priority: Int
+    ) async throws -> CodingTask {
+        try queue.sync {
+            try checkOpen()
+            return try executeTransaction {
+                guard var task = try loadTask(id: taskID) else {
+                    throw TaskRepositoryError.taskNotFound(taskID)
+                }
+                guard task.version == expectedVersion else {
+                    throw TaskRepositoryError.staleVersion(taskID: taskID, expected: expectedVersion, actual: task.version)
+                }
+                task.title = title
+                task.objective = objective
+                task.priority = priority
+                task.version += 1
+                task.updatedAt = Date()
+                try updateTask(task)
+                return task
+            }
+        }
+    }
+
+    public func deleteTask(taskID: UUID) async throws {
+        try queue.sync {
+            try checkOpen()
+            try executeTransaction {
+                guard try loadTask(id: taskID) != nil else {
+                    throw TaskRepositoryError.taskNotFound(taskID)
+                }
+                // Önkoşul kenarı RESTRICT ile korunur; silinen göreve dokunan
+                // tüm kenarlar önce kaldırılır, çocuk satırlar CASCADE ile gider.
+                try deleteDependencies(involving: taskID)
+                let sql = "DELETE FROM tasks WHERE id = ?;"
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, taskID.uuidString)
+                try stepDone(stmt)
+            }
+        }
+    }
+
+    public func renameProject(id: UUID, name: String) async throws -> CodingProject {
+        try queue.sync {
+            try checkOpen()
+            return try executeTransaction {
+                guard try loadProjectRow(id: id) != nil else {
+                    throw TaskRepositoryError.storeCorrupt("Project not found: \(id)")
+                }
+                let sql = "UPDATE projects SET name = ? WHERE id = ?;"
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, name)
+                bindText(stmt, 2, id.uuidString)
+                try stepDone(stmt)
+                guard let renamed = try loadProjectRow(id: id) else {
+                    throw TaskRepositoryError.storeCorrupt("Project not found: \(id)")
+                }
+                return renamed
+            }
+        }
+    }
+
+    public func deleteProject(id: UUID) async throws {
+        try queue.sync {
+            try checkOpen()
+            try executeTransaction {
+                guard try loadProjectRow(id: id) != nil else {
+                    throw TaskRepositoryError.storeCorrupt("Project not found: \(id)")
+                }
+                for task in try loadTasks(projectID: id) {
+                    try deleteDependencies(involving: task.id)
+                    let deleteTaskSQL = "DELETE FROM tasks WHERE id = ?;"
+                    var taskStmt: OpaquePointer?
+                    defer { sqlite3_finalize(taskStmt) }
+                    try prepare(deleteTaskSQL, &taskStmt)
+                    bindText(taskStmt, 1, task.id.uuidString)
+                    try stepDone(taskStmt)
+                }
+                let sql = "DELETE FROM projects WHERE id = ?;"
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                try prepare(sql, &stmt)
+                bindText(stmt, 1, id.uuidString)
+                try stepDone(stmt)
+            }
+        }
+    }
+
     public func addDependency(_ dependency: TaskDependency) async throws {
         try queue.sync {
             try checkOpen()
             try executeTransaction {
+                let tasks = try [dependency.prerequisiteTaskID, dependency.dependentTaskID].compactMap { try loadTask(id: $0) }
+                // Preserve SQLite's foreign-key error when a task is missing.
+                if tasks.count == 2 {
+                    let existing = try loadDependencies(projectID: dependency.projectID)
+                    _ = try TaskDependencyGraph.add(dependency, to: existing, tasks: tasks)
+                }
+
                 let sql = """
                     INSERT INTO task_dependencies (project_id, prerequisite_task_id, dependent_task_id)
                     VALUES (?, ?, ?);
@@ -1037,6 +1216,19 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         try stepDone(stmt)
     }
 
+    /// Göreve dokunan tüm bağımlılık kenarlarını kaldırır; çağıran işlem
+    /// içinden çağırmalıdır. Önkoşul kenarı RESTRICT ile korunduğu için
+    /// görev satırı silinmeden önce kenarların gitmesi şarttır.
+    private func deleteDependencies(involving taskID: UUID) throws {
+        let sql = "DELETE FROM task_dependencies WHERE prerequisite_task_id = ? OR dependent_task_id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, taskID.uuidString)
+        bindText(stmt, 2, taskID.uuidString)
+        try stepDone(stmt)
+    }
+
     private func insertCriterion(_ criterion: CodingAcceptanceCriterion) throws {
         let sql = """
             INSERT INTO criteria (id, task_id, description, is_completed, evidence_id)
@@ -1133,6 +1325,44 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         try stepDone(stmt)
     }
 
+    /// Tek proje satırını okur; kimliği bozuk satırda storeCorrupt fırlatır.
+    private func loadProjectRow(id: UUID) throws -> CodingProject? {
+        let sql = "SELECT id, name, repository_path, git_identity, protected_refs, created_at FROM projects WHERE id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        try prepare(sql, &stmt)
+        bindText(stmt, 1, id.uuidString)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        guard let stmt else {
+            throw TaskRepositoryError.storeCorrupt("Project row is unreadable: missing statement")
+        }
+        return try parseProject(from: stmt)
+    }
+
+    /// Proje satırını ayrıştırır; eksik kimlikte nil döner ki eski satırlar atlanabilsin.
+    private func parseProject(from stmt: OpaquePointer) throws -> CodingProject? {
+        guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText) else {
+            throw TaskRepositoryError.storeCorrupt("Project row has an invalid identity")
+        }
+        guard let name = optionalText(stmt, 1),
+            let repositoryPath = optionalText(stmt, 2),
+            let gitIdentity = optionalText(stmt, 3)
+        else {
+            return nil
+        }
+        let refsText = optionalText(stmt, 4) ?? "[]"
+        let protectedRefs = (try? JSONDecoder().decode([String].self, from: Data(refsText.utf8))) ?? []
+        let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
+        return CodingProject(
+            id: id,
+            name: name,
+            repositoryPath: repositoryPath,
+            gitIdentity: gitIdentity,
+            protectedRefs: protectedRefs,
+            createdAt: createdAt
+        )
+    }
+
     private func loadTask(id: UUID) throws -> CodingTask? {
         let sql = """
             SELECT
@@ -1147,7 +1377,10 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         bindText(stmt, 1, id.uuidString)
 
         if sqlite3_step(stmt) == SQLITE_ROW {
-            return try parseTask(from: stmt!)
+            guard let stmt else {
+                throw TaskRepositoryError.storeCorrupt("Task row is unreadable: missing statement")
+            }
+            return try parseTask(from: stmt)
         }
         return nil
     }
@@ -1167,20 +1400,35 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
         var tasks: [CodingTask] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let task = try parseTask(from: stmt!)
+            guard let stmt else {
+                throw TaskRepositoryError.storeCorrupt("Task row is unreadable: missing statement")
+            }
+            let task = try parseTask(from: stmt)
             tasks.append(task)
         }
         return tasks
     }
 
     private func parseTask(from stmt: OpaquePointer) throws -> CodingTask {
-        let id = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 0)))!
-        let projectID = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 1)))!
-        let title = String(cString: sqlite3_column_text(stmt, 2))
-        let objective = String(cString: sqlite3_column_text(stmt, 3))
+        // Bozuk satırda çökmek yerine storeCorrupt fırlat
+        guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText),
+            let projectIDText = optionalText(stmt, 1), let projectID = UUID(uuidString: projectIDText)
+        else {
+            throw TaskRepositoryError.storeCorrupt("Task row has an invalid identity")
+        }
+        guard let title = optionalText(stmt, 2) else {
+            throw TaskRepositoryError.storeCorrupt("Task \(id) has no title")
+        }
+        guard let objective = optionalText(stmt, 3) else {
+            throw TaskRepositoryError.storeCorrupt("Task \(id) has no objective")
+        }
         let priority = Int(sqlite3_column_int(stmt, 4))
-        let status = TaskStatus(rawValue: String(cString: sqlite3_column_text(stmt, 5)))!
-        let stage = TaskStage(rawValue: String(cString: sqlite3_column_text(stmt, 6)))!
+        guard let statusText = optionalText(stmt, 5), let status = TaskStatus(rawValue: statusText) else {
+            throw TaskRepositoryError.storeCorrupt("Task \(id) has an invalid status")
+        }
+        guard let stageText = optionalText(stmt, 6), let stage = TaskStage(rawValue: stageText) else {
+            throw TaskRepositoryError.storeCorrupt("Task \(id) has an invalid stage")
+        }
 
         var blockReason: TaskBlockReason?
         if let text = sqlite3_column_text(stmt, 7) {
@@ -1194,13 +1442,12 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         }
 
         let version = Int(sqlite3_column_int(stmt, 9))
-        let budgetStr = String(cString: sqlite3_column_text(stmt, 10))
+        guard let budgetStr = optionalText(stmt, 10) else {
+            throw TaskRepositoryError.storeCorrupt("Task \(id) has no budget")
+        }
         let budget = (try? JSONDecoder().decode(ExecutionBudget.self, from: Data(budgetStr.utf8))) ?? ExecutionBudget()
 
-        var currentAttemptID: UUID?
-        if let text = sqlite3_column_text(stmt, 11) {
-            currentAttemptID = UUID(uuidString: String(cString: text))
-        }
+        let currentAttemptID: UUID? = optionalText(stmt, 11).flatMap(UUID.init(uuidString:))
 
         let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 12))
         let updatedAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 13))
@@ -1235,14 +1482,20 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
         var criteria: [CodingAcceptanceCriterion] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let id = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 0)))!
-            let tid = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 1)))!
-            let desc = String(cString: sqlite3_column_text(stmt, 2))
-            let isComp = sqlite3_column_int(stmt, 3) == 1
-            var evid: UUID?
-            if let text = sqlite3_column_text(stmt, 4) {
-                evid = UUID(uuidString: String(cString: text))
+            guard let stmt else {
+                throw TaskRepositoryError.storeCorrupt("Criterion row is unreadable: missing statement")
             }
+            // Bozuk satırda çökmek yerine storeCorrupt fırlat
+            guard let idText = optionalText(stmt, 0), let id = UUID(uuidString: idText),
+                let tidText = optionalText(stmt, 1), let tid = UUID(uuidString: tidText)
+            else {
+                throw TaskRepositoryError.storeCorrupt("Criterion row has an invalid identity")
+            }
+            guard let desc = optionalText(stmt, 2) else {
+                throw TaskRepositoryError.storeCorrupt("Criterion \(id) has no description")
+            }
+            let isComp = sqlite3_column_int(stmt, 3) == 1
+            let evid: UUID? = optionalText(stmt, 4).flatMap(UUID.init(uuidString:))
             criteria.append(
                 CodingAcceptanceCriterion(
                     id: id,
@@ -1264,9 +1517,16 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
         var deps: [TaskDependency] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let pid = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 0)))!
-            let prereq = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 1)))!
-            let dep = UUID(uuidString: String(cString: sqlite3_column_text(stmt, 2)))!
+            guard let stmt else {
+                throw TaskRepositoryError.storeCorrupt("Dependency row is unreadable: missing statement")
+            }
+            // Bozuk satırda çökmek yerine storeCorrupt fırlat
+            guard let pidText = optionalText(stmt, 0), let pid = UUID(uuidString: pidText),
+                let prereqText = optionalText(stmt, 1), let prereq = UUID(uuidString: prereqText),
+                let depText = optionalText(stmt, 2), let dep = UUID(uuidString: depText)
+            else {
+                throw TaskRepositoryError.storeCorrupt("Dependency row has an invalid identity")
+            }
             deps.append(TaskDependency(projectID: pid, prerequisiteTaskID: prereq, dependentTaskID: dep))
         }
         return deps
@@ -1288,7 +1548,8 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         bindText(stmt, 1, taskID.uuidString)
 
         if sqlite3_step(stmt) == SQLITE_ROW {
-            return parseAttempt(from: stmt!)
+            guard let stmt else { return nil }
+            return parseAttempt(from: stmt)
         }
         return nil
     }
@@ -1311,7 +1572,8 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
         var attempts: [TaskAttempt] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            if let attempt = parseAttempt(from: stmt!) {
+            guard let stmt else { break }
+            if let attempt = parseAttempt(from: stmt) {
                 attempts.append(attempt)
             }
         }

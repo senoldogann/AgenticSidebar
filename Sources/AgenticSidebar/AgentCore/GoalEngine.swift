@@ -3,7 +3,7 @@ import Foundation
 /// Hedef koşusunun değer-tipi fotoğrafı: faz, kriterler, sayaçlar ve günlük.
 struct GoalRun: Equatable, Sendable, Codable {
     let id: UUID
-    let objective: String
+    var objective: String
     var criteria: [AcceptanceCriterion]
     var phase: GoalPhase
     var iteration: Int
@@ -185,6 +185,44 @@ struct GoalEngine: Sendable {
         return item
     }
 
+    /// Hedef metnini günceller (Codex-tarzı "içeriği güncelle, ajan güncel
+    /// içerikle devam etsin"): terminal koşuda işlem yapmaz. Boş metin
+    /// reddedilir. Sonraki tur metinleri güncel hedefle kurulur, o yüzden
+    /// ayrıca tur kuyruklamaya gerek yoktur.
+    @discardableResult
+    mutating func updateObjective(_ text: String, date: Date) -> Bool {
+        guard !run.isTerminal else {
+            return false
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != run.objective else {
+            return false
+        }
+        run.objective = trimmed
+        record(date: date, phase: run.phase, message: "Objective updated")
+        return true
+    }
+
+    /// Tüm kriterleri karşılandı işaretler (otonom review): terminal koşuda
+    /// işlem yapmaz. Yalnız doğrulama yeşilken çağrılmalıdır; kırmızı kapı
+    /// varken çağrılırsa `didFinishReview` yine `fixing` üretir.
+    @discardableResult
+    mutating func markAllCriteriaMet(date: Date) -> Bool {
+        guard !run.isTerminal, !run.criteria.isEmpty else {
+            return false
+        }
+        var changed = false
+        for index in run.criteria.indices where !run.criteria[index].isMet {
+            run.criteria[index].isMet = true
+            changed = true
+        }
+        guard changed else {
+            return false
+        }
+        record(date: date, phase: run.phase, message: "Criteria auto-confirmed (verification green)")
+        return true
+    }
+
     /// Araç çağrılarını sayar; bütçe aşılırsa koşuyu durdurur. Sıfır ve
     /// negatif değerler yok sayılır: sayaç asla geri sarılamaz.
     mutating func addToolCalls(_ count: Int, date: Date) {
@@ -248,6 +286,10 @@ struct GoalEngine: Sendable {
             pausedTotal += date.timeIntervalSince(began)
         }
         pauseBegan = nil
+        // Diskten dönen duraklatılmış koşuda duraklama öncesi faz kayıptır
+        // (yalnız bellekte tutulur, `GoalStoredRun` şemasında yoktur): güvenli
+        // varsayılan `planning` ile devam edilir, çökme olmaz. Bellek-içi
+        // duraklatmada her zaman doludur, o yüzden normal akış etkilenmez.
         run.phase = phaseBeforePause ?? .planning
         phaseBeforePause = nil
         record(date: date, phase: run.phase, message: "Resumed")
@@ -260,9 +302,61 @@ struct GoalEngine: Sendable {
             return false
         }
         pauseBegan = nil
+        // Bayat duraklama öncesi faz taşınmaz: koşu artık terminaldir,
+        // sonraki `resume` zaten faz korumasından döner.
+        phaseBeforePause = nil
         run.phase = .failed
         run.failureReason = .cancelledByUser
         record(date: date, phase: .failed, message: "Stopped by user")
+        return true
+    }
+
+    /// Tur zaman aşımı (ilerleme yok): terminal hata değildir, kurtarılabilir
+    /// deneme hakkıdır. Tur sayacı artar, bütçe aşılırsa koşu `failed` olur;
+    /// yoksa faz korunur ve çağrı tarafı aynı turu yeniden kuyruklar.
+    /// `true` = yeniden denenebilir, `false` = koşu terminal oldu.
+    @discardableResult
+    mutating func noteTurnTimeout(date: Date) -> Bool {
+        guard !run.isTerminal else {
+            return false
+        }
+        run.iteration += 1
+        if isOverBudget(now: date) {
+            run.phase = .failed
+            run.failureReason = .budgetExceeded(detail: "budget exceeded after \(run.iteration) iterations")
+            record(date: date, phase: .failed, message: "Turn stalled with no progress, budget exceeded, stopping")
+            return false
+        }
+        record(
+            date: date,
+            phase: run.phase,
+            message: "Turn stalled with no progress, retrying (attempt \(run.iteration))"
+        )
+        return true
+    }
+
+    /// Geçici tur hatası (ağ kesintisi, hız sınırı, akış kopması, sağlayıcı
+    /// yokluğu): terminal hata değildir, kurtarılabilir deneme hakkıdır. Tur
+    /// sayacı artar, bütçe aşılırsa koşu `failed` olur; yoksa faz korunur ve
+    /// çağrı tarafı aynı turu yeniden kuyruklar. `true` = yeniden denenebilir,
+    /// `false` = koşu terminal oldu.
+    @discardableResult
+    mutating func noteTransientTurnError(detail: String, date: Date) -> Bool {
+        guard !run.isTerminal else {
+            return false
+        }
+        run.iteration += 1
+        if isOverBudget(now: date) {
+            run.phase = .failed
+            run.failureReason = .budgetExceeded(detail: "budget exceeded after \(run.iteration) iterations")
+            record(date: date, phase: .failed, message: "Turn failed (\(detail)), budget exceeded, stopping")
+            return false
+        }
+        record(
+            date: date,
+            phase: run.phase,
+            message: "Turn failed (\(detail)), retrying (attempt \(run.iteration))"
+        )
         return true
     }
 
@@ -274,6 +368,8 @@ struct GoalEngine: Sendable {
             return
         }
         pauseBegan = nil
+        // `stop` ile aynı gerekçe: terminal koşuda duraklama öncesi faz kalmaz.
+        phaseBeforePause = nil
         run.phase = .failed
         run.failureReason = reason
         record(date: date, phase: .failed, message: message)

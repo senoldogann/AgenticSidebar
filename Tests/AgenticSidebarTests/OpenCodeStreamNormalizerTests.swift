@@ -378,8 +378,42 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
                 toolName: "chatgpt-system_computer_click",
                 patterns: ["*"],
                 alwaysPatterns: ["chatgpt-system_computer_click*"],
-                detail: "description: Click the Run button"
+                detail: "description: Click the Run button",
+                delegationTarget: nil
             )
+        )
+    }
+
+    /// Plan aşaması delegasyon yaptırımı `task` izninin hedefini yapısal
+    /// olarak görmelidir: karar, gösterim metnini ayrıştırarak değil
+    /// `subagent_type` alanından verilir.
+    func testTaskPermissionCarriesDelegationTarget() throws {
+        final class RequestBox: @unchecked Sendable {
+            var value: OpenCodePermissionRequest?
+        }
+        let box = RequestBox()
+        var normalizer = OpenCodeStreamNormalizer(
+            sessionID: "ses_target",
+            onPermissionRequest: { request in
+                box.value = request
+            }
+        )
+
+        let events = try normalizer.consume(
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_task","permission":"task","patterns":[],"always":[],"metadata":{"description":"Research the auth flow","subagent_type":"agenticsidebar-research"}}}"#
+        )
+        XCTAssertEqual(events, [])
+        XCTAssertEqual(box.value?.delegationTarget, "agenticsidebar-research")
+
+        _ = try normalizer.consume(
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_target","id":"per_bash","permission":"bash","patterns":["ls"],"always":[],"metadata":{"subagent_type":"agenticsidebar-research"}}}"#
+        )
+        XCTAssertEqual(
+            box.value?.delegationTarget,
+            nil,
+            "Only task delegations carry a target"
         )
     }
 
@@ -896,5 +930,103 @@ final class OpenCodeStreamNormalizerLifecycleTests: XCTestCase {
 
     private static func completeTextLine(index: Int) -> String {
         "data: {\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses_target\",\"part\":{\"id\":\"prt_\(index)\",\"sessionID\":\"ses_target\",\"messageID\":\"msg_1\",\"type\":\"text\",\"text\":\"t\(index)\"},\"time\":2}}"
+    }
+
+    /// Sözlük çıktılı araç sonucu düşmez: `text` alanı okunur metindir.
+    func testDictionaryToolOutputIsSurfaced() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        let events = try normalizer.consume(
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_shot","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"chatgpt-system_computer_screenshot","state":{"status":"completed","input":{},"output":{"text":"screenshot ready"},"time":{"start":1,"end":2}}},"time":2}}"#
+        )
+
+        let outputs = events.compactMap { event -> String? in
+            if case .activityFinished(_, _, let output, _) = event { return output }
+            return nil
+        }
+        XCTAssertEqual(outputs, ["screenshot ready"])
+    }
+
+    /// Dosya başvurulu sözlük çıktısı yol olarak taşınır (timeline görseli).
+    func testFileReferenceToolOutputIsSurfacedAsPath() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        let events = try normalizer.consume(
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_shot","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"chatgpt-system_computer_screenshot","state":{"status":"completed","input":{},"output":{"path":"/tmp/shot.png"},"time":{"start":1,"end":2}}},"time":2}}"#
+        )
+
+        let outputs = events.compactMap { event -> String? in
+            if case .activityFinished(_, _, let output, _) = event { return output }
+            return nil
+        }
+        XCTAssertEqual(outputs, ["/tmp/shot.png"])
+    }
+
+    /// Dizi çıktının metin blokları satır satır birleşir.
+    func testArrayToolOutputJoinsTextBlocks() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        let events = try normalizer.consume(
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_tool","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"read","state":{"status":"completed","input":{},"output":[{"text":"first"},{"text":"second"}],"time":{"start":1,"end":2}}},"time":2}}"#
+        )
+
+        let outputs = events.compactMap { event -> String? in
+            if case .activityFinished(_, _, let output, _) = event { return output }
+            return nil
+        }
+        XCTAssertEqual(outputs, ["first\nsecond"])
+    }
+
+    /// Ayrı `file` parçası, tek koşan computer aracının kartına işlenir.
+    func testFilePartAttachesToSingleRunningComputerTool() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        _ = try normalizer.consume(
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_shot","sessionID":"ses_target","messageID":"msg_1","type":"tool","callID":"call_1","tool":"chatgpt-system_computer_screenshot","state":{"status":"running","input":{},"time":{"start":1}}},"time":1}}"#
+        )
+
+        let events = try normalizer.consume(
+            line:
+                #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_file","sessionID":"ses_target","messageID":"msg_1","type":"file","filename":"shot.png","url":"/tmp/shot.png"},"time":2}}"#
+        )
+
+        XCTAssertEqual(events.count, 1)
+        guard case .activityUpdated(let descriptor) = events[0] else {
+            XCTFail("file parçası koşan computer aracını güncellemeli")
+            return
+        }
+        XCTAssertEqual(descriptor.id, ProviderActivityID("prt_shot"))
+        XCTAssertEqual(descriptor.kind, .computer)
+        XCTAssertEqual(descriptor.output, "/tmp/shot.png")
+    }
+
+    /// Sahibi belirsiz `file` parçası düşer (yanlış karta yazılmaz).
+    func testFilePartWithoutRunningComputerToolIsDropped() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.part.updated","properties":{"sessionID":"ses_target","part":{"id":"prt_file","sessionID":"ses_target","messageID":"msg_1","type":"file","filename":"shot.png","url":"/tmp/shot.png"},"time":2}}"#
+            ),
+            []
+        )
+    }
+
+    /// Girdisi sıfır bildirilen tur "bildirilmedi"dir, `%0` değil.
+    func testZeroInputTokensAreNotEmittedAsTurnUsage() throws {
+        var normalizer = OpenCodeStreamNormalizer(sessionID: "ses_target")
+
+        XCTAssertEqual(
+            try normalizer.consume(
+                line:
+                    #"data: {"type":"message.updated","properties":{"info":{"id":"msg_asst","sessionID":"ses_target","role":"assistant","tokens":{"input":0,"output":1204}}}}"#
+            ),
+            []
+        )
     }
 }

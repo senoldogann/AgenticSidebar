@@ -168,6 +168,7 @@ final class CodingTaskStateMachineTests: XCTestCase {
 
     func testCannotCompleteWithChangedFingerprint() throws {
         let taskID = UUID()
+        let attemptID = UUID()
         let criterion = CodingAcceptanceCriterion(
             taskID: taskID,
             description: "Passing tests",
@@ -184,7 +185,8 @@ final class CodingTaskStateMachineTests: XCTestCase {
             status: .review,
             stage: .acceptance,
             version: 3,
-            criteria: [criterion]
+            criteria: [criterion],
+            currentAttemptID: attemptID
         )
 
         let context = TaskTransitionContext(
@@ -194,7 +196,7 @@ final class CodingTaskStateMachineTests: XCTestCase {
             humanApproval: TaskApproval(
                 id: UUID(),
                 taskID: taskID,
-                attemptID: UUID(),
+                attemptID: attemptID,
                 fingerprint: "oldFingerprintHash",
                 actor: "user",
                 timestamp: Date(),

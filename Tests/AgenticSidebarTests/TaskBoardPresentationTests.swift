@@ -655,8 +655,8 @@ final class TaskBoardPresentationTests: XCTestCase {
         )
         let accept = actions.first { $0.action == .accept }
         XCTAssertFalse(accept?.isEnabled == true)
-        XCTAssertTrue(accept?.disabledReason?.contains("acceptance criterion") == true)
-        XCTAssertTrue(accept?.accessibilityLabel.contains("acceptance criterion") == true)
+        XCTAssertTrue(accept?.disabledReason?.contains("kabul ölçütü") == true)
+        XCTAssertTrue(accept?.accessibilityLabel.contains("kabul ölçütü") == true)
         XCTAssertEqual(
             store.cards.first { $0.id == seeded.task.id }?.status,
             .review,

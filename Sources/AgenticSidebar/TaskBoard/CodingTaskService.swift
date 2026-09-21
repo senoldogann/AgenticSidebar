@@ -106,6 +106,20 @@ struct TaskAcceptanceEvidence: Sendable, Equatable {
     let currentFingerprint: String
 }
 
+/// Pano detay bölmesinin salt-okunur denetçi girdileri: doğrulama kanıtları,
+/// güncel içerik parmak izi, inceleme bulguları ve denemenin çalışma alanı.
+/// Her alan ayrı ayrı yok olabilir; yokluk hata değil, panoda dürüstçe söylenir.
+/// `warning` yalnız gerçekten beklenmedik bir okuma kaybında dolar (koşmuş
+/// görevin kanıtı bu süreçte yüklenemediyse gibi); hiç koşmamış görevde boşluk
+/// normaldir ve uyarı üretilmez.
+struct TaskInspectorInputs: Sendable, Equatable {
+    let evidence: [VerificationEvidence]?
+    let currentFingerprint: String?
+    let findings: [ReviewFinding]?
+    let workspaceID: UUID?
+    var warning: String? = nil
+}
+
 /// Supplies gate inputs the repository protocol cannot list yet (evidence and fingerprint).
 ///
 /// The composition root wires this to the verification runner and the owned workspace; Task 13
@@ -161,6 +175,16 @@ actor CodingTaskService {
     /// koşu doğurur.
     private let liveDispatchAvailable: Bool
 
+    /// Gönderim öncesi doğrulama ön kontrolü. `nil` iken kapı atlanır
+    /// (eski kompozisyonlar ve mevcut testler aynen çalışır); canlı
+    /// kompozisyon gerçek sağlayıcıyı bağlar.
+    private let verificationPreflight: (any TaskVerificationPreflightProviding)?
+
+    /// Pano alt bandı bu bayrağı okur; yanlış "devre dışı" ibaresi gösterilmez.
+    var isLiveDispatchAvailable: Bool {
+        liveDispatchAvailable
+    }
+
     /// Process-lifetime project registry. Persistence arrives with the project repository port
     /// in the composition task; nothing here writes SQL or guesses Git state.
     private var registeredProjects: [UUID: CodingProject] = [:]
@@ -177,7 +201,8 @@ actor CodingTaskService {
         executionFingerprints: any TaskExecutionFingerprintProviding,
         clock: TaskSchedulerClock,
         requiredSteps: [String],
-        liveDispatchAvailable: Bool
+        liveDispatchAvailable: Bool,
+        verificationPreflight: (any TaskVerificationPreflightProviding)? = nil
     ) {
         self.repository = repository
         self.scheduler = scheduler
@@ -188,6 +213,7 @@ actor CodingTaskService {
         self.clock = clock
         self.requiredSteps = requiredSteps
         self.liveDispatchAvailable = liveDispatchAvailable
+        self.verificationPreflight = verificationPreflight
     }
 
     // MARK: - Projects and tasks
@@ -220,12 +246,36 @@ actor CodingTaskService {
             protectedRefs: protectedRefs,
             createdAt: clock.now()
         )
+        try await mapped { try await self.repository.saveProject(project) }
         registeredProjects[project.id] = project
         return project
     }
 
     func project(id: UUID) -> CodingProject? {
         registeredProjects[id]
+    }
+
+    /// Bellekte yoksa kalıcı depodan okur; yeniden başlatma sonrası projeyi bulur.
+    func projectFromStore(id: UUID) async -> CodingProject? {
+        if let cached = registeredProjects[id] {
+            return cached
+        }
+        guard let stored = try? await repository.loadProject(id: id) else {
+            return nil
+        }
+        registeredProjects[id] = stored
+        return stored
+    }
+
+    /// Kayıtlı projeleri listeler; bellek önbelleğini kalıcı durumla uzlaştırır.
+    func listProjects() async -> [CodingProject] {
+        guard let stored = try? await repository.listProjects() else {
+            return Array(registeredProjects.values).sorted { $0.createdAt < $1.createdAt }
+        }
+        for project in stored {
+            registeredProjects[project.id] = project
+        }
+        return stored
     }
 
     /// Creates a backlog task with ordered criteria; a repository rejection is surfaced, never absorbed.
@@ -236,7 +286,7 @@ actor CodingTaskService {
         priority: Int,
         criteria: [String]
     ) async throws -> CodingTask {
-        guard registeredProjects[projectID] != nil else {
+        if registeredProjects[projectID] == nil, await projectFromStore(id: projectID) == nil {
             throw CodingTaskServiceError.projectNotFound(projectID)
         }
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -277,6 +327,81 @@ actor CodingTaskService {
         return task
     }
 
+    /// Görevin başlık/amaç/öncelik üstverisini günceller.
+    ///
+    /// Koşan görev düzenlenemez: ajan o anda gördüğü amaçla çalışır, ortada
+    /// değişen amaç sessiz sapma üretirdi. Sürüm çiti bayat yazımı reddeder.
+    func updateTaskDetails(
+        taskID: UUID,
+        expectedVersion: Int,
+        title: String,
+        objective: String,
+        priority: Int
+    ) async throws -> CodingTask {
+        try await withExclusiveTaskAction(taskID: taskID) {
+            let trimmedTitle = try Self.requireHumanText(title, field: "title")
+            let trimmedObjective = try Self.requireHumanText(objective, field: "objective")
+            guard priority >= 0 else {
+                throw CodingTaskServiceError.invalidTaskInput(field: "priority", reason: "must not be negative")
+            }
+            let task = try await self.requireTask(taskID)
+            try Self.requireVersion(task: task, expectedVersion: expectedVersion)
+            guard task.status != .running else {
+                throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
+            }
+            return try await self.mapped {
+                try await self.repository.updateTaskDetails(
+                    taskID: taskID,
+                    expectedVersion: expectedVersion,
+                    title: trimmedTitle,
+                    objective: trimmedObjective,
+                    priority: priority
+                )
+            }
+        }
+    }
+
+    /// Görevi kenarlarıyla birlikte siler.
+    ///
+    /// Koşan görev silinemez: aktif deneme ve sahipli çalışma alanı ortada
+    /// kalırdı. Önce durdurulması gerekir.
+    func deleteTask(taskID: UUID) async throws {
+        try await withExclusiveTaskAction(taskID: taskID) {
+            let task = try await self.requireTask(taskID)
+            guard task.status != .running else {
+                throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
+            }
+            try await self.mapped { try await self.repository.deleteTask(taskID: taskID) }
+        }
+    }
+
+    /// Projenin görünen adını değiştirir; boş ad reddedilir.
+    func renameProject(id: UUID, name: String) async throws -> CodingProject {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw CodingTaskServiceError.invalidProjectInput(field: "name", reason: "must not be blank")
+        }
+        guard await projectFromStore(id: id) != nil else {
+            throw CodingTaskServiceError.projectNotFound(id)
+        }
+        return try await mapped { try await self.repository.renameProject(id: id, name: trimmed) }
+    }
+
+    /// Projeyi ve altındaki tüm görevleri siler.
+    ///
+    /// İçinde koşan görev varken silinemez: önce koşular durdurulmalıdır.
+    func deleteProject(id: UUID) async throws {
+        guard await projectFromStore(id: id) != nil else {
+            throw CodingTaskServiceError.projectNotFound(id)
+        }
+        let board = try await snapshot(projectID: id)
+        if let running = board.tasks.first(where: { $0.status == .running }) {
+            throw CodingTaskServiceError.actionNotAvailable(taskID: running.id, status: running.status)
+        }
+        try await mapped { try await self.repository.deleteProject(id: id) }
+        registeredProjects.removeValue(forKey: id)
+    }
+
     /// Adds a dependency edge after a pure cycle/self/duplicate test; a rejected edge never persists.
     func addDependency(
         projectID: UUID,
@@ -306,6 +431,66 @@ actor CodingTaskService {
 
     func attemptHistory(taskID: UUID) async throws -> [TaskAttempt] {
         try await mapped { try await self.repository.attemptHistory(taskID: taskID) }
+    }
+
+    /// Denetçi girdilerini okur; okuma yüzeyidir, asla throw etmez.
+    ///
+    /// Kaynak yokluğu (henüz koşmamış görevde kanıt/parmak izi gibi) `nil`
+    /// alandır: detay bölmesinin yüklenmesi denemelere bağlıdır, buna değil.
+    /// Koşmuş bir görevin girdisi okunamazsa kayıp `warning` ile yüzeye çıkar:
+    /// "henüz koşmadı" ile "yükleme patladı" artık aynı `nil` değildir.
+    /// Çalışma alanı kimliği, güncel denemenin kaydından alınır.
+    func inspectorInputs(taskID: UUID) async -> TaskInspectorInputs {
+        var warnings: [String] = []
+        let task: CodingTask?
+        do {
+            task = try await mapped { try await self.repository.task(id: taskID) }
+        } catch {
+            task = nil
+            warnings.append("Görev kaydı okunamadı; detay eksik görünebilir")
+        }
+        let history: [TaskAttempt]?
+        do {
+            history = try await attemptHistory(taskID: taskID)
+        } catch {
+            history = nil
+            warnings.append("Deneme geçmişi okunamadı; çalışma alanı bilgisi eksik görünebilir")
+        }
+        let hasRuns = history?.isEmpty == false
+        let inputs: TaskAcceptanceEvidence?
+        do {
+            inputs = try await acceptanceEvidence.acceptanceEvidence(taskID: taskID)
+        } catch {
+            inputs = nil
+            // Koşmamış görevde kanıt yokluğu normaldir; koşmuş görevde kayıp
+            // (ör. yeniden başlatmada süreç-içi defter boşaldıysa) uyarıdır.
+            if hasRuns {
+                if error is TaskEvidenceLedgerError {
+                    warnings.append(
+                        "Bu koşunun kanıtı bu süreçte yüklenemedi — uygulama yeniden başlatıldıysa normaldir; kanıtı görmek için koşunun bu açılışta üretilmesi gerekir"
+                    )
+                } else {
+                    warnings.append("Kabul girdileri okunamadı; kanıt eksik görünebilir")
+                }
+            }
+        }
+        let findings: [ReviewFinding]?
+        do {
+            findings = try await mapped { try await self.repository.findings(taskID: taskID) }
+        } catch {
+            findings = nil
+            warnings.append("İnceleme bulguları okunamadı; bulgu listesi eksik görünebilir")
+        }
+        let workspaceID = task?.currentAttemptID.flatMap { current in
+            history?.first { $0.id == current }?.workspaceID
+        }
+        return TaskInspectorInputs(
+            evidence: inputs?.evidence,
+            currentFingerprint: inputs?.currentFingerprint,
+            findings: findings,
+            workspaceID: workspaceID,
+            warning: warnings.isEmpty ? nil : warnings.joined(separator: " ")
+        )
     }
 
     /// Evaluates the completion gate without mutating anything; reasons are always explicit.
@@ -412,6 +597,19 @@ actor CodingTaskService {
                     taskID: taskID,
                     reason: String(describing: error)
                 )
+            }
+
+            // Doğrulama ön kontrolü: çözülemeyen çalışma alanı ajanı
+            // yakmadan reddedilir. Talep edilmiş deneme parmak izi yolundaki
+            // deseyle geri çekilir; onay kaydı yazılmaz, gönderim doğmaz.
+            if let verificationPreflight,
+                let unresolvable = await verificationPreflight.unresolvableReason(
+                    projectID: task.projectID,
+                    taskID: taskID
+                )
+            {
+                await self.retireClaimedAttemptIfCurrent(taskID: taskID, attemptID: attemptID, generation: generation)
+                return .resolved(.deferred(reason: unresolvable))
             }
 
             let approval = TaskApproval(

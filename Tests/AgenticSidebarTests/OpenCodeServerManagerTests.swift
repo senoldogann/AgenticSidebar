@@ -325,6 +325,7 @@ private actor RecordingOpenCodeProcessLauncher: OpenCodeProcessLaunching {
     func lastRequest() -> OpenCodeProcessLaunchRequest? { recordedRequests.last }
     func requests() -> [OpenCodeProcessLaunchRequest] { recordedRequests }
     func lastHandle() -> RecordingOpenCodeProcessHandle? { handles.last }
+    func recordedHandles() -> [RecordingOpenCodeProcessHandle] { handles }
 }
 
 private final class InMemoryOpenCodeCredentialStore: CredentialStore, @unchecked Sendable {
@@ -376,6 +377,454 @@ private func assertThrowsErrorAsync<T>(
         XCTFail("Expected expression to throw", file: file, line: line)
     } catch {
         errorHandler(error)
+    }
+}
+
+/// Çalışma alanına köklenmiş sunucu fabrikasının sözleşmesi: her koşu kendi
+/// kökünde, kendi portunda, kendi durum ad alanında bir sunucu alır; aynı
+/// çalışma alanı için ikinci sunucu açılmaz; bırakma çocuğu sonlandırır ve
+/// hiçbir kalıntı bırakmaz.
+final class OpenCodeWorkspaceServerFactoryTests: XCTestCase {
+    func testAcquireRootsServerAtWorkspaceWithIsolatedStateNamespaceAndReleasesOnStop() async throws {
+        let workspace = try makeExistingWorkspace()
+        let stateRoot = makeWorkingDirectory()
+        let launcher = RecordingOpenCodeProcessLauncher(reportedPID: 7_001)
+        let factory = makeFactory(
+            launcher: launcher,
+            ports: [52_101],
+            passwords: ["workspace-password"],
+            stateRoot: stateRoot
+        )
+
+        let session = try await factory.acquire(workspacePath: workspace.path)
+        let canonicalWorkspace = canonicalPath(workspace.path)
+        XCTAssertEqual(session.workspacePath, canonicalWorkspace)
+        XCTAssertEqual(session.connection.baseURL.absoluteString, "http://127.0.0.1:52101")
+        XCTAssertEqual(session.connection.password, "workspace-password")
+
+        let lastRequest = await launcher.lastRequest()
+        let request = try XCTUnwrap(lastRequest)
+        XCTAssertEqual(canonicalPath(request.workingDirectoryURL.path), canonicalWorkspace)
+        let stateDirectory = await factory.stateDirectoryURL(forWorkspacePath: workspace.path)
+        XCTAssertEqual(
+            request.environment["OPENCODE_CONFIG"],
+            stateDirectory.appendingPathComponent(ManagedOpenCodeConfiguration.fileName).path
+        )
+        XCTAssertFalse(
+            request.environment["OPENCODE_CONFIG"]?.hasPrefix(canonicalWorkspace + "/") ?? true,
+            "The managed configuration must not be written into the owned worktree"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: workspace.appendingPathComponent("opencode.json").path
+            ),
+            "A workspace-rooted server must not pollute the worktree with a project config"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: workspace.appendingPathComponent(ManagedOpenCodeConfiguration.fileName).path
+            ),
+            "A workspace-rooted server must not pollute the worktree with the managed config"
+        )
+        XCTAssertEqual(
+            request.logDirectoryURL.resolvingSymlinksInPath().standardized.path,
+            stateDirectory.resolvingSymlinksInPath().standardized.path,
+            "The server log must live in the workspace state namespace, not in the owned worktree"
+        )
+        XCTAssertEqual(
+            OpenCodeServerLedger.leases(in: stateDirectory).map(\.pid),
+            [7_001],
+            "The lease belongs to the workspace state namespace"
+        )
+        XCTAssertTrue(
+            OpenCodeServerLedger.leases(in: workspace).isEmpty,
+            "The owned worktree never holds server leases"
+        )
+        let activeAfterAcquire = await factory.activeWorkspacePaths()
+        XCTAssertEqual(activeAfterAcquire, [canonicalWorkspace])
+
+        await session.release()
+
+        let lastHandle = await launcher.lastHandle()
+        let handle = try XCTUnwrap(lastHandle)
+        let terminationCountAfterRelease = await handle.terminationCount()
+        XCTAssertEqual(terminationCountAfterRelease, 1)
+        let connectionAfterRelease = await session.manager.currentConnection()
+        XCTAssertNil(connectionAfterRelease)
+        XCTAssertTrue(OpenCodeServerLedger.leases(in: stateDirectory).isEmpty)
+        let activeAfterRelease = await factory.activeWorkspacePaths()
+        XCTAssertTrue(activeAfterRelease.isEmpty)
+
+        await session.release()
+        let terminationCountAfterSecondRelease = await handle.terminationCount()
+        XCTAssertEqual(
+            terminationCountAfterSecondRelease,
+            1,
+            "A second release is a no-op, not a second termination"
+        )
+    }
+
+    func testSecondAcquireForTheSameWorkspaceIsRefusedWhileActive() async throws {
+        let workspace = try makeExistingWorkspace()
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let factory = makeFactory(
+            launcher: launcher,
+            ports: [52_110, 52_111],
+            passwords: ["first-password", "second-password"],
+            stateRoot: makeWorkingDirectory()
+        )
+
+        let first = try await factory.acquire(workspacePath: workspace.path)
+        do {
+            _ = try await factory.acquire(workspacePath: workspace.path)
+            XCTFail("A second server for one active workspace must be refused")
+        } catch let error as OpenCodeWorkspaceServerError {
+            guard case .workspaceServerAlreadyActive(let path) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, canonicalPath(workspace.path))
+        }
+        let launchCountAfterFirst = await launcher.launchCount()
+        XCTAssertEqual(launchCountAfterFirst, 1)
+
+        await first.release()
+        let second = try await factory.acquire(workspacePath: workspace.path)
+        let launchCountAfterSecond = await launcher.launchCount()
+        XCTAssertEqual(launchCountAfterSecond, 2)
+        XCTAssertEqual(second.connection.baseURL.absoluteString, "http://127.0.0.1:52111")
+        await second.release()
+    }
+
+    func testAcquireFailsClosedWhenTheWorkspaceCannotBeRooted() async throws {
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgenticSidebar-missing-\(UUID().uuidString)", isDirectory: true)
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let factory = makeFactory(
+            launcher: launcher,
+            ports: [52_120],
+            passwords: ["unused-password"],
+            stateRoot: makeWorkingDirectory()
+        )
+
+        do {
+            _ = try await factory.acquire(workspacePath: missing.path)
+            XCTFail("A workspace that does not exist must not be rooted")
+        } catch let error as OpenCodeWorkspaceServerError {
+            guard case .workspaceNotRootable(let path, let reason) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, canonicalPath(missing.path))
+            XCTAssertFalse(reason.isEmpty)
+        }
+        let launchCount = await launcher.launchCount()
+        XCTAssertEqual(launchCount, 0, "Nothing may be launched for an unrootable workspace")
+        let activePaths = await factory.activeWorkspacePaths()
+        XCTAssertTrue(activePaths.isEmpty)
+    }
+
+    func testDistinctWorkspacesGetDistinctPortsPasswordsAndStateNamespaces() async throws {
+        let firstWorkspace = try makeExistingWorkspace()
+        let secondWorkspace = try makeExistingWorkspace()
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let stateRoot = makeWorkingDirectory()
+        let factory = makeFactory(
+            launcher: launcher,
+            ports: [52_130, 52_131],
+            passwords: ["password-a", "password-b"],
+            stateRoot: stateRoot
+        )
+
+        let first = try await factory.acquire(workspacePath: firstWorkspace.path)
+        let second = try await factory.acquire(workspacePath: secondWorkspace.path)
+
+        XCTAssertNotEqual(first.connection.baseURL, second.connection.baseURL)
+        XCTAssertNotEqual(first.connection.password, second.connection.password)
+        let firstState = await factory.stateDirectoryURL(forWorkspacePath: firstWorkspace.path)
+        let secondState = await factory.stateDirectoryURL(forWorkspacePath: secondWorkspace.path)
+        XCTAssertNotEqual(firstState, secondState)
+        XCTAssertTrue(firstState.path.hasPrefix(stateRoot.path))
+        XCTAssertTrue(secondState.path.hasPrefix(stateRoot.path))
+
+        await first.release()
+        let secondConnection = await second.manager.currentConnection()
+        XCTAssertNotNil(secondConnection, "Stopping one workspace server must not touch another")
+        let activePaths = await factory.activeWorkspacePaths()
+        XCTAssertEqual(activePaths, [canonicalPath(secondWorkspace.path)])
+        await second.release()
+    }
+
+    func testStartupFailureLeavesNoActiveSlotAndTerminatesEveryChild() async throws {
+        let workspace = try makeExistingWorkspace()
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let healthChecker = ScriptedOpenCodeHealthChecker(
+            results: [.failure(.startupFailure), .failure(.startupFailure), .success("1.18.31")]
+        )
+        let factory = OpenCodeWorkspaceServerFactory(
+            executableLocator: StubOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            processLauncher: launcher,
+            healthChecker: healthChecker,
+            portAllocator: SequencedOpenCodePortAllocator(ports: [52_140, 52_141, 52_142]),
+            listenerVerifier: StubListenerVerifier(owns: true),
+            credentialStore: InMemoryOpenCodeCredentialStore(),
+            stateRootURL: makeWorkingDirectory(),
+            passwordGenerator: { "generated-password" }
+        )
+
+        do {
+            _ = try await factory.acquire(workspacePath: workspace.path)
+            XCTFail("A server that never becomes healthy must fail closed")
+        } catch let error as OpenCodeWorkspaceServerError {
+            guard case .startupFailed(let path, let reason) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(path, canonicalPath(workspace.path))
+            XCTAssertFalse(reason.isEmpty)
+        }
+
+        let activeAfterFailure = await factory.activeWorkspacePaths()
+        XCTAssertTrue(
+            activeAfterFailure.isEmpty,
+            "A failed start must not leave the workspace reserved"
+        )
+        // Health is retried once on a fresh port; both children must be terminated.
+        let handles = await launcher.recordedHandles()
+        XCTAssertEqual(handles.count, 2)
+        for handle in handles {
+            let terminationCount = await handle.terminationCount()
+            XCTAssertEqual(terminationCount, 1)
+        }
+
+        // The slot is free again: the next acquire (health now succeeds) works.
+        let session = try await factory.acquire(workspacePath: workspace.path)
+        XCTAssertEqual(session.connection.baseURL.absoluteString, "http://127.0.0.1:52142")
+        await session.release()
+        let activeAfterSuccess = await factory.activeWorkspacePaths()
+        XCTAssertTrue(activeAfterSuccess.isEmpty)
+    }
+
+    func testStaleReleaseCannotStopAServerStartedLaterForTheSameWorkspace() async throws {
+        let workspace = try makeExistingWorkspace()
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let factory = makeFactory(
+            launcher: launcher,
+            ports: [52_150, 52_151],
+            passwords: ["password-one", "password-two"],
+            stateRoot: makeWorkingDirectory()
+        )
+
+        let first = try await factory.acquire(workspacePath: workspace.path)
+        await first.release()
+        let second = try await factory.acquire(workspacePath: workspace.path)
+
+        // Eski oturumun bırakması yeni sunucuya dokunmamalı.
+        await first.release()
+        let secondConnection = await second.manager.currentConnection()
+        XCTAssertNotNil(secondConnection)
+        let activePaths = await factory.activeWorkspacePaths()
+        XCTAssertEqual(activePaths, [canonicalPath(workspace.path)])
+        await second.release()
+    }
+
+    func testWorkspaceServersDoNotTouchTheChatServerLifecycle() async throws {
+        let workspace = try makeExistingWorkspace()
+        let chatLauncher = RecordingOpenCodeProcessLauncher(reportedPID: 7_100)
+        let chatManager = ManagedOpenCodeServerManager(
+            executableLocator: StubOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            processLauncher: chatLauncher,
+            healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
+            portAllocator: StubOpenCodePortAllocator(port: 52_300),
+            listenerVerifier: StubListenerVerifier(owns: true),
+            credentialStore: InMemoryOpenCodeCredentialStore(),
+            workingDirectoryURL: makeWorkingDirectory(),
+            passwordGenerator: { "chat-password" }
+        )
+        let chatConnection = try await chatManager.start(computerUse: nil)
+
+        let workspaceLauncher = RecordingOpenCodeProcessLauncher(reportedPID: 7_101)
+        let factory = makeFactory(
+            launcher: workspaceLauncher,
+            ports: [52_301],
+            passwords: ["workspace-password"],
+            stateRoot: makeWorkingDirectory()
+        )
+        let session = try await factory.acquire(workspacePath: workspace.path)
+
+        XCTAssertNotEqual(session.connection.baseURL, chatConnection.baseURL)
+        XCTAssertNotEqual(session.connection.password, chatConnection.password)
+        let workspaceRequest = await workspaceLauncher.lastRequest()
+        let chatRequest = await chatLauncher.lastRequest()
+        XCTAssertNotEqual(workspaceRequest?.workingDirectoryURL, chatRequest?.workingDirectoryURL)
+
+        let lastChatHandle = await chatLauncher.lastHandle()
+        let chatHandle = try XCTUnwrap(lastChatHandle)
+        let chatTerminationsBefore = await chatHandle.terminationCount()
+        XCTAssertEqual(chatTerminationsBefore, 0)
+        let chatConnectionWhileWorkspaceRuns = await chatManager.currentConnection()
+        XCTAssertEqual(chatConnectionWhileWorkspaceRuns, chatConnection)
+
+        await session.release()
+
+        let chatConnectionAfterRelease = await chatManager.currentConnection()
+        XCTAssertEqual(
+            chatConnectionAfterRelease,
+            chatConnection,
+            "Releasing a workspace server must leave the chat server exactly as it was"
+        )
+        let chatTerminationsAfter = await chatHandle.terminationCount()
+        XCTAssertEqual(chatTerminationsAfter, 0)
+
+        await chatManager.stop()
+    }
+    func testStopAllEndsEveryActiveWorkspaceServerAndIsIdempotent() async throws {
+        let firstWorkspace = try makeExistingWorkspace()
+        let secondWorkspace = try makeExistingWorkspace()
+        let launcher = RecordingOpenCodeProcessLauncher()
+        let stateRoot = makeWorkingDirectory()
+        let factory = makeFactory(
+            launcher: launcher,
+            ports: [52_160, 52_161],
+            passwords: ["password-one", "password-two"],
+            stateRoot: stateRoot
+        )
+
+        _ = try await factory.acquire(workspacePath: firstWorkspace.path)
+        _ = try await factory.acquire(workspacePath: secondWorkspace.path)
+
+        let stopped = await factory.stopAll()
+        XCTAssertEqual(stopped, 2)
+        let handles = await launcher.recordedHandles()
+        XCTAssertEqual(handles.count, 2)
+        for handle in handles {
+            let terminations = await handle.terminationCount()
+            XCTAssertEqual(terminations, 1)
+        }
+        let activeAfterStop = await factory.activeWorkspacePaths()
+        XCTAssertTrue(activeAfterStop.isEmpty)
+        let firstState = await factory.stateDirectoryURL(forWorkspacePath: firstWorkspace.path)
+        let secondState = await factory.stateDirectoryURL(forWorkspacePath: secondWorkspace.path)
+        XCTAssertTrue(OpenCodeServerLedger.leases(in: firstState).isEmpty)
+        XCTAssertTrue(OpenCodeServerLedger.leases(in: secondState).isEmpty)
+
+        let stoppedAgain = await factory.stopAll()
+        XCTAssertEqual(stoppedAgain, 0)
+    }
+
+    // MARK: - Yardımcılar
+
+    private func makeFactory(
+        launcher: RecordingOpenCodeProcessLauncher,
+        ports: [UInt16],
+        passwords: [String],
+        stateRoot: URL
+    ) -> OpenCodeWorkspaceServerFactory {
+        let generator = RotatingPasswordGenerator(passwords: passwords)
+        return OpenCodeWorkspaceServerFactory(
+            executableLocator: StubOpenCodeExecutableLocator(
+                url: URL(fileURLWithPath: "/opt/homebrew/bin/opencode")
+            ),
+            processLauncher: launcher,
+            healthChecker: StubOpenCodeHealthChecker(result: .success("1.18.31")),
+            portAllocator: SequencedOpenCodePortAllocator(ports: ports),
+            listenerVerifier: StubListenerVerifier(owns: true),
+            credentialStore: InMemoryOpenCodeCredentialStore(),
+            stateRootURL: stateRoot,
+            passwordGenerator: { await generator.next() }
+        )
+    }
+
+    private func makeExistingWorkspace() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgenticSidebar-workspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    private func canonicalPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardized.path
+    }
+}
+
+/// Üretim başlatıcının günlük konumu: sunucu günlüğü çalışma dizinine değil
+/// isteğin günlük dizinine yazılır. Çalışma alanına köklenmiş sunucularda
+/// çalışma dizini sahipli çalışma kopyasıdır; günlük oraya düşerse izlenmeyen
+/// dosya olarak parmak izini bozar ve çalışma kopyasını kirletir.
+final class FoundationOpenCodeProcessLauncherLogTests: XCTestCase {
+    func testLaunchWritesServerLogToLogDirectoryNotWorkingDirectory() async throws {
+        let workingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgenticSidebar-workdir-\(UUID().uuidString)", isDirectory: true)
+        let logDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgenticSidebar-logdir-\(UUID().uuidString)", isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: workingDirectory)
+            try? FileManager.default.removeItem(at: logDirectory)
+        }
+
+        let launcher = FoundationOpenCodeProcessLauncher()
+        let request = OpenCodeProcessLaunchRequest(
+            executableURL: URL(fileURLWithPath: "/usr/bin/true"),
+            arguments: [],
+            environment: [:],
+            workingDirectoryURL: workingDirectory,
+            logDirectoryURL: logDirectory
+        )
+        let handle = try await launcher.launch(request)
+        await handle.terminate()
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: logDirectory.appendingPathComponent("opencode-server.log").path
+            ),
+            "The server log must be written to the request's log directory"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: workingDirectory.appendingPathComponent("opencode-server.log").path
+            ),
+            "The server log must not pollute the working directory"
+        )
+    }
+}
+
+/// Sırayla farklı portlar dağıtır; tükenirse başlatma hatası verir.
+private final class SequencedOpenCodePortAllocator: OpenCodePortAllocating, @unchecked Sendable {
+    private let lock = NSLock()
+    private var ports: [UInt16]
+
+    init(ports: [UInt16]) {
+        self.ports = ports
+    }
+
+    func allocate() throws -> UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !ports.isEmpty else {
+            throw ProviderRuntimeError.startupFailure
+        }
+        return ports.removeFirst()
+    }
+}
+
+/// Sıradaki sağlık yanıtını döndürür; script tükenirse son sonucu yineler.
+private actor ScriptedOpenCodeHealthChecker: OpenCodeHealthChecking {
+    private var results: [Result<String, ProviderRuntimeError>]
+
+    init(results: [Result<String, ProviderRuntimeError>]) {
+        self.results = results
+    }
+
+    func waitUntilHealthy(connection: OpenCodeServerConnection) async throws -> String {
+        let result: Result<String, ProviderRuntimeError>
+        if results.count > 1 {
+            result = results.removeFirst()
+        } else {
+            result = results.first ?? .failure(.startupFailure)
+        }
+        return try result.get()
     }
 }
 

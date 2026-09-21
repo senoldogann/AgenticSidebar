@@ -40,4 +40,10 @@ final class GoalElapsedTests: XCTestCase {
         let label = GoalElapsedLabel(engine: nil)
         XCTAssertEqual(label.elapsedText(at: Date()), "")
     }
+
+    func testStartClockIsNotEmpty() {
+        let date = Date(timeIntervalSince1970: 5_000_000)
+        XCTAssertFalse(GoalStartFormat.clock(date).isEmpty, "Başlangıç saati boş olmamalı")
+        XCTAssertFalse(GoalStartFormat.full(date).isEmpty)
+    }
 }

@@ -160,6 +160,50 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: freshURL.path))
     }
 
+    func testShouldRescanMatrix() {
+        let now = Date()
+        XCTAssertTrue(
+            ScreenshotMonitorService.shouldRescan(directoryModDate: now, lastScannedModDate: nil),
+            "İlk tarama her zaman koşar"
+        )
+        XCTAssertTrue(
+            ScreenshotMonitorService.shouldRescan(directoryModDate: nil, lastScannedModDate: now),
+            "Okunamayan dizin her zaman taranır, yoksa yeni dosya kaçardı"
+        )
+        XCTAssertTrue(
+            ScreenshotMonitorService.shouldRescan(
+                directoryModDate: now.addingTimeInterval(1),
+                lastScannedModDate: now
+            )
+        )
+        XCTAssertFalse(
+            ScreenshotMonitorService.shouldRescan(directoryModDate: now, lastScannedModDate: now),
+            "Değişmeyen dizin taranmaz (enerji)"
+        )
+    }
+
+    func testTickSkipsUnchangedDirectoryAndFindsNewFiles() async throws {
+        let recorder = ScreenshotSubmissionRecorder()
+        let service = await makeService(recorder: recorder)
+        let (monitor, _) = makeMonitor(service: service, recognizer: "skip text")
+
+        monitor.start()
+        monitor.stop()
+
+        await monitor.tick()
+        var submissions = await waitForSubmissions(recorder, count: 0)
+        XCTAssertEqual(submissions.count, 0)
+
+        _ = try writeScreenshot(named: "Screenshot 2026-09-16 at 13.00.00.png")
+        await monitor.tick()
+        submissions = await waitForSubmissions(recorder, count: 1)
+        XCTAssertEqual(submissions.count, 1)
+
+        await monitor.tick()
+        submissions = await waitForSubmissions(recorder, count: 1)
+        XCTAssertEqual(submissions.count, 1, "Dizin değişmediyse ikinci tarama atlanır, yine de kayıt korunur")
+    }
+
     /// Submissions run inside a MainActor task, so the recorder is polled instead
     /// of being asserted synchronously.
     private func waitForSubmissions(
