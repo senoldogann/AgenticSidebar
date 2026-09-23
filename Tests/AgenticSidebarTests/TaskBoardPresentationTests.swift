@@ -25,6 +25,7 @@ private enum TaskBoardFixtures {
         unmetPrerequisiteIDs: [UUID] = [],
         criteriaCompleted: Int = 0,
         criteriaTotal: Int = 0,
+        budget: ExecutionBudget = ExecutionBudget(),
         updatedAt: Date = TaskBoardFixtures.fixedDate
     ) -> TaskBoardCard {
         TaskBoardCard(
@@ -43,6 +44,7 @@ private enum TaskBoardFixtures {
             unmetPrerequisiteIDs: unmetPrerequisiteIDs,
             criteriaCompleted: criteriaCompleted,
             criteriaTotal: criteriaTotal,
+            budget: budget,
             updatedAt: updatedAt
         )
     }
@@ -349,7 +351,7 @@ final class TaskBoardPresentationTests: XCTestCase {
         )
         XCTAssertEqual(
             actions.map(\.action),
-            [.start, .pause, .resume, .stop, .retry, .requestChanges, .accept]
+            [.start, .pause, .resume, .stop, .retry, .requestChanges, .accept, .reopen]
         )
         XCTAssertEqual(Set(actions.map(\.action)), Set(TaskBoardAction.allCases))
     }
@@ -581,7 +583,7 @@ final class TaskBoardPresentationTests: XCTestCase {
         XCTAssertEqual(enabledActions(store: store, taskID: task.id, actor: "reviewer", feedback: "geri bildirim"), [.resume, .retry])
     }
 
-    func testTerminalCardsEnableNothing() async throws {
+    func testTerminalCardsEnableOnlyReopen() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()
         let project = try await makeProject(service: service)
@@ -589,8 +591,9 @@ final class TaskBoardPresentationTests: XCTestCase {
         let cancelled = try await seedTask(harness: harness, projectID: project.id, title: "İptal", status: .cancelled, stage: .analysis)
         let store = await makeLoadedStore(harness: harness, projectID: project.id)
 
-        XCTAssertTrue(enabledActions(store: store, taskID: done.id, actor: "reviewer", feedback: "geri bildirim").isEmpty)
-        XCTAssertTrue(enabledActions(store: store, taskID: cancelled.id, actor: "reviewer", feedback: "geri bildirim").isEmpty)
+        // Terminal kartlarda yalnız yeniden açma açıktır.
+        XCTAssertEqual(enabledActions(store: store, taskID: done.id, actor: "reviewer", feedback: "geri bildirim"), [.reopen])
+        XCTAssertEqual(enabledActions(store: store, taskID: cancelled.id, actor: "reviewer", feedback: "geri bildirim"), [.reopen])
     }
 
     func testReviewCardEnablesRequestChangesAndAcceptOnly() async throws {
@@ -627,10 +630,10 @@ final class TaskBoardPresentationTests: XCTestCase {
             actor: "reviewer",
             feedback: "geri bildirim"
         )
+        // Geçici ret sabitlenmez: gerekçe çağrıya döner, düğme bir
+        // sonraki denemede yeniden değerlendirilir.
         let start = actions.first { $0.action == .start }
-        XCTAssertFalse(start?.isEnabled == true)
-        XCTAssertTrue(start?.disabledReason?.contains("toolUse") == true)
-        XCTAssertTrue(start?.accessibilityLabel.contains("toolUse") == true)
+        XCTAssertTrue(start?.isEnabled == true)
     }
 
     func testBlockedAcceptanceKeepsAcceptDisabledWithGateReasons() async throws {
@@ -1098,7 +1101,7 @@ final class TaskBoardPresentationTests: XCTestCase {
 
     func testPrimaryAndOverflowSetsPartitionEveryActionInCanonicalOrder() {
         XCTAssertEqual(TaskActionBarPresenter.primaryActions, [.start, .pause, .resume, .stop, .accept])
-        XCTAssertEqual(TaskActionBarPresenter.secondaryActions, [.retry, .requestChanges])
+        XCTAssertEqual(TaskActionBarPresenter.secondaryActions, [.retry, .requestChanges, .reopen])
         XCTAssertTrue(
             Set(TaskActionBarPresenter.primaryActions)
                 .isDisjoint(with: Set(TaskActionBarPresenter.secondaryActions))
@@ -1126,7 +1129,7 @@ final class TaskBoardPresentationTests: XCTestCase {
             TaskActionBarPresenter.primary(actions).map(\.action),
             [.start, .pause, .resume, .stop, .accept]
         )
-        XCTAssertEqual(TaskActionBarPresenter.overflow(actions).map(\.action), [.retry, .requestChanges])
+        XCTAssertEqual(TaskActionBarPresenter.overflow(actions).map(\.action), [.retry, .requestChanges, .reopen])
     }
 
     // MARK: - Board injection point

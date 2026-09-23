@@ -41,6 +41,25 @@ struct SlashCommand: Identifiable, Equatable, Sendable {
         return all.filter { $0.name.lowercased().contains(needle) }
     }
 
+    /// İçeriksiz komut adı (`/btw`, `/btw `, `/goal`): soru/hedef yoksa
+    /// transkripte yazılmaz, ipucu gösterilir. `parseGoal` ve
+    /// `ComposerView.sideQuestion(from:)` ile aynı önek sözleşmesi.
+    static func bareCommandName(from text: String) -> String? {
+        let lowered = text.lowercased()
+        for command in all {
+            let prefix = "/\(command.name)"
+            guard lowered.hasPrefix(prefix) else {
+                continue
+            }
+            let remainder = text.dropFirst(prefix.count)
+            guard remainder.isEmpty || remainder.allSatisfy({ $0.isWhitespace }) else {
+                continue
+            }
+            return command.name
+        }
+        return nil
+    }
+
     /// `/goal hedef` önekini ayıklar: `/goal` + boşluk + boş-olmayan hedef.
     /// `ComposerView.sideQuestion(from:)` ile aynı sözleşme; büyük/küçük
     /// harf duyarsızdır. Eşleşmezse `nil` döner, metin normal gönderilir.

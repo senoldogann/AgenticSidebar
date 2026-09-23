@@ -118,4 +118,14 @@ final class ComputerUseFilesTests: XCTestCase {
         XCTAssertTrue(instructions.contains("COMPUTER_USER_TAKEOVER"))
         XCTAssertTrue(instructions.contains("Hands off while anything runs"))
     }
+
+    func testInstructionsDescribeUnavailableRecoveryWithoutBlindRetry() {
+        let instructions = ComputerUseFiles.instructionsMarkdown()
+        // Ekran görüntüsündeki döngü (observe -> UNAVAILABLE -> aynı observe)
+        // yasaktır: önce tek bir health yoklaması, koşmuyorsa dur ve yönlendir.
+        XCTAssertTrue(instructions.contains("COMPUTER_UNAVAILABLE"))
+        XCTAssertTrue(instructions.contains("COMPUTER_DISABLED"))
+        XCTAssertTrue(instructions.contains("do NOT retry the same observe/click in a loop"))
+        XCTAssertTrue(instructions.contains("computer_health"))
+    }
 }

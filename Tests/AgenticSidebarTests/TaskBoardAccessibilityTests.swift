@@ -18,7 +18,8 @@ final class TaskBoardAccessibilityTests: XCTestCase {
             blockReason: TaskBlockReason? = nil,
             unmetPrerequisiteIDs: [UUID] = [],
             criteriaCompleted: Int = 0,
-            criteriaTotal: Int = 0
+            criteriaTotal: Int = 0,
+            budget: ExecutionBudget = ExecutionBudget()
         ) -> TaskBoardCard {
             TaskBoardCard(
                 id: id,
@@ -36,6 +37,7 @@ final class TaskBoardAccessibilityTests: XCTestCase {
                 unmetPrerequisiteIDs: unmetPrerequisiteIDs,
                 criteriaCompleted: criteriaCompleted,
                 criteriaTotal: criteriaTotal,
+                budget: budget,
                 updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
             )
         }

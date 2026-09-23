@@ -35,6 +35,8 @@ enum AgentSessionNotice: Equatable, Sendable {
     case promptEnhancementSuperseded
     case contextCompacted
     case compactionFailed(reason: CompactionFailureReason)
+    /// Boş ya da eksik eğik-çizgi komutu: transkripte yazılmaz, ipucu gösterilir.
+    case slashCommandHint(String)
 
     /// Kırpma bildirimi mi.
     ///

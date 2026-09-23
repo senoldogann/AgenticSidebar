@@ -96,13 +96,27 @@ struct GlobalOpenCodeConfigReader: Sendable {
         static let empty = ManagedPermissionKeys(permission: [], tools: [], agents: [])
     }
 
+    /// Boyutsuz okuma yok: genel config kullanıcının dosyasıdır, şişmiş ya da
+    /// bozuk dosya belleğe yığılmadan elenir.
+    static let maximumConfigBytes = 1_048_576
+
+    private func boundedContents(of url: URL) -> String? {
+        guard fileManager.fileExists(atPath: url.path),
+            let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
+            size <= Self.maximumConfigBytes,
+            let raw = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            return nil
+        }
+        return raw
+    }
+
     /// Permission rules declared in the user's global configuration files,
     /// along with the file URL they were read from.
     func globalPermissionOverrides() -> GlobalPermissionOverride? {
         for url in configURLs {
             guard
-                fileManager.fileExists(atPath: url.path),
-                let raw = try? String(contentsOf: url, encoding: .utf8),
+                let raw = boundedContents(of: url),
                 let object = Self.decodeObject(raw)
             else {
                 continue
@@ -231,7 +245,7 @@ struct GlobalOpenCodeConfigReader: Sendable {
     func mcpServers() -> [String: MCPDefinition] {
         guard
             let url = configURLs.first(where: { fileManager.fileExists(atPath: $0.path) }),
-            let raw = try? String(contentsOf: url, encoding: .utf8),
+            let raw = boundedContents(of: url),
             let object = Self.decodeObject(raw),
             let mcp = object["mcp"] as? [String: Any]
         else {
@@ -253,7 +267,7 @@ struct GlobalOpenCodeConfigReader: Sendable {
     func pluginModules() -> [String] {
         guard
             let url = configURLs.first(where: { fileManager.fileExists(atPath: $0.path) }),
-            let raw = try? String(contentsOf: url, encoding: .utf8),
+            let raw = boundedContents(of: url),
             let object = Self.decodeObject(raw),
             let plugins = object["plugin"] as? [Any]
         else {

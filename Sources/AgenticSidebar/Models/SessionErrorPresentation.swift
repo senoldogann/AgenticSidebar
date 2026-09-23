@@ -22,7 +22,7 @@ extension AgentSessionError {
         case .unsupportedCapability:
             "The selected provider, model, or reasoning level is not supported."
         case .transportFailure:
-            "The connection to the provider failed."
+            "The connection to the provider failed. Check your internet connection and try again."
         case .streamInterrupted:
             "The response ended before it completed."
         case .contextLimitExceeded:
@@ -78,6 +78,8 @@ extension AgentSessionNotice {
             "Earlier context was compacted into a summary; the on-screen transcript is unchanged."
         case .compactionFailed(let reason):
             reason.message
+        case .slashCommandHint(let hint):
+            hint
         }
     }
 
@@ -97,6 +99,8 @@ extension AgentSessionNotice {
             "archivebox"
         case .compactionFailed:
             "exclamationmark.triangle"
+        case .slashCommandHint:
+            "slash.circle"
         }
     }
 }

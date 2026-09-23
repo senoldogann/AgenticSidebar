@@ -355,6 +355,10 @@ actor TaskScheduler {
                 continue
             }
 
+            // Not: tek görevin hatası turu düşürür (yukarı yayılır). Tur başına
+            // kurtarma (`deferred`) denenmedi: `testNonContentionClaimFailure…`
+            // yayılma sözleşmesini sabitler ve `schedule()` üretimde çağrılmadığı
+            // için açlık riski gizildir. Sözleşme değişirse test güncellenmeli.
             entries.append(try await claimEntry(for: task, projectID: projectID, history: history))
         }
 

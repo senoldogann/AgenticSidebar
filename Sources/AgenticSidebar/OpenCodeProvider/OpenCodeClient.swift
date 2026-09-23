@@ -158,13 +158,22 @@ struct OpenCodeClient: OpenCodeClientProtocol {
             .filter { connected.contains($0.id) }
             .flatMap { provider in
                 provider.models.values.map { model in
-                    ProviderModelCapability(
+                    // Üst katalog bazı akıl yürüten modellerde (ör. opencode-go
+                    // `mimo-v2.6-pro`) `variants` sözlüğünü boş bırakır; oysa aynı
+                    // model başka sağlayıcıda `low/medium/high` taşır ve sunucu
+                    // bu varyant değerini kabul eder. Boş varyant + reasoning
+                    // durumunda efor menüsü boş kalmasın diye geri doldurulur;
+                    // bildirilen varyant varsa aynen korunur.
+                    let variantIDs =
+                        model.variants.isEmpty && model.supportsReasoning
+                        ? Self.reasoningFallbackVariantIDs : model.variants
+                    return ProviderModelCapability(
                         id: OpenCodeModelReference(
                             providerID: model.providerID,
                             modelID: model.id
                         ).flattenedID,
                         displayName: "\(provider.name) · \(model.name)",
-                        variants: model.variants.map {
+                        variants: variantIDs.map {
                             ProviderVariant(
                                 id: ProviderVariantID($0),
                                 displayName: Self.variantDisplayName($0)
@@ -440,7 +449,14 @@ struct OpenCodeClient: OpenCodeClientProtocol {
 
         do {
             let stream = try await transport.stream(request)
-            try validate(statusCode: stream.statusCode)
+            do {
+                try validate(statusCode: stream.statusCode)
+            } catch {
+                // Doğrulama patlarsa canlı akış düşürülmeden önce kapatılmalı,
+                // yoksa soket ve iletme görevi sızar.
+                await stream.cancel()
+                throw error
+            }
             return stream
         } catch {
             throw ProviderRuntimeError.mapTransportError(error)
@@ -487,8 +503,11 @@ struct OpenCodeClient: OpenCodeClientProtocol {
         pathComponents: [String],
         method: String
     ) -> URLRequest {
+        // Yol bileşenleri kullanıcı/sunucu girdisi taşıyabilir (`sessionID`,
+        // MCP adı, `providerID`): `/` içeren değer yanlış kimlikli uç noktaya
+        // istek atar. Bileşenler kodlanarak tek segmentte tutulur.
         let url = pathComponents.reduce(connection.baseURL) {
-            $0.appendingPathComponent($1)
+            $0.appendingPathComponent(Self.encodedPathComponent($1))
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -532,6 +551,19 @@ struct OpenCodeClient: OpenCodeClientProtocol {
     private static func variantDisplayName(_ rawValue: String) -> String {
         rawValue == "xhigh" ? "XHigh" : rawValue.capitalized
     }
+
+    /// Tek yol segmenti: `/` dahil ayrıcılar kodlanır, boş bileşen reddedilir.
+    private static func encodedPathComponent(_ component: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/")
+        return component.addingPercentEncoding(withAllowedCharacters: allowed) ?? component
+    }
+
+    /// Akıl yürüten ama katalogda varyantsız gelen modellerin efor menüsü.
+    /// Zen/opencode kataloğundaki diğer akıl yürüten modellerin ortak kümesidir
+    /// (`low/medium/high`; ör. aynı `mimo-v2.6-pro` xiaomi sağlayıcısında
+    /// birebir bunu bildirir).
+    private static let reasoningFallbackVariantIDs = ["low", "medium", "high"]
 
     private struct APIAuthBody: Encodable {
         let type: String

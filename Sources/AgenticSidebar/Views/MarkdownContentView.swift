@@ -174,11 +174,16 @@ struct MarkdownContentView: View {
         var rows: [MarkdownRow] = []
         var run: [MarkdownBlock] = []
 
+        // Satır kimliği konumsaldır: akışta açık çit kapanıp kod bloğuna
+        // dönüşünce eski sürüm ilk bloğun içeriğe bağlı kimliğini (`p-1` →
+        // `p-3`) değiştirip `NSTextView`'i yeniden kuruyor, satır bir kare
+        // boş kalıyordu. Konum tabanlı kimlikte büyüyen koşu aynı görünümde
+        // kalır, kapanan çit yalnız yeni satır ekler.
         func flushRun() {
-            guard let first = run.first else {
+            guard !run.isEmpty else {
                 return
             }
-            rows.append(.text(id: first.id, blocks: run))
+            rows.append(.text(id: "run-\(rows.count)", blocks: run))
             run = []
         }
 

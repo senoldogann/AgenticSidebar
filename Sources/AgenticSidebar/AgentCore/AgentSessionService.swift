@@ -560,6 +560,9 @@ final class AgentSessionService {
             do {
                 let capabilities = try await runtime.capabilities()
                 guard capabilities.id == runtime.id else {
+                    AppLog.agentSession.error(
+                        "Capability response identity does not match the runtime; ignoring it"
+                    )
                     continue
                 }
                 loadedProviders.append(capabilities)
@@ -575,11 +578,15 @@ final class AgentSessionService {
 
         // Every session keeps a usable configuration, but only idle ones are
         // re-normalized: a running turn already captured its configuration.
-        for session in sessions {
-            session.applyCapabilities(
-                loadedProviders,
-                normalizeConfiguration: !session.isBusy
-            )
+        // Boş keşif sonucu normalizasyonu atlanır; tek bir başarısız yenileme
+        // tüm boş oturumların yapılandırmasını silmemeli.
+        if !loadedProviders.isEmpty {
+            for session in sessions {
+                session.applyCapabilities(
+                    loadedProviders,
+                    normalizeConfiguration: !session.isBusy
+                )
+            }
         }
         // Yapılandırmasız kalan boşta oturum genel tercihle açılır; açık
         // seçimi olan oturuma dokunulmaz, koşan tura hiç dokunulmaz.

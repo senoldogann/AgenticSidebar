@@ -1,5 +1,24 @@
 import Foundation
 
+/// Language/ecosystem of a registered project, driving verification recipes
+/// and acceptance gates.
+///
+/// Detection is marker-based and deterministic (see `ProjectKindDetector`):
+/// a `Package.swift` with an executable product is SwiftPM, `package.json`
+/// is Node, `pyproject.toml`/`setup.py`/`setup.cfg`/`requirements.txt` is
+/// Python, `go.mod` is Go, `Cargo.toml` is Rust. A Git repository without
+/// any of those markers is `generic`: the board still tracks, runs and
+/// reviews it, but automated verification is limited to the workspace
+/// fingerprint and human acceptance criteria.
+public enum ProjectKind: String, Sendable, Codable, Equatable, CaseIterable {
+    case swiftpm
+    case node
+    case python
+    case go
+    case rust
+    case generic
+}
+
 /// Unique project registered in the Task Board.
 public struct CodingProject: Sendable, Identifiable, Codable, Equatable {
     public let id: UUID
@@ -7,6 +26,7 @@ public struct CodingProject: Sendable, Identifiable, Codable, Equatable {
     public var repositoryPath: String
     public var gitIdentity: String
     public var protectedRefs: [String]
+    public var kind: ProjectKind
     public let createdAt: Date
 
     public init(
@@ -15,6 +35,7 @@ public struct CodingProject: Sendable, Identifiable, Codable, Equatable {
         repositoryPath: String,
         gitIdentity: String,
         protectedRefs: [String] = ["main", "master"],
+        kind: ProjectKind = .generic,
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -22,7 +43,42 @@ public struct CodingProject: Sendable, Identifiable, Codable, Equatable {
         self.repositoryPath = repositoryPath
         self.gitIdentity = gitIdentity
         self.protectedRefs = protectedRefs
+        self.kind = kind
         self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case repositoryPath
+        case gitIdentity
+        case protectedRefs
+        case kind
+        case createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        repositoryPath = try container.decode(String.self, forKey: .repositoryPath)
+        gitIdentity = try container.decode(String.self, forKey: .gitIdentity)
+        protectedRefs = try container.decode([String].self, forKey: .protectedRefs)
+        // `kind` alanı sonradan eklendi: eski arşivlerde anahtar yoktur,
+        // yokluk "bilinmiyor" demektir ve pano onu `generic` sayar.
+        kind = try container.decodeIfPresent(ProjectKind.self, forKey: .kind) ?? .generic
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(repositoryPath, forKey: .repositoryPath)
+        try container.encode(gitIdentity, forKey: .gitIdentity)
+        try container.encode(protectedRefs, forKey: .protectedRefs)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(createdAt, forKey: .createdAt)
     }
 }
 

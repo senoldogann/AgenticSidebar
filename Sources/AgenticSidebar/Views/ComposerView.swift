@@ -337,6 +337,13 @@ struct ComposerView: View {
         .animation(.easeOut(duration: 0.14), value: visibleTrigger)
         .animation(.easeOut(duration: 0.14), value: focusedSession.queuedPrompts.isEmpty)
         .animation(.easeOut(duration: 0.14), value: focusedSession.todos.count)
+        // Panel `shouldShow` ile durum değişiminde de (aynı sayıda) açılıp
+        // kapanır; yalnız sayı izlenirse boy sıçraması animasyonsuz olur ve
+        // transkript kabını sarsar. Bitmemiş sayısı aynı kareyi izler.
+        .animation(
+            .easeOut(duration: 0.14),
+            value: focusedSession.todos.filter { !$0.status.isFinished }.count
+        )
         .popover(item: $previewingImage) { preview in
             ImagePreviewPopoverContent(
                 url: preview.url,
@@ -444,6 +451,11 @@ struct ComposerView: View {
         .onAppear {
             restoreStoredDraftIfEmpty()
             applyPendingRestore()
+        }
+        .onDisappear {
+            // Pane kapanınca tanıyıcı öksüz kalmamalı: mikrofon açık kalır,
+            // kısmi sonuçlar ölü taslağa akardı.
+            stopDictation()
         }
         .onChange(of: draftCenter?.pending) { _, _ in
             applyPendingRestore()
@@ -988,7 +1000,7 @@ struct ComposerView: View {
                 // The provider's drawn mark belongs here, on a label SwiftUI
                 // renders as a view, rather than inside the menu.
                 ProviderLogoView(
-                    logo: ProviderLogo.matching(selectedModelID?.rawValue ?? ""),
+                    logo: ProviderLogo.matching(resolvedSelectedModelID?.rawValue ?? ""),
                     size: 11,
                     tint: isSelectedModelThinking
                         ? (currentTheme.accentGradient.first ?? .secondary)
@@ -1274,7 +1286,8 @@ struct ComposerView: View {
     }
 
     @ViewBuilder
-    private var submitButton: some View {        HStack(spacing: composerControlSpacing) {
+    private var submitButton: some View {
+        HStack(spacing: composerControlSpacing) {
             sendOrQueueButton
 
             if focusedSession.isBusy {
@@ -1369,11 +1382,28 @@ struct ComposerView: View {
         focusedSession.configuration?.modelID
     }
 
+    /// Listede gerçekten bulunan seçim; bulunamayan kimlik görüntüde ve
+    /// logoda eski değeri taşımaz.
+    private var resolvedSelectedModelID: ProviderModelID? {
+        guard let selectedModelID,
+            focusedSession.availableModels.contains(where: { $0.id == selectedModelID })
+        else {
+            return nil
+        }
+        return selectedModelID
+    }
+
     private var selectedModelName: String {
+        // Seçili model listede yoksa ilk modelin adı yazılmamalı: hap yanlış
+        // model adını gösterir, hiçbir satır seçili görünmez ve gönderim bayat
+        // kimlikle devam eder. Kayıp seçim açıkça "Select model" der.
         if let selectedModelID,
             let model = focusedSession.availableModels.first(where: { $0.id == selectedModelID })
         {
             return model.displayName
+        }
+        if selectedModelID != nil {
+            return "Select model"
         }
         return focusedSession.availableModels.first?.displayName ?? "Select model"
     }
@@ -1396,10 +1426,13 @@ struct ComposerView: View {
     }
 
     private var selectedVariantName: String {
-        if let selectedVariantID,
-            let variant = focusedSession.availableVariants.first(where: { $0.id == selectedVariantID })
-        {
-            return variant.displayName
+        if let selectedVariantID {
+            if let variant = focusedSession.availableVariants.first(where: { $0.id == selectedVariantID }) {
+                return variant.displayName
+            }
+            // Listede olmayan varyant "Default" gibi davranmamalı: çip
+            // bekleyen değeri söyler, menüde hiçbir satır seçili görünmez.
+            return selectedVariantID.rawValue
         }
         return "Default"
     }
@@ -1469,11 +1502,30 @@ struct ComposerView: View {
             sessionService.materializePendingSession(pending)
         }
 
+        // İçeriksiz komut (`/btw`, `/goal`): transkripte yazılmaz, ipucu
+        // gösterilir, taslak korunur.
+        if let bare = SlashCommand.bareCommandName(from: effectivePrompt) {
+            focusedSession.presentNotice(
+                .slashCommandHint("Type a question after /\(bare), e.g. /\(bare) what does this do?"),
+                autoDismissAfter: .seconds(6)
+            )
+            return
+        }
+
         // Yan soru önek yakalama: `/btw` normal kuyruğa girmez, panele gider.
         // Meşgul oturumdan da sorulabilir; transkript kirlenmez.
         if let sideQuestion = Self.sideQuestion(from: effectivePrompt),
             let onSideQuestion
         {
+            // Ek ve etiketler yan soruya taşınmaz: sessizce düşürmek yerine
+            // durdurulur, kullanıcı neyi ayıklayacağına karar verir.
+            guard attachedURLs.isEmpty, selectedTags.isEmpty else {
+                focusedSession.presentNotice(
+                    .slashCommandHint("/btw does not take attachments or tags; remove them or send as a normal message."),
+                    autoDismissAfter: .seconds(6)
+                )
+                return
+            }
             onSideQuestion(sideQuestion, speedMode, agentMode)
             draft = ""
             attachedURLs = []
@@ -1571,7 +1623,16 @@ struct ComposerView: View {
     }
 
     private func suggestionToken(of trigger: ExtensionTrigger) -> String {
-        String(draft[trigger.tokenRange])
+        // `trigger` bir önceki gövde değerlendirmesinden kalma olabilir;
+        // taslak o sırada değiştiyse aralık artık uymaz ve `subscript`
+        // tuzağa düşer. Geçersiz aralıkta boş belirteç dönülür, panel gizlenir.
+        guard trigger.tokenRange.lowerBound >= draft.startIndex,
+            trigger.tokenRange.upperBound <= draft.endIndex,
+            trigger.tokenRange.lowerBound <= trigger.tokenRange.upperBound
+        else {
+            return ""
+        }
+        return String(draft[trigger.tokenRange])
     }
 
     private func dismissSuggestions(_ trigger: ExtensionTrigger) {

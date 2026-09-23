@@ -63,6 +63,22 @@ public enum AcceptanceGate {
     /// forever; a lint that actually ran and failed still blocks.
     public static let swiftPMRequiredSteps: [String] = ["build", "test"]
 
+    /// Required verification steps for one project kind.
+    ///
+    /// Her dil tarifi `build` + `test` adımlarını aynı adla ürettiği için
+    /// dilli projelerde kapı aynıdır; `generic` depoda otomatik denetim
+    /// yoktur (`snapshot` adımı yalnız parmak izini mühürler) ve kabul insan
+    /// ölçütlerine kalır. Bilinmeyen tür asla boş kapı üretmez: kapı
+    /// fail-closed çalışır.
+    public static func requiredSteps(for kind: ProjectKind) -> [String] {
+        switch kind {
+        case .swiftpm, .node, .python, .go, .rust:
+            ["build", "test"]
+        case .generic:
+            []
+        }
+    }
+
     public static func evaluate(
         task: CodingTask,
         attempt: TaskAttempt,

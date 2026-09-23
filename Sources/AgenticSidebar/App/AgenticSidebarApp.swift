@@ -764,7 +764,9 @@ extension TaskBoardComposition {
             gitExecutableDirectory: URL(fileURLWithPath: "/usr/bin")
         )
         let evidenceLedger = TaskEvidenceLedger(
-            probe: WorkspaceFingerprintProbe(runner: verificationRunner)
+            probe: WorkspaceFingerprintProbe(runner: verificationRunner),
+            repository: repository,
+            preflight: preflight
         )
         let verifier = RecipeTaskVerifier(
             resolver: VerificationResolver(toolchain: .detected()),
@@ -1089,18 +1091,27 @@ struct LiveExecutionFingerprintProvider: TaskExecutionFingerprintProviding {
 
 /// Gönderim öncesi doğrulama ön kontrolünün canlı karşılığı.
 ///
-/// Sahipli çalışma alanı güvenilir tarifeye çözülemezse (`Package.swift`
-/// yoksa) Türkçe gerekçe döner; servis talebi geri çekip ajanı hiç
-/// başlatmaz. Sahiplik yokluğu parmak izi yolunda zaten reddedildiği için
-/// burası yalnız ham nedeni taşır.
+/// Sahipli çalışma alanı güvenilir tarifeye çözülemezse (tanınan işaret
+/// yok, `.git` bile yok) Türkçe gerekçe döner; servis talebi geri çekip
+/// ajanı hiç başlatmaz. Sahiplik yokluğu parmak izi yolunda zaten
+/// reddedildiği için burası yalnız ham nedeni taşır.
 struct LiveVerificationPreflightProvider: TaskVerificationPreflightProviding {
     let workspaces: any TaskWorkspacePreflightPort
 
     func unresolvableReason(projectID: UUID, taskID: UUID) async -> String? {
         switch await workspaces.preflight(projectID: projectID, taskID: taskID) {
         case .owned(let workspace):
+            guard VerificationResolver.resolveKind(repository: URL(fileURLWithPath: workspace.workspacePath)) != nil else {
+                return "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanında tanınan proje işareti yok — "
+                    + "`Package.swift`, `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml` işaretlerinden "
+                    + "biri ya da Git deposu kökü gerekir; ajan koşusu başlamadan reddedildi"
+            }
+            // SwiftPM deposu çalıştırılabilir ürün bildirmiyorsa tarif
+            // üretilemez; hızlı kapı bunu da yakalar (ayrıntı çözümleyicide).
             guard VerificationResolver.isResolvable(repository: URL(fileURLWithPath: workspace.workspacePath)) else {
-                return "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanında Package.swift yok — bu pano sürümü yalnız SwiftPM projelerini doğrular; ajan koşusu başlamadan reddedildi"
+                return "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanındaki `Package.swift` çalıştırılabilir "
+                    + "ürün bildirmiyor — ürün bildirimini ekleyin ya da depoyu düzeltin; "
+                    + "ajan koşusu başlamadan reddedildi"
             }
             return nil
         case .notOwned(let reason), .unavailable(let reason):
@@ -1210,7 +1221,7 @@ struct RecipeTaskVerifier: TaskVerifying {
             case .unrecognizedProject:
                 return (
                     "VERIFICATION_UNRECOGNIZED_PROJECT",
-                    "VERIFICATION_UNRECOGNIZED_PROJECT: Package.swift bulunamadı — bu pano sürümü yalnız SwiftPM projelerini doğrular; depo kökünde Package.swift olan bir proje seçin"
+                    "VERIFICATION_UNRECOGNIZED_PROJECT: tanınan proje işareti bulunamadı — depo kökünde `Package.swift`, `package.json`, `pyproject.toml`, `go.mod` ya da `Cargo.toml` işaretlerinden biri olmalı"
                 )
             case .metadataUnreadable:
                 return (
@@ -1246,21 +1257,31 @@ struct RecipeTaskVerifier: TaskVerifying {
     }
 }
 
-/// Süreç ömürlü kanıt defteri.
+/// Süreç ömürlü kanıt defteri; kalıcı mağaza yedeklidir.
 ///
-/// Depo protokolü kanıt kaydedebilir ama henüz listeleyemez; bu yüzden
+/// Depo protokolü kanıt kaydedebilir ve artık listeleyebilir; bu yüzden
 /// kompozisyon bu süreçte üretilen adım kanıtlarını ve çalışma alanı yolunu
-/// saklar. Kabul değerlendirmesinde güncel içerik parmak izi, gerçek doğrulama
-/// yürütücüsünün aynı algoritmasıyla yeniden okunur. Yeniden başlatmada defter
-/// boştur ve kabul, kanıt görülmüş gibi yapmak yerine açık bir
-/// `acceptanceInputUnavailable` gerekçesiyle reddedilir.
+/// önce bellekte tutar. Bellek boşsa (uygulama yeniden başlatıldıysa)
+/// kalıcı mağazadan onarılır: görevin kanıt satırları SQLite'tan okunur,
+/// sahipli çalışma alanı yolu ön kontrolden çözülür ve güncel içerik parmak
+/// izi gerçek doğrulama yürütücüsünün aynı algoritmasıyla yeniden okunur.
+/// Hiçbir yerde kanıt yoksa kabul, kanıt görülmüş gibi yapmak yerine açık
+/// bir `acceptanceInputUnavailable` gerekçesiyle reddedilir.
 actor TaskEvidenceLedger: TaskAcceptanceEvidenceProviding {
     private let probe: WorkspaceFingerprintProbe
+    private let repository: (any CodingTaskRepository)?
+    private let preflight: (any TaskWorkspacePreflightPort)?
     private var entries: [UUID: [VerificationEvidence]] = [:]
     private var workspacePaths: [UUID: String] = [:]
 
-    init(probe: WorkspaceFingerprintProbe) {
+    init(
+        probe: WorkspaceFingerprintProbe,
+        repository: (any CodingTaskRepository)? = nil,
+        preflight: (any TaskWorkspacePreflightPort)? = nil
+    ) {
         self.probe = probe
+        self.repository = repository
+        self.preflight = preflight
     }
 
     func record(
@@ -1276,19 +1297,42 @@ actor TaskEvidenceLedger: TaskAcceptanceEvidenceProviding {
     }
 
     func acceptanceEvidence(taskID: UUID) async throws -> TaskAcceptanceEvidence {
-        guard let recorded = entries[taskID], !recorded.isEmpty, let workspacePath = workspacePaths[taskID] else {
+        if let recorded = entries[taskID], !recorded.isEmpty, let workspacePath = workspacePaths[taskID],
+            let fingerprint = await probe.fingerprint(of: workspacePath)
+        {
+            return TaskAcceptanceEvidence(evidence: recorded, currentFingerprint: fingerprint)
+        }
+        // Bellek boş ya da parmak izi okunamıyor: kalıcı mağazadan onarmayı
+        // dene (yeniden başlatma sonrası normal yol). Yedek kablo bağlı
+        // değilse (eski testler) eski davranış korunur: açık ret.
+        guard let repository, let preflight else {
             throw TaskEvidenceLedgerError.evidenceNotLoadedInThisProcess
         }
-        guard let fingerprint = await probe.fingerprint(of: workspacePath) else {
-            throw TaskEvidenceLedgerError.workspaceFingerprintUnavailable(path: workspacePath)
+        let stored = (try? await repository.evidence(taskID: taskID)) ?? []
+        guard !stored.isEmpty else {
+            throw TaskEvidenceLedgerError.evidenceNotLoadedInThisProcess
         }
-        return TaskAcceptanceEvidence(evidence: recorded, currentFingerprint: fingerprint)
+        guard let task = try? await repository.task(id: taskID) else {
+            throw TaskEvidenceLedgerError.evidenceNotLoadedInThisProcess
+        }
+        switch await preflight.preflight(projectID: task.projectID, taskID: taskID) {
+        case .owned(let workspace):
+            guard let fingerprint = await probe.fingerprint(of: workspace.workspacePath) else {
+                throw TaskEvidenceLedgerError.workspaceFingerprintUnavailable(path: workspace.workspacePath)
+            }
+            entries[taskID] = stored
+            workspacePaths[taskID] = workspace.workspacePath
+            return TaskAcceptanceEvidence(evidence: stored, currentFingerprint: fingerprint)
+        case .notOwned(let reason), .unavailable(let reason):
+            throw TaskEvidenceLedgerError.workspaceNotOwned(reason: reason)
+        }
     }
 }
 
 enum TaskEvidenceLedgerError: LocalizedError {
     case evidenceNotLoadedInThisProcess
     case workspaceFingerprintUnavailable(path: String)
+    case workspaceNotOwned(reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -1297,6 +1341,8 @@ enum TaskEvidenceLedgerError: LocalizedError {
                 "verification evidence was recorded by an earlier process and cannot be listed by this one yet"
         case .workspaceFingerprintUnavailable(let path):
             return "the owned workspace fingerprint at \(path) could not be read"
+        case .workspaceNotOwned(let reason):
+            return "the owned workspace for this task is not available: \(reason)"
         }
     }
 }

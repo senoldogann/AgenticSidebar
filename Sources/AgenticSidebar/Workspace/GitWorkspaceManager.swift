@@ -15,11 +15,11 @@ struct WorkspaceManagerConfiguration: Sendable, Equatable {
 ///
 /// Layout (all inside the app-owned `authorizedRoot`):
 /// - `registry/<projectID>/<taskID>/<workspaceID>.json` — atomic provenance manifests
-/// - `worktrees/<projectID>/<taskID>/<workspaceID>` — detached Git worktrees
+/// - `worktrees/<projectID>/<taskID>/<workspaceID>` — branch Git worktrees (`agentic/w-*`)
 ///
 /// Creation and retirement are the only mutating operations, and both run only after
 /// the official authority preflight passes. The source checkout is never touched:
-/// `git worktree add --detach <path> <sha>` leaves the source branch and HEAD exactly
+/// `git worktree add -b <branch> <path> <sha>` leaves the source branch and HEAD exactly
 /// where they were, and no destructive Git command is ever issued.
 actor GitWorkspaceManager: WorkspaceManaging {
     private struct WorkspaceHolding: Sendable, Equatable {
@@ -30,6 +30,7 @@ actor GitWorkspaceManager: WorkspaceManaging {
     }
 
     private static let maxStatusCharacters = 1_000
+    private static let maxDirtyPreviewLines = 5
     private static let commitObjectNamePattern = "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
 
     private let runner: GitCommandRunner
@@ -71,18 +72,15 @@ actor GitWorkspaceManager: WorkspaceManaging {
                 )
             }
             guard let manifestURL = manifests.first else {
-                // No owned workspace exists: this is the creation path, so the source
-                // must be clean before anything may be created. The checked-out
-                // branch is deliberately NOT required to be writable: the worktree
-                // is created detached (`worktree add --detach <sha>`) at the
-                // resolved base commit, so the source checkout is never switched,
-                // never written and never merged into — a clean `master` checkout
-                // yields the exact same base as a detached HEAD at the same
-                // commit, and push/merge stay behind human approvals. The dirty
-                // gate stays: uncommitted work would otherwise be silently
-                // excluded from the agent's base, and that choice belongs to
-                // the human (commit or stash), not to automation.
-                try verifySourceIsClean(project: project)
+                // No owned workspace exists: this is the creation path. The checked-out
+                // branch is deliberately NOT required to be writable and the source
+                // is deliberately NOT required to be clean: every creation opens a
+                // fresh `agentic/w-*` branch at the resolved base commit
+                // (`worktree add -b`), so the source checkout is never switched,
+                // never written and never merged into — a dirty `master` checkout
+                // yields the exact same base as a clean one at the same commit,
+                // the dirty work stays in place untouched, and push/merge stay
+                // behind human approvals.
                 return .notOwned(reason: "no owned workspace for task \(task.id.uuidString)")
             }
             // A preflight may only offer a workspace whose manifest and Git registration
@@ -148,6 +146,7 @@ actor GitWorkspaceManager: WorkspaceManaging {
 
         let commitSHA = try normalizedCommitSHA(base.commitSHA)
         let repositoryURL = URL(fileURLWithPath: project.repositoryPath)
+        reapOrphanWorkspaceBranches(repositoryURL: repositoryURL)
         try verifyCommitExists(commitSHA, repositoryURL: repositoryURL)
         let commonDirIdentity = try repositoryCommonDirIdentity(repositoryURL)
         try assertWorkspaceRootOutsideRepository(project: project)
@@ -172,9 +171,11 @@ actor GitWorkspaceManager: WorkspaceManaging {
             )
         }
 
+        let branchName = Self.workspaceBranchName(workspaceID: workspaceID)
         do {
-            _ = try runGit(["worktree", "add", "--detach", targetPath, commitSHA], in: repositoryURL)
+            _ = try runGit(["worktree", "add", "-b", branchName, targetPath, commitSHA], in: repositoryURL)
         } catch {
+            deleteBranchBestEffort(branchName, repositoryURL: repositoryURL)
             removeEmptyDirectories(upTo: worktreesRoot, from: target.deletingLastPathComponent())
             throw error
         }
@@ -213,7 +214,12 @@ actor GitWorkspaceManager: WorkspaceManaging {
                 }
             }
         } catch {
-            rollbackWorktree(URL(fileURLWithPath: targetPath), manifestURL: manifestURL, repositoryURL: repositoryURL)
+            rollbackWorktree(
+                URL(fileURLWithPath: targetPath),
+                manifestURL: manifestURL,
+                repositoryURL: repositoryURL,
+                branchName: branchName
+            )
             throw error
         }
 
@@ -339,6 +345,9 @@ actor GitWorkspaceManager: WorkspaceManaging {
         } catch {
             throw WorkspaceGuardError.storeRecordFailed(reason: "manifest removal failed: \(error)")
         }
+        // Oluşturmada açılan `agentic/w-*` dalı da en iyi gayretle silinir: eski
+        // ayrık worktree'lerde dal yoktur, o zaman silme sessizce tutmaz.
+        deleteBranchBestEffort(Self.workspaceBranchName(workspaceID: workspaceID), repositoryURL: repositoryURL)
         holdings[workspaceID] = nil
         removeEmptyDirectories(upTo: worktreesRoot, from: workspaceURL.deletingLastPathComponent())
         removeEmptyDirectories(upTo: registryRoot, from: manifestURL.deletingLastPathComponent())
@@ -530,16 +539,63 @@ actor GitWorkspaceManager: WorkspaceManaging {
         return nil
     }
 
-    private func verifySourceIsClean(project: CodingProject) throws {
-        let repositoryURL = URL(fileURLWithPath: project.repositoryPath)
-        let result = try runGit(["status", "--porcelain=v1", "--untracked-files=all"], in: repositoryURL)
-        let status = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard status.isEmpty else {
-            throw WorkspaceGuardError.worktreeDirty(
-                path: canonicalPath(repositoryURL),
-                status: clip(status, limit: Self.maxStatusCharacters)
+    /// Her oluşturmada açılan yeni dalın adı.
+    ///
+    /// `worktree add -b` kaynak checkout'u switch etmez; kirli kaynak yerinde
+    /// korunur, ajan çalışması bu dalda ilerler.
+    static func workspaceBranchName(workspaceID: UUID) -> String {
+        "agentic/w-" + workspaceID.uuidString
+    }
+
+    /// Otomatik açılan dalı en iyi gayretle siler; tutmazsa sessiz geçilir.
+    private func deleteBranchBestEffort(_ branchName: String, repositoryURL: URL) {
+        _ = try? runner.run(executable: "git", arguments: ["branch", "-D", branchName], directory: repositoryURL)
+    }
+
+    /// Crash-yetimi dalları toplar: `worktree add` ile manifest yazımı arası
+    /// crash, manifestsiz dalsız-worktree'süz dal bırakır. Yalnız kaydı ve
+    /// bildirgesi olmayan `agentic/w-*` dalları silinir; kayıtlı worktree'nin
+    /// dalını git kendisi reddeder (`branch -D` checked-out dalı silmez),
+    /// böylece uçuş hâlindeki eş yaratıma dokunulmaz.
+    private func reapOrphanWorkspaceBranches(repositoryURL: URL) {
+        guard let list = try? runGit(["branch", "--list", "agentic/w-*"], in: repositoryURL) else {
+            return
+        }
+        _ = try? runner.run(executable: "git", arguments: ["worktree", "prune"], directory: repositoryURL)
+        var reaped = 0
+        for line in list.standardOutput.split(separator: "\n") {
+            let name = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "* "))
+                .trimmingCharacters(in: .whitespaces)
+            guard name.hasPrefix("agentic/w-"),
+                let id = UUID(uuidString: String(name.dropFirst("agentic/w-".count))),
+                findManifest(workspaceID: id) == nil
+            else {
+                continue
+            }
+            if (try? runner.run(executable: "git", arguments: ["branch", "-D", name], directory: repositoryURL)) != nil {
+                reaped += 1
+            }
+        }
+        if reaped > 0 {
+            AppLog.lifecycle.info(
+                "Reaped \(reaped, privacy: .public) orphan workspace branches"
             )
         }
+    }
+
+    /// Kirli dosya listesini özetler: az dosyada ham çıktı aynen korunur, çok
+    /// dosyada sayı + ilk satırlar verilir, kuyruk kesilir.
+    ///
+    /// Sahip olunan çalışma alanının kirli raporunda kullanılır; kaynak kapısı
+    /// kalktığı için oluşturma yolunda çağrılmaz.
+    private func summarizeDirtyStatus(_ status: String) -> String {
+        let lines = status.split(separator: "\n")
+        guard lines.count > Self.maxDirtyPreviewLines else {
+            return clip(status, limit: Self.maxStatusCharacters)
+        }
+        let preview = lines.prefix(Self.maxDirtyPreviewLines).joined(separator: "\n")
+        return "\(lines.count) changed files, showing first \(Self.maxDirtyPreviewLines):\n\(preview)\n..."
     }
 
     // MARK: - Manifests
@@ -745,7 +801,7 @@ actor GitWorkspaceManager: WorkspaceManaging {
         do {
             let result = try runGit(["status", "--porcelain=v1", "--untracked-files=all"], in: workspaceURL)
             let status = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
-            return status.isEmpty ? .clean : .dirty(status: clip(status, limit: Self.maxStatusCharacters))
+            return status.isEmpty ? .clean : .dirty(status: summarizeDirtyStatus(status))
         } catch {
             return .unreadable(reason: "\(error)")
         }
@@ -769,12 +825,15 @@ actor GitWorkspaceManager: WorkspaceManaging {
 
     // MARK: - Cleanup
 
-    private func rollbackWorktree(_ workspaceURL: URL, manifestURL: URL?, repositoryURL: URL) {
+    private func rollbackWorktree(_ workspaceURL: URL, manifestURL: URL?, repositoryURL: URL, branchName: String?) {
         _ = try? runner.run(
             executable: "git",
-            arguments: ["worktree", "remove", workspaceURL.path],
+            arguments: ["worktree", "remove", "--force", workspaceURL.path],
             directory: repositoryURL
         )
+        if let branchName {
+            deleteBranchBestEffort(branchName, repositoryURL: repositoryURL)
+        }
         if FileManager.default.fileExists(atPath: workspaceURL.path) {
             try? FileManager.default.removeItem(at: workspaceURL)
         }
@@ -788,6 +847,10 @@ actor GitWorkspaceManager: WorkspaceManaging {
     }
 
     /// Removes now-empty bookkeeping directories upward, never touching the root itself.
+    ///
+    /// `rmdir(2)` — not `FileManager.removeItem`, which deletes recursively:
+    /// a file landing between the emptiness check and the removal must fail
+    /// the removal instead of being deleted.
     private func removeEmptyDirectories(upTo root: URL, from directory: URL) {
         let rootPath = canonicalPath(root)
         var current = directory.standardized
@@ -795,7 +858,8 @@ actor GitWorkspaceManager: WorkspaceManaging {
             guard let contents = try? FileManager.default.contentsOfDirectory(atPath: current.path), contents.isEmpty else {
                 return
             }
-            guard (try? FileManager.default.removeItem(at: current)) != nil else { return }
+            let removed: Int32 = current.path.withCString { rmdir($0) }
+            guard removed == 0 else { return }
             current = current.deletingLastPathComponent()
         }
     }

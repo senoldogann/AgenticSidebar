@@ -48,6 +48,26 @@ protocol ExtensionHTTPTransport: Sendable {
     func get(_ url: URL, headers: [String: String]) async throws -> ExtensionHTTPResponse
 }
 
+/// Konak değiştiren yönlendirmede `Authorization` başlığını düşürür:
+/// `URLSession` ilk isteğin başlıklarını hedefe aynen taşır, belirteç
+/// (`GITHUB_TOKEN`) yabancı konağa sızardı.
+final class AuthorizationStrippingRedirectDelegate: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        var redirected = request
+        let originalHost = task.originalRequest?.url?.host?.lowercased()
+        if redirected.url?.host?.lowercased() != originalHost {
+            redirected.setValue(nil, forHTTPHeaderField: "Authorization")
+        }
+        completionHandler(redirected)
+    }
+}
+
 struct URLSessionExtensionTransport: ExtensionHTTPTransport {
     static let defaultTimeout: TimeInterval = 30
     /// Tek yanıt için üst sınır. Kurulum toplamı `maximumTotalBytes` ile ayrıca sınırlıdır.
@@ -56,9 +76,16 @@ struct URLSessionExtensionTransport: ExtensionHTTPTransport {
     static let gitHubAPIHost = "api.github.com"
 
     private let session: URLSession
+    private let redirectDelegate: AuthorizationStrippingRedirectDelegate?
 
     init(session: URLSession) {
         self.session = session
+        self.redirectDelegate = nil
+    }
+
+    private init(session: URLSession, redirectDelegate: AuthorizationStrippingRedirectDelegate) {
+        self.session = session
+        self.redirectDelegate = redirectDelegate
     }
 
     static func live() -> Self {
@@ -71,7 +98,11 @@ struct URLSessionExtensionTransport: ExtensionHTTPTransport {
         configuration.httpCookieAcceptPolicy = .never
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return Self(session: URLSession(configuration: configuration))
+        let delegate = AuthorizationStrippingRedirectDelegate()
+        return Self(
+            session: URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil),
+            redirectDelegate: delegate
+        )
     }
 
     func get(_ url: URL, headers: [String: String]) async throws -> ExtensionHTTPResponse {

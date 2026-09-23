@@ -173,6 +173,23 @@ protocol OpenCodeListenerVerifying: Sendable {
         _ port: UInt16,
         processIdentifier: Int32?
     ) async -> Bool
+
+    /// Tek seferlik sahiplik denetimi: parola taşıyan her istekten önce
+    /// portun hâlâ çocuğa ait olduğu doğrulanır. Varsayılan `true` döner;
+    /// gerçek denetim `LibprocListenerVerifier` içindedir.
+    func processOwnsListeningPort(
+        _ port: UInt16,
+        processIdentifier: Int32?
+    ) -> Bool
+}
+
+extension OpenCodeListenerVerifying {
+    func processOwnsListeningPort(
+        _ port: UInt16,
+        processIdentifier: Int32?
+    ) -> Bool {
+        true
+    }
 }
 
 struct LibprocListenerVerifier: OpenCodeListenerVerifying {
@@ -203,6 +220,16 @@ struct LibprocListenerVerifier: OpenCodeListenerVerifying {
         }
 
         return false
+    }
+
+    func processOwnsListeningPort(
+        _ port: UInt16,
+        processIdentifier: Int32?
+    ) -> Bool {
+        guard let processIdentifier, processIdentifier > 0 else {
+            return false
+        }
+        return Self.listeningPorts(of: processIdentifier).contains(port)
     }
 
     /// The TCP ports this pid is listening on, read from its own descriptors.

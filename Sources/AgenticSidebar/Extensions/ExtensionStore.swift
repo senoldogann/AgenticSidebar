@@ -196,11 +196,13 @@ final class ExtensionStore {
             return false
         }
 
+        // Elle eklenen sunucu keyfi süreç çalıştırır: varsayılan kapalı gelir,
+        // kullanıcı denetleyip açar (eklentilerdeki `requiresTrust` düzeni).
         registry.upsert(
             mcpServer: MCPServerRecord(
                 name: trimmed,
                 definition: definition,
-                isEnabled: true,
+                isEnabled: false,
                 source: source,
                 isInherited: false,
                 installedAt: Date()
@@ -209,16 +211,7 @@ final class ExtensionStore {
         persist()
         Task {
             await applyToAgent()
-            if let client = await currentClient() {
-                do {
-                    _ = try await client.addMCPServer(name: trimmed, config: definition.openCodePayload)
-                    status = .info("“\(trimmed)” added and loaded into agent.")
-                } catch {
-                    status = .info("“\(trimmed)” added. Restart the agent if needed to connect.")
-                }
-            } else {
-                status = .info("“\(trimmed)” added. Will load when agent starts.")
-            }
+            status = .info("“\(trimmed)” added but disabled. Enable it after review.")
         }
         return true
     }
@@ -279,6 +272,12 @@ final class ExtensionStore {
             let url = try await client.startMCPAuthorization(name: name)
             if url == nil {
                 status = .info("“\(name)” did not ask for an authorization.")
+            } else if let url, !Self.isAllowedAuthorizationURL(url) {
+                AppLog.extensions.error(
+                    "Rejected MCP authorization URL with unexpected scheme or host"
+                )
+                status = .failure("“\(name)” returned an unsafe authorization URL.")
+                return nil
             }
             return url
         } catch {
@@ -623,6 +622,22 @@ extension ExtensionStore {
         }
         return !value.contains("\0") && !value.contains("\n") && !value.contains("\r")
             && !value.contains(" ") && !value.contains("\t") && !value.contains("..")
+    }
+
+    /// MCP yetkilendirme URL'si doğrulanmadan açılmaz: yalnız http/https,
+    /// userinfo yok; düz http yalnız döngü adresine.
+    static func isAllowedAuthorizationURL(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            let scheme = components.scheme?.lowercased(),
+            let host = components.host?.lowercased(), !host.isEmpty,
+            components.user == nil
+        else {
+            return false
+        }
+        if scheme == "https" {
+            return true
+        }
+        return scheme == "http" && (host == "127.0.0.1" || host == "localhost" || host == "::1")
     }
 
     /// `owner/repo` biçimi: boş ve nokta-dizin değil, dar karakter kümesi.

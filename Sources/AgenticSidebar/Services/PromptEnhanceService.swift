@@ -35,6 +35,7 @@ final class PromptEnhanceService {
 
     private(set) var active: ActiveEnhancement?
     private var streamTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
     private var activeStream: ProviderStream?
     private var askGeneration = 0
     @ObservationIgnored private var textAccumulator = StreamingTextAccumulator.empty
@@ -46,6 +47,8 @@ final class PromptEnhanceService {
 
     /// Yeni iyileştirme başlatır. Taslak `PromptEnhancer` süzgecinden
     /// geçmediyse çağrı reddedilir (düğme zaten kapalıdır, bu son savunmadır).
+    /// `timeout` akışın takılıp düğmeyi sonsuz loading'de bırakmasını engeller:
+    /// süre dolarsa akış iptal edilir ve hata bildirimine düşer.
     func enhance(
         context: SideQuestionContext,
         sessionID: UUID,
@@ -53,7 +56,8 @@ final class PromptEnhanceService {
         speedMode: ResponseSpeedMode,
         mode: AgentMode,
         tagNames: [String] = [],
-        attachmentNames: [String] = []
+        attachmentNames: [String] = [],
+        timeout: Duration
     ) {
         guard PromptEnhancer.isEnhanceable(draft) else {
             return
@@ -61,22 +65,31 @@ final class PromptEnhanceService {
         cancelStreaming()
         askGeneration &+= 1
         let token = askGeneration
-        let trimmedHistory = TranscriptBudget().select(from: context.messages).messages
         let instruction = PromptEnhancer.enhanceInstruction(
             draft: draft,
             mode: mode,
             tagNames: tagNames,
             attachmentNames: attachmentNames
         )
+        // Yeniden yazma taslak + talimattan ibarettir: sohbet geçmişi,
+        // araç grupları ve özet taşınmaz. Taşınsaydı her tıklamada 96k
+        // karaktere kadar bağlam (3 sıralı RPC + preamble kurulumu) ilk
+        // jetondan önce ödenirdi; ayrıca `TranscriptBudget.select` MainActor
+        // üzerindeki senkron kopya yükünü de kaldırır.
         let query = SideQuestionQuery(
             configuration: context.configuration,
-            historyMessages: trimmedHistory,
-            activityGroups: context.activityGroups,
+            historyMessages: [],
+            activityGroups: [],
             followups: [],
             question: instruction,
             speedMode: speedMode,
-            mode: mode,
-            contextSummary: context.contextSummary
+            // Geçici tur salt yeniden yazmadır: bestecinin kipi buraya
+            // talimat olarak taşınmaz. Taşınsaydı Plan/Review/Exam/ask
+            // yönergeleri yeniden yazma emriyle çelişirdi (model plan bloğu
+            // döndürür ya da görünmez oturumda araç incelemesine girerdi).
+            // Hedef kip, talimat metninin içinde bağlam olarak zaten var.
+            mode: .build,
+            contextSummary: ""
         )
         active = ActiveEnhancement(
             id: UUID(),
@@ -85,6 +98,14 @@ final class PromptEnhanceService {
             enhancedText: "",
             phase: .streaming
         )
+        timeoutTask?.cancel()
+        timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else {
+                return
+            }
+            self?.failOnTimeout(token: token)
+        }
         let runtime = context.runtime
         streamTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -114,6 +135,8 @@ final class PromptEnhanceService {
                 self.finishStreaming(token: token)
             } catch is CancellationError {
                 guard token == self.askGeneration else { return }
+                self.timeoutTask?.cancel()
+                self.timeoutTask = nil
                 self.activeStream = nil
                 self.flushPendingText(token: token)
                 if self.active?.phase == .streaming {
@@ -121,6 +144,8 @@ final class PromptEnhanceService {
                 }
             } catch {
                 guard token == self.askGeneration else { return }
+                self.timeoutTask?.cancel()
+                self.timeoutTask = nil
                 self.activeStream = nil
                 self.flushPendingText(token: token)
                 self.active?.phase = .failed
@@ -144,6 +169,8 @@ final class PromptEnhanceService {
     func cancelStreaming() {
         streamTask?.cancel()
         streamTask = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
         flushPendingText(token: askGeneration)
         if let stream = activeStream {
             activeStream = nil
@@ -167,6 +194,8 @@ final class PromptEnhanceService {
         guard token == askGeneration, active?.phase == .streaming else {
             return
         }
+        timeoutTask?.cancel()
+        timeoutTask = nil
         flushPendingText(token: token)
         guard active != nil else {
             return
@@ -177,6 +206,26 @@ final class PromptEnhanceService {
         } else {
             active?.phase = .done
         }
+    }
+
+    /// Süre dolan akışı hata ile kapatır: düğme loading'den çıkar, bildirim
+    /// gösterilir, taslak aynen durur. Üretimi artırarak ölmekte olan görevin
+    /// iptal yolunun bu kararı ezmesi engellenir (iptal koruması token'a
+    /// bakar); foto-finişte kazanan zaman aşımıdır, geç gelen metin atılır.
+    private func failOnTimeout(token: Int) {
+        guard token == askGeneration, active?.phase == .streaming else {
+            return
+        }
+        askGeneration &+= 1
+        streamTask?.cancel()
+        streamTask = nil
+        timeoutTask = nil
+        if let stream = activeStream {
+            activeStream = nil
+            Task { await stream.cancel() }
+        }
+        active?.phase = .failed
+        active?.errorText = "İyileştirme zaman aşımına uğradı; taslak aynen duruyor."
     }
 
     /// Sağlayıcı çok küçük deltalar yayınlasa bile SwiftUI durumu en fazla

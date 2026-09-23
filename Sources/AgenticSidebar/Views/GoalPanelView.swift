@@ -38,6 +38,11 @@ struct GoalPanelView: View {
             card { resumeRow(objective: resumable) }
         } else if let failed = orchestrator.failedRequest, failed.sessionID == focusedSessionID {
             card { failureRow(request: failed) }
+        } else if orchestrator.engine != nil, orchestrator.sessionID != focusedSessionID {
+            // Arka plan koşusu: başka sohbette süren hedef bu bölmede
+            // görünmezdi; kullanıcı hem koşudan habersiz kalır hem ret
+            // iletisini göremezdi. Yalnız bilgi + durdurma sunulur.
+            card { backgroundRow }
         }
     }
 
@@ -103,6 +108,27 @@ struct GoalPanelView: View {
             .foregroundStyle(.secondary)
             .pointingHandCursor()
             .help("Delete the stored goal run")
+        }
+    }
+
+    /// Başka sohbette süren koşunun bilgi satırı: eylem yalnız durdurmadır,
+    /// koşunun kendisi o sohbete dönünce görünür.
+    private var backgroundRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "target")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.purple)
+            Text("A goal is running in another conversation.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Button("Bitir") {
+                orchestrator.stop()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .pointingHandCursor()
+            .help("Koşan turu iptal eder, goal döngüsünü bitirir")
         }
     }
 

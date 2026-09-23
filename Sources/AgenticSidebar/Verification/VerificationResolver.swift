@@ -4,10 +4,41 @@ import Foundation
 ///
 /// The installed formatter version is part of the toolchain, not of the project, so a
 /// version mismatch can be reported instead of silently substituting another tool.
+/// Language runtimes (`node`, `python3`, `go`, `cargo`) are optional: a recipe
+/// only names the runtime its project kind needs, and a missing runtime refuses
+/// resolution instead of substituting another command.
 struct VerificationToolchain: Sendable, Equatable {
     let swiftExecutable: URL
     let swiftFormatExecutable: URL?
     let installedSwiftFormatVersion: String?
+    let nodeExecutable: URL?
+    let npmExecutable: URL?
+    let pythonExecutable: URL?
+    let pytestExecutable: URL?
+    let goExecutable: URL?
+    let cargoExecutable: URL?
+
+    init(
+        swiftExecutable: URL,
+        swiftFormatExecutable: URL? = nil,
+        installedSwiftFormatVersion: String? = nil,
+        nodeExecutable: URL? = nil,
+        npmExecutable: URL? = nil,
+        pythonExecutable: URL? = nil,
+        pytestExecutable: URL? = nil,
+        goExecutable: URL? = nil,
+        cargoExecutable: URL? = nil
+    ) {
+        self.swiftExecutable = swiftExecutable
+        self.swiftFormatExecutable = swiftFormatExecutable
+        self.installedSwiftFormatVersion = installedSwiftFormatVersion
+        self.nodeExecutable = nodeExecutable
+        self.npmExecutable = npmExecutable
+        self.pythonExecutable = pythonExecutable
+        self.pytestExecutable = pytestExecutable
+        self.goExecutable = goExecutable
+        self.cargoExecutable = cargoExecutable
+    }
 
     /// Detects the toolchain of the current host without interpreting a shell.
     ///
@@ -47,8 +78,35 @@ struct VerificationToolchain: Sendable, Equatable {
         return VerificationToolchain(
             swiftExecutable: swiftExecutable,
             swiftFormatExecutable: formatter,
-            installedSwiftFormatVersion: installedVersion
+            installedSwiftFormatVersion: installedVersion,
+            nodeExecutable: firstExecutable(candidates: ["/opt/homebrew/bin/node", "/usr/local/bin/node"], name: "node"),
+            npmExecutable: firstExecutable(candidates: ["/opt/homebrew/bin/npm", "/usr/local/bin/npm"], name: "npm"),
+            pythonExecutable: firstExecutable(
+                candidates: ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"],
+                name: "python3"
+            ),
+            pytestExecutable: executableInPath("pytest").map { URL(fileURLWithPath: $0) },
+            goExecutable: firstExecutable(
+                candidates: ["/opt/homebrew/bin/go", "/usr/local/go/bin/go", "/usr/local/bin/go"],
+                name: "go"
+            ),
+            cargoExecutable: firstExecutable(
+                candidates: [
+                    "\(NSHomeDirectory())/.cargo/bin/cargo",
+                    "/opt/homebrew/bin/cargo",
+                    "/usr/local/bin/cargo",
+                ],
+                name: "cargo"
+            )
         )
+    }
+
+    /// İlk çalıştırılabilir sabit adayı, yoksa `PATH` taraması; kabuk yok.
+    private static func firstExecutable(candidates: [String], name: String) -> URL? {
+        if let fixed = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return URL(fileURLWithPath: fixed)
+        }
+        return executableInPath(name).map { URL(fileURLWithPath: $0) }
     }
 
     /// `PATH` içindeki ilk çalıştırılabilir eşleşmenin tam yolu; kabuk yok,
@@ -203,13 +261,86 @@ struct NonStandardVerificationRequest: Sendable, Equatable {
     let approvedBy: String?
 }
 
+/// Marker-based project kind detection shared by registration, preflight
+/// and recipe resolution.
+///
+/// Öncelik sırası deterministiktir: `Package.swift` (çalıştırılabilir ürünlü)
+/// SwiftPM'dir; ardından `package.json` (Node), `pyproject.toml`/`setup.py`/
+/// `setup.cfg`/`requirements.txt` (Python), `go.mod` (Go), `Cargo.toml`
+/// (Rust) gelir. Hiçbir dil işareti yoksa ama `.git` varsa `generic` döner:
+/// pano izler, koşturur ve inceler; otomatik doğrulama parmak izi ve insan
+/// ölçütleriyle sınırlıdır. Ne dil işareti ne `.git` varsa `nil` döner ve
+/// çağrı reddedilir; komutlar asla dosya uzantısından türetilmez, depo
+/// betikleri asla çalıştırılmaz.
+enum ProjectKindDetector: Sendable {
+    /// Depo kökündeki dil işaretinden proje türü; tanınmazsa `nil`.
+    static func detect(in repository: URL) -> ProjectKind? {
+        let repositoryURL = repository.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: repositoryURL.path, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        else {
+            return nil
+        }
+        if hasExecutableSwiftPMProduct(in: repositoryURL) {
+            return .swiftpm
+        }
+        if fileExists("package.json", in: repositoryURL) {
+            return .node
+        }
+        if fileExists("pyproject.toml", in: repositoryURL) || fileExists("setup.py", in: repositoryURL)
+            || fileExists("setup.cfg", in: repositoryURL) || fileExists("requirements.txt", in: repositoryURL)
+        {
+            return .python
+        }
+        if fileExists("go.mod", in: repositoryURL) {
+            return .go
+        }
+        if fileExists("Cargo.toml", in: repositoryURL) {
+            return .rust
+        }
+        // `Package.swift` çalıştırılabilir ürünü yoksa SwiftPM sayılmaz ama
+        // depo SwiftPM olabilir; tür yine de `swiftpm`dir ki çözümleme
+        // tipik `unrecognizedProject` hatasını üretsin (sessiz `generic`
+        // düşüş, eksik ürün bildirimini gizlerdi).
+        if fileExists("Package.swift", in: repositoryURL) {
+            return .swiftpm
+        }
+        if FileManager.default.fileExists(atPath: repositoryURL.appendingPathComponent(".git").path) {
+            return .generic
+        }
+        return nil
+    }
+
+    /// Çalıştırılabilir ürün bildiren `Package.swift` var mı.
+    static func hasExecutableSwiftPMProduct(in repository: URL) -> Bool {
+        let packageURL = repository.appendingPathComponent("Package.swift", isDirectory: false)
+        guard let packageSource = try? String(contentsOf: packageURL, encoding: .utf8) else {
+            return false
+        }
+        return VerificationResolver.firstExecutableProduct(in: packageSource) != nil
+    }
+
+    private static func fileExists(_ name: String, in repository: URL) -> Bool {
+        FileManager.default.fileExists(atPath: repository.appendingPathComponent(name, isDirectory: false).path)
+    }
+}
+
 /// Resolves a trusted, versioned verification recipe for a repository.
 ///
-/// Only known project metadata produces commands. `Package.swift` marks a SwiftPM project;
-/// the executable product name comes from that file and the formatter pin comes from the
-/// repository's CI metadata. A formatter whose installed version does not match the pin is
-/// recorded as skipped, never substituted. A project without a recognized marker is refused,
-/// and a caller-supplied recipe may only run after explicit approval.
+/// Only known project metadata produces commands. `Package.swift` marks a
+/// SwiftPM project; the executable product name comes from that file and the
+/// formatter pin comes from the repository's CI metadata. `package.json`
+/// marks Node (`npm run build --if-present` + `npm test`), Python markers
+/// (`pyproject.toml`/`setup.py`/`setup.cfg`/`requirements.txt`) mark Python
+/// (`compileall` + `pytest` ya da `unittest`), `go.mod` marks Go
+/// (`go build` + `go test`), `Cargo.toml` marks Rust (`cargo build` +
+/// `cargo test`). A Git repository without any language marker resolves to a
+/// `generic` recipe whose single required `snapshot` step binds the workspace
+/// fingerprint; human criteria then decide acceptance. A formatter whose
+/// installed version does not match the pin is recorded as skipped, never
+/// substituted. A directory with no recognized marker and no `.git` is
+/// refused, and a caller-supplied recipe may only run after explicit approval.
 struct VerificationResolver: Sendable {
     static let recipeVersion = VerificationRecipe.currentVersion
     private static let buildTimeout: TimeInterval = 900
@@ -221,25 +352,20 @@ struct VerificationResolver: Sendable {
     /// Gönderim öncesi hafif ön kontrol: ajan koşmadan deponun güvenilir
     /// tarifeye çözülebileceğini söyler.
     ///
-    /// `resolve` ile aynı kilitleri paylaşır (dizin + `Package.swift` +
-    /// çalıştırılabilir ürün bildirimi) ama araç zinciri yoklamaz ve reçete
-    /// üretmez; dosya sistemi okuması dışında maliyeti yoktur. Arada dosya
-    /// silinirse (TOCTOU) doğrulayıcının `catch` yolu yine tutarlı kanıt
-    /// yazar, o yüzden burası yalnızca israfı önleyen hızlı kapıdır.
+    /// `resolve` ile aynı tanıma bakar (tür algısı) ama araç zinciri
+    /// yoklamaz ve reçete üretmez; dosya sistemi okuması dışında maliyeti
+    /// yoktur. Arada dosya silinirse (TOCTOU) doğrulayıcının `catch` yolu
+    /// yine tutarlı kanıt yazar, o yüzden burası yalnızca israfı önleyen
+    /// hızlı kapıdır.
     static func isResolvable(repository: URL) -> Bool {
-        let repositoryURL = repository.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: repositoryURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            return false
-        }
-        let packageURL = repositoryURL.appendingPathComponent("Package.swift", isDirectory: false)
-        guard FileManager.default.fileExists(atPath: packageURL.path) else {
-            return false
-        }
-        guard let packageSource = try? String(contentsOf: packageURL, encoding: .utf8) else {
-            return false
-        }
-        return firstExecutableProduct(in: packageSource) != nil
+        resolveKind(repository: repository) != nil
+            && (ProjectKindDetector.detect(in: repository) != .swiftpm
+                || ProjectKindDetector.hasExecutableSwiftPMProduct(in: repository.standardizedFileURL))
+    }
+
+    /// Depo kökünün proje türü; tanınmazsa `nil` (ret gerekçesi üretir).
+    static func resolveKind(repository: URL) -> ProjectKind? {
+        ProjectKindDetector.detect(in: repository)
     }
 
     func resolve(repository: URL) async throws -> VerificationRecipe {
@@ -248,10 +374,35 @@ struct VerificationResolver: Sendable {
         guard FileManager.default.fileExists(atPath: repositoryURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw VerificationResolverError.unrecognizedProject(path: repositoryURL.path, reason: "not a directory")
         }
-        let packageURL = repositoryURL.appendingPathComponent("Package.swift", isDirectory: false)
-        guard FileManager.default.fileExists(atPath: packageURL.path) else {
+        guard let kind = ProjectKindDetector.detect(in: repositoryURL) else {
             throw VerificationResolverError.unrecognizedProject(
                 path: repositoryURL.path,
+                reason: "no recognized project marker (Package.swift, package.json, pyproject.toml, go.mod, Cargo.toml) and no .git"
+            )
+        }
+        switch kind {
+        case .swiftpm:
+            return try resolveSwiftPM(repository: repositoryURL)
+        case .node:
+            return try resolveNode(repository: repositoryURL)
+        case .python:
+            return try resolvePython(repository: repositoryURL)
+        case .go:
+            return try resolveGo(repository: repositoryURL)
+        case .rust:
+            return try resolveRust(repository: repositoryURL)
+        case .generic:
+            return try resolveGeneric(repository: repositoryURL)
+        }
+    }
+
+    /// SwiftPM tarifi: mevcut davranış birebir korunur (build + test
+    /// zorunlu, format CI pini tutarsa isteğe bağlı).
+    private func resolveSwiftPM(repository: URL) throws -> VerificationRecipe {
+        let packageURL = repository.appendingPathComponent("Package.swift", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: packageURL.path) else {
+            throw VerificationResolverError.unrecognizedProject(
+                path: repository.path,
                 reason: "no recognized project marker (Package.swift)"
             )
         }
@@ -263,7 +414,7 @@ struct VerificationResolver: Sendable {
         }
         guard let product = Self.firstExecutableProduct(in: packageSource) else {
             throw VerificationResolverError.unrecognizedProject(
-                path: repositoryURL.path,
+                path: repository.path,
                 reason: "Package.swift declares no executable product"
             )
         }
@@ -290,7 +441,7 @@ struct VerificationResolver: Sendable {
         var skippedSteps: [VerificationStepSkip] = []
         var trustedSource = "Package.swift(product=\(product))"
 
-        if let pin = try formatterPin(in: repositoryURL) {
+        if let pin = try formatterPin(in: repository) {
             trustedSource += ";.github/workflows/ci.yml(swift-format=\(pin))"
             if let formatExecutable = toolchain.swiftFormatExecutable,
                 FileManager.default.isExecutableFile(atPath: formatExecutable.path)
@@ -331,6 +482,187 @@ struct VerificationResolver: Sendable {
             trustedSource: trustedSource,
             steps: steps,
             skippedSteps: skippedSteps
+        )
+    }
+
+    /// Node tarifi: `package.json` işaretinden çözülür.
+    ///
+    /// `build`, betik yoksa `npm`in kendi `--if-present` anlamıyla sıfır
+    /// çıkar (araç anlamı, ikame değil); `test` bilerek `--if-present`
+    /// taşımaz: betiksiz depoda `npm test` yüksek sesle düşer ve pano,
+    /// geçiyormuş gibi yapmak yerine test betiği ister.
+    private func resolveNode(repository: URL) throws -> VerificationRecipe {
+        guard let npm = toolchain.npmExecutable else {
+            throw VerificationResolverError.requiredToolUnavailable(step: "build", executable: "npm (not installed)")
+        }
+        try requireExecutable(npm, step: "build")
+        return VerificationRecipe(
+            name: "node:package.json",
+            version: Self.recipeVersion,
+            trustedSource: "package.json",
+            steps: [
+                VerificationStep(
+                    name: "build",
+                    executable: npm.path,
+                    arguments: ["run", "build", "--if-present"],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.buildTimeout,
+                    required: true
+                ),
+                VerificationStep(
+                    name: "test",
+                    executable: npm.path,
+                    arguments: ["test"],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.testTimeout,
+                    required: true
+                ),
+            ],
+            skippedSteps: []
+        )
+    }
+
+    /// Python tarifi: sözdizimi denetimi (`compileall`) + test koşusu.
+    ///
+    /// `pytest` kuruluysa o koşar, yoksa standart kütüphanedeki `unittest`
+    /// kullanılır; ikisi de yoksa (python bile yoksa) çözümleme reddedilir,
+    /// asla başka bir komut uydurulmaz.
+    private func resolvePython(repository: URL) throws -> VerificationRecipe {
+        guard let python = toolchain.pythonExecutable else {
+            throw VerificationResolverError.requiredToolUnavailable(step: "build", executable: "python3 (not installed)")
+        }
+        try requireExecutable(python, step: "build")
+        let testStep: VerificationStep
+        if let pytest = toolchain.pytestExecutable, FileManager.default.isExecutableFile(atPath: pytest.path) {
+            testStep = VerificationStep(
+                name: "test",
+                executable: pytest.path,
+                arguments: ["-q"],
+                relativeWorkingDirectory: ".",
+                timeoutSeconds: Self.testTimeout,
+                required: true
+            )
+        } else {
+            testStep = VerificationStep(
+                name: "test",
+                executable: python.path,
+                arguments: ["-m", "unittest", "discover"],
+                relativeWorkingDirectory: ".",
+                timeoutSeconds: Self.testTimeout,
+                required: true
+            )
+        }
+        return VerificationRecipe(
+            name: "python:pyproject",
+            version: Self.recipeVersion,
+            trustedSource: "pyproject.toml/setup.py/setup.cfg/requirements.txt",
+            steps: [
+                VerificationStep(
+                    name: "build",
+                    executable: python.path,
+                    arguments: ["-m", "compileall", "-q", "."],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.buildTimeout,
+                    required: true
+                ),
+                testStep,
+            ],
+            skippedSteps: []
+        )
+    }
+
+    /// Go tarifi: `go.mod` işaretinden çözülür.
+    private func resolveGo(repository: URL) throws -> VerificationRecipe {
+        guard let go = toolchain.goExecutable else {
+            throw VerificationResolverError.requiredToolUnavailable(step: "build", executable: "go (not installed)")
+        }
+        try requireExecutable(go, step: "build")
+        return VerificationRecipe(
+            name: "go:go.mod",
+            version: Self.recipeVersion,
+            trustedSource: "go.mod",
+            steps: [
+                VerificationStep(
+                    name: "build",
+                    executable: go.path,
+                    arguments: ["build", "./..."],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.buildTimeout,
+                    required: true
+                ),
+                VerificationStep(
+                    name: "test",
+                    executable: go.path,
+                    arguments: ["test", "./..."],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.testTimeout,
+                    required: true
+                ),
+            ],
+            skippedSteps: []
+        )
+    }
+
+    /// Rust tarifi: `Cargo.toml` işaretinden çözülür.
+    private func resolveRust(repository: URL) throws -> VerificationRecipe {
+        guard let cargo = toolchain.cargoExecutable else {
+            throw VerificationResolverError.requiredToolUnavailable(step: "build", executable: "cargo (not installed)")
+        }
+        try requireExecutable(cargo, step: "build")
+        return VerificationRecipe(
+            name: "rust:Cargo.toml",
+            version: Self.recipeVersion,
+            trustedSource: "Cargo.toml",
+            steps: [
+                VerificationStep(
+                    name: "build",
+                    executable: cargo.path,
+                    arguments: ["build"],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.buildTimeout,
+                    required: true
+                ),
+                VerificationStep(
+                    name: "test",
+                    executable: cargo.path,
+                    arguments: ["test"],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: Self.testTimeout,
+                    required: true
+                ),
+            ],
+            skippedSteps: []
+        )
+    }
+
+    /// Generic tarif: dil işareti yok, `.git` var.
+    ///
+    /// Tek zorunlu `snapshot` adımı hiçbir şeyi derlemez; koşucu her kanıta
+    /// çalışma alanı parmak izini bağladığı için bu adım revizyonu kanıta
+    /// mühürler. Kabul kararı insan ölçütlerine ve `accept` onayına kalır.
+    /// `true` aracı yoksa tarif üretilemez: kanıtsız "geçti" uydurulmaz.
+    private func resolveGeneric(repository: URL) throws -> VerificationRecipe {
+        let truthy =
+            ["/usr/bin/true", "/bin/true"].first { FileManager.default.isExecutableFile(atPath: $0) }
+            .map { URL(fileURLWithPath: $0) }
+        guard let truthy else {
+            throw VerificationResolverError.requiredToolUnavailable(step: "snapshot", executable: "/usr/bin/true")
+        }
+        return VerificationRecipe(
+            name: "generic:git",
+            version: Self.recipeVersion,
+            trustedSource: "git(no language marker)",
+            steps: [
+                VerificationStep(
+                    name: "snapshot",
+                    executable: truthy.path,
+                    arguments: [],
+                    relativeWorkingDirectory: ".",
+                    timeoutSeconds: 60,
+                    required: true
+                )
+            ],
+            skippedSteps: []
         )
     }
 
@@ -400,7 +732,7 @@ struct VerificationResolver: Sendable {
     }
 
     /// First `.executable(name: "...")` product declaration, in file order.
-    private static func firstExecutableProduct(in source: String) -> String? {
+    static func firstExecutableProduct(in source: String) -> String? {
         firstMatch(#"\.executable\(\s*name:\s*"([^"]+)""#, in: source)
     }
 

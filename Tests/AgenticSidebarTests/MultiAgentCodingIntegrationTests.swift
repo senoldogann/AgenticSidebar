@@ -900,6 +900,14 @@ private actor IntegrationWorkspaceProvisioning: TaskWorkspaceProvisioningPort {
         self.root = root
         let repositoryURL = root.appendingPathComponent("repository", isDirectory: true)
         try FileManager.default.createDirectory(at: repositoryURL, withIntermediateDirectories: true)
+        // Fikstür deposunun dil beyanı: pano tür algısı burayı `.node`
+        // sayar, kabul kapısı `["build", "test"]` bekler; bu, sahte tarifin
+        // ürettiği adım adlarıyla (`IntegrationRecipeVerifier.requiredSteps`)
+        // birebir örtüşür. İşaret yoksa proje `generic` düşer ve kapı boş
+        // kalırdı — parmak-izi-eşleşmezliği iddiaları o zaman tutmazdı.
+        try Data("{\"name\":\"integration-fixture\"}\n".utf8).write(
+            to: repositoryURL.appendingPathComponent("package.json", isDirectory: false)
+        )
         self.repositoryPath = repositoryURL.path
     }
 

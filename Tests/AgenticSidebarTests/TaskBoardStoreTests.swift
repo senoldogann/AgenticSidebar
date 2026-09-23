@@ -135,7 +135,9 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertTrue(startAvailability.isEnabled)
     }
 
-    func testUnavailableRuntimeRefusalDisablesStartWithMissingCapability() async throws {
+    /// Geçici `unavailable` reti karta sabitlenmez: sağlayıcı seçilip yeniden
+    /// denenebilmesi için start açık kalır; neden çağrı sonucundadır.
+    func testUnavailableRuntimeRefusalKeepsStartEnabledForRetry() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()
         let project = try await makeProject(service: service)
@@ -155,8 +157,8 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertTrue(refusal.message.contains("toolUse"))
 
         let availability = try XCTUnwrap(store.actionAvailability(for: task.id).first { $0.action == .start })
-        XCTAssertFalse(availability.isEnabled)
-        XCTAssertTrue(availability.disabledReason?.contains("toolUse") == true)
+        XCTAssertTrue(availability.isEnabled, "Geçici ret düğmeyi kilitlememeli; sağlayıcı seçilip yeniden denenebilmeli")
+        XCTAssertNil(availability.disabledReason)
 
         let counts = await harness.repository.mutationCounts()
         XCTAssertEqual(counts.claimAttempts, 0)
@@ -231,8 +233,11 @@ final class TaskBoardStoreTests: XCTestCase {
         store.selectProject(project.id)
         await store.refresh()
 
+        // Kapı yalnız koşan görevi tutar: seçim değişimi diğer görevin
+        // denetçi okumasını (task read) yapar; kapı tüm okumaları tutsa
+        // seçim hiç dönemez, test kilitlenirdi.
         let gate = AsyncGate()
-        await harness.repository.gateTaskReads(gate)
+        await harness.repository.gateTaskReads(gate, for: [running.id])
         let action = Task { await store.start(taskID: running.id) }
         await gate.waitUntilEntered()
 
@@ -675,9 +680,10 @@ final class TaskBoardStoreTests: XCTestCase {
         XCTAssertNil(store.selectedProjectID)
     }
 
-    /// M1: Git deposu olup `Package.swift` barındırmayan klasör kayıt anında
-    /// reddedilir; ret servise hiç ulaşmaz ve kayıt defterine yazılmaz.
-    func testCreateProjectRefusesNonSwiftPMFolderWithoutCallingService() async throws {
+    /// M1 (çok-dilli pano): Git deposu olup dil işareti (`Package.swift`,
+    /// `package.json`, …) barındırmayan klasör kayıt anında kabul edilir ve
+    /// `generic` türle izlenir; dil kapısı kayıt değil, doğrulama katmanındadır.
+    func testCreateProjectAcceptsGitFolderWithoutLanguageMarkerAsGeneric() async throws {
         let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
         let service = harness.makeService()
         let store = TaskBoardStore(service: service)
@@ -695,16 +701,17 @@ final class TaskBoardStoreTests: XCTestCase {
 
         let result = await store.createProject(name: "Git only", repositoryURL: gitOnly)
 
-        guard case .refused(let refusal) = result else {
-            XCTFail("A folder without Package.swift must be refused, got \(result)")
-            return
-        }
-        XCTAssertEqual(refusal.kind, .rejected)
-        XCTAssertTrue(refusal.message.contains("Package.swift"))
-        XCTAssertEqual(store.lastFailure, refusal.message)
-        XCTAssertNil(store.selectedProjectID)
-        XCTAssertEqual(store.phase, .idle)
-        XCTAssertTrue(registeredProjectIDs.isEmpty, "A refused registration must never reach the registry")
+        XCTAssertEqual(result, .applied)
+        let projectID = try XCTUnwrap(store.selectedProjectID)
+        let project = await service.project(id: projectID)
+        XCTAssertEqual(project?.kind, .generic)
+        XCTAssertEqual(project?.repositoryPath, gitOnly.path)
+        XCTAssertNil(store.lastFailure)
+        XCTAssertEqual(
+            registeredProjectIDs,
+            [projectID],
+            "An accepted registration must notify the composition registry exactly once"
+        )
     }
 
     func testProjectRegistrationPresenterDisablesSubmitUntilReady() {
@@ -784,7 +791,11 @@ final class TaskBoardStoreTests: XCTestCase {
             return XCTFail("A composition without live dispatch must refuse startRun, got \(result)")
         }
         XCTAssertEqual(refusal.kind, .unavailable)
-        XCTAssertTrue(refusal.message.contains("fingerprint") || refusal.message.contains("dispatch"))
+        XCTAssertTrue(
+            refusal.message.contains("fingerprint") || refusal.message.contains("dispatch")
+                || refusal.message.contains("gönderim") || refusal.message.contains("canlı"),
+            "Beklenmeyen ret mesajı: \(refusal.message)"
+        )
         let counts = await harness.repository.mutationCounts()
         XCTAssertEqual(counts.claimAttempts, 0)
     }

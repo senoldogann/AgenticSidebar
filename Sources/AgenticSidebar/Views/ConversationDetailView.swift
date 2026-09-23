@@ -453,7 +453,9 @@ struct ConversationDetailView: View {
         onCollapse: ((UUID) -> Void)? = nil
     ) -> some View {
         let isVisibleUser = message.role == .user
-        let isVisibleAssistant = message.role == .assistant && !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // `trimmingCharacters` tüm metni kopyalar; bu satır her flush'ta her
+        // mesaj için çalışır. Kopyasız denklik denetimi aynı cevabı verir.
+        let isVisibleAssistant = message.role == .assistant && Self.containsVisibleText(message.text)
         let hasTurnHeader = message.role == .user && shouldShowTurnHeader(for: message, index: index, isBusy: isBusy)
         let activityGroup = index.activityGroup(after: message.id)
 
@@ -659,7 +661,8 @@ struct ConversationDetailView: View {
             speedMode: speedMode,
             mode: mode,
             tagNames: tagNames,
-            attachmentNames: attachmentNames
+            attachmentNames: attachmentNames,
+            timeout: .seconds(120)
         )
     }
 
@@ -751,7 +754,8 @@ struct ConversationDetailView: View {
     }
 
     /// Yan cevabı besteci taslağına ekler (metin korunur, altına eklenir).
-    private func insertSideAnswerToComposer(_ text: String) {        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func insertSideAnswerToComposer(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let draftMemory else {
             return
         }
@@ -974,6 +978,9 @@ struct ConversationDetailView: View {
             },
             turnError: { [sessionService] id in
                 sessionService.session(for: id)?.state.error
+            },
+            wasCancelled: { [sessionService] id in
+                sessionService.session(for: id)?.state.status == .cancelled
             },
             lastAssistantText: { [sessionService] id in
                 sessionService.session(for: id)?.state.messages.last(where: { $0.role == .assistant })?.text
@@ -1441,6 +1448,12 @@ struct ConversationDetailView: View {
         TranscriptIndex.railTitle(for: prompt)
     }
 
+    /// `!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty` ile
+    /// aynı cevap, kopyasız: tarama ilk görünür karakterde durur.
+    static func containsVisibleText(_ text: String) -> Bool {
+        text.unicodeScalars.contains { !CharacterSet.whitespacesAndNewlines.contains($0) }
+    }
+
     /// Rows report a rounded position; updates only invalidate active prompt when it changes.
     ///
     /// Bu geri çağrı da bir yerleşim geçişinin içinde çalışır (her 8 pt'lik
@@ -1666,6 +1679,18 @@ struct ConversationDetailView: View {
             .onChange(of: focusedSession.state.activityGroups.last?.activities.count) { _, _ in
                 handleActivityCountChange(proxy: proxy)
             }
+            .onChange(
+                of: AgentTodoPlacement.shouldShow(
+                    todos: focusedSession.todos,
+                    isTurnRunning: focusedSession.isBusy
+                )
+            ) { _, _ in
+                // Composer üstündeki todo paneli açılıp kapanınca transkript
+                // kabının boyu değişir; ölçümdeki geçici düşüş kullanıcı
+                // jesti sanılıp takip modu ölmemeli (metinlerin kaybolmuş
+                // gibi görünmesi buydu). Inspector/collapse ile aynı bastırma.
+                followState.suppressTransientDrop()
+            }
             .onChange(of: focusedSession.isBusy) { oldValue, newValue in
                 handleBusyChange(oldValue: oldValue, newValue: newValue, proxy: proxy)
             }
@@ -1695,18 +1720,24 @@ struct ConversationDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func handleStreamingTextChange(proxy: ScrollViewProxy) {
+    private func handleStreamingTextChange(proxy _: ScrollViewProxy) {
+        // Akış parça başı kör `scrollTo` kaldırıldı: `.defaultScrollAnchor(.bottom)`
+        // büyüyen içeriği zaten dipte tutar. Her 40 ms'de atılan açık kaydırma
+        // sistem çapasıyla kavga edip pencereyi ıssız bölgeye bırakıyordu
+        // (güncelleme anında kaybolan transkript buydu). Takip aralığı nabzı
+        // korunur: `shouldAutoFollow` son otomatik kaydırma zamanını ilerletir,
+        // sayaç-tabanlı kaydırma iki kez ateşlenmez.
         guard focusedSession.isBusy, followState.shouldAutoFollow(now: Date()) else {
             return
         }
-        proxy.scrollTo("bottom_anchor", anchor: .bottom)
     }
 
-    private func handleActivityCountChange(proxy: ScrollViewProxy) {
+    private func handleActivityCountChange(proxy _: ScrollViewProxy) {
+        // Yukarıdakiyle aynı gerekçe: aktivite sayacı her arttığında atılan
+        // `scrollTo`, metin akışındakiyle aynı kavgayı çıkarırdı.
         guard focusedSession.isBusy, followState.shouldAutoFollow(now: Date()) else {
             return
         }
-        proxy.scrollTo("bottom_anchor", anchor: .bottom)
     }
 
     private func handleBusyChange(oldValue: Bool, newValue: Bool, proxy: ScrollViewProxy) {
@@ -1720,6 +1751,10 @@ struct ConversationDetailView: View {
         offsetTracker.clear()
         followState.reset()
         activePromptID = nil
+        // Çıkan oturumun bekleyen kaydırma işi iptal edilir; 40 ms sonra
+        // uyanıp yeni oturumun transkriptine `scrollTo` atmamalı.
+        messageCountScrollTask?.cancel()
+        messageCountScrollTask = nil
         Task { @MainActor in
             proxy.scrollTo("bottom_anchor", anchor: .bottom)
         }
@@ -1993,12 +2028,18 @@ private struct ChatMessageRow: View {
                     userMessageActions
                 }
             } else {
-                let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty {
+                if ConversationDetailView.containsVisibleText(message.text) {
                     VStack(alignment: .leading, spacing: 4) {
-                        MarkdownContentView(markdown: message.text)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 2)
+                        // Akan yanıt paylaşılan ayrıştırma deposuna yazılmaz:
+                        // her flush tam metni anahtar yapar, depoyu çalkalar ve
+                        // 256 girdilik sınırı etkisizleştirirdi.
+                        MarkdownContentView(
+                            markdown: message.text,
+                            allowsPlanDocuments: true,
+                            isStreaming: isActiveAssistant
+                        )
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
 
                         if isPlanAwaitingApproval {
                             planApprovalBar

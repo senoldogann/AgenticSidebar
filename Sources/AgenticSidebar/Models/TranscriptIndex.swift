@@ -41,7 +41,12 @@ struct TranscriptIndex {
             if message.role == .user {
                 foundAssistantInCurrentTurn = false
             } else if message.role == .assistant {
-                let isNonEmpty = !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                // `trimmingCharacters` tüm metni kopyalar; bu döngü her
+                // aktivite flush'unda tüm transkriptte çalışırdı. Kopyasız
+                // denklik denetimi aynı cevabı verir.
+                let isNonEmpty = message.text.unicodeScalars.contains {
+                    !CharacterSet.whitespacesAndNewlines.contains($0)
+                }
                 if isNonEmpty && !foundAssistantInCurrentTurn {
                     lastAssistantIDs.insert(message.id)
                     foundAssistantInCurrentTurn = true
@@ -185,8 +190,17 @@ final class TranscriptIndexCache {
         if newGroupKey != groupKey {
             groupKey = newGroupKey
             groupRebuilds += 1
-            groupsByAnchor = TranscriptIndex.groupsByAnchor(activityGroups)
-            didRebuildGroup = true
+            // Revizyon sayacı akan aktivite içeriğini de görünür kılar, ama
+            // meta veri yalnız çapraz (anchor) kümeye bakar: içerik büyürken
+            // çapa değişmedikçe O(N) meta veri aynı sonucu yeniden kurardı.
+            // Gruplar tazelenir (kart canlı kalır), meta veri yalnız çapa
+            // değişince kurulur.
+            let freshGroups = TranscriptIndex.groupsByAnchor(activityGroups)
+            let anchorsChanged =
+                freshGroups.count != groupsByAnchor.count
+                || freshGroups.keys.contains { groupsByAnchor[$0] == nil }
+            groupsByAnchor = freshGroups
+            didRebuildGroup = anchorsChanged
         }
 
         if didRebuildPrompt || didRebuildGroup {

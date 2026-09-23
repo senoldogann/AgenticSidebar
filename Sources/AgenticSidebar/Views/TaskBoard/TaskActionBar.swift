@@ -24,14 +24,14 @@ enum TaskActionBarPresenter {
     /// menüsü bu sıradan türetilir; klavye odak sırası `keyboardTabOrder` ile
     /// aynı sırayı izler.
     static let displayOrder: [TaskBoardAction] = [
-        .start, .pause, .resume, .stop, .retry, .requestChanges, .accept,
+        .start, .pause, .resume, .stop, .retry, .requestChanges, .accept, .reopen,
     ]
 
     /// Çubukta her zaman görünen birincil eylemler; kanonik sıranın alt dizisi.
     static let primaryActions: [TaskBoardAction] = [.start, .pause, .resume, .stop, .accept]
 
     /// Taşma menüsünde toplanan ikincil eylemler; kanonik sıranın alt dizisi.
-    static let secondaryActions: [TaskBoardAction] = [.retry, .requestChanges]
+    static let secondaryActions: [TaskBoardAction] = [.retry, .requestChanges, .reopen]
 
     static let busyExplanation = "Bu görev için bir işlem sürüyor; sonuç gelene kadar bekleyin."
     static let missingFeedbackReason = "Değişiklik isteği için geri bildirim gerekli"
@@ -129,6 +129,7 @@ enum TaskActionBarPresenter {
         case .retry: "Yeniden dene"
         case .requestChanges: "Değişiklik iste"
         case .accept: "Kabul et"
+        case .reopen: "Yeniden aç"
         }
     }
 
@@ -141,6 +142,7 @@ enum TaskActionBarPresenter {
         case .retry: "arrow.clockwise"
         case .requestChanges: "arrow.uturn.backward"
         case .accept: "checkmark.seal.fill"
+        case .reopen: "arrow.counterclockwise"
         }
     }
 }
@@ -300,6 +302,8 @@ struct TaskActionBar: View {
                 result = await store.requestChanges(taskID: taskID, actor: actor, feedback: feedback)
             case .accept:
                 result = await store.accept(taskID: taskID, actor: actor)
+            case .reopen:
+                result = await store.reopen(taskID: taskID)
             }
             lastRefusalMessage = TaskActionBarPresenter.refusalMessage(result)
         }

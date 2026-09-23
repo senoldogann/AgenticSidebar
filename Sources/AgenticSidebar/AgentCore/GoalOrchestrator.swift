@@ -33,6 +33,10 @@ final class GoalOrchestrator {
         /// `contextLimitExceeded`…) yoksa faz ilerler; varsa koşu terminal
         /// hataya düşer — hatalı tur başarılı sanılmaz.
         var turnError: @MainActor (UUID) -> AgentSessionError?
+        /// Son tur kullanıcı Stop ile iptal edildi mi (`nil` hata + `.cancelled`
+        /// durumu başarıdan ayırt edilemezdi; iptal faz ilerletmemeli).
+        /// Öntanımlı `false`, eski kurulumlar bozulmaz.
+        var wasCancelled: @MainActor (UUID) -> Bool = { _ in false }
         /// Son asistan yanıtı: otonom review kapısı buradan
         /// `CRITICAL_HIGH_COUNT` satırını okur. `nil` = yanıt yok ya da
         /// okunamadı; kapı o zaman bulguyu 0 sayar (eski davranış).
@@ -219,8 +223,9 @@ final class GoalOrchestrator {
             return false
         }
         guard !isActive else {
-            message = "A goal is already running in this pane."
-            return false
+            // Yalnız ileti kart çizmezdi: başka sohbetteki kullanıcı ret
+            // nedenini hiç göremezdi. Ret kartı odaktaki sohbete aittir.
+            return refusal("A goal is already running in this pane.")
         }
         if let storeURL, let stored = GoalStore.load(from: storeURL), !stored.run.isTerminal {
             return refusal("This conversation already has a running goal (“\(stored.run.objective)”).")
@@ -794,6 +799,11 @@ final class GoalOrchestrator {
         engine: inout GoalEngine,
         now: Date
     ) {
+        // Meşgul oturuma gönderim kuyruğa düşer ve her saniyelik `tick`
+        // aynı eylemi üst üste yığardı: önce boşalması beklenir.
+        guard !bridge.isBusy(sessionID) else {
+            return
+        }
         let acceptance = bridge.submit(sessionID, text, turnMode, speedMode)
         guard acceptance.wasAccepted else {
             engine.fail(
@@ -803,6 +813,15 @@ final class GoalOrchestrator {
             )
             self.engine = engine
             message = "Goal stopped: the session could not accept the prompt."
+            persist(now: now)
+            return
+        }
+        // `.queued` başarı değildir: tur henüz başlamadı, taban çizgisi ve
+        // `turnInFlight` kurulursa kullanıcının turu hedefe sayılır. Eylem
+        // beklemede kalır, oturum boşalınca `tick` yeniden gönderir.
+        guard acceptance == .started else {
+            message = "Goal turn queued behind the running turn."
+            self.engine = engine
             persist(now: now)
             return
         }
@@ -855,6 +874,19 @@ final class GoalOrchestrator {
         // Kullanıcı bekleme iletisi turun bitişiyle hükmünü yitirir.
         if message == "Goal paused: waiting for your input." {
             message = nil
+        }
+        // İptal edilen tur başarılı bitmiş gibi faz ilerletmemeli: hedef
+        // duraklatılır, `resume` kaldığı fazdan güvenli eylemle devam eder.
+        // `state.error` iptalde temizlendiği için hata kolu bunu yakalayamaz.
+        if bridge.wasCancelled(sessionID) {
+            turnStartedAt = nil
+            turnLastProgressAt = nil
+            if engine.pause(date: now) {
+                self.engine = engine
+                message = "Goal turn cancelled; goal paused — resume to continue."
+                persist(now: now)
+            }
+            return
         }
         // Hatalı biten tur faz ilerletmez: kalıcı hata (kimlik, bağlam taşması,
         // desteklenmeyen yetenek…) koşuyu terminal hataya düşürür; geçici
@@ -949,12 +981,24 @@ final class GoalOrchestrator {
         if buildOK, testsOK {
             _ = engine.markAllCriteriaMet(date: now)
         }
-        let findings: Int
-        if let sessionID {
-            findings = GoalReviewFindings.count(from: bridge.lastAssistantText(sessionID))
-        } else {
-            findings = 0
+        let reviewText: String? = sessionID.flatMap { bridge.lastAssistantText($0) }
+        // İşaret yoksa bulgu 0 sayılmaz: boş/bozuk review yanıtı kapıyı
+        // sessizce yeşile döndürürdü. Bilinmeyen = düzeltme turu (bütçe
+        // korumalı), döngü incelemeyi yeniden üretir.
+        guard
+            let reviewText,
+            reviewText.range(
+                of: #"CRITICAL_HIGH_COUNT\s*:\s*\d+"#,
+                options: [.regularExpression, .caseInsensitive]
+            ) != nil
+        else {
+            pendingAction = .submitFix(reasons: ["review output unreadable, re-reviewing"])
+            message = "Review output unreadable; running a fix turn to re-review."
+            self.engine = engine
+            persist(now: now)
+            return
         }
+        let findings = GoalReviewFindings.count(from: reviewText)
         guard engine.didFinishReview(criticalOrHighFindings: findings, date: now) else {
             return
         }

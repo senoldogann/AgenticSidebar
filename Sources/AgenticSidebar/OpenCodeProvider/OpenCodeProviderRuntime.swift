@@ -259,6 +259,10 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         let handledPermissionIDs = Mutex<HandledPermissionIDs>(HandledPermissionIDs())
         let reconciliationManager = self.serverManager
         let reconciliationClientFactory = self.clientFactory
+        // İzin yanıtı tur-yerel `client` ile atılırdı; yeniden başlatma sonrası
+        // ölü bağlantıya POST askıda kalır. Yanıt anında bağlantı tazelenir.
+        let permissionServerManager = self.serverManager
+        let permissionClientFactory = self.clientFactory
 
         let handlePermissionRequest: @Sendable (OpenCodePermissionRequest) -> Void = { request in
             let isNew = handledPermissionIDs.withLock { $0.insert(request.id) }
@@ -282,10 +286,17 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                     reply = .reject
                 }
                 do {
-                    try await client.replyPermission(
-                        requestID: request.id,
-                        reply: reply.rawValue
-                    )
+                    if let freshConnection = await permissionServerManager.currentConnection() {
+                        try await permissionClientFactory(freshConnection).replyPermission(
+                            requestID: request.id,
+                            reply: reply.rawValue
+                        )
+                    } else {
+                        try await client.replyPermission(
+                            requestID: request.id,
+                            reply: reply.rawValue
+                        )
+                    }
                 } catch {
                     AppLog.openCode.error(
                         "Could not deliver the permission reply for \(request.toolName, privacy: .public)"
@@ -391,6 +402,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 await channel.finish()
             } catch is CancellationError {
                 reconciliationTask.cancel()
+                await lineStream.cancel()
                 await channel.finish(throwing: CancellationError())
             } catch let error as ProviderRuntimeError {
                 reconciliationTask.cancel()
@@ -555,6 +567,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 await channel.finish()
             } catch is CancellationError {
                 await cleanupOnce()
+                await lineStream.cancel()
                 await channel.finish(throwing: CancellationError())
             } catch let error as ProviderRuntimeError {
                 await cleanupOnce()

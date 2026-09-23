@@ -35,7 +35,7 @@ final class AgentSession {
     }
 
     @ObservationIgnored private var pendingBackendQuestion: PendingBackendQuestion?
-    @ObservationIgnored private var queuedBackendQuestions: [OpenCodeQuestionRequest] = []
+    @ObservationIgnored private var queuedBackendQuestions: [(request: OpenCodeQuestionRequest, turnID: UUID)] = []
 
     private(set) var activeTurnID: UUID?
 
@@ -860,7 +860,8 @@ final class AgentSession {
         state.questionHistory.append(question)
         state.activeQuestion = nil
 
-        // If the session is currently idle, send the formatted response as the next turn prompt.
+        // Yanıt kaybolmamalı: boşta ise sonraki tur olur, meşgulse
+        // kuyruğa girer ve çalışan turun ardından koşar.
         if !isBusy {
             let mode = activeTurnMode
             send(
@@ -868,6 +869,14 @@ final class AgentSession {
                 attachmentPaths: [],
                 speedMode: activeTurnSpeedMode,
                 mode: mode,
+                tags: []
+            )
+        } else if !answer.formattedResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            _ = send(
+                answer.formattedResponse,
+                attachmentPaths: [],
+                speedMode: activeTurnSpeedMode,
+                mode: activeTurnMode,
                 tags: []
             )
         }
@@ -1081,8 +1090,8 @@ final class AgentSession {
     private func receiveBackendQuestion(_ request: OpenCodeQuestionRequest, turnID: UUID) {
         guard !request.questions.isEmpty else { return }
         if pendingBackendQuestion != nil {
-            guard !queuedBackendQuestions.contains(where: { $0.requestID == request.requestID }) else { return }
-            queuedBackendQuestions.append(request)
+            guard !queuedBackendQuestions.contains(where: { $0.request.requestID == request.requestID }) else { return }
+            queuedBackendQuestions.append((request: request, turnID: turnID))
             return
         }
         pendingBackendQuestion = PendingBackendQuestion(request: request, turnID: turnID)
@@ -1160,9 +1169,18 @@ final class AgentSession {
     private func submitBackendAnswers() {
         guard let batch = pendingBackendQuestion,
             batch.answers.count == batch.request.questions.count,
-            let stream = activeStream,
             !state.isQuestionSubmitting
         else { return }
+        // Akış kapanmışsa yanıt sessizce düşmemeli: soru beklemede tutulur
+        // ve yeniden-dene bayrağı konur, yoksa oturum `.waiting` konumunda
+        // asılı kalır.
+        guard activeTurnID == batch.turnID, let stream = activeStream else {
+            state.questionSubmissionFailed = true
+            AppLog.agentSession.error(
+                "Backend question answer could not be delivered: turn is no longer active"
+            )
+            return
+        }
 
         state.isQuestionSubmitting = true
         state.questionSubmissionFailed = false
@@ -1237,16 +1255,22 @@ final class AgentSession {
     }
 
     private func presentNextBackendQuestion(turnID: UUID) {
-        guard !queuedBackendQuestions.isEmpty, activeTurnID == turnID else { return }
+        guard activeTurnID == turnID else { return }
+        // Ölü turun sorusu yeni turun akışına karışmamalı: yalnız aynı
+        // turne ait kuyruk sunulur, diğerleri düşürülür.
+        while !queuedBackendQuestions.isEmpty, queuedBackendQuestions.first?.turnID != turnID {
+            queuedBackendQuestions.removeFirst()
+        }
+        guard !queuedBackendQuestions.isEmpty else { return }
         let next = queuedBackendQuestions.removeFirst()
-        receiveBackendQuestion(next, turnID: turnID)
+        receiveBackendQuestion(next.request, turnID: turnID)
     }
 
     /// A cancelled/completed stream cannot accept a stale question reply.
     private func clearBackendQuestions(turnID: UUID) {
+        queuedBackendQuestions.removeAll { $0.turnID == turnID }
         guard pendingBackendQuestion?.turnID == turnID else { return }
         pendingBackendQuestion = nil
-        queuedBackendQuestions.removeAll()
         state.activeQuestion = nil
         state.isQuestionSubmitting = false
         state.questionSubmissionFailed = false
@@ -1268,10 +1292,12 @@ final class AgentSession {
 
         let next = queuedPrompts.removeFirst()
         // Kuyruktan düşen mesaj ya tura dönüşür (o zaman `state` değişimi
-        // kalıcılığı tetikler) ya da başlayamaz — ikinci hâlde düşüşün kendisi
-        // yazılmalı, yoksa mesaj ne turda ne kuyruktadır.
+        // kalıcılığı tetikler) ya da başlayamaz — ikinci hâlde başa iade
+        // edilir, yoksa mesaj ne turda ne kuyruktadır.
         noteQueueChange()
         if startTurn(for: next) == nil {
+            queuedPrompts.insert(next, at: 0)
+            noteQueueChange()
             AppLog.agentSession.error(
                 "A queued prompt could not start because the session has no usable provider"
             )
@@ -1404,6 +1430,10 @@ final class AgentSession {
             state.status = .cancelled
             state.completedAt = Date()
         }
+
+        // İptal edilen turun bekleyen sorusu ölü turne bağlı kalmamalı;
+        // kart takılı kalır ve sonraki turun akışına karışır.
+        clearBackendQuestions(turnID: cancelledTurnID)
 
         activeTask = nil
         activeStream = nil

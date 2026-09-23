@@ -207,6 +207,9 @@ enum CrashReporter {
     private static func openSignalLog(in directory: URL, fileManager: FileManager) {
         closeSignalLog()
         let url = directory.appendingPathComponent(signalLogName)
+        // Her açılışta taze başlar: sinyal işleyici çöküşte tek satır ekler ve
+        // süreç ölür; budanmazsa dosya çöküş başına bir satır büyür.
+        try? fileManager.removeItem(at: url)
         if !fileManager.fileExists(atPath: url.path) {
             fileManager.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
         }

@@ -18,6 +18,7 @@ struct TaskBoardCard: Sendable, Identifiable, Equatable {
     let unmetPrerequisiteIDs: [UUID]
     let criteriaCompleted: Int
     let criteriaTotal: Int
+    let budget: ExecutionBudget
     let updatedAt: Date
 }
 
@@ -53,6 +54,7 @@ enum TaskBoardAction: String, Sendable, CaseIterable, Equatable {
     case retry
     case requestChanges
     case accept
+    case reopen
 }
 
 /// Availability of one action, including why an unavailable action is disabled.
@@ -439,7 +441,8 @@ final class TaskBoardStore {
         taskID: UUID,
         title: String,
         objective: String,
-        priority: Int
+        priority: Int,
+        budget: ExecutionBudget? = nil
     ) async -> TaskBoardActionResult {
         guard !isUpdatingTask else {
             return .refused(TaskBoardRefusal(kind: .busy, message: "Görev güncelleme zaten sürüyor"))
@@ -458,7 +461,8 @@ final class TaskBoardStore {
                 expectedVersion: card.version,
                 title: title,
                 objective: objective,
-                priority: priority
+                priority: priority,
+                budget: budget
             )
             lastFailure = nil
             await refresh()
@@ -726,6 +730,17 @@ final class TaskBoardStore {
         }
     }
 
+    func reopen(taskID: UUID) async -> TaskBoardActionResult {
+        await perform(.reopen, taskID: taskID) { card in
+            do {
+                _ = try await self.service.reopen(taskID: taskID, expectedVersion: card.version)
+                return .applied
+            } catch {
+                return .refused(Self.refusal(from: error))
+            }
+        }
+    }
+
     // MARK: - Review actions
 
     func requestChanges(taskID: UUID, actor: String, feedback: String) async -> TaskBoardActionResult {
@@ -776,12 +791,21 @@ final class TaskBoardStore {
         case .applied:
             refusals[taskID] = nil
         case .refused(let refusal):
-            refusals[taskID] = TaskBoardActionRefusal(
-                action: action,
-                kind: refusal.kind,
-                message: refusal.message,
-                taskVersion: card.version
-            )
+            // Geçici retler (`deferred`/`unavailable`) sabitlenmez: sürüm
+            // değişmediği için düğme sonsuza dek kapalı kalırdı (kartın
+            // sürümü yalnız geçiş yazınca artar). Neden çağrıya döner,
+            // düğme her seferinde yeniden değerlendirilir.
+            switch refusal.kind {
+            case .deferred, .unavailable:
+                refusals[taskID] = nil
+            default:
+                refusals[taskID] = TaskBoardActionRefusal(
+                    action: action,
+                    kind: refusal.kind,
+                    message: refusal.message,
+                    taskVersion: card.version
+                )
+            }
         }
         await refresh()
         return result
@@ -802,21 +826,22 @@ final class TaskBoardStore {
     ///
     /// Ham `reason` metni mesajda aynen tutulur (testler ve loglar ona göre
     /// eşleşir); bilinen çalışma alanı ve doğrulama engellerine yalnızca
-    /// Türkçe çözüm cümlesi eklenir. Kirli kaynak, Git-olmayan klasör, kapsam
-    /// dışı yol ve çözülemeyen proje en sık görülen "pano çalışmıyor"
-    /// nedenleridir. Korumalı dal kapısı kaldırıldı: çalışma alanı taban
-    /// committe ayrık kurulduğu için temiz `main`/`master` checkout artık
-    /// engel değildir.
+    /// Türkçe çözüm cümlesi eklenir. Kirli kaynak kapısı kaldırıldı: her
+    /// oluşturma kirli kaynaktan yeni `agentic/w-*` dalında devam eder, kaynak
+    /// checkout'a hiç dokunulmaz; aşağıdaki `WORKTREE_DIRTY` dalı yalnız eski
+    /// kayıtlarla uyumluluk için durur.
     private static func deferredRefusal(reason: String) -> TaskBoardRefusal {
         var message = "Gönderilmedi: \(reason)"
         if reason.contains("WORKTREE_DIRTY") {
-            message += ". Kaynak depoda commitlenmemiş değişiklik var — önce commit/stash yapıp tekrar Başlat'a basın"
+            message += ". Kaynak depo kirliydi (eski kayıt) — güncel sürüm kirli kaynaktan otomatik yeni dal açarak devam eder"
         } else if reason.contains("WORKTREE_NOT_A_REPOSITORY") {
             message += ". Seçili klasör bir Git deposu değil — proje kaydında depo kökünü seçin"
         } else if reason.contains("WORKTREE_SCOPE_VIOLATION") {
             message += ". Yol yetkili kapsam dışında — proje kökünü ve pano çalışma dizinini doğrulayın"
         } else if reason.contains("VERIFICATION_UNRECOGNIZED_PROJECT") {
-            message += ". Bu pano sürümü yalnız SwiftPM projelerini doğrular — `Package.swift` içeren bir depo seçin ya da görevi SwiftPM köküne taşıyın; ajan koşusu başlamadan reddedildi"
+            message += ". Depoda tanınan proje işareti yok — `Package.swift`, `package.json`,"
+            message += " `pyproject.toml`, `go.mod`, `Cargo.toml` işaretlerinden biri ya da Git deposu kökü seçin;"
+            message += " ajan koşusu başlamadan reddedildi"
         } else if reason.contains("WORKTREE_PROJECT_UNKNOWN") || reason.contains("is unknown") {
             message += ". Proje bu süreçte tanınmıyor — panoyu yenileyip projeyi yeniden seçin"
         } else if reason.contains("providerUnavailable") {
@@ -866,6 +891,11 @@ final class TaskBoardStore {
         case .accept:
             guard card.status == .review else {
                 return disabled(action, "Kabul yalnız görev incelemedeyken çalışır")
+            }
+            return enabled(action)
+        case .reopen:
+            guard card.status == .cancelled || card.status == .done else {
+                return disabled(action, "Yeniden açma yalnız iptal edilmiş ya da bitmiş görevlerde çalışır")
             }
             return enabled(action)
         }
@@ -923,6 +953,7 @@ final class TaskBoardStore {
                 unmetPrerequisiteIDs: unmet,
                 criteriaCompleted: task.criteria.filter(\.isCompleted).count,
                 criteriaTotal: task.criteria.count,
+                budget: task.budget,
                 updatedAt: task.updatedAt
             )
         }
@@ -947,13 +978,14 @@ final class TaskBoardStore {
     // MARK: - Project validation
 
     /// Klasör denetimi en iyi çabadır ve servis çağrısından önce koşar:
-    /// var olmayan bir klasör, `.git` girdisi taşımayan bir klasör ya da
-    /// `Package.swift` barındırmayan bir klasör için kayıt reddedilir.
+    /// var olmayan bir klasör ya da `.git` girdisi taşımayan bir klasör
+    /// için kayıt reddedilir.
     /// Çalışma kopyalarında (worktree) `.git` bir dosya da olabileceğinden
     /// yalnızca varlığına bakılır; gerçek depo sahipliği denetimi talep
-    /// anındaki çalışma alanı ön kontrolüne aittir. `Package.swift` kapısı
-    /// kayıt anında fail-fast verir: çözülemeyen depo daha Başlat'a
-    /// basılmadan, Türkçe gerekçeyle reddedilir.
+    /// anındaki çalışma alanı ön kontrolüne aittir. Dil işareti
+    /// (`Package.swift`, `package.json`, …) kayıt kapısı değildir: işaretsiz
+    /// bir Git deposu `generic` türle kaydedilir, doğrulanması parmak izi ve
+    /// insan ölçütleriyle sınırlı kalır.
     private static func repositoryFolderValidationMessage(for repositoryURL: URL) -> String? {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: repositoryURL.path, isDirectory: &isDirectory),
@@ -964,10 +996,6 @@ final class TaskBoardStore {
         let gitMarker = repositoryURL.appendingPathComponent(".git")
         guard FileManager.default.fileExists(atPath: gitMarker.path) else {
             return "Seçilen klasör bir Git deposu değil: \(repositoryURL.path)"
-        }
-        let packageMarker = repositoryURL.appendingPathComponent("Package.swift", isDirectory: false)
-        guard FileManager.default.fileExists(atPath: packageMarker.path) else {
-            return "Seçilen klasörde Package.swift yok — bu pano sürümü yalnız SwiftPM projelerini doğrular: \(repositoryURL.path)"
         }
         return nil
     }

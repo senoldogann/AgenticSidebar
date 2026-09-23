@@ -223,14 +223,16 @@ final class TaskRecoveryTests: XCTestCase {
             expectedVersion: Int,
             title: String,
             objective: String,
-            priority: Int
+            priority: Int,
+            budget: ExecutionBudget?
         ) async throws -> CodingTask {
             try await base.updateTaskDetails(
                 taskID: taskID,
                 expectedVersion: expectedVersion,
                 title: title,
                 objective: objective,
-                priority: priority
+                priority: priority,
+                budget: budget
             )
         }
 
@@ -328,6 +330,10 @@ final class TaskRecoveryTests: XCTestCase {
 
         func recordEvidence(_ evidence: VerificationEvidence) async throws {
             try await base.recordEvidence(evidence)
+        }
+
+        func evidence(taskID: UUID) async throws -> [VerificationEvidence] {
+            try await base.evidence(taskID: taskID)
         }
 
         func recordFinding(_ finding: ReviewFinding) async throws {

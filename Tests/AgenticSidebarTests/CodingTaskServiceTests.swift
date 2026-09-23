@@ -424,6 +424,7 @@ struct RepositoryMutationCounts: Equatable, Sendable {
 actor ServiceHookingRepository: CodingTaskRepository {
     private let base: SQLiteTaskStore
     private var gatedTaskReads: AsyncGate?
+    private var gatedTaskReadIDs: Set<UUID>?
     private var gatedSnapshots: AsyncGate?
     private var nextClaimAttemptFailure: TaskRepositoryError?
     private var nextSnapshotFailure: TaskRepositoryError?
@@ -448,6 +449,15 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func gateTaskReads(_ gate: AsyncGate) {
         gatedTaskReads = gate
+        gatedTaskReadIDs = nil
+    }
+
+    /// Yalnız verilen görevlerin okumasını kapıya alır; seçim değişimi gibi
+    /// başka görevlerin okuması kapıya takılmadan akar. `nil` tüm okumaları
+    /// kapar (eski davranış).
+    func gateTaskReads(_ gate: AsyncGate, for taskIDs: Set<UUID>) {
+        gatedTaskReads = gate
+        gatedTaskReadIDs = taskIDs
     }
 
     func gateSnapshots(_ gate: AsyncGate) {
@@ -518,14 +528,16 @@ actor ServiceHookingRepository: CodingTaskRepository {
         expectedVersion: Int,
         title: String,
         objective: String,
-        priority: Int
+        priority: Int,
+        budget: ExecutionBudget?
     ) async throws -> CodingTask {
         try await base.updateTaskDetails(
             taskID: taskID,
             expectedVersion: expectedVersion,
             title: title,
             objective: objective,
-            priority: priority
+            priority: priority,
+            budget: budget
         )
     }
 
@@ -554,7 +566,7 @@ actor ServiceHookingRepository: CodingTaskRepository {
 
     func task(id: UUID) async throws -> CodingTask? {
         taskReadCount += 1
-        if let gate = gatedTaskReads {
+        if let gate = gatedTaskReads, gatedTaskReadIDs?.contains(id) ?? true {
             await gate.enter()
         }
         if let failure = nextTaskReadFailure {
@@ -647,6 +659,10 @@ actor ServiceHookingRepository: CodingTaskRepository {
     func recordEvidence(_ evidence: VerificationEvidence) async throws {
         recordEvidenceCount += 1
         try await base.recordEvidence(evidence)
+    }
+
+    func evidence(taskID: UUID) async throws -> [VerificationEvidence] {
+        try await base.evidence(taskID: taskID)
     }
 
     func recordFinding(_ finding: ReviewFinding) async throws {
@@ -804,6 +820,9 @@ final class ServiceTestHarness {
             updatedAt: now
         )
         try await store.createTask(task)
+        // Gerçek koşuda zamanlayıcı denemeye çalışma alanı kimliği bağlar;
+        // tohum da aynısını yapar ki denetçi girdileri (`workspaceID`)
+        // gerçekçi okunsun.
         let attempt = TaskAttempt(
             id: attemptID,
             taskID: taskID,
@@ -811,6 +830,7 @@ final class ServiceTestHarness {
             role: .developer,
             providerID: "runtime-1",
             modelID: "model-1",
+            workspaceID: UUID(),
             generation: 1,
             startedAt: now
         )
@@ -1607,7 +1627,8 @@ final class CodingTaskServiceTests: XCTestCase {
         )
         XCTAssertEqual(changed.status, .ready)
         XCTAssertEqual(changed.stage, .plan)
-        XCTAssertEqual(changed.version, seeded.task.version + 1)
+        // Geçiş + sarkan deneme kapatma: iki yazım, iki sürüm artışı.
+        XCTAssertEqual(changed.version, seeded.task.version + 2)
 
         do {
             _ = try await service.requestChanges(
@@ -1991,7 +2012,7 @@ final class CodingTaskServiceTests: XCTestCase {
             fingerprintFailure: nil,
             fingerprintGate: nil,
             verificationPreflight: ScriptedVerificationPreflight(
-                reason: "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanında Package.swift yok"
+                reason: "VERIFICATION_UNRECOGNIZED_PROJECT: çalışma alanında tanınan proje işareti yok"
             )
         )
         _ = try await fixture.service.createTask(

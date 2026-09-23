@@ -244,6 +244,7 @@ actor CodingTaskService {
             repositoryPath: trimmedPath,
             gitIdentity: trimmedIdentity,
             protectedRefs: protectedRefs,
+            kind: ProjectKindDetector.detect(in: URL(fileURLWithPath: trimmedPath)) ?? .generic,
             createdAt: clock.now()
         )
         try await mapped { try await self.repository.saveProject(project) }
@@ -336,13 +337,19 @@ actor CodingTaskService {
         expectedVersion: Int,
         title: String,
         objective: String,
-        priority: Int
+        priority: Int,
+        budget: ExecutionBudget? = nil
     ) async throws -> CodingTask {
         try await withExclusiveTaskAction(taskID: taskID) {
             let trimmedTitle = try Self.requireHumanText(title, field: "title")
             let trimmedObjective = try Self.requireHumanText(objective, field: "objective")
             guard priority >= 0 else {
                 throw CodingTaskServiceError.invalidTaskInput(field: "priority", reason: "must not be negative")
+            }
+            if let budget {
+                guard budget.maxAttempts > 0, budget.maxTaskDurationSeconds > 0, budget.maxToolCallsPerAttempt > 0 else {
+                    throw CodingTaskServiceError.invalidTaskInput(field: "budget", reason: "must be positive")
+                }
             }
             let task = try await self.requireTask(taskID)
             try Self.requireVersion(task: task, expectedVersion: expectedVersion)
@@ -355,7 +362,8 @@ actor CodingTaskService {
                     expectedVersion: expectedVersion,
                     title: trimmedTitle,
                     objective: trimmedObjective,
-                    priority: priority
+                    priority: priority,
+                    budget: budget
                 )
             }
         }
@@ -701,6 +709,7 @@ actor CodingTaskService {
     /// çekmeyle emekliye ayrılır; bayat bir hata daha yeni bir denemeyi
     /// durduramaz.
     private func dispatch(attempt attemptID: UUID, generation: Int, fingerprint: String, taskID: UUID) async {
+        dispatchedRuns[taskID]?.handle.cancel()
         let handle = Task { [weak self] in
             guard let self else { return }
             do {
@@ -721,16 +730,28 @@ actor CodingTaskService {
                     reason: String(describing: error)
                 )
             }
+            // Bitince kendi girdisini kaldırır: kuşak uymazsa daha yeni bir
+            // koşu yazılmış demektir, ona dokunulmaz.
+            await self.removeDispatchedRun(taskID: taskID, generation: generation)
         }
-        dispatchedRuns[taskID] = handle
+        dispatchedRuns[taskID] = (generation: generation, handle: handle)
+    }
+
+    /// Biten koşunun girdisini kaldırır; araya daha yeni kuşak girdiyse el sürmez.
+    private func removeDispatchedRun(taskID: UUID, generation: Int) {
+        if dispatchedRuns[taskID]?.generation == generation {
+            dispatchedRuns.removeValue(forKey: taskID)
+        }
     }
 
     /// Bekleyen koşu görevleri; kapanış ve durdurma bu tutamağı bekler.
-    private var dispatchedRuns: [UUID: Task<Void, Never>] = [:]
+    /// Kuşakla birlikte tutulur: biten koşu kendi girdisini kaldırır, üzerine
+    /// yazılmış daha yeni koşuya dokunmaz.
+    private var dispatchedRuns: [UUID: (generation: Int, handle: Task<Void, Never>)] = [:]
 
     /// Bu süreçte başlatılmış koşu görevlerinin bitmesini bekler (kapanış yolu).
     func awaitDispatchedRuns() async {
-        let handles = dispatchedRuns.values
+        let handles = dispatchedRuns.values.map(\.handle)
         for handle in handles {
             _ = await handle.value
         }
@@ -873,6 +894,28 @@ actor CodingTaskService {
         }
     }
 
+    /// Bitmiş ya da iptal edilmiş görevi birikime döndürür: yanlışlıkla
+    /// kapatılan kartın tek çıkışıdır (sil+yeni tarihsiz kalırdı). Sürüm
+    /// çiti bayat yazımı reddeder; terminal-olmayan kart reddedilir.
+    @discardableResult
+    func reopen(taskID: UUID, expectedVersion: Int) async throws -> CodingTask {
+        try await withExclusiveTaskAction(taskID: taskID) {
+            let task = try await self.requireTask(taskID)
+            try Self.requireVersion(task: task, expectedVersion: expectedVersion)
+            guard task.status.isTerminal else {
+                throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
+            }
+            return try await self.mapped {
+                try await self.repository.transition(
+                    taskID: taskID,
+                    expectedVersion: expectedVersion,
+                    action: .reopen,
+                    context: TaskTransitionContext(fingerprint: "", actor: "")
+                )
+            }
+        }
+    }
+
     // MARK: - Review and acceptance
 
     /// Sends a reviewed task back to ready with the reviewer's feedback.
@@ -890,7 +933,7 @@ actor CodingTaskService {
             guard task.status == .review else {
                 throw CodingTaskServiceError.actionNotAvailable(taskID: taskID, status: task.status)
             }
-            return try await self.mapped {
+            let transitioned = try await self.mapped {
                 try await self.repository.transition(
                     taskID: taskID,
                     expectedVersion: expectedVersion,
@@ -901,6 +944,32 @@ actor CodingTaskService {
                     )
                 )
             }
+            // İncelemeye gönderim denemeyi bitirmez: sarkan `inProgress`
+            // satır sonraki başlatmayı `deferred(activeAttempt)` ile
+            // kilitler ve kartın çıkışı kalmaz. Değişiklik isteği sarkmış
+            // denemeyi kapatır; yeni başlatma taze deneme açar.
+            if let active = try await self.activeAttempt(taskID: taskID),
+                active.outcome == .inProgress
+            {
+                do {
+                    _ = try await self.repository.endAttempt(
+                        taskID: taskID,
+                        attemptID: active.id,
+                        expectedVersion: transitioned.version,
+                        outcome: .cancelled,
+                        toolCallCount: nil,
+                        durationSeconds: nil
+                    )
+                    // Deneme kapatma sürümü bir artırır: bayat `transitioned`
+                    // yerine güncel kayıt döner, çit bir sonraki yazıda tutar.
+                    return try await self.requireTask(taskID)
+                } catch {
+                    AppLog.lifecycle.error(
+                        "Could not close the dangling attempt \(active.id.uuidString, privacy: .public) after requesting changes: \(String(describing: error), privacy: .public)"
+                    )
+                }
+            }
+            return transitioned
         }
     }
 
@@ -970,6 +1039,23 @@ actor CodingTaskService {
         let decision: AcceptanceDecision
     }
 
+    /// Görevin projesine göre kabul kapısının beklediği adım listesi.
+    ///
+    /// Proje kayıtlıysa türüne göre (`swiftpm`/`node`/`python`/`go`/`rust`
+    /// için `build`+`test`, `generic` için boş) çözülür; görev ham mağazaya
+    /// yazılıp projesi bilinmiyorsa (eski testler, tohumlanmış satırlar)
+    /// kompozisyonun enjekte ettiği liste kullanılır. Böylece mevcut
+    /// davranış korunurken canlı pano her dilde doğru kapıyı uygular.
+    private func effectiveRequiredSteps(task: CodingTask) async -> [String] {
+        if let cached = registeredProjects[task.projectID] {
+            return AcceptanceGate.requiredSteps(for: cached.kind)
+        }
+        if let stored = await projectFromStore(id: task.projectID) {
+            return AcceptanceGate.requiredSteps(for: stored.kind)
+        }
+        return requiredSteps
+    }
+
     private func acceptanceContext(task: CodingTask) async throws -> AcceptanceContext {
         guard let attemptID = task.currentAttemptID else {
             throw CodingTaskServiceError.noActiveAttempt(taskID: task.id)
@@ -993,7 +1079,7 @@ actor CodingTaskService {
             findings: findings,
             approvals: approvals,
             currentFingerprint: inputs.currentFingerprint,
-            requiredSteps: requiredSteps
+            requiredSteps: await self.effectiveRequiredSteps(task: task)
         )
         return AcceptanceContext(
             task: task,

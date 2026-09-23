@@ -194,11 +194,17 @@ final class ScreenshotMonitorService {
         let temporaryURL = temporaryDirectoryURL
         Self.removeStaleTemporaryScreenshots(in: temporaryURL)
         Task.detached(priority: .utility) { [weak self] in
-            let seeded = Set(
-                Self.scanRecentScreenshots(in: screenshotsURL, now: Date()).map(\.path)
-            )
+            let seeded = Self.scanRecentScreenshots(in: screenshotsURL, now: Date()).map(\.path)
             await MainActor.run { [weak self] in
-                self?.trackedFilePathSet = seeded
+                // Her iki koleksiyon da tohumlanır: yalnız küme tohumlanırsa
+                // tohumlanan yollar tahliye kuyruğuna girmez, kümeden hiç
+                // düşmez ve silinip yeniden yaratılan dosya bir daha
+                // analiz edilmezdi. Bu sırada `tick` zaten izledikleri varsa
+                // üzerine yazılmaz, birleştirilir.
+                guard let self else { return }
+                for path in seeded where !self.trackedFilePathSet.contains(path) {
+                    self.track(path)
+                }
             }
         }
 

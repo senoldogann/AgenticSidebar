@@ -107,13 +107,14 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 let refsData = try JSONEncoder().encode(project.protectedRefs)
                 let refsString = String(data: refsData, encoding: .utf8) ?? "[]"
                 let sql = """
-                    INSERT INTO projects (id, name, repository_path, git_identity, protected_refs, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO projects (id, name, repository_path, git_identity, protected_refs, created_at, kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name = excluded.name,
                         repository_path = excluded.repository_path,
                         git_identity = excluded.git_identity,
-                        protected_refs = excluded.protected_refs;
+                        protected_refs = excluded.protected_refs,
+                        kind = excluded.kind;
                     """
                 var stmt: OpaquePointer?
                 defer { sqlite3_finalize(stmt) }
@@ -124,6 +125,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 bindText(stmt, 4, project.gitIdentity)
                 bindText(stmt, 5, refsString)
                 sqlite3_bind_double(stmt, 6, project.createdAt.timeIntervalSince1970)
+                bindText(stmt, 7, project.kind.rawValue)
                 try stepDone(stmt)
             }
         }
@@ -139,7 +141,10 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
     public func listProjects() async throws -> [CodingProject] {
         try queue.sync {
             try checkOpen()
-            let sql = "SELECT id, name, repository_path, git_identity, protected_refs, created_at FROM projects ORDER BY created_at ASC;"
+            let sql = """
+                SELECT id, name, repository_path, git_identity, protected_refs, created_at, kind
+                FROM projects ORDER BY created_at ASC;
+                """
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
             try prepare(sql, &stmt)
@@ -188,7 +193,8 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         expectedVersion: Int,
         title: String,
         objective: String,
-        priority: Int
+        priority: Int,
+        budget: ExecutionBudget?
     ) async throws -> CodingTask {
         try queue.sync {
             try checkOpen()
@@ -202,6 +208,10 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
                 task.title = title
                 task.objective = objective
                 task.priority = priority
+                // Bütçe bitmiş kartın çıkışıdır: yükseltme sürüm çitiyle yazılır.
+                if let budget {
+                    task.budget = budget
+                }
                 task.version += 1
                 task.updatedAt = Date()
                 try updateTask(task)
@@ -738,6 +748,37 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
             bindText(stmt, 1, id.uuidString)
             guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
             return loadEvidence(stmt: stmt)
+        }
+    }
+
+    /// Loads every evidence entry for a task, oldest first.
+    ///
+    /// Kayıt yolu `recordEvidence` ile aynı tablodur: süreç yeniden başlasa
+    /// bile kanıt burada durur; süreç-içi defter boşaldığında kabul girdileri
+    /// bu okumayla onarılır.
+    public func evidence(taskID: UUID) async throws -> [VerificationEvidence] {
+        try queue.sync {
+            try checkOpen()
+            let sql = """
+                SELECT
+                    id, task_id, attempt_id, recipe_name, step_name, status, exit_code,
+                    timed_out, details_redacted, workspace_fingerprint, blocked_by, recorded_at,
+                    recipe_version
+                FROM verification_evidence
+                WHERE task_id = ?
+                ORDER BY recorded_at ASC, id ASC;
+                """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            try prepare(sql, &stmt)
+            bindText(stmt, 1, taskID.uuidString)
+            var entries: [VerificationEvidence] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let entry = loadEvidence(stmt: stmt) {
+                    entries.append(entry)
+                }
+            }
+            return entries
         }
     }
 
@@ -1327,7 +1368,7 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
 
     /// Tek proje satırını okur; kimliği bozuk satırda storeCorrupt fırlatır.
     private func loadProjectRow(id: UUID) throws -> CodingProject? {
-        let sql = "SELECT id, name, repository_path, git_identity, protected_refs, created_at FROM projects WHERE id = ?;"
+        let sql = "SELECT id, name, repository_path, git_identity, protected_refs, created_at, kind FROM projects WHERE id = ?;"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         try prepare(sql, &stmt)
@@ -1353,12 +1394,16 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         let refsText = optionalText(stmt, 4) ?? "[]"
         let protectedRefs = (try? JSONDecoder().decode([String].self, from: Data(refsText.utf8))) ?? []
         let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 5))
+        // v7 öncesi satırlarda `kind` sütunu yoktur ya da `DEFAULT 'generic'`
+        // ile doldurulmuştur; tanınmayan değer asla uydurulmaz, `generic` sayılır.
+        let kind = optionalText(stmt, 6).flatMap(ProjectKind.init(rawValue:)) ?? .generic
         return CodingProject(
             id: id,
             name: name,
             repositoryPath: repositoryPath,
             gitIdentity: gitIdentity,
             protectedRefs: protectedRefs,
+            kind: kind,
             createdAt: createdAt
         )
     }
@@ -1571,11 +1616,21 @@ public final class SQLiteTaskStore: CodingTaskRepository, @unchecked Sendable {
         bindText(stmt, 1, projectID.uuidString)
 
         var attempts: [TaskAttempt] = []
+        var skippedCorruptRows = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
             guard let stmt else { break }
             if let attempt = parseAttempt(from: stmt) {
                 attempts.append(attempt)
+            } else {
+                skippedCorruptRows += 1
             }
+        }
+        // Bozuk satır sessizce atlanmamalı: görünmez "in-progress" satır
+        // ikinci aktif denemeye kapı aralar. Sayı günlüğe düşer.
+        if skippedCorruptRows > 0 {
+            AppLog.lifecycle.error(
+                "Skipped \(skippedCorruptRows, privacy: .public) corrupt active attempt rows"
+            )
         }
         return attempts
     }

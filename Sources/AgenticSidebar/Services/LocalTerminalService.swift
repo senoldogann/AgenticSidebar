@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -245,6 +246,10 @@ final class LocalTerminalService {
         start()
     }
 
+    /// SIGTERM'i yoksayan eski kabuklar; `waitUntilExit` ana iş parçacığını
+    /// bloklayamayacağı için ayrı iş parçacığında beklenir.
+    private var retiringProcesses: [Process] = []
+
     /// Kabuğu durdurur; `exit` yazılmışsa süreç zaten bitmiştir.
     func stop() {
         // Kabuk kapanmadan önce üretilmiş son satırlar ekranda kalmalı.
@@ -258,6 +263,20 @@ final class LocalTerminalService {
         if let currentProcess = process, currentProcess.isRunning {
             currentProcess.terminationHandler = nil
             currentProcess.terminate()
+            // Beklemeden bırakmak zombi + üst üste binen kabuk demekti.
+            // Emekli kümesi referansı tutar, arka plan basamağı SIGKILL
+            // sınırıyla biçer; `restart` penceresi artık sınırlıdır.
+            retiringProcesses.append(currentProcess)
+            Task.detached(priority: .utility) { [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                if currentProcess.isRunning {
+                    kill(currentProcess.processIdentifier, SIGKILL)
+                }
+                currentProcess.waitUntilExit()
+                await MainActor.run { [weak self] in
+                    self?.retiringProcesses.removeAll { $0 === currentProcess }
+                }
+            }
         }
         process = nil
         inputPipe = nil

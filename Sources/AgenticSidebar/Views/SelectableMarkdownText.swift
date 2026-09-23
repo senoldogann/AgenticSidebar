@@ -454,6 +454,8 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
         coordinator.pieceOffsets = offsets
         coordinator.writtenLength = replacementStart + replacement.length
         coordinator.lastEdit = NSRange(location: replacementStart, length: replacedLength)
+        // İçerik değişti: ölçüm önbelleği geçersiz.
+        coordinator.measureGeneration &+= 1
 
         if startIndex == 0 {
             coordinator.fullRebuilds += 1
@@ -488,7 +490,20 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             return nil
         }
 
-        return Self.measuredSize(of: nsView, width: width)
+        // Yerleşim aynı satırı kaydırma ve akış sırasında defalarca ölçer;
+        // içerik ve genişlik değişmedikçe tam yerleşim tekrarlanmaz.
+        let coordinator = context.coordinator
+        if coordinator.lastMeasuredWidth == width,
+            coordinator.lastMeasuredGeneration == coordinator.measureGeneration
+        {
+            return coordinator.lastMeasuredSize
+        }
+
+        let size = Self.measuredSize(of: nsView, width: width)
+        coordinator.lastMeasuredWidth = width
+        coordinator.lastMeasuredGeneration = coordinator.measureGeneration
+        coordinator.lastMeasuredSize = size
+        return size
     }
 
     /// A configured text view: not editable, not scrollable, transparent, and
@@ -603,6 +618,13 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
         fileprivate(set) var lastEdit = NSRange(location: 0, length: 0)
         fileprivate(set) var fullRebuilds = 0
         fileprivate(set) var incrementalEdits = 0
+        /// Her yazımda artar; `sizeThatFits` aynı kuşak + genişlikte ölçümü
+        /// atlar. Yazı tipi değişimi de `apply` yolundan geçtiği için ayrı
+        /// anahtar gerekmez.
+        var measureGeneration = 0
+        var lastMeasuredGeneration = -1
+        var lastMeasuredWidth: CGFloat = 0
+        var lastMeasuredSize = CGSize.zero
 
         func textView(
             _ textView: NSTextView,
@@ -612,15 +634,11 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             guard let url = link as? URL ?? (link as? String).flatMap(URL.init(string:)) else {
                 return false
             }
-            // LLM üretimi metindeki bağlantı tek tıkla açılırdı: `file://`,
-            // özel şemalar dahil. Yalnız http/https doğrudan açılır; diğer
-            // şemalar bilinçli onay ister.
-            guard let scheme = url.scheme?.lowercased() else {
+            // LLM üretimi metin keyfi bağlantı ekebilir: tek tıkla açılış
+            // kimlik avına kapı aralar. http/https dahil her şema bilinçli
+            // onay ister; kullanıcı konağı görerek karar verir.
+            guard let scheme = url.scheme?.lowercased(), !scheme.isEmpty else {
                 return false
-            }
-            if scheme == "http" || scheme == "https" {
-                NSWorkspace.shared.open(url)
-                return true
             }
             let alert = NSAlert()
             alert.messageText = "Bağlantı açılsın mı?"

@@ -92,6 +92,13 @@ struct SkillInstaller: Sendable {
                     forRelativePath: file.relativePath,
                     in: staging
                 )
+                // Yazmadan ÖNCE ara dizinlerde sembolik bağ denetimi: dizin
+                // oluştuktan sonraki kontrol, araya plant edilen bağ ile
+                // arşiv içeriğini `staging` dışına taşıyabilirdi.
+                try Self.assertNoSymlink(
+                    in: fileURL.deletingLastPathComponent(),
+                    under: staging
+                )
                 try fileManager.createDirectory(
                     at: fileURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true
@@ -139,6 +146,10 @@ struct SkillInstaller: Sendable {
     }
 
     func remove(skillNamed name: String) throws {
+        // Kayıt dışı adla çağrı dizin dışına kaçmamalı (`../` gibi).
+        guard SkillManifestParser.isValidName(name) else {
+            throw ExtensionFetchError.badResponse
+        }
         let directory = directoryURL(for: name)
         guard fileManager.fileExists(atPath: directory.path) else {
             return
@@ -162,6 +173,22 @@ struct SkillInstaller: Sendable {
             backupItemName: nil,
             options: []
         )
+    }
+
+    /// `parent` yolunun `root` altındaki her bileşeninin sembolik bağ
+    /// olmadığını doğrular; biri bile bağ ise kurulum reddedilir.
+    static func assertNoSymlink(in parent: URL, under root: URL) throws {
+        var current = parent
+        let rootPath = root.standardized.path
+        while current.standardized.path.hasPrefix(rootPath + "/") || current.standardized.path == rootPath {
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil {
+                throw ExtensionFetchError.badResponse
+            }
+            if current.standardized.path == rootPath {
+                break
+            }
+            current = current.deletingLastPathComponent()
+        }
     }
 
     /// Joins a path from a downloaded archive onto the destination, refusing

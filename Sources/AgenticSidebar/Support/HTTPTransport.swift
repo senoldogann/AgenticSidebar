@@ -60,52 +60,119 @@ struct URLSessionHTTPTransport: ProviderHTTPTransport {
     }
 
     func send(_ request: URLRequest) async throws -> HTTPResponse {
-        do {
-            let (data, response) = try await session.data(for: request)
-            guard let response = response as? HTTPURLResponse else {
-                throw ProviderRuntimeError.unexpectedResponse
+        // Bağlantı kesintisinde sınırlı yeniden deneme: ilk kurulum anındaki
+        // kopuş (`notConnectedToInternet`, `networkConnectionLost`, zaman
+        // aşımı) geçicidir, aynı istek bağlantı dönünce kurulur. Politika
+        // değişmedi: yalnız bağlantı kesintisi denenir, diğer hatalar
+        // (401/429/5xx, iptal) ilk denemede aynen döner.
+        var lastError: Error?
+        for attempt in 0..<Self.connectivityRetryAttempts {
+            do {
+                let (data, response) = try await session.data(for: request)
+                guard let response = response as? HTTPURLResponse else {
+                    throw ProviderRuntimeError.unexpectedResponse
+                }
+                return HTTPResponse(statusCode: response.statusCode, data: data)
+            } catch {
+                if error is CancellationError || error is ProviderRuntimeError {
+                    throw error
+                }
+                guard Self.isConnectivityInterruption(error), attempt + 1 < Self.connectivityRetryAttempts else {
+                    throw ProviderRuntimeError.mapTransportError(error)
+                }
+                lastError = error
+                try? await Task.sleep(for: Self.connectivityRetryDelay(attempt: attempt))
             }
-            return HTTPResponse(statusCode: response.statusCode, data: data)
-        } catch {
-            throw ProviderRuntimeError.mapTransportError(error)
         }
+        throw ProviderRuntimeError.mapTransportError(lastError ?? ProviderRuntimeError.transport)
     }
 
     func stream(_ request: URLRequest) async throws -> HTTPLineStream {
-        do {
-            let (bytes, response) = try await session.bytes(for: request)
-            guard let response = response as? HTTPURLResponse else {
-                throw ProviderRuntimeError.unexpectedResponse
-            }
-
-            // A stream that accepts every line without pressing back on the
-            // socket would buffer an entire response in memory whenever the
-            // consumer is busy, so lines go through a bounded channel.
-            let channel = BoundedChannel<String>(capacity: Self.lineBufferCapacity)
-            let forwardingTask = Task {
-                do {
-                    for try await line in bytes.lines {
-                        try Task.checkCancellation()
-                        try await channel.send(line)
-                    }
-                    await channel.finish()
-                } catch is CancellationError {
-                    await channel.finish(throwing: CancellationError())
-                } catch {
-                    await channel.finish(throwing: ProviderRuntimeError.transport)
+        // `send` ile aynı gerekçe: SSE aboneliği kurulurken kopan bağlantı
+        // sınırlı sayıda yeniden denenir. Akış ortasında kopan bağlantı
+        // burada değil üst katmanda biter (`streamInterrupted`); kaldığı
+        // yerden devam, sunucu tarafı oturum durumuna bağlıdır.
+        var lastError: Error?
+        for attempt in 0..<Self.connectivityRetryAttempts {
+            do {
+                return try await Self.establishStream(request, session: session)
+            } catch {
+                if error is CancellationError || error is ProviderRuntimeError {
+                    throw error
                 }
-            }
-
-            return HTTPLineStream(
-                statusCode: response.statusCode,
-                lines: channel.makeStream(),
-                cancel: {
-                    forwardingTask.cancel()
-                    await channel.finish(throwing: CancellationError())
+                guard Self.isConnectivityInterruption(error), attempt + 1 < Self.connectivityRetryAttempts else {
+                    throw ProviderRuntimeError.mapTransportError(error)
                 }
-            )
-        } catch {
-            throw ProviderRuntimeError.mapTransportError(error)
+                lastError = error
+                try? await Task.sleep(for: Self.connectivityRetryDelay(attempt: attempt))
+            }
         }
+        throw ProviderRuntimeError.mapTransportError(lastError ?? ProviderRuntimeError.transport)
+    }
+
+    /// Bağlantı kesintisinde en fazla bu kadar kurulum denemesi yapılır.
+    private static let connectivityRetryAttempts = 3
+
+    /// Üstel bekleme: 0.5 sn, 1 sn, 2 sn tavanla.
+    private static func connectivityRetryDelay(attempt: Int) -> Duration {
+        switch attempt {
+        case 0: .milliseconds(500)
+        case 1: .seconds(1)
+        default: .seconds(2)
+        }
+    }
+
+    /// Kırık sayılmayan, geçici kopuş sayılan `URLError` kodları.
+    static func isConnectivityInterruption(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet,
+            .networkConnectionLost,
+            .timedOut,
+            .cannotFindHost,
+            .cannotConnectToHost,
+            .dnsLookupFailed,
+            .resourceUnavailable,
+            .internationalRoamingOff,
+            .callIsActive,
+            .dataNotAllowed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func establishStream(_ request: URLRequest, session: URLSession) async throws -> HTTPLineStream {
+        let (bytes, response) = try await session.bytes(for: request)
+        guard let response = response as? HTTPURLResponse else {
+            throw ProviderRuntimeError.unexpectedResponse
+        }
+
+        // A stream that accepts every line without pressing back on the
+        // socket would buffer an entire response in memory whenever the
+        // consumer is busy, so lines go through a bounded channel.
+        let channel = BoundedChannel<String>(capacity: Self.lineBufferCapacity)
+        let forwardingTask = Task {
+            do {
+                for try await line in bytes.lines {
+                    try Task.checkCancellation()
+                    try await channel.send(line)
+                }
+                await channel.finish()
+            } catch is CancellationError {
+                await channel.finish(throwing: CancellationError())
+            } catch {
+                await channel.finish(throwing: ProviderRuntimeError.transport)
+            }
+        }
+
+        return HTTPLineStream(
+            statusCode: response.statusCode,
+            lines: channel.makeStream(),
+            cancel: {
+                forwardingTask.cancel()
+                await channel.finish(throwing: CancellationError())
+            }
+        )
     }
 }

@@ -311,10 +311,18 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
                             else {
                                 return
                             }
-                            try? await client.replyPermission(
-                                requestID: permReq.id,
-                                reply: reply.rawValue
-                            )
+                            do {
+                                try await client.replyPermission(
+                                    requestID: permReq.id,
+                                    reply: reply.rawValue
+                                )
+                            } catch {
+                                // Ateşle-unut yanıt kaybı sessiz kalmamalı: kullanıcı
+                                // kartta onayladı, arka uç habersiz kaldı.
+                                AppLog.openCode.error(
+                                    "Permission reply for request \(permReq.id, privacy: .public) could not be delivered"
+                                )
+                            }
                         }
                     }
 

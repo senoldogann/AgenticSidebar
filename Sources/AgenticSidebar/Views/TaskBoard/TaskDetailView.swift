@@ -964,6 +964,9 @@ private struct TaskEditSheet: View {
     @State private var title: String
     @State private var objective: String
     @State private var priority: TaskCreationForm.Priority
+    @State private var maxAttempts: String
+    @State private var maxToolCalls: String
+    @State private var maxDurationSeconds: String
     @State private var isSubmitting = false
     @State private var failureMessage: String?
 
@@ -975,6 +978,9 @@ private struct TaskEditSheet: View {
         self._title = State(initialValue: detail.card.title)
         self._objective = State(initialValue: detail.card.objective)
         self._priority = State(initialValue: Self.priority(for: detail.card.priority))
+        self._maxAttempts = State(initialValue: String(detail.card.budget.maxAttempts))
+        self._maxToolCalls = State(initialValue: String(detail.card.budget.maxToolCallsPerAttempt))
+        self._maxDurationSeconds = State(initialValue: String(detail.card.budget.maxTaskDurationSeconds))
     }
 
     private static func priority(for value: Int) -> TaskCreationForm.Priority {
@@ -1017,6 +1023,27 @@ private struct TaskEditSheet: View {
             .help("Yüksek öncelik panoda üstte görünür")
             .accessibilityLabel("Öncelik")
 
+            Text("Bütçe (bütçesi biten kart buradan yükseltilir)")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                TextField("Deneme", text: $maxAttempts)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 90)
+                    .help("En fazla deneme sayısı")
+                    .accessibilityLabel("En fazla deneme sayısı")
+                TextField("Araç çağrısı", text: $maxToolCalls)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 110)
+                    .help("Deneme başına en fazla araç çağrısı")
+                    .accessibilityLabel("Deneme başına en fazla araç çağrısı")
+                TextField("Süre (sn)", text: $maxDurationSeconds)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 110)
+                    .help("Görev başına en fazla süre (saniye)")
+                    .accessibilityLabel("Görev başına en fazla süre saniye")
+            }
+
             if let failureMessage {
                 Label(failureMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11))
@@ -1048,6 +1075,15 @@ private struct TaskEditSheet: View {
             failureMessage = formError
             return
         }
+        guard
+            let attempts = Int(maxAttempts.trimmingCharacters(in: .whitespacesAndNewlines)),
+            let toolCalls = Int(maxToolCalls.trimmingCharacters(in: .whitespacesAndNewlines)),
+            let duration = Int(maxDurationSeconds.trimmingCharacters(in: .whitespacesAndNewlines)),
+            attempts > 0, toolCalls > 0, duration > 0
+        else {
+            failureMessage = "Bütçe alanları pozitif tam sayı olmalı."
+            return
+        }
         isSubmitting = true
         failureMessage = nil
         Task {
@@ -1055,7 +1091,12 @@ private struct TaskEditSheet: View {
                 taskID: card.id,
                 title: title,
                 objective: objective,
-                priority: TaskCreationForm.priorityValue(for: priority)
+                priority: TaskCreationForm.priorityValue(for: priority),
+                budget: ExecutionBudget(
+                    maxAttempts: attempts,
+                    maxTaskDurationSeconds: duration,
+                    maxToolCallsPerAttempt: toolCalls
+                )
             )
             isSubmitting = false
             switch result {

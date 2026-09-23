@@ -20,7 +20,10 @@ enum MarkdownInlineText {
         // Her flush tüm transkript gövdelerini yeniden değerlendirir; metni
         // değişmeyen satırların Foundation parse'ı bu önbellekten döner.
         // Büyüyen kuyruk metni her flush'ta yenidir, o yine ayrıştırılır.
-        if text.count > maximumParsableCharacters {
+        // `count` yerine `utf16.count`: grapheme sayımı tüm diziyi yürür
+        // (her flush'ta her blokta O(n)), UTF-16 uzunluğu O(1)'dir; eşik
+        // denetimi için aynı kararı verir.
+        if text.utf16.count > maximumParsableCharacters {
             return AttributedString(text)
         }
         if let cached = MarkdownInlineCache.shared.attributed(for: text) {
@@ -65,14 +68,11 @@ final class MarkdownInlineCache: @unchecked Sendable {
     func attributed(for text: String) -> AttributedString? {
         lock.lock()
         defer { lock.unlock() }
-        guard let value = entries[text] else {
-            return nil
-        }
-        if let index = recency.firstIndex(of: text) {
-            recency.remove(at: index)
-            recency.append(text)
-        }
-        return value
+        // Salt okuma: LRU dokunuşu (`firstIndex` + taşıma) her flush'ta her
+        // blokta tam-dizgi karşılaştırmalarıyla doğrusal taramaydı. Sıra
+        // eklenme sırası olarak kalır (FIFO tahliye); önbellek doğruluğu
+        // değişmez, yalnız tahliye önceliği daha az keskindir.
+        return entries[text]
     }
 
     func store(_ value: AttributedString, for text: String) {
@@ -83,12 +83,14 @@ final class MarkdownInlineCache: @unchecked Sendable {
         }
         entries[text] = value
         recency.append(text)
-        totalCharacters += text.count
+        // `count` grapheme yürüyüşüdür; muhasebe için UTF-16 uzunluğu
+        // yeter ve O(1)'dir.
+        totalCharacters += text.utf16.count
         while recency.count > Self.maximumEntries
             || (totalCharacters > Self.maximumTotalCharacters && recency.count > 1)
         {
             let oldest = recency.removeFirst()
-            totalCharacters -= oldest.count
+            totalCharacters -= oldest.utf16.count
             entries[oldest] = nil
         }
     }

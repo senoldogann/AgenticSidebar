@@ -15,6 +15,9 @@ final class FakeGoalSession {
     var turnFailure: AgentSessionError?
     /// Tur kullanıcıyı bekliyor mu (aracı sorusu / onay kuyruğu simülasyonu).
     var waitingForUser = false
+    /// Son review yanıtı: üretim talimatı `CRITICAL_HIGH_COUNT` satırını
+    /// zorunlu kılar, işaret yoksa kapı bilinmeyen sayar ve yeniden inceler.
+    var reviewText: String? = "No issues found.\nCRITICAL_HIGH_COUNT: 0"
 
     func bridge() -> GoalOrchestrator.Bridge {
         GoalOrchestrator.Bridge(
@@ -28,6 +31,7 @@ final class FakeGoalSession {
                 return self.acceptance
             },
             turnError: { [weak self] _ in self?.turnFailure },
+            lastAssistantText: { [weak self] _ in self?.reviewText },
             cancel: { _ in },
             isWaitingForUser: { [weak self] _ in self?.waitingForUser ?? false }
         )

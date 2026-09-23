@@ -270,9 +270,27 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
                     throw ProviderRuntimeError.startupFailure
                 }
 
-                let version = try await healthChecker.waitUntilHealthy(
-                    connection: candidateConnection
-                )
+                // Tek seferlik denetimden sonra çocuk ölürse portu kapan bir
+                // süreç alabilir; somut denetleyiciye her parola taşıyan
+                // denemeden önce sahiplik yeniden doğrulatılır.
+                let version: String
+                if let concreteChecker = healthChecker as? URLSessionOpenCodeHealthChecker {
+                    let verifier = listenerVerifier
+                    let checkedPort = port
+                    version = try await concreteChecker.waitUntilHealthy(
+                        connection: candidateConnection,
+                        portOwnerCheck: {
+                            verifier.processOwnsListeningPort(
+                                checkedPort,
+                                processIdentifier: await launchedHandle.processIdentifier()
+                            )
+                        }
+                    )
+                } else {
+                    version = try await healthChecker.waitUntilHealthy(
+                        connection: candidateConnection
+                    )
+                }
                 connection = candidateConnection
                 serverStatus = .running(version: version, baseURL: baseURL)
                 // Written down while it is known to be ours: if this process is
@@ -549,12 +567,29 @@ struct URLSessionOpenCodeHealthChecker: OpenCodeHealthChecking {
     }
 
     func waitUntilHealthy(connection: OpenCodeServerConnection) async throws -> String {
+        try await waitUntilHealthy(connection: connection, portOwnerCheck: nil)
+    }
+
+    /// `portOwnerCheck` her denemede parola gönderilmeden önce çalışır:
+    /// çocuk öldüyse ve portu yabancı bir süreç kaptıysa parola yabancı
+    /// ele geçmez, başlatma hızlıca başarısız olur.
+    func waitUntilHealthy(
+        connection: OpenCodeServerConnection,
+        portOwnerCheck: (@Sendable () async -> Bool)?
+    ) async throws -> String {
         let url = connection.baseURL
             .appendingPathComponent("global")
             .appendingPathComponent("health")
 
         for attempt in 0..<attempts {
             try Task.checkCancellation()
+
+            if let portOwnerCheck, await !portOwnerCheck() {
+                AppLog.openCode.error(
+                    "The child no longer owns the port; not sending the server password"
+                )
+                throw ProviderRuntimeError.startupFailure
+            }
 
             var request = URLRequest(url: url)
             request.setValue(connection.authorizationHeader, forHTTPHeaderField: "Authorization")
@@ -569,6 +604,15 @@ struct URLSessionOpenCodeHealthChecker: OpenCodeHealthChecking {
                     throw ProviderRuntimeError.authenticationFailure
                 }
 
+                // Deterministik istemci hatası yeniden denemeyle düzelmez:
+                // ~4 sn retry yerine hızlı çıkılır ve tanı günlüğe düşer.
+                if (400..<500).contains(response.statusCode) {
+                    AppLog.openCode.error(
+                        "OpenCode health check failed with status \(response.statusCode, privacy: .public); not retrying"
+                    )
+                    throw ProviderRuntimeError.startupFailure
+                }
+
                 if response.statusCode == 200,
                     let health = try? JSONDecoder().decode(HealthResponse.self, from: data),
                     health.healthy
@@ -576,7 +620,7 @@ struct URLSessionOpenCodeHealthChecker: OpenCodeHealthChecking {
                     return health.version
                 }
             } catch let error as ProviderRuntimeError {
-                if error == .authenticationFailure {
+                if error == .authenticationFailure || error == .startupFailure {
                     throw error
                 }
             } catch is CancellationError {

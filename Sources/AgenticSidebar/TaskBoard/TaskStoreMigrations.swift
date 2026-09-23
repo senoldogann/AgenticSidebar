@@ -27,6 +27,7 @@ public enum TaskStoreMigrations {
         verificationEvidenceDetails,
         verificationEvidenceRecipeVersion,
         reviewFindingsAndApprovals,
+        projectKind,
     ]
 
     private static let initialSchema = TaskStoreMigration(version: 1, name: "InitialSchema_v1") { db in
@@ -298,6 +299,20 @@ public enum TaskStoreMigrations {
             CREATE INDEX IF NOT EXISTS idx_findings_task ON review_findings(task_id);
             CREATE INDEX IF NOT EXISTS idx_approvals_task ON task_approvals(task_id);
             """,
+            on: db
+        )
+    }
+
+    /// Schema v7: projects record their detected language kind.
+    /// Existing rows keep every column and load as `generic`: the schema
+    /// change may not invent a language for a project registered before
+    /// kinds were tracked. Fresh rows write their kind explicitly.
+    private static let projectKind = TaskStoreMigration(
+        version: 7,
+        name: "ProjectKind_v7"
+    ) { db in
+        try execute(
+            "ALTER TABLE projects ADD COLUMN kind TEXT NOT NULL DEFAULT 'generic';",
             on: db
         )
     }

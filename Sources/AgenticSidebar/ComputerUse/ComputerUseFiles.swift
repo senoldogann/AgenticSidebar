@@ -154,12 +154,17 @@ enum ComputerUseFiles {
                  not one per action; Full access answers it automatically when a request is raised.
                - Never try to work around a denied action; explain what you need instead.
                - If `COMPUTER_USER_TAKEOVER` occurs, stop immediately and yield control.
-               - Recovery — never retry the identical payload:
-                 `COMPUTER_PROTOCOL_INVALID` or `Input validation error` -> shrink to ONE action,
-                 re-observe for a fresh snapshot, fix the schema (selector? `target.by`? `x`/`y`-vs-`target`?)
-                 and send once; `STALE_SNAPSHOT`/`NEEDS_REPLAN` -> discard the old observation,
-                 `computer_observe` again and re-ground; `COMPUTER_USER_TAKEOVER` -> stop, tell the user
-                 physical input aborted the run, and wait.
+                - Recovery — never retry the identical payload:
+                  `COMPUTER_PROTOCOL_INVALID` or `Input validation error` -> shrink to ONE action,
+                  re-observe for a fresh snapshot, fix the schema (selector? `target.by`? `x`/`y`-vs-`target`?)
+                  and send once; `STALE_SNAPSHOT`/`NEEDS_REPLAN` -> discard the old observation,
+                  `computer_observe` again and re-ground; `COMPUTER_USER_TAKEOVER` -> stop, tell the user
+                  physical input aborted the run, and wait.
+                - `COMPUTER_UNAVAILABLE` means the native helper link is down (often mid-restart),
+                  not a bad selector: call `\(serverName)_computer_health` ONCE. If its `state` is not
+                  `running`, stop and tell the user Computer Use is momentarily down (Settings → Computer
+                  Use, then restart OpenCode) — do NOT retry the same observe/click in a loop.
+                  `COMPUTER_DISABLED` means Computer Use is off: stop and tell the user how to enable it.
             """
     }
 

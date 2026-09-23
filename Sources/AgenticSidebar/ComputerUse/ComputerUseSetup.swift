@@ -150,7 +150,9 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
             returning: ComputerUseSetupOutcome.self
         ) { group in
             group.addTask {
-                let reader = Task.detached(priority: .utility) { () -> Int in
+                // Ayrık değil grup çocuğu: dış iptal buraya ulaşır, boru
+                // kapanınca (`terminate`/`kill` sonrası EOF) okuyucu biter.
+                let reader = Task(priority: .utility) { () -> Int in
                     var lines = 0
                     var forwarded = 0
                     do {
@@ -215,8 +217,16 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
                 }
                 // The sleeper won: the command hung. SIGTERM it; the waiter
                 // above maps the death to a 124 timeout (not a user cancel).
+                // SIGTERM'i yoksayan sürece kısa süre tanınır, sonra SIGKILL:
+                // yoksa `waitUntilExit` sonsuza dek bloklanır.
                 timedOut.value = true
                 process.terminate()
+                Task {
+                    try? await Task.sleep(for: .seconds(5))
+                    if process.isRunning {
+                        kill(process.processIdentifier, SIGKILL)
+                    }
+                }
             }
             timedOut.value = true
             process.terminate()
@@ -238,8 +248,16 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
     }
 
     func cancel() {
-        lock.withLock {
-            currentProcess?.terminate()
+        let process = lock.withLock {
+            currentProcess
+        }
+        process?.terminate()
+        // SIGTERM'i yoksayan süreci ölüme terk etme: kısa süre sonra SIGKILL.
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .seconds(5))
+            if let process, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
         }
     }
 

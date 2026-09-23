@@ -9,7 +9,11 @@ enum StreamingURLSessionFactory {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 300
         configuration.timeoutIntervalForResource = 3_600
-        configuration.waitsForConnectivity = false
+        // Bağlantı kesintisinde isteği hemen öldürmek yerine işletim
+        // sistemine kuyruklatır: bağlantı dönünce akış kaldığı yerden değil,
+        // en baştan kurulur ama kullanıcı `transportFailure` görmeden bekler.
+        // Yeniden deneme politikası `URLSessionHTTPTransport` içindedir.
+        configuration.waitsForConnectivity = true
         return URLSession(configuration: configuration)
     }
 }

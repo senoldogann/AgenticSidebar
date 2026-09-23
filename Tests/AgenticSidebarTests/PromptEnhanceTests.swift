@@ -94,7 +94,8 @@ final class PromptEnhanceServiceTests: XCTestCase {
             sessionID: UUID(),
             draft: "hatayı düzelt",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
 
         let finished = await Self.waitForInactive(service: service)
@@ -111,7 +112,8 @@ final class PromptEnhanceServiceTests: XCTestCase {
             sessionID: UUID(),
             draft: "hatayı düzelt",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
 
         let finished = await Self.waitForInactive(service: service)
@@ -126,7 +128,8 @@ final class PromptEnhanceServiceTests: XCTestCase {
             sessionID: UUID(),
             draft: "hatayı düzelt",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
 
         let finished = await Self.waitForInactive(service: service)
@@ -142,12 +145,31 @@ final class PromptEnhanceServiceTests: XCTestCase {
             sessionID: UUID(),
             draft: "hatayı düzelt",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
 
         let finished = await Self.waitForInactive(service: service)
         XCTAssertEqual(finished?.phase, PromptEnhanceService.Phase.failed)
         XCTAssertTrue(finished?.errorText?.contains("API anahtarı") == true)
+    }
+
+    func testStalledStreamFailsOnTimeoutInsteadOfLoadingForever() async {
+        let service = PromptEnhanceService()
+        service.enhance(
+            context: Self.context(script: .hang),
+            sessionID: UUID(),
+            draft: "hatayı düzelt",
+            speedMode: .normal,
+            mode: .build,
+            timeout: .milliseconds(150)
+        )
+
+        let finished = await Self.waitForInactive(service: service)
+        XCTAssertEqual(finished?.phase, PromptEnhanceService.Phase.failed)
+        XCTAssertTrue(finished?.errorText?.contains("zaman aşım") == true)
+        XCTAssertFalse(service.isEnhancing)
+        XCTAssertNil(service.consumeDone())
     }
 
     func testCommandDraftNeverStartsAStream() {
@@ -157,7 +179,8 @@ final class PromptEnhanceServiceTests: XCTestCase {
             sessionID: UUID(),
             draft: "/btw bu nedir?",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
 
         XCTAssertNil(service.active)
@@ -171,14 +194,16 @@ final class PromptEnhanceServiceTests: XCTestCase {
             sessionID: UUID(),
             draft: "ilk taslak",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
         service.enhance(
             context: Self.context(script: .answer(["YENİ"])),
             sessionID: UUID(),
             draft: "ikinci taslak",
             speedMode: .normal,
-            mode: .build
+            mode: .build,
+            timeout: .seconds(30)
         )
 
         let finished = await Self.waitForInactive(service: service)
@@ -222,6 +247,8 @@ private struct EnhanceScriptRuntime: ProviderRuntime {
         case answer([String])
         case failure(ProviderRuntimeError)
         case empty
+        /// Hiç olay üretmez ve tamamlanmaz; yalnızca iptalde biter.
+        case hang
     }
 
     let id = ProviderID("stub-enhance")
@@ -256,6 +283,12 @@ private struct EnhanceScriptRuntime: ProviderRuntime {
             pair.continuation.yield(.completed)
             pair.continuation.finish()
             return ProviderStream(events: pair.stream)
+        case .hang:
+            let pair = AsyncThrowingStream<ProviderEvent, Error>.makeStream()
+            return ProviderStream(
+                events: pair.stream,
+                cancellation: { pair.continuation.finish() }
+            )
         }
     }
 }

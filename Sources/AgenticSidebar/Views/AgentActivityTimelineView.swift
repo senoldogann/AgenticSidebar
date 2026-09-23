@@ -1121,6 +1121,11 @@ struct AgentActivityTimelineView: View, Equatable {
         let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         let displayLines = lines.count > 20 ? Array(lines.suffix(20)) : lines
         let omittedCount = lines.count - displayLines.count
+        // Kimlik küresel satır indisidir: sonek içi `offset` her uzamada aynı
+        // satıra başka kimlik verip listeyi yeniden kuruyor, kart en üste
+        // sıçrıyordu. Küresel indis append-only'dir: eski satırlar kimliğini
+        // korur, yeni satır eklenir, kayan pencere dışına düşen sessizce gider.
+        let startIndex = lines.count - displayLines.count
 
         return VStack(alignment: .leading, spacing: 4) {
             if omittedCount > 0 {
@@ -1129,8 +1134,8 @@ struct AgentActivityTimelineView: View, Equatable {
                     .foregroundStyle(.secondary)
                     .padding(.bottom, 2)
             }
-            ForEach(Array(displayLines.enumerated()), id: \.offset) { _, line in
-                subagentStepLineView(line: line, isDark: isDark)
+            ForEach(startIndex..<lines.count, id: \.self) { index in
+                subagentStepLineView(line: displayLines[index - startIndex], isDark: isDark)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

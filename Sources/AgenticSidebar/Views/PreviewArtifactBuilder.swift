@@ -45,26 +45,59 @@ enum PreviewArtifactBuilder {
     /// çerçeve öğeleri, on* olay öznitelikleri ve javascript: adresleri.
     /// CSP ve izolasyon katmanları yerinde durur; bu, tek katman hatasında
     /// aktifleşecek vektörleri baştan kaldırır.
+    /// Desenler çağrı başına derlenmez: aynı belge her satırda yeniden
+    /// taranır, derleme maliyeti her seferinde ödenmezdi.
+    private static let elementPairPatterns: [(element: String, regex: NSRegularExpression?)] = [
+        "script", "iframe", "object", "embed", "form", "foreignobject",
+    ].map { element in
+        (
+            element: element,
+            regex: try? NSRegularExpression(
+                pattern: "<\(element)\\b[^>]*>([\\s\\S]*?)</\(element)\\s*>",
+                options: [.caseInsensitive]
+            )
+        )
+    }
+
+    private static let elementOpenPatterns: [(element: String, regex: NSRegularExpression?)] = [
+        "script", "iframe", "object", "embed", "form", "foreignobject",
+    ].map { element in
+        (
+            element: element,
+            regex: try? NSRegularExpression(
+                pattern: "<\(element)\\b[^>]*/?>",
+                options: [.caseInsensitive]
+            )
+        )
+    }
+
+    private static let metaPattern = try? NSRegularExpression(
+        pattern: "<meta\\b[^>]*>", options: [.caseInsensitive]
+    )
+    private static let eventHandlerPattern = try? NSRegularExpression(
+        pattern: "\\s+on[a-z]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)",
+        options: [.caseInsensitive]
+    )
+    private static let javascriptSchemePattern = try? NSRegularExpression(
+        pattern: "javascript\\s*:", options: [.caseInsensitive]
+    )
+
     static func sanitizedMarkup(_ markup: String) -> String {
         var result = markup
-        for element in ["script", "iframe", "object", "embed", "form", "foreignobject"] {
-            result = replacingMatches(
-                pattern: "<\(element)\\b[^>]*>([\\s\\S]*?)</\(element)\\s*>",
-                in: result
-            )
-            result = replacingMatches(pattern: "<\(element)\\b[^>]*/?>", in: result)
+        for entry in elementPairPatterns {
+            result = replacingMatches(regex: entry.regex, in: result)
         }
-        result = replacingMatches(pattern: "<meta\\b[^>]*>", in: result)
-        result = replacingMatches(
-            pattern: "\\s+on[a-z]+\\s*=\\s*(\"[^\"]*\"|'[^']*'|[^\\s>]+)",
-            in: result
-        )
-        result = replacingMatches(pattern: "javascript\\s*:", in: result)
+        for entry in elementOpenPatterns {
+            result = replacingMatches(regex: entry.regex, in: result)
+        }
+        result = replacingMatches(regex: metaPattern, in: result)
+        result = replacingMatches(regex: eventHandlerPattern, in: result)
+        result = replacingMatches(regex: javascriptSchemePattern, in: result)
         return result
     }
 
-    private static func replacingMatches(pattern: String, in text: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+    private static func replacingMatches(regex: NSRegularExpression?, in text: String) -> String {
+        guard let regex else {
             return text
         }
         return regex.stringByReplacingMatches(

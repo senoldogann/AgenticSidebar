@@ -10,6 +10,7 @@ public enum TaskAction: Sendable, Codable, Equatable {
     case requestChanges(feedback: String)
     case accept
     case cancel
+    case reopen
 }
 
 /// Context accompanying a transition request.
@@ -52,9 +53,14 @@ public enum TaskStateMachine {
         action: TaskAction,
         context: TaskTransitionContext
     ) throws -> CodingTask {
-        // Invariant: Terminal tasks (done, cancelled) cannot be mutated.
-        guard !task.status.isTerminal else {
-            throw TaskTransitionError.taskTerminal(status: task.status)
+        // Invariant: Terminal tasks (done, cancelled) cannot be mutated —
+        // except `reopen`, which is their only way back to the board.
+        if case .reopen = action {
+            // Koşul `reopen` dalının kendisindedir.
+        } else {
+            guard !task.status.isTerminal else {
+                throw TaskTransitionError.taskTerminal(status: task.status)
+            }
         }
 
         var updated = task
@@ -177,6 +183,23 @@ public enum TaskStateMachine {
 
         case .cancel:
             updated.status = .cancelled
+
+        case .reopen:
+            // Terminal kartın çıkışı: iptal/bitmiş görev birikime döner,
+            // taze deneme bir sonraki başlatmada açılır. Terminal koruması
+            // yukarıda aşıldığı için buraya yalnız terminal kart ulaşır.
+            guard task.status == .cancelled || task.status == .done else {
+                throw TaskTransitionError.illegalTransition(
+                    from: task.status,
+                    to: .backlog,
+                    reason: "reopen is only legal from cancelled or done"
+                )
+            }
+            updated.status = .backlog
+            updated.stage = .analysis
+            updated.blockReason = nil
+            updated.previousStageBeforeBlock = nil
+            updated.currentAttemptID = nil
         }
 
         updated.version = task.version + 1

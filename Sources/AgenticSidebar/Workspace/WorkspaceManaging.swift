@@ -47,11 +47,13 @@ struct WorkspaceBase: Sendable, Equatable {
 /// Every case carries a stable `WORKTREE_*` code token so callers, reports and
 /// tests can act on the exact guard that refused the operation.
 enum WorkspaceGuardError: LocalizedError, Equatable, Sendable {
-    /// The source repository has tracked or untracked changes.
+    /// Kaynak depoda izlenen/izlenmeyen değişiklik var.
+    /// Artık uygulanmaz (her oluşturma kirli kaynaktan yeni `agentic/w-*`
+    /// dalında devam eder); eski kayıtlarla uyumluluk için tutulur.
     case worktreeDirty(path: String, status: String)
     /// The source repository is checked out on a protected branch.
-    /// Artık uygulanmaz (çalışma alanı `--detach` kurulduğu için temiz
-    /// korumalı checkout engel değildir); eski kayıtlarla uyumluluk için tutulur.
+    /// Artık uygulanmaz (çalışma alanı yeni `agentic/w-*` dalında kurulduğu
+    /// için korumalı checkout engel değildir); eski kayıtlarla uyumluluk için tutulur.
     case protectedBranch(branch: String)
     /// A symbolic link would carry the workspace outside its authorized root.
     case symlinkEscape(path: String)
@@ -323,9 +325,11 @@ struct GitWorkspaceSchedulerAdapter: TaskWorkspacePreflightPort {
 
 /// Backs the scheduler's `TaskWorkspaceProvisioningPort` with a `WorkspaceManaging` implementation.
 ///
-/// `create` maps directly to `createOwnedWorkspace`, so every manager guard (clean source,
-/// writable branch, authorized root, exact identity) still applies unchanged, and
-/// `resolveBase` maps to the manager's validated HEAD resolution.
+/// `create` maps directly to `createOwnedWorkspace`, so every manager guard (authorized
+/// root, exact identity) still applies unchanged, and `resolveBase` maps to the
+/// manager's validated HEAD resolution. Source cleanliness is deliberately not a
+/// guard: every creation opens a fresh `agentic/w-*` branch at the base commit and
+/// leaves the source checkout untouched.
 ///
 /// `discardUnclaimed` is guard-safe by construction: the creating attempt's live holding is
 /// released first (a mismatched attempt is a no-op release, so a workspace held by another

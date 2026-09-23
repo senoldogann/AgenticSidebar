@@ -136,14 +136,20 @@ struct MCPDefinition: Codable, Equatable, Sendable {
         case .local:
             return !command.isEmpty && !(command.first ?? "").isEmpty
         case .remote:
-            guard let url else {
+            guard let url, let components = URLComponents(string: url),
+                let scheme = components.scheme?.lowercased(),
+                let host = components.host?.lowercased(),
+                components.user == nil
+            else {
                 return false
             }
-            if url.hasPrefix("https://") {
+            if scheme == "https", !host.isEmpty {
                 return true
             }
-            // Yalnız döngü adresinde düz http kabul edilir.
-            return url.hasPrefix("http://127.0.0.1") || url.hasPrefix("http://localhost")
+            // Yalnız döngü adresinde düz http kabul edilir; konak tam
+            // eşleşir (`http://localhost@evil.com` gibi userinfo oyunları
+            // `hasPrefix` denetimini atlatırdı).
+            return scheme == "http" && (host == "127.0.0.1" || host == "localhost" || host == "::1")
         }
     }
 

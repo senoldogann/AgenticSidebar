@@ -86,6 +86,10 @@ struct OpenCodeModelDescriptor: Decodable, Sendable {
     let providerID: String
     let name: String
     let variants: [String]
+    /// `capabilities.reasoning`: model akıl yürütmeyi destekliyor mu
+    /// (üst katalog bazen `variants` sözlüğünü boş bırakır; efor
+    /// menüsü bu bayrakla geri doldurulur, yokluğu `false` sayılır).
+    let supportsReasoning: Bool
     /// `limit.context`: modelin kabul ettiği en fazla girdi jetonu
     /// (OpenCode model kataloğu; yokluğu bilinmiyor demektir, uydurulmaz).
     let contextLimit: Int?
@@ -95,7 +99,12 @@ struct OpenCodeModelDescriptor: Decodable, Sendable {
         case providerID
         case name
         case variants
+        case capabilities
         case limit
+    }
+
+    private enum CapabilitiesKeys: String, CodingKey {
+        case reasoning
     }
 
     private enum LimitKeys: String, CodingKey {
@@ -121,14 +130,30 @@ struct OpenCodeModelDescriptor: Decodable, Sendable {
         providerID = try container.decode(String.self, forKey: .providerID)
         name = try container.decode(String.self, forKey: .name)
 
-        if container.contains(.variants) {
-            let variantsContainer = try container.nestedContainer(
-                keyedBy: VariantKey.self,
-                forKey: .variants
-            )
+        // Biçim değişimine dayanıklıdır: `variants` sözlük ya da dizi
+        // gelebilir; ikisi de okunur. Bozuk gelirse model çöpe gitmez,
+        // varyantsız sayılır (efor menüsü `supportsReasoning` ile
+        // geri doldurulabilir).
+        if let names = try? container.decode([String].self, forKey: .variants) {
+            variants = names.sorted()
+        } else if let variantsContainer = try? container.nestedContainer(
+            keyedBy: VariantKey.self,
+            forKey: .variants
+        ) {
             variants = variantsContainer.allKeys.map(\.stringValue).sorted()
         } else {
             variants = []
+        }
+
+        // `capabilities` yoksa ya da `reasoning` bool değilse `false`:
+        // bilinmeyen yetenek uydurulmaz, efor menüsü boş kalır.
+        if let capabilitiesContainer = try? container.nestedContainer(
+            keyedBy: CapabilitiesKeys.self,
+            forKey: .capabilities
+        ) {
+            supportsReasoning = (try? capabilitiesContainer.decode(Bool.self, forKey: .reasoning)) ?? false
+        } else {
+            supportsReasoning = false
         }
 
         // Sayı biçimi garanti değildir (katalog tam sayı, bazı sunucular

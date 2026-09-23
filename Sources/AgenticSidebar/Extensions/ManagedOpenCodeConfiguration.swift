@@ -317,10 +317,13 @@ enum ManagedOpenCodeConfiguration {
             JSONValue.Member("lsp", .string("allow")),
             JSONValue.Member("question", .string("allow")),
             JSONValue.Member("websearch", .string("allow")),
-            JSONValue.Member("webfetch", .string("allow")),
+            // Salt-okunur turda ağ ve proje-dışı okuma onaydan geçer:
+            // `allow` olsaydı keyfi beceri içeriği ve dış kaynaklar
+            // sorulmadan tura girerdi.
+            JSONValue.Member("webfetch", .string("ask")),
             JSONValue.Member("todowrite", .string("allow")),
             JSONValue.Member("task", .string(taskRule)),
-            JSONValue.Member("external_directory", .string("allow")),
+            JSONValue.Member("external_directory", .string("ask")),
         ]
     }
 
@@ -329,13 +332,15 @@ enum ManagedOpenCodeConfiguration {
     /// kapatmalar bu yüzden tek üyede birleşir (önce izin, sonra retler —
     /// içeride de son kural kazanır).
     private static func skillMember(deniedSkills: [String]) -> JSONValue.Member {
+        // Salt-okunur ajanlarda battaniye `ask`: beceri, tura keyfi
+        // içerik/talimat taşıyabildiği için onaysız yüklenmez.
         if deniedSkills.isEmpty {
-            return JSONValue.Member("skill", .string("allow"))
+            return JSONValue.Member("skill", .string("ask"))
         }
         return JSONValue.Member(
             "skill",
             .object(
-                [("*", JSONValue.string("allow"))]
+                [("*", JSONValue.string("ask"))]
                     + deniedSkills
                     .sorted()
                     .map { ($0, JSONValue.string("deny")) }

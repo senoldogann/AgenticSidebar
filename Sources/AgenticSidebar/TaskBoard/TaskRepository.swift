@@ -141,7 +141,8 @@ public protocol CodingTaskRepository: Sendable {
         expectedVersion: Int,
         title: String,
         objective: String,
-        priority: Int
+        priority: Int,
+        budget: ExecutionBudget?
     ) async throws -> CodingTask
     /// Görevi ve bağımlılık kenarlarıyla birlikte tek işlemde siler.
     func deleteTask(taskID: UUID) async throws
@@ -190,6 +191,11 @@ public protocol CodingTaskRepository: Sendable {
     ) async throws
     func appendEvent(_ event: CodingTaskEvent) async throws
     func recordEvidence(_ evidence: VerificationEvidence) async throws
+    /// Görevin tüm doğrulama kanıtlarını eskiden yeniye sıralı yükler.
+    ///
+    /// Süreç-içi kanıt defteri yeniden başlatmada boşalır; kalıcı okuma,
+    /// kabul girdilerinin süreç ömrüne bağlı kalmamasını sağlar.
+    func evidence(taskID: UUID) async throws -> [VerificationEvidence]
     func recordFinding(_ finding: ReviewFinding) async throws
     func findings(taskID: UUID) async throws -> [ReviewFinding]
     func dismissFinding(

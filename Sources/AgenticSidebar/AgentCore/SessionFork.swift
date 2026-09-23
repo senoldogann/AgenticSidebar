@@ -51,6 +51,9 @@ enum SessionFork {
             return message.withID(fresh)
         }
         let prefixIDs = Set(messages.map(\.id))
+        // Grup turn kimlikleri de yenilenir: bayat `turnID` dal oturumunda hiç
+        // koşmamış bir tura aittir, canlı tur eşleşmelerini şaşırtır.
+        var turnMap: [UUID: UUID] = [:]
         let groups =
             sourceActivityGroups
             .filter { group in
@@ -59,8 +62,20 @@ enum SessionFork {
                 }
                 return prefixIDs.contains(mapped)
             }
-            .map { group in
-                AgentTurnActivityGroup(
+            .map { group -> AgentTurnActivityGroup in
+                let freshTurnID: UUID?
+                if let sourceTurnID = group.turnID {
+                    if let mapped = turnMap[sourceTurnID] {
+                        freshTurnID = mapped
+                    } else {
+                        let fresh = UUID()
+                        turnMap[sourceTurnID] = fresh
+                        freshTurnID = fresh
+                    }
+                } else {
+                    freshTurnID = nil
+                }
+                return AgentTurnActivityGroup(
                     id: UUID(),
                     anchorMessageID: idMap[group.anchorMessageID] ?? group.anchorMessageID,
                     activities: group.activities.map { activity in
@@ -76,7 +91,7 @@ enum SessionFork {
                             completedAt: activity.completedAt
                         )
                     },
-                    turnID: group.turnID
+                    turnID: freshTurnID
                 )
             }
         return SessionForkPlan(

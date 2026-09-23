@@ -38,6 +38,38 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(reference.modelID, "claude/opus")
     }
 
+    func testCapabilitiesFillEffortVariantsForReasoningModelsWithoutDeclaredVariants() async throws {
+        let transport = MockOpenCodeTransport(
+            sendHandler: { _ in
+                OpenCodeHTTPResponse(
+                    statusCode: 200,
+                    data: Data(
+                        #"{"all":[{"id":"opencode-go","name":"OpenCode Go","models":{"mimo-v2.6-pro":{"id":"mimo-v2.6-pro","providerID":"opencode-go","name":"MiMo-V2.6-Pro","capabilities":{"reasoning":true},"variants":{}},"plain":{"id":"plain","providerID":"opencode-go","name":"Plain","capabilities":{"reasoning":false},"variants":{}},"declared":{"id":"declared","providerID":"opencode-go","name":"Declared","capabilities":{"reasoning":true},"variants":{"max":{},"high":{}}}}}],"connected":["opencode-go"],"default":{}}"#
+                            .utf8
+                    )
+                )
+            }
+        )
+        let client = makeClient(transport: transport)
+
+        let capabilities = try await client.capabilities()
+        let byID = Dictionary(uniqueKeysWithValues: capabilities.models.map { ($0.id, $0) })
+
+        XCTAssertEqual(
+            byID[ProviderModelID("opencode-go/mimo-v2.6-pro")]?.variants.map(\.id),
+            [ProviderVariantID("low"), ProviderVariantID("medium"), ProviderVariantID("high")]
+        )
+        XCTAssertEqual(
+            byID[ProviderModelID("opencode-go/mimo-v2.6-pro")]?.variants.map(\.displayName),
+            ["Low", "Medium", "High"]
+        )
+        XCTAssertEqual(byID[ProviderModelID("opencode-go/plain")]?.variants, [])
+        XCTAssertEqual(
+            byID[ProviderModelID("opencode-go/declared")]?.variants.map(\.id),
+            [ProviderVariantID("high"), ProviderVariantID("max")]
+        )
+    }
+
     func testCapabilitiesExposeModelContextLimitAndTolerateItsAbsence() async throws {
         let transport = MockOpenCodeTransport(
             sendHandler: { _ in
@@ -315,11 +347,11 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(permissions["lsp"], "allow")
         XCTAssertEqual(permissions["question"], "allow")
         XCTAssertEqual(permissions["websearch"], "allow")
-        XCTAssertEqual(permissions["webfetch"], "allow")
+        XCTAssertEqual(permissions["webfetch"], "ask")
         XCTAssertEqual(permissions["todowrite"], "allow")
         XCTAssertEqual(permissions["task"], "ask")
-        XCTAssertEqual(permissions["external_directory"], "allow")
-        XCTAssertEqual(permissions["skill"], "allow")
+        XCTAssertEqual(permissions["external_directory"], "ask")
+        XCTAssertEqual(permissions["skill"], "ask")
         XCTAssertEqual(permissions["bash"], nil)
         XCTAssertEqual(permissions["edit"], nil)
         XCTAssertEqual(permissions["write"], nil)
@@ -345,11 +377,11 @@ final class OpenCodeClientTests: XCTestCase {
         XCTAssertEqual(permissions["lsp"], "allow")
         XCTAssertEqual(permissions["question"], "allow")
         XCTAssertEqual(permissions["websearch"], "allow")
-        XCTAssertEqual(permissions["webfetch"], "allow")
+        XCTAssertEqual(permissions["webfetch"], "ask")
         XCTAssertEqual(permissions["todowrite"], "allow")
         XCTAssertEqual(permissions["task"], "deny")
-        XCTAssertEqual(permissions["external_directory"], "allow")
-        XCTAssertEqual(permissions["skill"], "allow")
+        XCTAssertEqual(permissions["external_directory"], "ask")
+        XCTAssertEqual(permissions["skill"], "ask")
         XCTAssertEqual(permissions["bash"], nil)
         XCTAssertEqual(permissions["edit"], nil)
         XCTAssertEqual(permissions["write"], nil)

@@ -299,7 +299,9 @@ final class GitWorkspaceManagerTests: XCTestCase {
 
     // MARK: - Preflight guards
 
-    func testPreflightRefusesDirtyTrackedRoot() async throws {
+    /// Kirli kaynak oluşturmayı engellemez: her Başlat yeni `agentic/w-*`
+    /// dalında devam eder, kaynak checkout yerinde korunur.
+    func testPreflightAllowsDirtyTrackedRoot() async throws {
         let fixture = try makeCleanFixture(name: "dirty-tracked")
         let project = makeProject(fixture: fixture)
         let task = makeTask(projectID: project.id)
@@ -308,10 +310,14 @@ final class GitWorkspaceManagerTests: XCTestCase {
         let readme = fixture.repositoryURL.appendingPathComponent("README.md")
         try Data("tracked\nmodified\n".utf8).write(to: readme)
 
-        assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_DIRTY")
+        guard case .notOwned = await manager.preflight(project: project, task: task) else {
+            XCTFail("expected notOwned despite dirty source")
+            return
+        }
     }
 
-    func testPreflightRefusesDirtyUntrackedRoot() async throws {
+    /// İzlenmeyen dosya da oluşturmayı engellemez: yeni dal açılır, kaynak kirli kalır.
+    func testPreflightAllowsDirtyUntrackedRoot() async throws {
         let fixture = try makeCleanFixture(name: "dirty-untracked")
         let project = makeProject(fixture: fixture)
         let task = makeTask(projectID: project.id)
@@ -319,11 +325,51 @@ final class GitWorkspaceManagerTests: XCTestCase {
 
         try Data("scratch\n".utf8).write(to: fixture.repositoryURL.appendingPathComponent("notes.txt"))
 
-        assertGuardError(await manager.preflight(project: project, task: task), code: "WORKTREE_DIRTY")
+        guard case .notOwned = await manager.preflight(project: project, task: task) else {
+            XCTFail("expected notOwned despite untracked source change")
+            return
+        }
+    }
+
+    /// Çok dosyalı kirli çalışma alanında duvar metni üretilmez: sayı + ilk
+    /// dosyalar verilir, kuyruk kesilir. Kaynak kapısı kalktığı için özet,
+    /// sahip olunan çalışma alanının kirli raporunda doğrulanır.
+    func testDirtyOwnedWorkspaceStatusSummarizesLongFileList() async throws {
+        let fixture = try makeCleanFixture(name: "dirty-summary")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+
+        let workspaceURL = URL(fileURLWithPath: record.workspacePath)
+        for index in 0..<10 {
+            try Data("content \(index)\n".utf8).write(
+                to: workspaceURL.appendingPathComponent("tracked-\(index).txt")
+            )
+        }
+        try runGit(["add", "."], in: workspaceURL)
+
+        guard case .present(let report) = await manager.inspect(workspaceID: record.workspaceID) else {
+            XCTFail("expected present inspection")
+            return
+        }
+        guard case .dirty(let status) = report.cleanliness else {
+            XCTFail("expected dirty cleanliness, got \(report.cleanliness)")
+            return
+        }
+        XCTAssertTrue(status.contains("10 changed files"), "özet dosya sayısını vermeli: \(status)")
+        XCTAssertTrue(status.contains("tracked-0.txt"), "özet ilk dosyaları göstermeli: \(status)")
+        XCTAssertFalse(status.contains("tracked-9.txt"), "özet kuyruğu kesmeli: \(status)")
+        XCTAssertLessThan(status.count, 1_000, "özet duvar metni olmamalı")
     }
 
     /// Korumalı dalda açık temiz kaynak, oluşturmayı engellemez: çalışma alanı
-    /// açık committe `--detach` kurulur, kaynak checkout'a hiç dokunulmaz.
+    /// taban committe yeni `agentic/w-*` dalında kurulur, kaynak checkout'a hiç dokunulmaz.
     func testPreflightIgnoresCheckedOutProtectedBranch() async throws {
         let fixture = try makeCleanFixture(name: "protected-branch")
         let project = makeProject(fixture: fixture)
@@ -339,7 +385,7 @@ final class GitWorkspaceManagerTests: XCTestCase {
     }
 
     /// Korumalı dalda açık kaynaktan kurulum: kaynak dalda ve kirlenmeden
-    /// kalır, çalışma alanı taban committte ayrık kurulur.
+    /// kalır, çalışma alanı taban committe yeni dalda kurulur.
     func testCreateOwnedWorkspaceFromProtectedCheckoutLeavesSourceUntouched() async throws {
         let fixture = try makeCleanFixture(name: "protected-create")
         let project = makeProject(fixture: fixture)
@@ -564,7 +610,7 @@ final class GitWorkspaceManagerTests: XCTestCase {
         )
 
         // The owned workspace must stay visible for recovery even though the source
-        // checkout now has an untracked change; dirtiness only blocks fresh creation.
+        // checkout now has an untracked change; source dirtiness never blocks creation.
         try Data("scratch\n".utf8).write(to: fixture.repositoryURL.appendingPathComponent("scratch.txt"))
 
         let preflight = await manager.preflight(project: project, task: task)
@@ -757,28 +803,73 @@ final class GitWorkspaceManagerTests: XCTestCase {
         XCTAssertEqual(ownedRecord.workspaceID, record.workspaceID)
     }
 
-    func testCreateRefusesDirtySourceBeforeAnyMutation() async throws {
+    /// Kirli kaynaktan oluşturma: yeni `agentic/w-*` dalı açılır, kaynak dal/HEAD
+    /// ve kirli iş yerinde korunur, çalışma alanı taban committe kurulur.
+    func testCreateFromDirtySourceOpensBranchAndLeavesSourceUntouched() async throws {
         let fixture = try makeCleanFixture(name: "create-dirty")
         let project = makeProject(fixture: fixture)
         let task = makeTask(projectID: project.id)
         let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let branchBefore = try runGit(["rev-parse", "--abbrev-ref", "HEAD"], in: fixture.repositoryURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headBefore = try runGit(["rev-parse", "HEAD"], in: fixture.repositoryURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         try Data("dirty\n".utf8).write(to: fixture.repositoryURL.appendingPathComponent("dirty.txt"))
 
-        await assertThrownGuardError(
-            {
-                _ = try await manager.createOwnedWorkspace(
-                    task: task,
-                    attempt: makeAttempt(taskID: task.id),
-                    base: WorkspaceBase(commitSHA: fixture.baseSHA)
-                )
-            },
-            code: "WORKTREE_DIRTY"
+        guard case .notOwned = await manager.preflight(project: project, task: task) else {
+            XCTFail("expected notOwned despite dirty source")
+            return
+        }
+
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: makeAttempt(taskID: task.id),
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
         )
 
-        let worktreesRoot = fixture.authorizedRoot.appendingPathComponent("worktrees", isDirectory: true)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreesRoot.path))
-        let registryRoot = fixture.authorizedRoot.appendingPathComponent("registry", isDirectory: true)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: registryRoot.path))
+        XCTAssertEqual(record.baseSHA, fixture.baseSHA)
+        let expectedBranch = GitWorkspaceManager.workspaceBranchName(workspaceID: record.workspaceID)
+        let workspaceURL = URL(fileURLWithPath: record.workspacePath)
+        let worktreeHead = try runGit(["rev-parse", "HEAD"], in: workspaceURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(worktreeHead, fixture.baseSHA)
+        let worktreeBranch = try runGit(["rev-parse", "--abbrev-ref", "HEAD"], in: workspaceURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(worktreeBranch, expectedBranch, "çalışma alanı yeni dalda olmalı")
+        let branchAfter = try runGit(["rev-parse", "--abbrev-ref", "HEAD"], in: fixture.repositoryURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headAfter = try runGit(["rev-parse", "HEAD"], in: fixture.repositoryURL)
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(branchAfter, branchBefore, "kaynak checkout dal değiştirmemeli")
+        XCTAssertEqual(headAfter, headBefore, "kaynak HEAD oynamamalı")
+        let sourceStatus = try runGit(["status", "--porcelain=v1", "--untracked-files=all"], in: fixture.repositoryURL).stdout
+        XCTAssertTrue(sourceStatus.contains("dirty.txt"), "kirli iş korunmalı: \(sourceStatus)")
+        let worktreeList = try runGit(["worktree", "list", "--porcelain"], in: fixture.repositoryURL).stdout
+        XCTAssertTrue(worktreeList.contains(record.workspacePath), "worktree kayıtlı olmalı: \(worktreeList)")
+    }
+
+    /// Emeklilik, otomatik açılan dalı da temizler; dal sızıntısı kalmaz.
+    func testRetireRemovesAutoCreatedWorkspaceBranch() async throws {
+        let fixture = try makeCleanFixture(name: "retire-branch")
+        let project = makeProject(fixture: fixture)
+        let task = makeTask(projectID: project.id)
+        let attempt = makeAttempt(taskID: task.id)
+        let manager = makeManager(fixture: fixture, projects: [project], events: nil)
+        let record = try await manager.createOwnedWorkspace(
+            task: task,
+            attempt: attempt,
+            base: WorkspaceBase(commitSHA: fixture.baseSHA)
+        )
+        await manager.releaseOwnedWorkspace(workspaceID: record.workspaceID, attemptID: attempt.id)
+
+        try await manager.retire(workspaceID: record.workspaceID, approval: makeApproval(taskID: task.id, attemptID: attempt.id))
+
+        let branchName = GitWorkspaceManager.workspaceBranchName(workspaceID: record.workspaceID)
+        let branches = try runGit(["branch", "--list", branchName], in: fixture.repositoryURL).stdout
+        XCTAssertTrue(
+            branches.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "otomatik dal silinmeli, sızmamalı: \(branches)"
+        )
     }
 
     func testCreateRefusesInvalidAndMissingBase() async throws {
