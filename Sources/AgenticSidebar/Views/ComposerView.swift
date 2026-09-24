@@ -538,7 +538,8 @@ struct ComposerView: View {
                 submissionAvailability: submissionAvailability,
                 onSubmit: sendDraft,
                 onCancelSuggestions: dismissVisibleSuggestions,
-                onSpillLargePaste: spillLargePasteToAttachment
+                onSpillLargePaste: spillLargePasteToAttachment,
+                onPasteImage: pasteImageToAttachment
             )
             .id(focusedSession.id)
 
@@ -1846,6 +1847,30 @@ struct ComposerView: View {
         } catch {
             AppLog.agentSession.error(
                 "A long paste could not be spilled to a file; inserting inline"
+            )
+            return false
+        }
+    }
+
+    /// Panodan yapıştırılan görüntü, sürükle-bırakla gelenle aynı yoldan dosya
+    /// eki olur: kalıcı klasöre yazılır, taslağa eklenir. Yazma başarısız
+    /// olursa `false` döner ve yapıştırma platforma düşer.
+    private func pasteImageToAttachment(_ data: Data, _ typeIdentifier: String) -> Bool {
+        do {
+            let url = try DroppedImageAttachment.save(
+                data,
+                typeIdentifier: typeIdentifier
+            )
+            if !attachedURLs.contains(url) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                    attachedURLs.append(url)
+                }
+            }
+            pushDraftToStore()
+            return true
+        } catch {
+            AppLog.agentSession.error(
+                "A pasted image could not be stored as an attachment"
             )
             return false
         }

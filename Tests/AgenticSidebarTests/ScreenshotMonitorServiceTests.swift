@@ -47,7 +47,7 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
         monitor.start()
         monitor.stop()
 
-        let screenshotURL = try writeScreenshot(named: "Screenshot 2026-09-16 at 10.00.00.png")
+        _ = try writeScreenshot(named: "Screenshot 2026-09-16 at 10.00.00.png")
 
         await monitor.tick()
 
@@ -59,9 +59,12 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
         XCTAssertEqual(submission.attachmentPaths.count, 1)
         XCTAssertEqual(
             submission.attachmentPaths.first
-                .map { URL(fileURLWithPath: $0).lastPathComponent },
-            screenshotURL.lastPathComponent,
-            "The screenshot itself must be attached to the prompt"
+                .map { URL(fileURLWithPath: $0).pathExtension },
+            "png"
+        )
+        XCTAssertTrue(
+            submission.attachmentPaths.first?.contains("Screenshot_2026-09-16_at_10.00.00") == true,
+            "The screenshot itself must be attached to the prompt (staged under a sanitized name)"
         )
 
         await monitor.tick()

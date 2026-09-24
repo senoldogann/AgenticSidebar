@@ -24,7 +24,17 @@ final class OpenCodePromptPartTests: XCTestCase {
         )
 
         XCTAssertEqual(parts.count, 2)
-        XCTAssertEqual(parts.first, .text("<user_turn>\nWhat is broken here?\n</user_turn>"))
+        guard case .text(let text) = try XCTUnwrap(parts.first) else {
+            return XCTFail("Expected a text part")
+        }
+        XCTAssertTrue(
+            text.contains("What is broken here?"),
+            "The user message stays in the text part"
+        )
+        XCTAssertTrue(
+            text.contains(imageURL.path),
+            "An inlined image keeps its on-disk path so the agent can open the file itself"
+        )
         XCTAssertEqual(
             parts.last,
             .file(

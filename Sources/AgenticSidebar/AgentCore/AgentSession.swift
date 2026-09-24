@@ -1355,10 +1355,18 @@ final class AgentSession {
             return nil
         }
 
+        let stagedAttachmentPaths = AttachmentStager.stage(
+            paths: queuedPrompt.attachmentPaths,
+            sessionID: id,
+            date: Date(),
+            uniquifier: DroppedImageAttachment.defaultUniquifier(),
+            fileManager: FileManager.default,
+            baseURL: AttachmentStager.liveBaseURL()
+        )
         let userMessage = ChatMessage(
             role: .user,
             text: queuedPrompt.text,
-            attachmentPaths: queuedPrompt.attachmentPaths,
+            attachmentPaths: stagedAttachmentPaths,
             extensionTags: queuedPrompt.extensionTags
         )
         state.messages.append(userMessage)

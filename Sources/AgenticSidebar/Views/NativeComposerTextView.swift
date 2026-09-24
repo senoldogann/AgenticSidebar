@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class NativeComposerTextView: NSTextView {
@@ -9,11 +10,18 @@ final class NativeComposerTextView: NSTextView {
     /// `true` when the paste was handled so nothing is inserted; `false` falls
     /// back to the platform paste and the text lands inline.
     var onSpillLargePaste: ((String) -> Bool)?
+    /// A pasted image becomes a file attachment the same way a dropped one
+    /// does. Arguments are the raw bytes and the source type identifier;
+    /// return `true` when the image was attached, `false` to fall through.
+    var onPasteImage: ((Data, String) -> Bool)?
     /// Escape önce öneri panelini kapatır; kapatacak bir panel yoksa `false`
     /// döner ve tuş sistemin varsayılanına bırakılır.
     var onCancelSuggestions: (() -> Bool)?
 
     override func paste(_ sender: Any?) {
+        guard !pasteImageIfNeeded() else {
+            return
+        }
         guard !spillLargePasteIfNeeded() else {
             return
         }
@@ -53,6 +61,25 @@ final class NativeComposerTextView: NSTextView {
         }
 
         return handler(text)
+    }
+
+    /// Panodaki görüntü dosya eki olur (ekran görüntüsü Cmd+V'si).
+    ///
+    /// Metin kopyası bu türleri taşımadığı için resim önce bakılır: metin
+    /// eşiğiyle çakışmaz. Düz metin yapıştırma (`pasteAsPlainText`) bilerek
+    /// buraya uğramaz — açık niyet metinse resim eklenmemelidir.
+    private func pasteImageIfNeeded() -> Bool {
+        guard let handler = onPasteImage else {
+            return false
+        }
+        let board = NSPasteboard.general
+        if let data = board.data(forType: .tiff), !data.isEmpty {
+            return handler(data, UTType.tiff.identifier)
+        }
+        if let data = board.data(forType: .png), !data.isEmpty {
+            return handler(data, UTType.png.identifier)
+        }
+        return false
     }
 
     override func keyDown(with event: NSEvent) {
@@ -129,6 +156,8 @@ struct ComposerTextEditor: NSViewRepresentable {
     let onCancelSuggestions: @MainActor () -> Bool
     /// Eşik üstü yapıştırma dosya eki olur; `true` ekler, `false` satıra yazar.
     let onSpillLargePaste: @MainActor (String) -> Bool
+    /// Panoya kopyalanmış görüntü dosya eki olur; `true` ekler, `false` düşer.
+    let onPasteImage: @MainActor (Data, String) -> Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text)
@@ -255,6 +284,7 @@ struct ComposerTextEditor: NSViewRepresentable {
         textView.onSubmit = onSubmit
         textView.onCancelSuggestions = onCancelSuggestions
         textView.onSpillLargePaste = onSpillLargePaste
+        textView.onPasteImage = onPasteImage
     }
 
     private func textView(in scrollView: NSScrollView) -> NativeComposerTextView? {

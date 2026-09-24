@@ -102,6 +102,14 @@ final class PromptAttachmentTests: XCTestCase {
     }
 
     func testSubmitPreservesEveryAttachmentPathOnTheUserMessage() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let imageURL = directory.appendingPathComponent("one.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imageURL)
+        let noteURL = directory.appendingPathComponent("two.txt")
+        try Data("two".utf8).write(to: noteURL)
+
         let runtime = TestProviderRuntime(
             id: ProviderID("alpha"),
             displayName: "Alpha",
@@ -119,17 +127,24 @@ final class PromptAttachmentTests: XCTestCase {
         let task = try XCTUnwrap(
             service.submit(
                 "Two files",
-                attachmentPaths: ["/tmp/one.png", "/tmp/two.txt"]
+                attachmentPaths: [imageURL.path, noteURL.path]
             )
         )
         await task.value
 
         let userMessage = try XCTUnwrap(service.state.messages.first)
-        XCTAssertEqual(
-            userMessage.attachmentPaths,
-            ["/tmp/one.png", "/tmp/two.txt"]
-        )
         XCTAssertEqual(userMessage.attachmentPaths.count, 2)
+        XCTAssertTrue(
+            userMessage.attachmentPaths[0].contains("one"),
+            "Dışarıdaki ek tur klasörüne sabitlenir, ad gövdesi korunur"
+        )
+        XCTAssertTrue(userMessage.attachmentPaths[1].contains("two"))
+        XCTAssertTrue(
+            userMessage.attachmentPaths.allSatisfy {
+                FileManager.default.fileExists(atPath: $0)
+            },
+            "Tura giren her yol tur başında var olmalıdır"
+        )
     }
 
     func testChatMessagePresenterCleansRawOCRAndBoilerplateFromScreenshotPrompt() {

@@ -5,6 +5,12 @@ Dock icon, can be summoned with a global shortcut, optionally reports session
 state from the menu bar, and drives either the direct OpenAI Responses API or a
 managed local OpenCode server.
 
+## Screenshots
+
+![Chat session with folder-scoped conversation, live file-change review and simulator panel](docs/screenshots/chat-session.png)
+
+![Settings window with appearance options](docs/screenshots/settings-appearance.png)
+
 ## Requirements
 
 - macOS 26 SDK (the package targets `.macOS(.v26)`)

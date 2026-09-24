@@ -42,6 +42,9 @@ enum OpenCodePromptPart: Encodable, Equatable, Sendable {
 /// user turn is submitted. Attachments that cannot be safely inlined stay
 /// referenced by path in the prompt text — the managed agent can read local files
 /// itself — so a single oversized or unsupported file never breaks a turn.
+/// Inlined images travel as vision parts *and* keep a path line in the prompt
+/// text, so the agent can also open the file itself when the pixels are not
+/// enough (crop, convert, attach the result back).
 ///
 /// A `file` part is only ever a medium the model layer accepts as an attachment:
 /// an image or a PDF. A text document is *quoted into the prompt* instead. That
@@ -81,6 +84,7 @@ enum OpenCodePromptBuilder {
         var parts: [OpenCodePromptPart] = []
         var quotedDocuments: [QuotedDocument] = []
         var quotedTotal = 0
+        var inlinedMediaPaths: [String] = []
         var referencedOnly: [String] = []
 
         for path in message.attachmentPaths {
@@ -90,6 +94,7 @@ enum OpenCodePromptBuilder {
                 maximumInlineBytes: maximumInlineBytes
             ) {
                 parts.append(part)
+                inlinedMediaPaths.append(path)
             } else if quotedTotal < maximumQuotedTotalCharacters,
                 let document = quotedDocument(
                     forPath: path,
@@ -110,6 +115,7 @@ enum OpenCodePromptBuilder {
         let text = promptText(
             message.text,
             quotedDocuments: quotedDocuments,
+            onDiskMediaPaths: inlinedMediaPaths,
             referencedOnly: referencedOnly,
             speedMode: speedMode,
             mode: mode,
@@ -238,6 +244,7 @@ enum OpenCodePromptBuilder {
     private static func promptText(
         _ text: String,
         quotedDocuments: [QuotedDocument],
+        onDiskMediaPaths: [String],
         referencedOnly: [String],
         speedMode: ResponseSpeedMode,
         mode: AgentMode,
@@ -247,6 +254,19 @@ enum OpenCodePromptBuilder {
         var sections: [String] = text.isEmpty ? [] : [text]
 
         sections.append(contentsOf: quotedDocuments.map(quotedSection))
+
+        if !onDiskMediaPaths.isEmpty {
+            let list =
+                onDiskMediaPaths
+                .map { "- \($0)" }
+                .joined(separator: "\n")
+
+            sections.append(
+                """
+                Attached images also stored on this machine (open them with file tools when the file itself is needed, not just the pixels):
+                \(list)
+                """)
+        }
 
         if !referencedOnly.isEmpty {
             let list =
