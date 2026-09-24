@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 15
 
     env:
-      SWIFT_FORMAT_VERSION: "604.0.0"
+      SWIFT_FORMAT_VERSION: "603.0.0"
 
     steps:
       - uses: actions/checkout@v4
