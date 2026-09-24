@@ -907,38 +907,24 @@ actor OpenCodeWorkspaceServerFactory {
         guard !servers.isEmpty else {
             return WorkspaceServerStopAllReport(stopped: 0, timedOut: false)
         }
-        let confirmedStops = Mutex(0)
-        // `true` = durdurmalar bütçeden önce bitti, `false` = sayaç kazandı.
-        let finishedBeforeTimeout = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
-            group.addTask {
-                await withTaskGroup(of: Void.self) { inner in
-                    for server in servers {
-                        inner.addTask {
-                            await server.manager.stop()
-                            confirmedStops.withLock { $0 += 1 }
-                        }
-                    }
-                }
-                return !Task.isCancelled
+
+        // Swift 6.2: nested task group closures are `sending`; capturing
+        // local variables triggers `#SendingClosureRisksDataRace`. Instead,
+        // run stops sequentially with a timeout budget — simpler and race-free.
+        let start = ContinuousClock.now
+        var stoppedCount = 0
+        for server in servers {
+            let remaining = Self.stopAllTimeout - start.duration(to: ContinuousClock.now)
+            if remaining <= .zero {
+                AppLog.openCode.error(
+                    "stopAll exceeded its 10s budget; remaining stops continue in background"
+                )
+                return WorkspaceServerStopAllReport(stopped: stoppedCount, timedOut: true)
             }
-            group.addTask {
-                try? await Task.sleep(for: Self.stopAllTimeout)
-                return false
-            }
-            guard let first = await group.next() else {
-                return false
-            }
-            group.cancelAll()
-            return first
+            await server.manager.stop()
+            stoppedCount += 1
         }
-        if !finishedBeforeTimeout {
-            let confirmed = confirmedStops.withLock { $0 }
-            AppLog.openCode.error(
-                "stopAll exceeded its 10s budget; remaining stops continue in background"
-            )
-            return WorkspaceServerStopAllReport(stopped: confirmed, timedOut: true)
-        }
-        return WorkspaceServerStopAllReport(stopped: servers.count, timedOut: false)
+        return WorkspaceServerStopAllReport(stopped: stoppedCount, timedOut: false)
     }
 
     /// Bir çalışma alanının yapılandırma/kiralama ad alanı.

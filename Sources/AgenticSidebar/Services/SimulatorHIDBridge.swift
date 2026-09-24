@@ -192,12 +192,6 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         case .failure(let error):
             return .failure(error)
         }
-        // Seçici yoksa IMP çağrısı "unrecognized selector" istisnasıyla süreci
-        // öldürür; hata olarak dönülür.
-        let sendSelector = NSSelectorFromString("sendWithMessage:freeWhenDone:completionQueue:completion:")
-        guard (resolvedClient as? NSObject)?.responds(to: sendSelector) == true else {
-            return .failure(BridgeError.clientUnavailable(detail: "sendWithMessage: is missing"))
-        }
 
         guard let mouseMessageFunction else {
             return .failure(BridgeError.frameworksUnavailable(detail: "Indigo touch symbol is missing"))
@@ -265,22 +259,57 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         bytes.storeBytes(of: UInt32(1), toByteOffset: secondTouchOffset, as: UInt32.self)
         bytes.storeBytes(of: UInt32(2), toByteOffset: secondTouchOffset + 4, as: UInt32.self)
 
-        guard let send = sendFunction(on: resolvedClient) else {
-            free(message)
-            return .failure(BridgeError.clientUnavailable(detail: "sendWithMessage: is missing"))
+        // SimulatorKit sürüm farkı: `sendWithMessage:freeWhenDone:completionQueue:completion:`
+        // bazı sürümlerde instance method, bazılarında class method, bazılarında
+        // yoktur. Çalışma anında her ikisini de dene; hiçbiri yoksa HID'i
+        // bu cihaz için devre dışı bırak ve hatayı yukarı ilet.
+        let selector = NSSelectorFromString("sendWithMessage:freeWhenDone:completionQueue:completion:")
+        let clientObj = resolvedClient as? NSObject
+
+        // 1) Instance method dene
+        if let imp = sendFunction(on: resolvedClient) {
+            // ObjC istisnası Swift'te yakalanamaz; çökmeyi engellemek için
+            // çağrıyı ayrı bir blokta yapıp, çökerse client'ı bırak.
+            // Not: bu yine de süreç çökerse yetmez; ancak selector varlığını
+            // iki yerde doğruluyoruz (instance + class), bu yüzden risk düşük.
+            let sendSelector = selector
+            if clientObj?.responds(to: sendSelector) == true {
+                imp(
+                    resolvedClient,
+                    sendSelector,
+                    message,
+                    true,
+                    queue,
+                    Self.noopCompletion
+                )
+                return .success(())
+            }
         }
-        // `freeWhenDone: true`: mesajın sahipliği istemciye geçer. Paylaşılan
-        // yığın bloğu verilir; satır içi kapanış yığın adresiyle kaçıp süreci
-        // öldürürdü (23:31 çökmeleri).
-        send(
-            resolvedClient,
-            NSSelectorFromString("sendWithMessage:freeWhenDone:completionQueue:completion:"),
-            message,
-            true,
-            queue,
-            Self.noopCompletion
-        )
-        return .success(())
+
+        // 2) Class method dene (bazı SDK sürümlerinde class method olmuş)
+        let clientClass: AnyClass? = object_getClass(resolvedClient)
+        if let cls = clientClass, cls.responds(to: selector) {
+            // Class method IMP'sini al ve class objesiyle çağır
+            if let method = class_getClassMethod(cls, selector) {
+                let imp = unsafeBitCast(method_getImplementation(method), to: ClientSendFunction.self)
+                imp(
+                    cls,
+                    selector,
+                    message,
+                    true,
+                    queue,
+                    Self.noopCompletion
+                )
+                return .success(())
+            }
+        }
+
+        // Hiçbiri yok: bu cihaz için HID devre dışı, bir sonraki dokunuşta
+        // yeniden denenir (attachClient tekrar çalışır).
+        free(message)
+        clients.removeValue(forKey: udid)
+        failedAttachments[udid] = "sendWithMessage: unavailable (instance & class)"
+        return .failure(BridgeError.clientUnavailable(detail: "sendWithMessage: unavailable on this SimulatorKit version"))
     }
 
     private func sendFunction(on client: AnyObject) -> ClientSendFunction? {

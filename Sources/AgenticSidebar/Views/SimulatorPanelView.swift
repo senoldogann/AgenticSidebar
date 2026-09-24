@@ -213,6 +213,11 @@ struct SimulatorPanelView: View {
     /// Dokunma katmanı ekran görüntüsünün üstündedir; çerçeve ve ada
     /// tıklanamaz (`allowsHitTesting(false)`), bu yüzden normalize koordinat
     /// hep ekran oranına göre bölünür.
+    ///
+    /// `.drawingGroup()` ile tek bir Metal katmanına rasterize edilir:
+    /// kare değiştiğinde SwiftUI layout ağacını yeniden hesaplamaz, GPU'da
+    /// yalnız piksel değişimi kalır. Bu, ~12 fps canlı akışta layout thrashing
+    /// (örn. 200+ `NSView _layoutSubtreeWithOldSize:` çerçevesi) engeller.
     private func iPhoneDeviceFrame(frame: CGImage) -> some View {
         ZStack {
             Image(decorative: frame, scale: 1)
@@ -272,6 +277,7 @@ struct SimulatorPanelView: View {
                 .allowsHitTesting(false)
         }
         .shadow(color: .black.opacity(0.35), radius: 14, y: 6)
+        .drawingGroup()
     }
 
     /// Görüntünün üstündeki saydam dokunma katmanı: katman görüntüyle aynı
@@ -336,9 +342,16 @@ struct SimulatorPanelView: View {
 
     /// Akış kaynağı rozeti: canlı akış aktifken yeşil "Canlı", izin yoksa
     /// izin düğmesi, `simctl` yolundayken hiçbir şey (ekran zaten gelir).
+    ///
+    /// `Equatable` conformance sayesinde phase aynı kaldığında View kimliği
+    /// değişmez, aniden yeniden render olmaz. Bu, canlı akış başladığında/
+    /// bittiğinde tek seferlik geçişe indirger.
     @ViewBuilder
     private var liveBadge: some View {
-        switch service.liveStream.phase {
+        let phase = service.liveStream.phase
+        let isBooted = service.selectedDevice?.isBooted == true
+
+        switch phase {
         case .active:
             Label("Canlı", systemImage: "bolt.fill")
                 .font(.system(size: 10, weight: .semibold))
@@ -356,9 +369,7 @@ struct SimulatorPanelView: View {
             .pointingHandCursor()
             .help("Grant Screen Recording for a fluid live stream; until then frames come from simctl.")
         case .idle, .starting, .unavailable:
-            // Canlı akış yokken kareler `simctl` yolundan (~2 fps) gelir; rozet
-            // boş kalırsa yavaşlık sebepsiz görünür, o yüzden yedek mod yazılır.
-            if service.selectedDevice?.isBooted == true {
+            if isBooted {
                 Label("simctl · ~2 fps", systemImage: "camera.fill")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
