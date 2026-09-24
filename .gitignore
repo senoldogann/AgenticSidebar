@@ -7,3 +7,7 @@ DerivedData/
 .worktrees/
 .freebuff/
 as-review/
+# Yanlışlıkla oluşan tek çizgili dosya adı (bir kerelik `simctl` artığı).
+-
+*.orig
+*.rej

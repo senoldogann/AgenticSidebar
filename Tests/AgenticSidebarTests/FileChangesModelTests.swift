@@ -323,4 +323,46 @@ final class FileChangesModelTests: XCTestCase {
         XCTAssertEqual(merged?.fileCount, 2)
         XCTAssertEqual(merged?.files.map(\.fileName), ["A.swift", "B.swift"])
     }
+
+    func testHasFileChangesIsCheapGateForHeaderBadge() {
+        XCTAssertFalse(TurnFileChangesSummary.hasFileChanges(in: []))
+
+        let commandOnly = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [
+                AgentActivity(
+                    id: ProviderActivityID("cmd-1"),
+                    kind: .command,
+                    phase: .completed,
+                    title: "Running ls",
+                    detail: "ls",
+                    output: "ok",
+                    diff: nil,
+                    startedAt: Date(),
+                    completedAt: Date()
+                )
+            ]
+        )
+        XCTAssertFalse(TurnFileChangesSummary.hasFileChanges(in: [commandOnly]))
+
+        let edited = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [
+                AgentActivity(
+                    id: ProviderActivityID("edit-1"),
+                    kind: .edit,
+                    phase: .completed,
+                    title: "Edited A.swift",
+                    detail: "/workspace/A.swift",
+                    output: "Success",
+                    diff: "+ one",
+                    startedAt: Date(),
+                    completedAt: Date()
+                )
+            ]
+        )
+        XCTAssertTrue(TurnFileChangesSummary.hasFileChanges(in: [commandOnly, edited]))
+    }
 }

@@ -1385,6 +1385,8 @@ final class TaskSchedulerTests: XCTestCase {
         XCTAssertNil(claim(in: followUp, taskID: other.id), "Repository must stay locked by the surviving attempt")
     }
 
+    /// Sözleşme: tek görevin claim hatası turu düşürmez; kira salınır,
+    /// görev `deferred` yazılır ve tur kalan görevlerle devam eder.
     func testNonContentionClaimFailureReleasesRepositoryLease() async throws {
         let store = try SQLiteTaskStore.inMemory()
         let clock = TestTaskSchedulerClock(start: startDate)
@@ -1409,18 +1411,31 @@ final class TaskSchedulerTests: XCTestCase {
             provisioning: nil
         )
 
-        do {
-            _ = try await scheduler.schedule(projectID: projectID)
-            XCTFail("Expected the injected claim failure to propagate")
-        } catch let error as TaskRepositoryError {
-            XCTAssertEqual(error, .underlying("injected claim failure"))
+        // Enjeksiyon tek atımlıktır: ilk görev düşer, tur devam eder ve
+        // kardeş görev aynı depoda başarıyla claim edilir.
+        let report = try await scheduler.schedule(projectID: projectID)
+        guard case .deferred(let reason) = try entry(in: report, taskID: task.id).disposition else {
+            XCTFail("A failed claim must defer the task, never dispatch or propagate")
+            return
         }
-
-        let replacementAttemptID = UUID()
-        try await store.acquireRepositoryLease(
-            repositoryPath: sharedPath, taskID: other.id, attemptID: replacementAttemptID, leaseTimeoutSeconds: 60)
-        try await store.releaseRepositoryLease(
-            repositoryPath: sharedPath, taskID: other.id, attemptID: replacementAttemptID)
+        XCTAssertTrue(reason.hasPrefix("claimFailed"), "Unexpected reason \(reason)")
+        guard case .claimed = try entry(in: report, taskID: other.id).disposition else {
+            XCTFail("The sibling task must proceed after the first task's isolated failure")
+            return
+        }
+        // Kira claim edilen kardeştedir: tek görevin hatası ne kira
+        // sızdırdı ne de kardeş görevi aç bıraktı.
+        do {
+            try await store.acquireRepositoryLease(
+                repositoryPath: sharedPath, taskID: task.id, attemptID: UUID(), leaseTimeoutSeconds: 60)
+            XCTFail("Lease must be held by the claimed sibling")
+        } catch let error as TaskRepositoryError {
+            guard case .repositoryLeaseConflict(_, let heldBy) = error else {
+                XCTFail("Unexpected lease error \(error)")
+                return
+            }
+            XCTAssertEqual(heldBy, other.id)
+        }
     }
 
     func testUnavailableProviderDefersWithoutClaim() async throws {

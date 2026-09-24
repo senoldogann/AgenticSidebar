@@ -211,7 +211,8 @@ final class AgentSessionService {
                 lastMessageAt: session.state.messages.last?.createdAt,
                 createdAt: session.createdAt,
                 customTitle: session.customTitle,
-                isPinned: session.isPinned
+                isPinned: session.isPinned,
+                workingDirectoryPath: session.workingDirectoryPath
             )
         }
         if sessionList != newList {
@@ -248,9 +249,16 @@ final class AgentSessionService {
 
     @discardableResult
     func createSession() -> UUID {
+        createSession(workingDirectoryPath: nil)
+    }
+
+    /// Klasör bağlı yeni oturum açar; `nil` mevcut varsayılan davranıştır.
+    @discardableResult
+    func createSession(workingDirectoryPath: String?) -> UUID {
         let session = AgentSession(
             runtimes: runtimes,
-            state: AgentSessionState(configuration: initialConfigurationForNewSession())
+            state: AgentSessionState(configuration: initialConfigurationForNewSession()),
+            workingDirectoryPath: workingDirectoryPath
         )
         adopt(session)
         // Normalizing with no known capabilities yet would throw away the
@@ -278,13 +286,31 @@ final class AgentSessionService {
     /// döner, yazılan metin korunur.
     @discardableResult
     func beginPendingSession() -> UUID {
-        if let pendingSessionID, pendingSession != nil {
+        beginPendingSession(workingDirectoryPath: nil)
+    }
+
+    /// Klasör bağlı bekleyen taslak açar; mevcut taslak varsa klasörü
+    /// günceller, yazılan metin korunur.
+    ///
+    /// `nil` mevcut taslağı olduğu gibi gösterir (klasörü silmez); klasörü
+    /// kaldırmak için `clearPendingSessionDirectory()` kullanılır. Ayrım
+    /// bilinçlidir: `+ New session` düğmesi klasör seçmeden de çalışır ve
+    /// seçilmiş bir klasörü sessizce düşürmemelidir.
+    @discardableResult
+    func beginPendingSession(workingDirectoryPath: String?) -> UUID {
+        if let pendingSessionID, let pending = pendingSession {
+            // Klasörsüz çağrı mevcut taslağı olduğu gibi gösterir; klasörlü
+            // çağrı klasörü günceller. İkisinde de yazılan metin korunur.
+            if workingDirectoryPath != nil {
+                pending.setWorkingDirectory(path: workingDirectoryPath)
+            }
             isPendingSessionVisible = true
             return pendingSessionID
         }
         let session = AgentSession(
             runtimes: runtimes,
-            state: AgentSessionState(configuration: initialConfigurationForNewSession())
+            state: AgentSessionState(configuration: initialConfigurationForNewSession()),
+            workingDirectoryPath: workingDirectoryPath
         )
         adopt(session)
         session.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
@@ -296,7 +322,9 @@ final class AgentSessionService {
 
     /// Bekleyen taslağı aynı kimlikle gerçek oturuma dönüştürür: listenin
     /// başına eklenir, aktif olur, kaydedilir. Taslak anahtarı değişmediği
-    /// için bestecideki metin/ek olduğu gibi kalır.
+    /// için bestecideki metin/ek olduğu gibi kalır. Kimlik değişmediğinden
+    /// `onChange(of: focusedSession.id)` tetiklenmez; doğum anına bağlı
+    /// görünüm işleri için `didMaterializePendingSession` bildirilir.
     func materializePendingSession(_ id: UUID) {
         guard let pendingSession, pendingSessionID == id else {
             return
@@ -308,6 +336,7 @@ final class AgentSessionService {
         isPendingSessionVisible = false
         refreshSessionList()
         saveImmediately()
+        NotificationCenter.default.post(name: .didMaterializePendingSession, object: id)
     }
 
     /// Gönderilmemiş taslağı siler: oturum hiç doğmamış sayılır.
@@ -315,6 +344,13 @@ final class AgentSessionService {
         pendingSession = nil
         pendingSessionID = nil
         isPendingSessionVisible = false
+    }
+
+    /// Bekleyen taslağın klasör bağını kaldırır; taslak metni korunur.
+    /// `beginPendingSession(nil)` bilerek korumacıdır, o yüzden silme ayrı
+    /// bir eylemdir.
+    func clearPendingSessionDirectory() {
+        pendingSession?.setWorkingDirectory(path: nil)
     }
 
     /// Bekleyen taslağın görünürlüğü: sohbet seçimi gizler, taslağı silmez.
@@ -509,10 +545,16 @@ final class AgentSessionService {
             status: .idle
         )
         forkedState.activityGroups = fork.activityGroups
+        // Klasör bağlanır; bağlam özeti bilinçli taşınmaz: özet, dallanma
+        // noktasından düşen ön eke aittir ve mesaj kimlikleri fork'ta yeniden
+        // eşlenir (`SessionFork` kimlik haritası özeti kapsamaz). Özeti eski
+        // kimliklerle taşımak yanlış aralığı özetlenmiş sayardı; dal, gerekirse
+        // kendi özetini sıfırdan üretir.
         let branch = AgentSession(
             runtimes: runtimes,
             state: forkedState,
-            customTitle: fork.title
+            customTitle: fork.title,
+            workingDirectoryPath: source.workingDirectoryPath
         )
         adopt(branch)
         branch.applyCapabilities(providers, normalizeConfiguration: !providers.isEmpty)
@@ -831,8 +873,9 @@ final class AgentSessionService {
                 if snapshot.id == activeSessionID {
                     return true
                 }
-                // Boş ama sabitli ya da başlıklı oturum kaybolmamalı; yoksa
-                // kullanıcı sabitlediği boş taslağı relaunch'ta kaybeder.
+                // Boş ama sabitli, başlıklı ya da klasör bağlı oturum
+                // kaybolmamalı; yoksa kullanıcı sabitlediği boş taslağı ya da
+                // seçtiği klasör bağını relaunch'ta kaybeder.
                 if !snapshot.messages.isEmpty {
                     return true
                 }
@@ -841,6 +884,9 @@ final class AgentSessionService {
                 }
                 if let customTitle = snapshot.customTitle {
                     return !customTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                if let directory = snapshot.workingDirectoryPath {
+                    return !directory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 }
                 return false
             }

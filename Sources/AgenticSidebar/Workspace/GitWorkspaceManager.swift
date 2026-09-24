@@ -547,9 +547,15 @@ actor GitWorkspaceManager: WorkspaceManaging {
         "agentic/w-" + workspaceID.uuidString
     }
 
-    /// Otomatik açılan dalı en iyi gayretle siler; tutmazsa sessiz geçilir.
+    /// Otomatik açılan dalı en iyi gayretle siler; tutmazsa loglanır.
     private func deleteBranchBestEffort(_ branchName: String, repositoryURL: URL) {
-        _ = try? runner.run(executable: "git", arguments: ["branch", "-D", branchName], directory: repositoryURL)
+        do {
+            _ = try runner.run(executable: "git", arguments: ["branch", "-D", branchName], directory: repositoryURL)
+        } catch {
+            AppLog.lifecycle.error(
+                "Could not delete the workspace branch; it was left for manual cleanup"
+            )
+        }
     }
 
     /// Crash-yetimi dalları toplar: `worktree add` ile manifest yazımı arası
@@ -559,9 +565,18 @@ actor GitWorkspaceManager: WorkspaceManaging {
     /// böylece uçuş hâlindeki eş yaratıma dokunulmaz.
     private func reapOrphanWorkspaceBranches(repositoryURL: URL) {
         guard let list = try? runGit(["branch", "--list", "agentic/w-*"], in: repositoryURL) else {
+            AppLog.lifecycle.error(
+                "Could not list workspace branches for orphan reaping; retrying on the next pass"
+            )
             return
         }
-        _ = try? runner.run(executable: "git", arguments: ["worktree", "prune"], directory: repositoryURL)
+        do {
+            _ = try runner.run(executable: "git", arguments: ["worktree", "prune"], directory: repositoryURL)
+        } catch {
+            AppLog.lifecycle.error(
+                "Could not prune worktrees before orphan reaping"
+            )
+        }
         var reaped = 0
         for line in list.standardOutput.split(separator: "\n") {
             let name = line.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -151,6 +151,10 @@ final class AgentSession {
     /// Budanmazsa uzun bir sohbette bütün tur geçmişi RAM'de birikir.
     private static let maximumInMemoryActivities = SessionArchiveStore.maximumActivitiesPerSession
 
+    /// Tur sürerken budamanın seyrek çalışması için pay: sınır aşıldıktan
+    /// sonra her yeni aktivitede değil, bu kadar fazlası birikince budanır.
+    private static let activityPruneHeadroom = 40
+
     /// Bellekte bir aktivite için saklanan en fazla karakter.
     ///
     /// Arşiv sınırından yüksek tutulur — kullanıcı açtığı kartta hâlâ anlamlı
@@ -343,12 +347,24 @@ final class AgentSession {
         }
     }
 
+    /// Oturumun bağlı olduğu klasörün dosya yolu; `nil` = klasörsüz oturum.
+    /// `state` dışında tutulur, değişimde kalıcılık ve özet elle tetiklenir.
+    /// Yazma tek kaynaktan (`setWorkingDirectory`) yapılır; doğrudan atama
+    /// normalleştirmeyi atlayıp `"  "` gibi boş-biçimli yollar saklardı.
+    private(set) var workingDirectoryPath: String? {
+        didSet {
+            noteSummaryChange()
+            onPersistentChange?()
+        }
+    }
+
     init(
         runtimes: [any ProviderRuntime],
         state: AgentSessionState = AgentSessionState(),
         budget: TranscriptBudget = TranscriptBudget(),
         customTitle: String? = nil,
-        isPinned: Bool = false
+        isPinned: Bool = false,
+        workingDirectoryPath: String? = nil
     ) {
         self.runtimes = runtimes
         self.state = state
@@ -357,6 +373,7 @@ final class AgentSession {
         self.budget = budget
         self.customTitle = customTitle
         self.isPinned = isPinned
+        self.workingDirectoryPath = Self.normalizedDirectoryPath(workingDirectoryPath)
         self.status = state.status
         self.configuration = state.configuration
         self.todos = state.todos
@@ -376,6 +393,7 @@ final class AgentSession {
         self.budget = budget
         self.customTitle = snapshot.customTitle
         self.isPinned = snapshot.isPinned
+        self.workingDirectoryPath = Self.normalizedDirectoryPath(snapshot.workingDirectoryPath)
         self.contextSummary = snapshot.contextSummary
         self.summarizedThroughMessageID = snapshot.summarizedThroughMessageID
         // Kuyruk, kesintiden sağ çıkar: kapanışta tur ortasında bekleyen mesaj,
@@ -415,8 +433,26 @@ final class AgentSession {
             isPinned: isPinned,
             queuedPrompts: queuedPrompts,
             contextSummary: contextSummary,
-            summarizedThroughMessageID: summarizedThroughMessageID
+            summarizedThroughMessageID: summarizedThroughMessageID,
+            workingDirectoryPath: workingDirectoryPath
         )
+    }
+
+    /// Klasör yolunu tek kaynaktan normalleştirir: boş/boşluk yol `nil` olur.
+    static func normalizedDirectoryPath(_ path: String?) -> String? {
+        guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !trimmed.isEmpty
+        else {
+            return nil
+        }
+        return trimmed
+    }
+
+    /// Bağlı klasörü değiştirir; boş yol klasörü kaldırır.
+    func setWorkingDirectory(path: String?) {
+        let normalized = Self.normalizedDirectoryPath(path)
+        guard workingDirectoryPath != normalized else { return }
+        workingDirectoryPath = normalized
     }
 
     /// İlk kullanıcı mesajından türetilen otomatik başlık.
@@ -450,6 +486,12 @@ final class AgentSession {
 
     var title: String {
         effectiveTitle
+    }
+
+    /// Proje önekli başlık; klasörsüzde `title` ile aynı.
+    /// Örnek: `AgenticSidebar > Merhaba`.
+    var qualifiedTitle: String {
+        WorkingDirectoryDisplay.qualifiedTitle(title: title, directoryPath: workingDirectoryPath)
     }
 
     /// Kullanıcı başlığını günceller; boş ya da yalnızca boşluk ise `nil` olur.
@@ -2034,6 +2076,21 @@ final class AgentSession {
     /// önbellekteki eski kopyayla çiziliyordu.
     private func noteActivityChange() {
         state.activityRevision &+= 1
+        pruneActivityHistoryDuringTurnIfNeeded()
+    }
+
+    /// Tur sürerken de zaman çizelgesini tavanda tutar.
+    ///
+    /// Bitişteki budama uzun tek bir turda işe yaramıyor: tur boyunca yüzlerce
+    /// aktivite birikiyor, hem RAM hem de her yerleşim turunun maliyeti
+    /// aktivite sayısıyla büyüyordu. Pay, budamanın her aktivitede O(n)
+    /// çalışmasını engeller.
+    private func pruneActivityHistoryDuringTurnIfNeeded() {
+        let total = state.activityGroups.reduce(0) { $0 + $1.activities.count }
+        guard total > Self.maximumInMemoryActivities + Self.activityPruneHeadroom else {
+            return
+        }
+        pruneActivityHistory()
     }
 
     private static func boundedForMemory(_ text: String) -> String {

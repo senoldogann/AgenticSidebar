@@ -355,11 +355,22 @@ actor TaskScheduler {
                 continue
             }
 
-            // Not: tek görevin hatası turu düşürür (yukarı yayılır). Tur başına
-            // kurtarma (`deferred`) denenmedi: `testNonContentionClaimFailure…`
-            // yayılma sözleşmesini sabitler ve `schedule()` üretimde çağrılmadığı
-            // için açlık riski gizildir. Sözleşme değişirse test güncellenmeli.
-            entries.append(try await claimEntry(for: task, projectID: projectID, history: history))
+            // Not: tek görevin kira/temizlik hatası turu düşürmez; görev
+            // `deferred` yazılır ve tur kalan görevlerle devam eder.
+            // `schedule()` üretimde çağrılmadığı için bu yol testlerle sabitlenir.
+            do {
+                entries.append(try await claimEntry(for: task, projectID: projectID, history: history))
+            } catch {
+                AppLog.taskBoard.error(
+                    "A task claim failed unexpectedly; deferring only that task"
+                )
+                entries.append(
+                    TaskScheduleEntry(
+                        taskID: task.id,
+                        disposition: .deferred(reason: "claimFailed:\(error.localizedDescription)")
+                    )
+                )
+            }
         }
 
         return TaskScheduleReport(projectID: projectID, entries: entries)
@@ -371,6 +382,12 @@ actor TaskScheduler {
     /// live run per task, the exact active attempt identity, the owned workspace
     /// identity, registry eligibility, accepted budgets and a human
     /// `executeRecipe` approval bound to the exact task, attempt and fingerprint.
+    ///
+    /// Ret sözleşmesi: ret (`throw`) yalnızca koşu rezervasyonunu temizler;
+    /// claim edilmiş attempt satırı ve depo kirası SAHİPLENİLMEZ. Çağıran her
+    /// rette `stop(taskID:)` çağırmalıdır, yoksa attempt `.running` ve kira
+    /// elde kalır. Üretim yolu (`CodingTaskService.dispatch`) bunu
+    /// `retireClaimedAttempt` ile yapar; doğrudan kullanıcılar aynı kurala uyar.
     ///
     /// Events are consumed serially (a bounded stream therefore applies backpressure),
     /// only events matching the exact `(taskID, attemptID, generation)` identity may
@@ -682,6 +699,11 @@ actor TaskScheduler {
     /// A live run is cancelled and awaited before the task is blocked: a suspended
     /// task must not keep writing. The attempt row stays in progress until an
     /// explicit retry or reconciliation replaces it, exactly as before.
+    ///
+    /// Kira uyarısı: duraklatma depo kirasını TUTAR (süre aşımında bile geri
+    /// alınamaz); aynı depoyu paylaşan kardeş görevler devam/resume/stop
+    /// çağrılana dek kira alamaz. Kart başına düğme, depo-geneli kilit
+    /// demektir — uzun süreli duraklatma yerine durdurma tercih edilir.
     func pause(taskID: UUID) async throws {
         guard activeAttempts[taskID] != nil else {
             throw TaskSchedulerError.noActiveAttempt(taskID)
@@ -1060,7 +1082,12 @@ actor TaskScheduler {
                 if let repositoryError = error as? TaskRepositoryError, Self.isContention(repositoryError) {
                     return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "claimRejected"))
                 }
-                throw error
+                // Tek görevin claim hatası kira bırakmaz (yukarıda salındı)
+                // ve turu düşürmez: görev `deferred` yazılır.
+                return TaskScheduleEntry(
+                    taskID: task.id,
+                    disposition: .deferred(reason: "claimFailed:\(error.localizedDescription)")
+                )
             }
         }
     }
@@ -1072,8 +1099,8 @@ actor TaskScheduler {
     /// attempt bound to the created `workspaceID`. Any failure after creation discards
     /// the workspace by exact identity, so a rejected lease, a rejected claim or a
     /// thrown repository failure never leaves an orphan workspace behind. Claim
-    /// failures are reported deferred; a discard failure is raised because leaving an
-    /// orphan would be worse than a visibly failed schedule pass.
+    /// failures are reported deferred; a discard failure is logged and the task
+    /// is deferred as well, so one task never starves the rest of the pass.
     private func provisionedClaimEntry(
         for task: CodingTask,
         runtimeID: String,
@@ -1113,12 +1140,24 @@ actor TaskScheduler {
                 attemptID: identity.attemptID,
                 leaseTimeoutSeconds: TimeInterval(task.budget.maxTaskDurationSeconds) + Self.repositoryLeaseGraceSeconds
             )
-        } catch {
-            try await provisioning.discardUnclaimed(workspaceID: workspace.workspaceID, attemptID: identity.attemptID)
-            if let repositoryError = error as? TaskRepositoryError, Self.isContention(repositoryError) {
+        } catch let leaseError {
+            // Tek görevin kira/temizlik hatası turu düşürmez: çalışma alanı
+            // elden geldiğince bırakılır, görev `deferred` yazılır, tur
+            // kalan görevlerle devam eder.
+            do {
+                try await provisioning.discardUnclaimed(workspaceID: workspace.workspaceID, attemptID: identity.attemptID)
+            } catch {
+                AppLog.taskBoard.error(
+                    "Could not discard the unclaimed workspace after a lease failure; continuing with the remaining tasks"
+                )
+            }
+            if let repositoryError = leaseError as? TaskRepositoryError, Self.isContention(repositoryError) {
                 return TaskScheduleEntry(taskID: task.id, disposition: .deferred(reason: "repositoryBusy"))
             }
-            throw error
+            return TaskScheduleEntry(
+                taskID: task.id,
+                disposition: .deferred(reason: "repositoryLeaseFailed:\(leaseError.localizedDescription)")
+            )
         }
 
         do {

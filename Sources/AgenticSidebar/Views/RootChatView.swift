@@ -40,13 +40,14 @@ struct RootChatView: View {
     /// Canlı gönderim durumu; pano alt bandı bu değere göre çizilir.
     @State private var taskBoardLiveDispatchAvailable = true
 
-    /// Pano sayfasının boyutları: beş kolon 5 × 236 + 4 × 10 aralık + 2 × 10
-    /// iç boşluk = 1240 pt ister; varsayılan genişlik hepsini kaydırmasız
-    /// gösterir, en küçük boy dar ekranda kullanılabilirliği korur. Pano
-    /// kare görünmesin diye genişlik yüksekliğin belirgin üstündedir.
-    private static let taskBoardSheetMinWidth: CGFloat = 1080
+    /// Pano sayfasının boyutları: kolonlar kullanılabilir genişliğe esner
+    /// (`TaskBoardLayout`), o yüzden en küçük boy dar ekrana inebilir;
+    /// varsayılan genişlik beş kolonu da kaydırmasız gösterir. Dikeyde pano
+    /// esnektir (kolonlar kendi içinde kayar), alt satırlar sabittir; en
+    /// küçük yükseklik alt satırları kesmeden pencereye sığar.
+    private static let taskBoardSheetMinWidth: CGFloat = 720
     private static let taskBoardSheetDefaultWidth: CGFloat = 1500
-    private static let taskBoardSheetMinHeight: CGFloat = 700
+    private static let taskBoardSheetMinHeight: CGFloat = 560
     private static let taskBoardSheetDefaultHeight: CGFloat = 920
 
     @Environment(\.colorScheme) private var systemColorScheme
@@ -153,17 +154,18 @@ struct RootChatView: View {
     /// Sayfa çekerek yeniden boyutlandırılabilir: `frame(min/ideal/max:
     /// .infinity)` sayfayı esnek yapar, `presentationSizing(.fitted)` bilerek
     /// kullanılmaz çünkü fitted sayfayı içeriğe kilitleyip sürükleyerek
-    /// büyütmeyi engeller. Varsayılan ölçü beş kolonu da kaydırmasız gösterir:
-    /// 5 × 236 kolon + aralıklar = 1240 pt, artı pay ile 1500 pt; yükseklik
-    /// 920 pt ile kart listesine nefes aldırır.
+    /// büyütmeyi engeller. Kolonlar genişliğe esner, dar pencerede yatay
+    /// kaydırma devreye girer; dikeyde kolonlar kendi içinde kayar, o yüzden
+    /// pano en küçük yükseklikte de kesilmez.
     @ViewBuilder
     private var taskBoardSheet: some View {
         if let taskBoardStore {
             VStack(spacing: 0) {
                 TaskBoardView(store: taskBoardStore, preset: currentTheme, isDark: isDarkMode)
                     // Pano sayfanın aslan payını alır: proje satırları sabit,
-                    // kalan dikey alan kolonlara kalır.
-                    .frame(minHeight: 560, maxHeight: .infinity)
+                    // kalan dikey alan kolonlara kalır. En küçük boy düşük
+                    // tutulur, yoksa kısa ekranda alt satırlar kesilirdi.
+                    .frame(minHeight: 300, maxHeight: .infinity)
 
                 Divider().opacity(0.35)
 
@@ -427,14 +429,14 @@ struct RootChatView: View {
     /// Klasör seçici yalnızca dizin kabul eder; seçim sonrası ad alanı klasör
     /// adından türetilir ve önceki hata mesajı temizlenir.
     private func presentProjectFolderPicker() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = false
-        panel.prompt = "Seç"
-        panel.message = "Projenin Git deposu klasörünü seçin"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard
+            let url = DirectoryPicker.chooseDirectory(
+                prompt: "Seç",
+                message: "Projenin Git deposu klasörünü seçin"
+            )
+        else {
+            return
+        }
         projectRegistrationFolder = url
         projectRegistrationName = TaskBoardProjectRegistrationPresenter.suggestedName(for: url)
         projectRegistrationMessage = nil
@@ -540,6 +542,60 @@ struct RootChatView: View {
                     }
                     .help("Open a terminal in this conversation's side panel")
                     .accessibilityLabel("Open terminal")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .openPaneComputerLive,
+                            object: PaneSlot.primary.rawValue
+                        )
+                    } label: {
+                        Image(systemName: "computermouse")
+                    }
+                    .help("Watch the computer-use session live in the side panel")
+                    .accessibilityLabel("Watch computer use")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .openPaneSimulator,
+                            object: PaneSlot.primary.rawValue
+                        )
+                    } label: {
+                        Image(systemName: "iphone")
+                    }
+                    .help("Open the iOS Simulator in the side panel")
+                    .accessibilityLabel("Open iOS Simulator")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        NotificationCenter.default.post(
+                            name: .openPaneBrowser,
+                            object: PaneSlot.primary.rawValue
+                        )
+                    } label: {
+                        Image(systemName: "globe")
+                    }
+                    .help("Open a browser in the side panel")
+                    .accessibilityLabel("Open browser")
+                }
+                // Canlı review düğmesi yalnız değişiklik varken çizilir:
+                // klasörsüz ya da dokunulmamış sohbette araç çubuğu şişmez.
+                if let activeSession = sessionService.session(for: sessionService.activeSessionID),
+                    TurnFileChangesSummary.hasFileChanges(in: activeSession.state.activityGroups)
+                {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            NotificationCenter.default.post(
+                                name: .openPaneSessionChanges,
+                                object: PaneSlot.primary.rawValue
+                            )
+                        } label: {
+                            Image(systemName: "doc.badge.plus")
+                        }
+                        .help("Review this conversation's file changes in the side panel")
+                        .accessibilityLabel("Review file changes")
+                    }
                 }
             }
             if taskBoardStore != nil {
@@ -743,13 +799,14 @@ struct RootChatView: View {
     }
 
     /// Bekleyen taslak şeridi: ne olacağı tek cümle, vazgeçme tek düğme.
-    /// Vazgeçme oturum doğurmaz, taslak silinir.
+    /// Vazgeçme oturum doğurmaz, taslak silinir. Taslak klasöre bağlıysa
+    /// klasör adı da söylenir, yoksa ek etiket çizilmez.
     private var pendingHintRow: some View {
         HStack(spacing: 8) {
             Image(systemName: "plus.bubble")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
-            Text("New session — sending the first message creates the chat.")
+            Text(pendingHintText)
                 .font(.system(size: 11.5))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -767,17 +824,35 @@ struct RootChatView: View {
         .padding(.vertical, 6)
     }
 
+    /// Bekleyen taslağın ipucu metni: klasör bağlıysa adıyla söylenir.
+    /// Ad türetimi `WorkingDirectoryDisplay` tek kaynağındadır.
+    private var pendingHintText: String {
+        guard let pending = sessionService.pendingSessionID,
+            let path = sessionService.session(for: pending)?.workingDirectoryPath,
+            let name = WorkingDirectoryDisplay.name(for: path)
+        else {
+            return "New session — sending the first message creates the chat."
+        }
+        return "New session in “\(name)” — sending the first message creates the chat."
+    }
+
     /// Yan yana iken pencere araç çubuğu başlığı kullanılmaz: bölmeler kendi
     /// başlığını gösterir, yoksa birincil bölmenin terminal simgesi pencerenin
     /// en sağına düşer ve sağdaki sohbete ait sanılır.
     private func conversationPane(scope: PaneScope, sessionID: UUID, activeID: UUID, showHeader: Bool, showSwap: Bool, focusID: UUID?)
         -> some View
     {
-        VStack(spacing: 0) {
+        // Başlık rozeti için ucuz ön kontrol: sayım/diff birleştirme yok,
+        // ilk dosya bulgusunda durur; tam özet tıklama anında hesaplanır.
+        let paneSession = sessionService.session(for: sessionID)
+        let paneHasFileChanges =
+            paneSession.map { TurnFileChangesSummary.hasFileChanges(in: $0.state.activityGroups) } ?? false
+        return VStack(spacing: 0) {
             if showHeader {
                 SplitPaneHeader(
-                    title: sessionService.session(for: sessionID)?.title ?? "Session",
-                    isBusy: sessionService.session(for: sessionID)?.isBusy ?? false,
+                    title: paneSession?.qualifiedTitle ?? "Session",
+                    directoryPath: paneSession?.workingDirectoryPath,
+                    isBusy: paneSession?.isBusy ?? false,
                     onFocus: scope.isPrimary
                         ? nil
                         : {
@@ -803,7 +878,32 @@ struct RootChatView: View {
                             name: .openPaneTerminal,
                             object: scope.paneID
                         )
-                    }
+                    },
+                    onOpenComputerLive: {
+                        NotificationCenter.default.post(
+                            name: .openPaneComputerLive,
+                            object: scope.paneID
+                        )
+                    },
+                    onOpenSimulator: {
+                        NotificationCenter.default.post(
+                            name: .openPaneSimulator,
+                            object: scope.paneID
+                        )
+                    },
+                    onOpenBrowser: {
+                        NotificationCenter.default.post(
+                            name: .openPaneBrowser,
+                            object: scope.paneID
+                        )
+                    },
+                    onOpenSessionChanges: {
+                        NotificationCenter.default.post(
+                            name: .openPaneSessionChanges,
+                            object: scope.paneID
+                        )
+                    },
+                    hasFileChanges: paneHasFileChanges
                 )
             }
             ConversationDetailView(
@@ -829,7 +929,7 @@ struct RootChatView: View {
                 .font(.system(size: 13, weight: .semibold))
             Menu {
                 ForEach(assignableSessions(activeID: activeID), id: \.id) { session in
-                    Button(session.displayTitle) {
+                    Button(session.qualifiedTitle) {
                         splitStore.pin(session.id, to: scope.slot)
                         splitStore.focus(scope.slot)
                     }

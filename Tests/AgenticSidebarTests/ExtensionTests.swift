@@ -1009,8 +1009,11 @@ final class ExtensionTagInstructionTests: XCTestCase {
 }
 
 final class ExtensionStoreTests: XCTestCase {
+    /// Elle eklenen sunucu varsayılan kapalı gelir (keyfi süreç
+    /// çalıştırır): kayıt listeler, susturma desenini yazar, ajan anlık
+    /// görüntüsüne açıkça etkinleştirilmeden girmez.
     @MainActor
-    func testAddingAServerPersistsItAndEnablesIt() throws {
+    func testAddingAServerPersistsItDisabledByDefault() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -1026,6 +1029,13 @@ final class ExtensionStoreTests: XCTestCase {
             )
         )
 
+        XCTAssertEqual(store.registry.mcpServers.map(\.name), ["github"])
+        XCTAssertEqual(store.registry.mcpServers.first?.isEnabled, false)
+        XCTAssertTrue(store.registry.enabledMCPDefinitions.isEmpty)
+        XCTAssertEqual(store.contextSummary.activeMCPServers, 0)
+        XCTAssertEqual(store.registry.silencedMCPToolPatterns, ["github_*": false])
+
+        store.setMCPEnabled("github", true)
         XCTAssertEqual(store.registry.enabledMCPDefinitions.keys.sorted(), ["github"])
         XCTAssertEqual(store.contextSummary.activeMCPServers, 1)
 
@@ -1158,6 +1168,13 @@ final class ExtensionStoreTests: XCTestCase {
             name: "github",
             definition: MCPDefinition(transport: .remote, url: "https://example.com/mcp")
         )
+        await store.applyToAgent()
+
+        // Varsayılan kapalı: anlık görüntü boş gelir, susturma deseni doludur.
+        XCTAssertEqual(applied?.mcpServers.keys.sorted(), [])
+        XCTAssertEqual(applied?.silencedToolPatterns, ["github_*": false])
+
+        store.setMCPEnabled("github", true)
         await store.applyToAgent()
 
         XCTAssertEqual(applied?.mcpServers.keys.sorted(), ["github"])

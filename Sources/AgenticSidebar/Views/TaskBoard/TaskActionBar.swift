@@ -184,16 +184,16 @@ struct TaskActionBar: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             if let lastRefusalMessage {
                 Label(lastRefusalMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel(lastRefusalMessage)
             }
 
-            HStack(spacing: 6) {
+            HStack(spacing: 8) {
                 ForEach(primaryActions) { action in
                     button(action)
                 }
@@ -203,15 +203,15 @@ struct TaskActionBar: View {
                 Spacer(minLength: 0)
                 if store.isActionInFlight(for: taskID) {
                     Text("İşlem sürüyor")
-                        .font(.system(size: 10))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                         .accessibilityLabel("Bu görev için işlem sürüyor")
                 }
             }
             .focusSection()
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
     }
 
     private var overflowMenu: some View {
@@ -229,8 +229,8 @@ struct TaskActionBar: View {
             }
         } label: {
             Image(systemName: "ellipsis.circle")
-                .font(.system(size: 11, weight: .semibold))
-                .frame(height: 22)
+                .font(.system(size: 12, weight: .semibold))
+                .frame(minWidth: 28, minHeight: 28)
                 .padding(.horizontal, 6)
                 .contentShape(Rectangle())
         }
@@ -246,24 +246,30 @@ struct TaskActionBar: View {
         Button {
             perform(action.action)
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Image(systemName: action.systemImage)
-                    .font(.system(size: 9.5, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                 Text(action.title)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
             }
             .foregroundStyle(foreground(for: action))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .frame(minHeight: 28)
             .background(
                 background(for: action),
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(border(for: action), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
         .disabled(!action.isEnabled)
         .opacity(action.isEnabled ? 1 : 0.45)
         .pointingHandCursor()
+        .animation(.easeInOut(duration: 0.18), value: action.isEnabled)
         .help(action.disabledReason ?? action.title)
         .accessibilityLabel(action.accessibilityLabel)
         .accessibilityHint(action.accessibilityHint ?? "")
@@ -279,9 +285,18 @@ struct TaskActionBar: View {
 
     private func background(for action: TaskBoardActionPresentation) -> Color {
         if action.action == .accept && action.isEnabled {
-            return (preset.accentGradient.first ?? .accentColor).opacity(isDark ? 0.18 : 0.12)
+            return (preset.accentGradient.first ?? .accentColor).opacity(isDark ? 0.20 : 0.12)
         }
-        return Color.primary.opacity(0.06)
+        return Color.primary.opacity(action.isEnabled ? 0.07 : 0.04)
+    }
+
+    /// Buton çerçevesi arka planla aynı tonda kalır; kabul eylemi vurgu
+    /// rengini taşır, diğerleri tema sınırında erir (renk kararı değişmedi).
+    private func border(for action: TaskBoardActionPresentation) -> Color {
+        if action.action == .accept && action.isEnabled {
+            return (preset.accentGradient.first ?? .accentColor).opacity(0.45)
+        }
+        return Color.primary.opacity(0.08)
     }
 
     private func perform(_ action: TaskBoardAction) {

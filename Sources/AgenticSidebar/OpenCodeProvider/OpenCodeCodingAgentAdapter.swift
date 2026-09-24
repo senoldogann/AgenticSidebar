@@ -169,6 +169,9 @@ actor OpenCodeCodingAgentAdapter: CodingAgentRuntime {
         guard let connection = await serverManager.currentConnection() else {
             throw CodingAgentAdapterError.serverUnavailable
         }
+        guard await serverManager.verifyCurrentListener() else {
+            throw CodingAgentAdapterError.serverUnavailable
+        }
 
         let serverDir = await serverManager.workingDirectory()
         let canonicalWorkspace = URL(fileURLWithPath: request.workspacePath).resolvingSymlinksInPath().standardized.path

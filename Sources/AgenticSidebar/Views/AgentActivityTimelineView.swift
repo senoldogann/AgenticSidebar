@@ -47,6 +47,21 @@ struct AgentActivityTimelineView: View, Equatable {
     /// taşmasız geçiş kullanılır.
     private static let largeGroupAnimationThreshold = 30
 
+    /// Açık grupta çizilen en fazla aktivite. Satır sayısı sınırsızken her
+    /// yerleşim turu yüzlerce satırı ölçüyordu; liste artık bu pencereye
+    /// sabitlenir, eskiler tek satırlık sayıyla bildirilir.
+    private static let expandedListMaximumActivities = 40
+
+    /// Araç çıktısı ve düşünme gövdesinde gösterilen satır penceresi. İç
+    /// `ScrollView`'lar transkript satırının ölçümünde içeriğin tamamını
+    /// ölçtürüyordu; kartlar artık kaydırmaz, son satırları gösterir.
+    private static let cardMaximumLines = 20
+    private static let thinkingMaximumLines = 24
+
+    /// Satır içi diff önizlemesinde gösterilen en fazla satır. Tamamı zaten
+    /// Review panelinde okunur.
+    private static let diffMaximumLines = 40
+
     init(
         group: AgentTurnActivityGroup,
         isTurnActive: Bool,
@@ -109,17 +124,27 @@ struct AgentActivityTimelineView: View, Equatable {
                         summaryButton(for: nonThinkingActivities, isExpanded: true)
                     }
 
+                    // Liste artık tembel değil, pencereli: transkript satırı
+                    // içinde iç içe `ScrollView` + `LazyVStack` ölçümü
+                    // (`LazyStack.measureEstimates` + `ScrollViewUtilities.
+                    // sizeThatFits`) ana iş parçacığını kilitliyordu. Pencere
+                    // son N aktiviteyle sınırlı; eskiler sayı olarak bildirilir.
+                    let displayed = Self.displayedActivities(
+                        from: group.activities,
+                        isLiveRunning: runningActivity != nil
+                    )
+                    let window = Self.expandedWindow(
+                        from: displayed,
+                        maximumActivities: Self.expandedListMaximumActivities
+                    )
                     ScrollView(.vertical, showsIndicators: true) {
-                        // Eager `VStack` 150 satırı tek turda kurup ana iş
-                        // parçacığını blokluyordu; tembel yığın yalnız
-                        // görünenleri kurar.
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(
-                                Self.displayedActivities(
-                                    from: group.activities,
-                                    isLiveRunning: runningActivity != nil
-                                )
-                            ) { activity in
+                        VStack(alignment: .leading, spacing: 4) {
+                            if window.omitted > 0 {
+                                Text("… (\(window.omitted) earlier steps)")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(window.activities) { activity in
                                 timelineRow(activity, isNested: true)
                             }
                         }
@@ -232,6 +257,35 @@ struct AgentActivityTimelineView: View, Equatable {
         isLiveRunning: Bool
     ) -> [AgentActivity] {
         isLiveRunning ? finishedActivities(from: activities) : activities
+    }
+
+    /// Genişletilmiş listenin çizilen penceresi: son `maximumActivities`
+    /// aktivite tutulur, düşenlerin sayısı döndürülür. Ölçüm maliyeti satır
+    /// sayısıyla büyüdüğü için pencere zorunludur.
+    nonisolated static func expandedWindow(
+        from activities: [AgentActivity],
+        maximumActivities: Int
+    ) -> (activities: [AgentActivity], omitted: Int) {
+        guard activities.count > maximumActivities else {
+            return (activities, 0)
+        }
+        let kept = Array(activities.suffix(maximumActivities))
+        return (kept, activities.count - kept.count)
+    }
+
+    /// Uzun bir metni son `maximumLines` satıra indirger; düşen satır sayısını
+    /// döndürür. Kartlar iç `ScrollView` taşımaz: transkript satırı ölçülürken
+    /// kaydırma kabı içeriğin tamamını ölçtürüyordu.
+    nonisolated static func boundedLineWindow(
+        _ text: String,
+        maximumLines: Int
+    ) -> (text: String, omitted: Int) {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > maximumLines else {
+            return (text, 0)
+        }
+        let kept = lines.suffix(maximumLines)
+        return (kept.joined(separator: "\n"), lines.count - kept.count)
     }
 
     private func summaryTitle(for activities: [AgentActivity]) -> String {
@@ -578,8 +632,9 @@ struct AgentActivityTimelineView: View, Equatable {
     }
 
     /// Her düşünme bloğu kendi satırında açılır-kapanır durur: bitince
-    /// `Thought 10s` rozeti kalır, gövde varsayılan kapalıdır. Koşarken
-    /// varsayılan açıktır ve süre canlı akar.
+    /// `Thought 10s` rozeti kalır, gövde varsayılan kapalıdır. Koşarken de
+    /// varsayılan kapalıdır, süre satırda canlı akar; gövde yalnız kullanıcı
+    /// açarsa görünür.
     @ViewBuilder
     private func thinkingRow(_ thinking: AgentActivity) -> some View {
         // Boş düşünme satırı çizilmez: reasoning paylaşmayan modellerde
@@ -716,6 +771,7 @@ struct AgentActivityTimelineView: View, Equatable {
 
             if activity.kind == .command {
                 resultCard(
+                    activity: activity,
                     header: activity.detail,
                     headerSymbol: "terminal",
                     body: activity.output
@@ -723,7 +779,7 @@ struct AgentActivityTimelineView: View, Equatable {
             } else if activity.kind == .thinking {
                 // Düşünme içeriği: modelin ara adımları. `output`'ta birikir
                 // (arşiv sınırı orayı kırpar), kart kapalıyken yalnız süre
-                // görünür; canlı turda kart varsayılan açıktır.
+                // görünür; gövde varsayılan kapalıdır.
                 // Zeminsiz düz metin: dış satır ("Thought Ns") zaten
                 // başlığı söyler, iç kartın zemini ve ikinci "Thought"
                 // başlığı çiftlik etkisi yapıyordu.
@@ -734,6 +790,7 @@ struct AgentActivityTimelineView: View, Equatable {
                 subagentExecutionCard(activity: activity)
             } else if activity.kind == .mcp {
                 resultCard(
+                    activity: activity,
                     header: activity.detail ?? activity.title ?? "MCP Tool Call",
                     headerSymbol: "server.rack",
                     body: activity.output ?? (activity.phase == .running ? "Executing MCP tool..." : nil)
@@ -744,6 +801,7 @@ struct AgentActivityTimelineView: View, Equatable {
                 // For reads and writes the tool's result *is* the file content,
                 // so the card is labelled with the path it came from.
                 resultCard(
+                    activity: activity,
                     header: activity.detail,
                     headerSymbol: "doc.text",
                     body: output
@@ -761,18 +819,32 @@ struct AgentActivityTimelineView: View, Equatable {
     }
 
     /// Düşünme gövdesi: kart kromu yok, başlık yok — yalnız metin.
-    /// Uzunsa kendi içinde kayar, çevreyi büyütmez.
+    ///
+    /// İç `ScrollView` bilinçli olarak yok: transkript satırının ölçümü
+    /// kaydırma kabının içeriğini de ölçtürüyor, uzun gövde her yerleşim
+    /// turunu ağırlaştırıyordu. Gövde son `thinkingMaximumLines` satıra
+    /// indirgenir.
     @ViewBuilder
     private func thinkingBody(output: String) -> some View {
-        ScrollView(.vertical, showsIndicators: true) {
-            Text(output)
+        let window = Self.boundedLineWindow(
+            output,
+            maximumLines: Self.thinkingMaximumLines
+        )
+
+        VStack(alignment: .leading, spacing: 4) {
+            Text(window.text)
                 .font(.system(size: toolFontSize))
-                .foregroundStyle(.primary)
+                .foregroundStyle(.secondary)
                 .lineSpacing(2)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            if window.omitted > 0 {
+                Text("… (\(window.omitted) earlier lines)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
         }
-        .frame(maxHeight: 220)
         .padding(.leading, 24)
         .padding(.trailing, 8)
     }
@@ -791,6 +863,7 @@ struct AgentActivityTimelineView: View, Equatable {
             }
             if let textOutput, !textOutput.isEmpty {
                 resultCard(
+                    activity: activity,
                     header: activity.title ?? activity.detail ?? "Computer action",
                     headerSymbol: "computermouse",
                     body: textOutput
@@ -913,14 +986,21 @@ struct AgentActivityTimelineView: View, Equatable {
     }
 
     /// The console-style surface shared by command output and file results.
+    ///
+    /// Kart kaydırmaz: son `cardMaximumLines` satır gösterilir, düşen satırlar
+    /// sayıyla bildirilir ve tamamı sağ panelde açılabilir. İç `ScrollView`
+    /// transkript satırı ölçülürken içeriğin tamamını ölçtürüp ana iş
+    /// parçacığını kilitliyordu (CPU diag: `ScrollViewUtilities.sizeThatFits`).
     @ViewBuilder
     private func resultCard(
+        activity: AgentActivity,
         header: String?,
         headerSymbol: String,
         body: String?
     ) -> some View {
         let isDark = colorScheme == .dark
         let text = body ?? ""
+        let window = Self.boundedLineWindow(text, maximumLines: Self.cardMaximumLines)
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
@@ -935,18 +1015,46 @@ struct AgentActivityTimelineView: View, Equatable {
                     .truncationMode(.middle)
                     .textSelection(.enabled)
             }
-            .padding(.bottom, text.isEmpty ? 0 : 2)
+            .padding(.bottom, window.text.isEmpty ? 0 : 2)
 
-            if !text.isEmpty {
-                ScrollView(.vertical, showsIndicators: true) {
-                    Text(text)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.primary)
-                        .lineSpacing(2)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            if !window.text.isEmpty {
+                Text(window.text)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .lineSpacing(2)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if window.omitted > 0 {
+                HStack(spacing: 8) {
+                    Text("… (\(window.omitted) earlier lines)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.secondary)
+
+                    Spacer(minLength: 4)
+
+                    if let onOpenReport {
+                        Button {
+                            onOpenReport(activity)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                    .font(.system(size: 10, weight: .semibold))
+
+                                Text("Full output")
+                                    .font(.system(size: 11, weight: .medium))
+                            }
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color.blue.opacity(0.12)))
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .help("Open the full output in the side panel")
+                    }
                 }
-                .frame(maxHeight: 220)
             }
         }
         .padding(10)
@@ -1228,8 +1336,10 @@ struct AgentActivityTimelineView: View, Equatable {
     private func diffCard(diff: String, path: String?) -> some View {
         let isDark = colorScheme == .dark
         let allLines = diff.components(separatedBy: "\n")
-        let maximumDiffLines = 200
-        let lines = Array(allLines.prefix(maximumDiffLines))
+        // Satır içi önizleme kısa tutulur: iç `ScrollView` + `LazyVStack`
+        // transkript ölçümünde içeriğin tamamını ölçtürüyordu. Tamamı zaten
+        // Review panelinde okunur.
+        let lines = Array(allLines.prefix(Self.diffMaximumLines))
         let omittedCount = max(0, allLines.count - lines.count)
         // Tek geçiş: her body çalışında satırlar zaten dilimleniyor,
         // iki ayrı `filter` turuna gerek yok.
@@ -1267,28 +1377,25 @@ struct AgentActivityTimelineView: View, Equatable {
                     .foregroundStyle(.red)
             }
 
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                        Text(line.isEmpty ? " " : line)
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(diffLineForeground(line, isDark: isDark))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 0.5)
-                            .background(diffLineBackground(line, isDark: isDark))
-                            .textSelection(.enabled)
-                    }
-                    if omittedCount > 0 {
-                        Text("… \(omittedCount) satır gizlendi")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
-                    }
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    Text(line.isEmpty ? " " : line)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(diffLineForeground(line, isDark: isDark))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 0.5)
+                        .background(diffLineBackground(line, isDark: isDark))
+                        .textSelection(.enabled)
+                }
+                if omittedCount > 0 {
+                    Text("… \(omittedCount) satır gizlendi")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
                 }
             }
-            .frame(maxHeight: 260)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)

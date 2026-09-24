@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Security
+import Synchronization
 
 actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     private static let startupAttempts = 2
@@ -131,6 +132,24 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
         connection
     }
 
+    /// Parola taşıyan her istekten önce çağrılır: çocuk öldüyse ya da portu
+    /// yabancı bir süreç kaptıysa `false` döner ve çağıran parolayı göndermez.
+    /// Süreç canlılığı + port sahipliği birlikte bakılır; yalnızca bağlantı
+    /// nesnesinin varlığı kanıt sayılmaz.
+    func verifyCurrentListener() async -> Bool {
+        guard let connection, await currentProcessIsRunning() else {
+            return false
+        }
+        let handlePID = await processHandle?.processIdentifier() ?? nil
+        guard let pid = activePID ?? handlePID, pid > 0 else {
+            return false
+        }
+        guard let port = connection.baseURL.port, port > 0, port <= Int(UInt16.max) else {
+            return false
+        }
+        return listenerVerifier.processOwnsListeningPort(UInt16(port), processIdentifier: pid)
+    }
+
     func workingDirectory() -> URL? {
         workingDirectoryURL
     }
@@ -236,6 +255,18 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
             )
 
             serverStatus = .starting
+            // Fırlatma öncesi ikiliyi yeniden çözümle: `locate()` ile `launch`
+            // arası pencere daraltılır; farklı bir yola takas edildiyse
+            // başlatma durur. Yerinde değiştirme (aynı yol) bu denetimle
+            // yakalanmaz — güven `trust()`un grup/dünya-yazılabilir reddine
+            // dayanır; tam kapanış açılmış fd üzerinden `fstat` ister.
+            guard executableLocator.locate()?.resolvingSymlinksInPath().path == executableURL.resolvingSymlinksInPath().path else {
+                AppLog.openCode.error(
+                    "The OpenCode executable changed between resolution and launch; not starting"
+                )
+                serverStatus = .stopped
+                throw ProviderRuntimeError.executableUnavailable
+            }
             let launchedHandle: any OpenCodeProcessHandling
             do {
                 launchedHandle = try await processLauncher.launch(request)
@@ -714,6 +745,9 @@ actor OpenCodeWorkspaceServerFactory {
     /// `acquire` askıya alındığında (süreç başlatma) aynı çalışma alanı için
     /// ikinci bir çağrının ikinci bir sunucu açmasını engelleyen rezervasyon.
     private var reservations: Set<String> = []
+    /// Kapanış sürerken yeni sunucu açılmasını engelleyen çit: `stopAll`
+    /// anlık görüntüyü aldıktan sonra gelen `acquire` kapanıştan sağ çıkardı.
+    private var isStopping = false
 
     init(
         executableLocator: any OpenCodeExecutableLocating,
@@ -775,8 +809,22 @@ actor OpenCodeWorkspaceServerFactory {
         guard activeServers[canonicalPath] == nil, !reservations.contains(canonicalPath) else {
             throw OpenCodeWorkspaceServerError.workspaceServerAlreadyActive(path: canonicalPath)
         }
+        guard !isStopping else {
+            throw OpenCodeWorkspaceServerError.startupFailed(
+                path: canonicalPath,
+                reason: "the server factory is stopping; the new server would outlive shutdown"
+            )
+        }
         reservations.insert(canonicalPath)
         defer { reservations.remove(canonicalPath) }
+        // Rezervasyon sonrası ikinci denetim: çit, anlık görüntü ile
+        // başlatma arasına giren `acquire` kapanıştan sağ çıkmasın.
+        guard !isStopping else {
+            throw OpenCodeWorkspaceServerError.startupFailed(
+                path: canonicalPath,
+                reason: "the server factory is stopping; the new server would outlive shutdown"
+            )
+        }
 
         let manager = ManagedOpenCodeServerManager(
             executableLocator: executableLocator,
@@ -837,23 +885,38 @@ actor OpenCodeWorkspaceServerFactory {
     /// gelen bir `release` artık hiçbir şeye dokunmaz.
     ///
     /// Durdurmalar paralel koşar (`TaskGroup`) ve 10 sn üst sınırı vardır:
-    /// süre dolarsa bekleme bırakılır, kalan durdurmalar iptal edilir.
+    /// süre dolarsa o ana dek doğrulanan sayı raporlanır, kalan durdurmalar
+    /// arka planda sürer (iptal edilemez — `stop()` kesme noktası taşımaz).
     /// Slotlar önceden boşaltıldığı için geç gelen `release` yine de
-    /// hiçbir şeye dokunmaz.
+    /// hiçbir şeye dokunmaz. Kapanış sürerken `acquire` reddedilir.
     static let stopAllTimeout: Duration = .seconds(10)
 
+    /// Kapanış raporu: `stopped` yalnızca doğrulanan sayıdır (zaman aşımında
+    /// alt sınır), `timedOut` bütçenin aşıldığını söyler.
+    struct WorkspaceServerStopAllReport: Equatable, Sendable {
+        var stopped: Int
+        var timedOut: Bool
+    }
+
     @discardableResult
-    func stopAll() async -> Int {
+    func stopAll() async -> WorkspaceServerStopAllReport {
+        isStopping = true
+        defer { isStopping = false }
         let servers = Array(activeServers.values)
         activeServers.removeAll()
         guard !servers.isEmpty else {
-            return 0
+            return WorkspaceServerStopAllReport(stopped: 0, timedOut: false)
         }
-        let finished = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+        let confirmedStops = Mutex(0)
+        // `true` = durdurmalar bütçeden önce bitti, `false` = sayaç kazandı.
+        let finishedBeforeTimeout = await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
             group.addTask {
                 await withTaskGroup(of: Void.self) { inner in
                     for server in servers {
-                        inner.addTask { await server.manager.stop() }
+                        inner.addTask {
+                            await server.manager.stop()
+                            confirmedStops.withLock { $0 += 1 }
+                        }
                     }
                 }
                 return !Task.isCancelled
@@ -863,15 +926,19 @@ actor OpenCodeWorkspaceServerFactory {
                 return false
             }
             guard let first = await group.next() else {
-                return true
+                return false
             }
             group.cancelAll()
             return first
         }
-        if !finished {
-            AppLog.openCode.error("stopAll exceeded its 10s budget; remaining stops were cancelled")
+        if !finishedBeforeTimeout {
+            let confirmed = confirmedStops.withLock { $0 }
+            AppLog.openCode.error(
+                "stopAll exceeded its 10s budget; remaining stops continue in background"
+            )
+            return WorkspaceServerStopAllReport(stopped: confirmed, timedOut: true)
         }
-        return servers.count
+        return WorkspaceServerStopAllReport(stopped: servers.count, timedOut: false)
     }
 
     /// Bir çalışma alanının yapılandırma/kiralama ad alanı.

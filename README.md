@@ -58,6 +58,19 @@ and the stored transcript always stays complete.
 Streaming hops use bounded channels, so a fast provider cannot turn the UI queue into
 unbounded memory growth — the reader is pressed back instead.
 
+A session can be bound to a working folder: the folder button beside "New
+session" binds the unsent draft (tapping it again unbinds), and folder-bound
+sessions are listed as "Folder > Title". The layout picker offers single,
+side-by-side and 2×2 panes; each pane streams independently with its own
+incremental rendering, and the same conversation can never occupy two panes.
+
+While a folder-bound session changes files, a `doc.badge.plus` button appears
+in the toolbar (single pane) or the pane header (side-by-side): it opens the
+session's file changes in the side panel with per-file `+`/`-` diffs, and
+re-tapping refreshes the snapshot as the turn progresses. The side panel
+collapses to an icon rail with the chevron in its tab bar (per session, tabs
+and live terminals survive collapsed) and reopens from any rail icon.
+
 ## Agent mode and the prompt queue
 
 The composer's mode menu mirrors the speed menu: **Build** is the agentic default, and
@@ -182,6 +195,24 @@ composer's text and a window at its end, the rail's titles and the activity
 anchors are computed once per change rather than once per frame, and a bounded
 shared cache keeps markdown parses across conversation switches. See
 `docs/verification/2026-09-16-composer-and-transcript-performance.md`.
+
+## Simulator and live panels
+
+The right-hand **iOS Simulator** tab shows a booted device's screen inside the
+app and lets you tap and drag on it directly:
+
+- The fluid path is a live window stream (`SCStream`, ~12 fps, capped at 900 px
+  wide) of the Simulator/DeviceHub window for the selected device. It needs the
+  device window on screen and **Screen Recording** granted to AgenticSidebar;
+  without either, frames fall back to `simctl io screenshot` (~2 fps). The
+  footer badge says which path is active (`Canlı`, `simctl · ~2 fps`, or an
+  `Ekran Kaydı` prompt), so a slow view is never a mystery.
+- Capture runs only while the panel is visible and only for the selected booted
+  device. Touches go to the device over the HID bridge; typing still wants the
+  real device window (`Open window` brings it forward without stealing focus
+  when booting).
+- The same on-visibility rule holds for the Computer live view: no hidden
+  screen capture while its panel is closed.
 
 ## Extensions: MCP, plugins and skills
 
@@ -379,5 +410,22 @@ that is the state worth holding. Superseded pushes are cancelled by a `concurren
 group, the SwiftPM build is cached, and the single test that touches the real login
 keychain skips itself unless `RUN_KEYCHAIN_TESTS=1` is set, so what CI proves is the
 hermetic suite. `swift-format lint` runs as a third step and **is a gate**: the
-tree is formatted to the checked-in `.swift-format`, so a new violation fails the
-build the same way a new warning does.
+  tree is formatted to the checked-in `.swift-format`, so a new violation fails the
+  build the same way a new warning does.
+
+## Contributing
+
+- `swift build --product AgenticSidebar` and `swift test` must stay clean with
+  `-Xswiftc -warnings-as-errors`; `swift-format lint -r --strict Sources Tests`
+  (pinned version in `ci.yml`) is a gate, not a suggestion.
+- Never commit `dist/`, `.build/`, `DerivedData/`, `as-review/`, `.freebuff/`,
+  lease files under `servers/`, or anything with a secret. API keys live in the
+  login Keychain and server passwords rotate on every start — neither belongs
+  in a file that ships.
+- `docs/verification/` holds dated host evidence; small machine-specific paths
+  in old notes are history, not configuration. New docs should prefer `~` and
+  relative paths.
+
+## License
+
+MIT — see `LICENSE`.

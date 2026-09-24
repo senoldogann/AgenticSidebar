@@ -23,6 +23,13 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
     private let auditLog: ToolAuditLog?
     private var remoteSessionIDs: [UUID: String] = [:]
 
+    /// İptal edilmiş turların uygulama oturum kimlikleri. Koşan turun izni
+    /// asenkron yanıtlanır; iptalden sonra gelen yanıt ölü oturuma POST
+    /// edilmemelidir (adaptördeki `permissionReplyIsCurrent` karşılığı).
+    /// Üst sınır adaptörle aynıdır; eşlemesi kalmamış kimlikler atılır.
+    private var cancelledAppSessions: Set<UUID> = []
+    private static let maximumCancelledAppSessions = 1_024
+
     /// The server that owns `remoteSessionIDs`. Remote sessions live inside a
     /// specific server process, so a restarted backend (new port or password)
     /// must invalidate the whole mapping.
@@ -100,6 +107,11 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         guard let connection = await serverManager.currentConnection() else {
             throw ProviderRuntimeError.unavailable
         }
+        // Parola taşıyan isteklerden önce portun hâlâ çocuğa ait olduğu
+        // doğrulanır; değilse parola gönderilmez (fail-closed).
+        guard await serverManager.verifyCurrentListener() else {
+            throw ProviderRuntimeError.unavailable
+        }
         guard
             let model = OpenCodeModelReference(
                 flattenedID: request.configuration.modelID
@@ -115,6 +127,9 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         }
 
         let client = clientFactory(connection)
+        // Yeni tur iptal damgasını temizler: aynı sohbetin önceki turu
+        // iptal edildiyse bu turun izin yanıtları yine geçerlidir.
+        cancelledAppSessions.remove(request.sessionID)
         var resolution = try await remoteSessionID(
             for: request.sessionID,
             client: client,
@@ -152,7 +167,19 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             ? ManagedOpenCodeConfiguration.planAgentName : "build"
 
         // Subscribe before submitting so fast backend events cannot be missed.
-        let lineStream = try await client.eventStream()
+        // Abonelik kurulamazsa taze eşleme düşürülür: boş bir uzak oturumu
+        // saklamak, sonraki turun preamble'sız devam etmesi demektir.
+        let lineStream: OpenCodeLineStream
+        do {
+            lineStream = try await client.eventStream()
+        } catch {
+            await forgetRemoteSession(appSessionID: request.sessionID, via: client)
+            throw error
+        }
+        // Retry dalı yeni bağlantıda yeni abonelik açabilir; aşağıdaki akış
+        // ve kapatma yolları her zaman etkin istemci/abonelikle konuşur.
+        var effectiveClient = client
+        var effectiveStream: OpenCodeLineStream?
         do {
             try await client.sendPromptAsync(
                 sessionID: resolution.id,
@@ -164,27 +191,17 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
         } catch let error as ProviderRuntimeError where error == .unexpectedResponse {
             // The backend no longer knows this session (for example after a restart
             // that kept the same loopback address). Delete the orphan before
-            // forgetting it, then recreate once and retry on the subscription
-            // that is already open.
+            // forgetting it, then recreate once and retry with a subscription
+            // on the current server (the old socket may be dead).
             AppLog.openCode.error(
                 "OpenCode rejected the remote session; recreating it once"
             )
-            let orphanedSessionID = remoteSessionIDs[request.sessionID]
-            remoteSessionIDs[request.sessionID] = nil
-            if let orphanedSessionID {
-                do {
-                    try await client.deleteSession(sessionID: orphanedSessionID)
-                } catch {
-                    AppLog.openCode.error(
-                        "Could not delete the remote session for a removed conversation: \(String(describing: error), privacy: .public)"
-                    )
-                }
-            }
+            await forgetRemoteSession(appSessionID: request.sessionID, via: client)
+            // Yeniden denemeden önce bağlantıyı tazele: sunucu yeniden
+            // başladıysa eski soket ölüdür.
+            let freshConnection = await serverManager.currentConnection() ?? connection
+            let freshClient = clientFactory(freshConnection)
             do {
-                // Yeniden denemeden önce bağlantıyı tazele: sunucu yeniden
-                // başladıysa eski soket ölüdür.
-                let freshConnection = await serverManager.currentConnection() ?? connection
-                let freshClient = clientFactory(freshConnection)
                 resolution = try await self.remoteSessionID(
                     for: request.sessionID,
                     client: freshClient,
@@ -204,6 +221,13 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                         contextSummary: request.contextSummary
                     )
                 )
+                await lineStream.cancel()
+                do {
+                    effectiveStream = try await freshClient.eventStream()
+                } catch {
+                    await forgetRemoteSession(appSessionID: request.sessionID, via: freshClient)
+                    throw error
+                }
                 try await freshClient.sendPromptAsync(
                     sessionID: resolution.id,
                     model: model,
@@ -211,22 +235,17 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                     parts: parts,
                     agent: agentName
                 )
+                effectiveClient = freshClient
             } catch {
                 await lineStream.cancel()
+                if let effectiveStream {
+                    await effectiveStream.cancel()
+                }
                 // The retry never landed either: the same stale-mapping hazard
                 // as the first failure, one level deeper. Drop the recreated
-                // mapping (and the orphan) so the next turn starts fresh.
-                let orphanedSessionID = remoteSessionIDs[request.sessionID]
-                remoteSessionIDs[request.sessionID] = nil
-                if let orphanedSessionID {
-                    do {
-                        try await client.deleteSession(sessionID: orphanedSessionID)
-                    } catch {
-                        AppLog.openCode.error(
-                            "Could not delete the remote session for a removed conversation: \(String(describing: error), privacy: .public)"
-                        )
-                    }
-                }
+                // mapping (and the orphan, on the server that owns it) so the
+                // next turn starts fresh.
+                await forgetRemoteSession(appSessionID: request.sessionID, via: freshClient)
                 throw error
             }
         } catch {
@@ -235,20 +254,12 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             // session: keeping it would make the next turn reuse it without the
             // history preamble. Drop it (and the orphan) so the next turn starts
             // fresh with the preamble.
-            let orphanedSessionID = remoteSessionIDs[request.sessionID]
-            remoteSessionIDs[request.sessionID] = nil
-            if let orphanedSessionID {
-                do {
-                    try await client.deleteSession(sessionID: orphanedSessionID)
-                } catch {
-                    AppLog.openCode.error(
-                        "Could not delete the remote session for a removed conversation: \(String(describing: error), privacy: .public)"
-                    )
-                }
-            }
+            await forgetRemoteSession(appSessionID: request.sessionID, via: client)
             throw error
         }
 
+        let activeClient = effectiveClient
+        let activeLineStream = effectiveStream ?? lineStream
         let activeSessionID = resolution.id
         // Bounded: a burst of backend events suspends the reader instead of
         // piling up while the session applies them one by one.
@@ -269,6 +280,12 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             guard isNew else { return }
 
             Task {
+                // İptal edilmiş turun geç yanıtı ölü oturuma POST edilmez:
+                // kullanıcı turu durdurduysa onay kartı ne derse desin yanıt
+                // düşer (adaptördeki `permissionReplyIsCurrent` karşılığı).
+                guard await self.permissionReplyIsCurrent(appSessionID: appSessionID, remoteSessionID: activeSessionID) else {
+                    return
+                }
                 let reply: OpenCodePermissionReply
                 if let permissionHandler {
                     // Sahiplik her iki kaynaktan gelen istek için yeniden hesaplanır:
@@ -285,6 +302,11 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                     // it must not read as blanket approval.
                     reply = .reject
                 }
+                // Yanıt anında sahiplik yeniden doğrulanır: beklerken tur
+                // iptal edildiyse yanıt atılmaz.
+                guard await self.permissionReplyIsCurrent(appSessionID: appSessionID, remoteSessionID: activeSessionID) else {
+                    return
+                }
                 do {
                     if let freshConnection = await permissionServerManager.currentConnection() {
                         try await permissionClientFactory(freshConnection).replyPermission(
@@ -292,7 +314,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                             reply: reply.rawValue
                         )
                     } else {
-                        try await client.replyPermission(
+                        try await activeClient.replyPermission(
                             requestID: request.id,
                             reply: reply.rawValue
                         )
@@ -348,16 +370,61 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
 
         let forwardingTask = Task {
             var auditActivities: [ProviderActivityID: ProviderActivityDescriptor] = [:]
+            var auditedChildStepKeys: Set<String> = []
+            var finishedChildStepKeys: Set<String> = []
+            let childAuditQueue = Mutex<[OpenCodeChildToolEvent]>([])
             var normalizer = OpenCodeStreamNormalizer(
                 sessionID: activeSessionID,
                 onPermissionRequest: { request in
                     handlePermissionRequest(request)
+                },
+                onChildToolStep: { step in
+                    childAuditQueue.withLock { $0.append(step) }
                 }
             )
             var questionRouter = OpenCodeQuestionEventRouter(sessionID: activeSessionID)
             do {
-                streamLoop: for try await line in lineStream.lines {
+                streamLoop: for try await line in activeLineStream.lines {
                     try Task.checkCancellation()
+                    // Delege çocuk araçları üst aktiviteye gömülür; denetim
+                    // kaydı burada üretilir. Kuyruk denetim kapalıyken de
+                    // boşaltılır, yoksa sınırsız büyür.
+                    let drainedChildAudits = childAuditQueue.withLock { queue -> [OpenCodeChildToolEvent] in
+                        let items = queue
+                        queue.removeAll()
+                        return items
+                    }
+                    if let auditLog {
+                        for childAudit in drainedChildAudits {
+                            let stepKey = childAudit.owner.rawValue + "/" + childAudit.stepID
+                            let childKind = ProviderActivityDescriptor.sanitizedTool(
+                                id: childAudit.owner,
+                                toolName: childAudit.tool
+                            ).kind
+                            if let outcome = childAudit.outcome {
+                                guard !finishedChildStepKeys.contains(stepKey) else { continue }
+                                finishedChildStepKeys.insert(stepKey)
+                                auditedChildStepKeys.insert(stepKey)
+                                await auditLog.recordExecution(
+                                    ToolAuditLog.ExecutionRecord(
+                                        timestamp: Date(), sessionID: activeSessionID,
+                                        activityID: stepKey, toolKind: childKind,
+                                        title: nil, detail: nil,
+                                        event: outcome == .completed ? .completed : .failed
+                                    ))
+                            } else {
+                                guard !auditedChildStepKeys.contains(stepKey) else { continue }
+                                auditedChildStepKeys.insert(stepKey)
+                                await auditLog.recordExecution(
+                                    ToolAuditLog.ExecutionRecord(
+                                        timestamp: Date(), sessionID: activeSessionID,
+                                        activityID: stepKey, toolKind: childKind,
+                                        title: nil, detail: nil,
+                                        event: .started
+                                    ))
+                            }
+                        }
+                    }
                     for question in questionRouter.consume(line: line) {
                         try await channel.send(.questionAsked(question))
                     }
@@ -398,19 +465,19 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                     }
                 }
                 reconciliationTask.cancel()
-                await lineStream.cancel()
+                await activeLineStream.cancel()
                 await channel.finish()
             } catch is CancellationError {
                 reconciliationTask.cancel()
-                await lineStream.cancel()
+                await activeLineStream.cancel()
                 await channel.finish(throwing: CancellationError())
             } catch let error as ProviderRuntimeError {
                 reconciliationTask.cancel()
-                await lineStream.cancel()
+                await activeLineStream.cancel()
                 await channel.finish(throwing: error)
             } catch {
                 reconciliationTask.cancel()
-                await lineStream.cancel()
+                await activeLineStream.cancel()
                 await channel.finish(throwing: ProviderRuntimeError.transport)
             }
         }
@@ -420,16 +487,31 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             cancellation: {
                 forwardingTask.cancel()
                 reconciliationTask.cancel()
+                await self.noteTurnCancelled(appSessionID: appSessionID)
                 await self.cancelPendingPermissions?(activeSessionID, appSessionID)
-                try? await client.abort(sessionID: activeSessionID)
-                await lineStream.cancel()
+                // Etkin bağlantıya abort: retry sonrası taze sunucudaki
+                // oturum kapatılır, ölü sokete değil.
+                if let freshConnection = await permissionServerManager.currentConnection() {
+                    try? await permissionClientFactory(freshConnection).abort(sessionID: activeSessionID)
+                } else {
+                    try? await activeClient.abort(sessionID: activeSessionID)
+                }
+                await activeLineStream.cancel()
                 await channel.finish(throwing: CancellationError())
             },
             questionReply: { requestID, answers in
-                try await client.replyQuestion(requestID: requestID, answers: answers)
+                if let freshConnection = await permissionServerManager.currentConnection() {
+                    try await permissionClientFactory(freshConnection).replyQuestion(requestID: requestID, answers: answers)
+                } else {
+                    try await activeClient.replyQuestion(requestID: requestID, answers: answers)
+                }
             },
             questionRejection: { requestID in
-                try await client.rejectQuestion(requestID: requestID)
+                if let freshConnection = await permissionServerManager.currentConnection() {
+                    try await permissionClientFactory(freshConnection).rejectQuestion(requestID: requestID)
+                } else {
+                    try await activeClient.rejectQuestion(requestID: requestID)
+                }
             }
         )
     }
@@ -447,6 +529,9 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             throw ProviderRuntimeError.unexpectedResponse
         }
         guard let connection = await serverManager.currentConnection() else {
+            throw ProviderRuntimeError.unavailable
+        }
+        guard await serverManager.verifyCurrentListener() else {
             throw ProviderRuntimeError.unavailable
         }
         guard
@@ -610,6 +695,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
     /// oturum ise hiç silinmiyordu. Sunucu ulaşılamıyorsa yerel eşleme yine de
     /// düşürülür: ölü bir kimliği saklamanın değeri yok.
     func releaseSession(_ sessionID: UUID) async {
+        cancelledAppSessions.remove(sessionID)
         guard let remoteSessionID = remoteSessionIDs.removeValue(forKey: sessionID) else {
             return
         }
@@ -625,6 +711,43 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 "Could not delete the remote session for a removed conversation: \(String(describing: error), privacy: .public)"
             )
         }
+    }
+
+    /// Eşlemeyi düşürüp uzak oturumu elden geldiğince siler; bozuk sokete
+    /// silme gönderilmez, hata yalnızca loglanır. Dört çağrı noktasındaki
+    /// tekrarın tek kaynağıdır.
+    private func forgetRemoteSession(appSessionID: UUID, via client: any OpenCodeClientProtocol) async {
+        let orphanedSessionID = remoteSessionIDs[appSessionID]
+        remoteSessionIDs[appSessionID] = nil
+        if let orphanedSessionID {
+            do {
+                try await client.deleteSession(sessionID: orphanedSessionID)
+            } catch {
+                AppLog.openCode.error(
+                    "Could not delete the remote session for a removed conversation: \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+    }
+
+    /// İptal damgasını işler; taşan en eski eşlemesiz kimlikler düşer
+    /// (adaptördeki budamayla aynı yön: canlı kimlik asla atılmaz).
+    private func noteTurnCancelled(appSessionID: UUID) {
+        cancelledAppSessions.insert(appSessionID)
+        if cancelledAppSessions.count > Self.maximumCancelledAppSessions {
+            let dead = cancelledAppSessions.filter { remoteSessionIDs[$0] == nil }
+            let overflow = cancelledAppSessions.count - Self.maximumCancelledAppSessions
+            for id in dead.prefix(overflow) {
+                cancelledAppSessions.remove(id)
+            }
+        }
+    }
+
+    /// İzin yanıtı hâlâ güncel tura mı ait: iptal damgası yok ve eşleme
+    /// aynı uzak oturumu gösteriyor.
+    private func permissionReplyIsCurrent(appSessionID: UUID, remoteSessionID: String) -> Bool {
+        !cancelledAppSessions.contains(appSessionID)
+            && remoteSessionIDs[appSessionID] == remoteSessionID
     }
 
     private func remoteSessionID(

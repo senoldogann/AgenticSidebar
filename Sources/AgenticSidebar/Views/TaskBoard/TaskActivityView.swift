@@ -93,14 +93,18 @@ struct TaskActivityView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Text("Etkinlik")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .tracking(0.4)
+                    .foregroundStyle(.tertiary)
                 Text(TaskActivityPresenter.summary(attempts))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
                 Spacer(minLength: 0)
                 if isActionInFlight {
                     Text(TaskActionBarPresenter.busyExplanation)
@@ -112,53 +116,82 @@ struct TaskActivityView: View {
 
             if rows.isEmpty {
                 Text("Bu görev için henüz deneme kaydı yok")
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(rows) { row in
-                    attemptRow(row)
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(rows) { row in
+                        attemptRow(row)
+                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            (isDark ? preset.surfaceDark : preset.surfaceLight).opacity(isDark ? 0.6 : 0.85),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(
+                    (isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.8),
+                    lineWidth: 1
+                )
+        )
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Etkinlik. \(TaskActivityPresenter.summary(attempts))")
     }
 
     private func attemptRow(_ row: TaskBoardAttemptPresentation) -> some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(alignment: .top, spacing: 8) {
             Circle()
-                .fill(row.isActive ? (preset.accentGradient.first ?? .accentColor) : Color.secondary.opacity(0.5))
-                .frame(width: 6, height: 6)
-                .padding(.top, 4)
+                .fill(row.isActive ? (preset.accentGradient.first ?? .accentColor) : Color.secondary.opacity(0.45))
+                .frame(width: 8, height: 8)
+                .padding(.top, 5)
+                .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 5) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
                     Text(row.sequenceLabel)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 11.5, weight: .semibold))
                     Text(row.roleLabel)
-                        .font(.system(size: 10))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
                     Text(row.outcomeLabel)
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(row.isActive ? (preset.accentGradient.first ?? .accentColor) : .secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(
+                            (row.isActive ? (preset.accentGradient.first ?? .accentColor) : Color.secondary)
+                                .opacity(isDark ? 0.20 : 0.10),
+                            in: Capsule()
+                        )
                 }
                 Text(row.providerLabel)
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.tertiary)
+                    .lineLimit(1)
                 HStack(spacing: 6) {
                     Text(row.timingLabel)
-                        .font(.system(size: 10))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                     if let toolCallLabel = row.toolCallLabel {
+                        Text("·")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
                         Text(toolCallLabel)
-                            .font(.system(size: 10))
+                            .font(.system(size: 10.5))
                             .foregroundStyle(.tertiary)
                     }
                 }
             }
             Spacer(minLength: 0)
         }
+        .padding(8)
+        .background(Color.primary.opacity(isDark ? 0.05 : 0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .accessibilityElement(children: .combine)
         .accessibilityLabel(row.accessibilityLabel)
     }

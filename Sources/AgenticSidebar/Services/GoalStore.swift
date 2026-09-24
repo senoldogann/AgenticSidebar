@@ -200,7 +200,8 @@ enum GoalStore {
         let data = try JSONEncoder().encode(stored)
         try fileManager.createDirectory(
             at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
         )
         if fileManager.fileExists(atPath: url.path) {
             let previous = try Data(contentsOf: url)
@@ -215,6 +216,10 @@ enum GoalStore {
             }
         }
         try data.write(to: url, options: .atomic)
+        try? fileManager.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 
     /// Bozuk/uyumsuz dosya `nil` döner. Saf okumadır: dosyayı taşımaz,

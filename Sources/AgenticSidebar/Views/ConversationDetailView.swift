@@ -39,6 +39,15 @@ struct ConversationDetailView: View {
         return sessionService.activeSession
     }
 
+    /// Canlı bilgisayar sekmesinin durumu: odaklı oturumun son turunda koşan
+    /// (ya da yeni biten) bir bilgisayar adımı varsa akış, yoksa boş durum.
+    private var computerLiveState: ComputerLiveState {
+        ComputerLivePresentation.state(
+            isSessionBusy: focusedSession.isBusy,
+            groups: focusedSession.state.activityGroups
+        )
+    }
+
     @Environment(SettingsStore.self) private var settingsStore
     /// What "write again" on an earlier message is for: the draft it edits lives
     /// in the composer, one view away.
@@ -52,7 +61,19 @@ struct ConversationDetailView: View {
     @State private var selectedInspectorTabID: String? = nil
     @State private var inspectorWidth: CGFloat = 620
     @State private var isInspectorExpanded: Bool = false
+    /// Sağ panel dar ikon şeridine inmiş mi: sekmeler ve seçim korunur,
+    /// içerik gizlenir; şeritteki ikona tıklama sekmeyi seçip geri açar.
+    /// Oturum başına `inspectorStateBySession` içinde saklanır.
+    @State private var isInspectorCollapsed: Bool = false
     @State private var terminalCenter = TerminalServiceCenter()
+    /// Tarayıcı, simülatör ve canlı bilgisayar servisleri de bölme başına
+    /// yaşar: sekme değişiminde sayfa/cihaz seçimi kaybolmaz.
+    @State private var browserCenter = BrowserServiceCenter()
+    @State private var simulatorService = SimulatorService()
+    @State private var computerLiveService = ComputerLiveCaptureService()
+    /// Bestecideki dal seçici: bölme başına yaşar, oturumun klasörüne göre
+    /// tazelenir; klasörsüz oturumda ya da git dışı klasörde gizlenir.
+    @State private var gitBranchStore = GitBranchStore()
     /// Yalnız bu iki karar gövdeyi etkiler. Kaydırma ölçümleri bunlara doğrudan
     /// yazılmaz: ölçümü yapan geri çağrı bir ekran döngüsünün içinde çalışır ve
     /// oradan `@State` yazmak aynı döngüde yeni bir yerleşim turu ister.
@@ -200,6 +221,7 @@ struct ConversationDetailView: View {
                         sessionService: sessionService,
                         permissionApprovalCenter: permissionApprovalCenter,
                         focusedSessionID: focusedSessionID,
+                        gitBranchStore: gitBranchStore,
                         onInspectFile: { url in
                             openFileInInspector(url: url)
                         },
@@ -242,11 +264,12 @@ struct ConversationDetailView: View {
                 .frame(
                     // Yan panel açıkken sohbet sütunu kalan alana iner: sabit
                     // 360 tabanı dar bölmede panelin üstüne binerdi. Kapalıyken
-                    // eski taban korunur.
+                    // eski taban korunur. Daraltılmış şerit yalnız ~40 pt yer
+                    // kaplar, tam panel payı düşülmez.
                     minWidth: isInspectorExpanded
                         ? 0
                         : (inspectorTabs.isEmpty
-                            ? 360 : max(0, paneWidth - fittedInspectorWidth - 6)),
+                            ? 360 : max(0, paneWidth - (isInspectorCollapsed ? 46 : fittedInspectorWidth + 6))),
                     maxWidth: isInspectorExpanded ? 0 : .infinity,
                     maxHeight: .infinity
                 )
@@ -256,63 +279,115 @@ struct ConversationDetailView: View {
                     let selectedID = selectedInspectorTabID,
                     let activeTab = inspectorTabs.first(where: { $0.id == selectedID }) ?? inspectorTabs.last
                 {
-                    if !isInspectorExpanded {
+                    if !isInspectorExpanded, !isInspectorCollapsed {
                         inspectorResizeSplitter
                     }
 
-                    InspectorTabsContainerView(
-                        tabs: inspectorTabs,
-                        selectedTabID: activeTab.id,
-                        preset: preset,
-                        isDark: isDark,
-                        isExpanded: isInspectorExpanded,
-                        terminalCenter: terminalCenter,
-                        onSelectTab: { tabID in
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                selectedInspectorTabID = tabID
-                            }
-                        },
-                        onCloseTab: { tabID in
-                            closeInspectorTab(tabID)
-                        },
-                        onToggleExpand: {
-                            withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
-                                isInspectorExpanded.toggle()
-                            }
-                        },
-                        onCloseAll: {
-                            withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
-                                for tab in inspectorTabs {
-                                    if case .terminal(let id, _) = tab.kind {
-                                        terminalCenter.close(id: id)
-                                    }
+                    if isInspectorCollapsed, !isInspectorExpanded {
+                        inspectorCollapsedRail(preset: preset, isDark: isDark)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
+                    } else {
+                        InspectorTabsContainerView(
+                            tabs: inspectorTabs,
+                            selectedTabID: activeTab.id,
+                            preset: preset,
+                            isDark: isDark,
+                            isExpanded: isInspectorExpanded,
+                            terminalCenter: terminalCenter,
+                            browserCenter: browserCenter,
+                            simulatorService: simulatorService,
+                            computerLiveService: computerLiveService,
+                            computerLiveState: computerLiveState,
+                            onSelectTab: { tabID in
+                                withAnimation(.easeInOut(duration: 0.18)) {
+                                    selectedInspectorTabID = tabID
                                 }
-                                inspectorTabs = []
-                                selectedInspectorTabID = nil
-                                isInspectorExpanded = false
+                            },
+                            onCloseTab: { tabID in
+                                closeInspectorTab(tabID)
+                            },
+                            onToggleExpand: {
+                                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                    isInspectorExpanded.toggle()
+                                }
+                            },
+                            onToggleCollapse: {
+                                withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+                                    isInspectorCollapsed = true
+                                }
+                            },
+                            onCloseAll: {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.85)) {
+                                    for tab in inspectorTabs {
+                                        if case .terminal(let id, _) = tab.kind {
+                                            terminalCenter.close(id: id)
+                                        }
+                                    }
+                                    browserCenter.closeAll()
+                                    simulatorService.panelDisappeared()
+                                    computerLiveService.stop()
+                                    inspectorTabs = []
+                                    selectedInspectorTabID = nil
+                                    isInspectorExpanded = false
+                                    isInspectorCollapsed = false
+                                }
                             }
-                        }
-                    )
-                    .frame(
-                        // Dar bölmede ham genişlik transkripti ezerdi: kapak,
-                        // kullanılabilir genişliğe göre hesaplanır (en az
-                        // 280, bölmeyi en çok 32 pt daraltır).
-                        minWidth: isInspectorExpanded ? 400 : min(380, fittedInspectorWidth),
-                        idealWidth: isInspectorExpanded ? nil : fittedInspectorWidth,
-                        maxWidth: isInspectorExpanded ? .infinity : fittedInspectorWidth
-                    )
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                        )
+                        .frame(
+                            // Dar bölmede ham genişlik transkripti ezerdi: kapak,
+                            // kullanılabilir genişliğe göre hesaplanır (en az
+                            // 280, bölmeyi en çok 32 pt daraltır).
+                            minWidth: isInspectorExpanded ? 400 : min(380, fittedInspectorWidth),
+                            idealWidth: isInspectorExpanded ? nil : fittedInspectorWidth,
+                            maxWidth: isInspectorExpanded ? .infinity : fittedInspectorWidth
+                        )
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                    }
                 }
             }
         }
         .background(isDark ? preset.backgroundDark : preset.backgroundLight)
-        .navigationTitle(showsNavigationTitle ? focusedSession.title : "")
+        .navigationTitle(showsNavigationTitle ? focusedSession.qualifiedTitle : "")
         .onReceive(NotificationCenter.default.publisher(for: .openPaneTerminal)) { notification in
             guard let targetPane = notification.object as? String else { return }
             let myPane = paneID ?? "primary"
             guard targetPane == myPane else { return }
-            let dir = ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
-            openTerminalInInspector(workingDirectory: dir)
+            openTerminalInInspector(workingDirectory: Self.terminalDirectory(for: focusedSession))
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openPaneBrowser)) { notification in
+            guard let targetPane = notification.object as? String else { return }
+            guard targetPane == (paneID ?? "primary") else { return }
+            openBrowserInInspector()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openPaneSimulator)) { notification in
+            guard let targetPane = notification.object as? String else { return }
+            guard targetPane == (paneID ?? "primary") else { return }
+            openSimulatorInInspector()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openPaneComputerLive)) { notification in
+            guard let targetPane = notification.object as? String else { return }
+            guard targetPane == (paneID ?? "primary") else { return }
+            openComputerLiveInInspector()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openPaneSessionChanges)) { notification in
+            guard let targetPane = notification.object as? String else { return }
+            guard targetPane == (paneID ?? "primary") else { return }
+            openSessionChangesInInspector()
+        }
+        .onChange(of: computerLiveState) { _, state in
+            // Bilgisayar turu kendiliğinden başladığında panel de kendiliğinden
+            // açılır — ama yalnız inspector boşsa: kullanıcının açtığı bir
+            // sekmeyi (rapor, dosya, terminal) ezmek sürpriz olurdu.
+            guard state != .idle, inspectorTabs.isEmpty else { return }
+            openComputerLiveInInspector()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .didMaterializePendingSession)) { notification in
+            // Doğum anı: kimlik değişmediği için `onChange(of:
+            // focusedSession.id)` tetiklenmez. Kaydırma ve inspector aynı
+            // kimlikte süreklidir; yalnız goal bildirimi doğumda yeniden
+            // değerlendirilir (taslağın goal kaydı olamaz).
+            guard (notification.object as? UUID) == focusedSession.id else { return }
+            noticeGoalForFocusedSession()
         }
         .onAppear {
             // Yarım kalan hedef varsa panel devam etmeyi önerir (otomatik
@@ -754,12 +829,15 @@ struct ConversationDetailView: View {
     }
 
     /// Yan cevabı besteci taslağına ekler (metin korunur, altına eklenir).
+    /// Anahtar çözümlenmiş oturumdur (`focusedSession.id`): disk taslağı ve
+    /// kip tercihleriyle aynı türetim; ham `focusedSessionID ?? active` üçüncü
+    /// bir anahtar üretirdi. Canlı odakta ikisi aynıdır.
     private func insertSideAnswerToComposer(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let draftMemory else {
             return
         }
-        let key = focusedSessionID ?? sessionService.activeSessionID
+        let key = focusedSession.id
         var drafts = draftMemory.drafts
         var draft = drafts[key, default: .empty]
         draft.text = draft.text.isEmpty ? trimmed : draft.text + "\n\n" + trimmed
@@ -874,21 +952,15 @@ struct ConversationDetailView: View {
     /// orası kullanılır ("bir üstü seçme" hatası); geçersiz seçim ret
     /// kartına düşer, ikinci pencere açılmaz.
     private func promptPackageFolder() -> URL? {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = false
-        panel.prompt = "Choose"
-        panel.message = "Choose the project folder (SwiftPM package or Xcode project) where build and tests will run."
-        guard panel.runModal() == .OK, let url = panel.url else {
-            return nil
-        }
-        return url
+        DirectoryPicker.chooseDirectory(
+            prompt: "Choose",
+            message: "Choose the project folder (SwiftPM package or Xcode project) where build and tests will run."
+        )
     }
 
-    /// Hedef doğrulamanın koşacağı dizin: önce bu bölmenin bilinen dizini
-    /// (koşan/biten koşudan), sonra kayıtlı tercih (geçerliyse), sonra
+    /// Hedef doğrulamanın koşacağı dizin: önce oturumun bağlı klasörü
+    /// (klasörlü oturum doğrudan orada çalışır), sonra bu bölmenin bilinen
+    /// dizini (koşan/biten koşudan), sonra kayıtlı tercih (geçerliyse), sonra
     /// oturumdaki dosya sinyallerinden türetilen proje dizini (ekler,
     /// aktivite yolları, bestecideki bekleyen ekler). `nil` = hiçbir aday
     /// desteklenen proje değildir; çağıran klasör sorar.
@@ -897,6 +969,7 @@ struct ConversationDetailView: View {
         // ret aldıysa (ör. tek alt dizin projesi) bir sonraki `/goal`
         // aynı seçimi hatırlasın, yeniden klasör sormasın.
         let known = [
+            focusedSession.workingDirectoryPath ?? "",
             goalOrchestrator.workingDirectoryPath,
             goalOrchestrator.failedRequest?.workingDirectoryPath ?? "",
             GoalStore.preferredPackageDirectory() ?? "",
@@ -1062,6 +1135,30 @@ struct ConversationDetailView: View {
         }
     }
 
+    /// Sağ-üstteki canlı review düğmesinin hedefi: oturumun o ana kadarki
+    /// dosya değişikliklerini tek sekmede açar ya da tazeler. Sekme kimliği
+    /// oturuma bağlı olduğu için akış sırasında tekrar tıklama yeni sekme
+    /// açmaz, mevcut sekmeyi güncel özetle değiştirir. Değişiklik yoksa
+    /// hiçbir şey olmaz (düğme o durumda zaten çizilmez).
+    private func openSessionChangesInInspector() {
+        guard
+            let summary = TurnFileChangesSummary.sessionReviewSummary(
+                from: focusedSession.state.activityGroups
+            )
+        else {
+            return
+        }
+        let tab = InspectorTab.forSessionChanges(sessionID: focusedSession.id, summary: summary)
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+            if let idx = inspectorTabs.firstIndex(where: { $0.id == tab.id }) {
+                inspectorTabs[idx] = tab
+            } else {
+                inspectorTabs.append(tab)
+            }
+            selectedInspectorTabID = tab.id
+        }
+    }
+
     private func openReviewInInspector(summary: TurnFileChangesSummary, initialFile: FileChangeItem?) {
         let tab = InspectorTab.forReview(summary: summary, initialFile: initialFile)
         withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
@@ -1074,6 +1171,26 @@ struct ConversationDetailView: View {
         }
     }
 
+    /// Terminalin açılacağı dizin: oturum klasöre bağlıysa ve dizin
+    /// gerçekten varsa orası, yoksa yönetilen varsayılan. Klasörsüz oturumda
+    /// davranış değişmez.
+    private static func terminalDirectory(for session: AgentSession) -> URL {
+        if let path = session.workingDirectoryPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !path.isEmpty
+        {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+                isDirectory.boolValue
+            {
+                return URL(fileURLWithPath: path, isDirectory: true)
+            }
+        }
+        return ManagedOpenCodeServerManager.managedWorkingDirectoryURL()
+    }
+
+    /// Inspector terminal sekmesini açar ya da seçer. Sekme kimliği klasörü
+    /// içerdiği için aynı klasör canlı kabuğu korur, başka klasör yeni
+    /// sekmede kendi dizininde açılır (`TerminalPanelView` başlığı dizini gösterir).
     private func openTerminalInInspector(workingDirectory: URL) {
         let paneKey = paneID ?? "primary"
         let tab = InspectorTab.forTerminal(
@@ -1089,14 +1206,58 @@ struct ConversationDetailView: View {
         }
     }
 
+    /// Tarayıcı sekmesini açar ya da seçer. Sayfa merkezde yaşadığı için
+    /// ikinci açılış aynı sekmeyi öne alır.
+    private func openBrowserInInspector() {
+        let tab = InspectorTab.forBrowser(paneID: paneID ?? "primary")
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+            if !inspectorTabs.contains(where: { $0.id == tab.id }) {
+                inspectorTabs.append(tab)
+            }
+            selectedInspectorTabID = tab.id
+        }
+    }
+
+    /// Simülatör sekmesini açar ya da seçer; liste taraması panel görününce
+    /// kendiliğinden başlar.
+    private func openSimulatorInInspector() {
+        let tab = InspectorTab.forSimulator(paneID: paneID ?? "primary")
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+            if !inspectorTabs.contains(where: { $0.id == tab.id }) {
+                inspectorTabs.append(tab)
+            }
+            selectedInspectorTabID = tab.id
+        }
+    }
+
+    /// Canlı bilgisayar sekmesini açar ya da seçer.
+    private func openComputerLiveInInspector() {
+        let tab = InspectorTab.forComputerLive(paneID: paneID ?? "primary")
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+            if !inspectorTabs.contains(where: { $0.id == tab.id }) {
+                inspectorTabs.append(tab)
+            }
+            selectedInspectorTabID = tab.id
+        }
+    }
+
     private func closeInspectorTab(_ tabID: String) {
         withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
             guard let idx = inspectorTabs.firstIndex(where: { $0.id == tabID }) else {
                 return
             }
             let removed = inspectorTabs.remove(at: idx)
-            if case .terminal(let id, _) = removed.kind {
+            switch removed.kind {
+            case .terminal(let id, _):
                 terminalCenter.close(id: id)
+            case .browser:
+                browserCenter.closeAll(withPrefix: tabID)
+            case .simulator:
+                simulatorService.panelDisappeared()
+            case .computerLive:
+                computerLiveService.stop()
+            case .file, .subagentReport, .changesReview:
+                break
             }
             if selectedInspectorTabID == tabID {
                 if inspectorTabs.indices.contains(idx) {
@@ -1106,8 +1267,51 @@ struct ConversationDetailView: View {
                 } else {
                     selectedInspectorTabID = nil
                     isInspectorExpanded = false
+                    isInspectorCollapsed = false
                 }
             }
+        }
+    }
+
+    /// Daraltılmış sağ panel şeridi: sekme ikonları dikey dizilir, tıklanan
+    /// ikon sekmeyi seçip paneli soldan-sağa animasyonla geri açar. Sekmeler
+    /// ve canlı servisler (terminal, tarayıcı, simülatör) arkada yaşamaya
+    /// devam eder, yalnız içerik gizlenir.
+    private func inspectorCollapsedRail(preset: AppThemePreset, isDark: Bool) -> some View {
+        VStack(spacing: 2) {
+            ForEach(inspectorTabs) { tab in
+                Button {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.85)) {
+                        selectedInspectorTabID = tab.id
+                        isInspectorCollapsed = false
+                    }
+                } label: {
+                    Image(systemName: tab.iconName)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(tab.id == selectedInspectorTabID ? .primary : .secondary)
+                        .frame(width: 32, height: 32)
+                        .background(
+                            tab.id == selectedInspectorTabID
+                                ? (isDark ? Color.white.opacity(0.10) : Color.black.opacity(0.06))
+                                : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointingHandCursor()
+                .help(tab.title)
+                .accessibilityLabel("Expand \(tab.title)")
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 8)
+        .frame(width: 40)
+        .frame(maxHeight: .infinity)
+        .background((isDark ? preset.surfaceDark : preset.surfaceLight).opacity(0.96))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill((isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.6))
+                .frame(width: 1)
         }
     }
 
@@ -1703,6 +1907,9 @@ struct ConversationDetailView: View {
             .onChange(of: isInspectorExpanded) { _, _ in
                 handleInspectorLayoutChange(proxy: proxy)
             }
+            .onChange(of: isInspectorCollapsed) { _, _ in
+                handleInspectorLayoutChange(proxy: proxy)
+            }
             .overlay(alignment: .leading) {
                 promptNavigatorOverlay(proxy: proxy)
             }
@@ -1767,9 +1974,17 @@ struct ConversationDetailView: View {
         let current = InspectorPaneState(
             tabs: inspectorTabs,
             selectedID: selectedInspectorTabID,
-            expanded: isInspectorExpanded
+            expanded: isInspectorExpanded,
+            collapsed: isInspectorCollapsed
         )
-        let liveIDs = Set(sessionService.sessions.map(\.id))
+        // Bekleyen taslak listede yoktur ama bölmede yaşar: sekmeleri
+        // korunur, yoksa klasörlü taslakta açılan terminal, sohbet seçiminde
+        // gizlenip `+` ile dönüldüğünde boş panel gösterirdi (kabuk arkada
+        // öksüz koşardı).
+        var liveIDs = Set(sessionService.sessions.map(\.id))
+        if let pending = sessionService.pendingSessionID {
+            liveIDs.insert(pending)
+        }
         let result = InspectorPaneState.switched(
             inspectorStateBySession,
             from: oldID,
@@ -1781,6 +1996,7 @@ struct ConversationDetailView: View {
         inspectorTabs = result.restored.tabs
         selectedInspectorTabID = result.restored.selectedID
         isInspectorExpanded = result.restored.expanded
+        isInspectorCollapsed = result.restored.collapsed && !result.restored.tabs.isEmpty
     }
 
     /// Inspector açılıp kapanınca (ya da genişleyince) genişlik animasyonu

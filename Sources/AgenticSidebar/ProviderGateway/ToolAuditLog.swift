@@ -188,6 +188,31 @@ actor ToolAuditLog {
         for match in kept.reversed() {
             maskValue(after: match.upperBound, in: &result)
         }
+        return maskBareTokens(in: result)
+    }
+
+    /// Anahtarsız sırlar: boşlukla ayrılmış değerler (`--password hunter2`),
+    /// şema önekliler (`Bearer abc123`) ve bilinen belirteç biçimleri
+    /// (`AKIA…`, `ghp_…`). Anahtar-tabanlı maskeleme bunları yakalayamaz;
+    /// desenler `VerificationOutputRedactor` ile aynı kümedir.
+    private static func maskBareTokens(in text: String) -> String {
+        let patterns: [(pattern: String, template: String)] = [
+            (#"(?i)((?:basic|bearer)\s+)[A-Za-z0-9._~+/=-]{4,}"#, "$1[REDACTED]"),
+            (#"AKIA[0-9A-Z]{16}"#, "[REDACTED]"),
+            (#"gh[pousr]_[A-Za-z0-9]{20,}"#, "[REDACTED]"),
+            (#"sk-(?:proj|live)-[A-Za-z0-9._~-]{8,}"#, "[REDACTED]"),
+        ]
+        var result = text
+        for entry in patterns {
+            guard let regex = try? NSRegularExpression(pattern: entry.pattern) else { continue }
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: range,
+                withTemplate: entry.template
+            )
+        }
         return result
     }
 

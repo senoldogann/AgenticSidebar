@@ -183,17 +183,16 @@ enum HUDActivityMapper {
 /// Canlı HUD ana bilgisayarı: görünmezdir, yalnızca denetleyiciyi besler.
 ///
 /// `AgentSession` dosyasına dokunmadan oturum durumundan beslenir: çağıran
-/// `sessionService.state.activityGroups.flatMap(\.activities)` geçirir.
+/// `HUDActivityMapper.items(from:)` sonucunu geçirir. Ham `[AgentActivity]`
+/// geçirilseydi `onChange` her aktivite güncellemesinde bütün araç çıktısı
+/// metinlerini derinlemesine karşılaştırırdı; HUD yalnız koşan bilgisayar
+/// adımlarını gördüğü için karşılaştırma bu satırlarla sınırlıdır.
 /// Boşken panel gizlenir, doluyken `orderFrontRegardless` ile odak çalmadan
 /// gösterilir.
 struct FloatingHUDHostView: View {
-    let activities: [AgentActivity]
+    let items: [HUDActivityItem]
 
     @State private var controller = FloatingHUDController()
-
-    private var items: [HUDActivityItem] {
-        HUDActivityMapper.items(from: activities)
-    }
 
     var body: some View {
         Color.clear
@@ -203,7 +202,7 @@ struct FloatingHUDHostView: View {
             .onAppear {
                 controller.update(with: items)
             }
-            .onChange(of: activities) { _, _ in
+            .onChange(of: items) { _, _ in
                 controller.update(with: items)
             }
             .onDisappear {

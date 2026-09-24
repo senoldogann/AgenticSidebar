@@ -222,12 +222,20 @@ final class ExtensionStore {
         Task {
             await applyToAgent()
             if let client = await currentClient() {
-                if isEnabled {
-                    if let record = registry.mcpServers.first(where: { $0.name == name }) {
-                        _ = try? await client.addMCPServer(name: name, config: record.definition.openCodePayload)
+                do {
+                    if isEnabled {
+                        if let record = registry.mcpServers.first(where: { $0.name == name }) {
+                            _ = try await client.addMCPServer(name: name, config: record.definition.openCodePayload)
+                        }
+                    } else {
+                        try await client.disconnectMCPServer(name: name)
                     }
-                } else {
-                    try? await client.disconnectMCPServer(name: name)
+                } catch {
+                    AppLog.extensions.error(
+                        "MCP server state could not be applied on the backend; the registry was kept"
+                    )
+                    status = .failure("“\(name)” could not be \(isEnabled ? "enabled" : "silenced") on the backend.")
+                    return
                 }
             }
             status = .info(
@@ -244,7 +252,15 @@ final class ExtensionStore {
         Task {
             await applyToAgent()
             if let client = await currentClient() {
-                try? await client.disconnectMCPServer(name: name)
+                do {
+                    try await client.disconnectMCPServer(name: name)
+                } catch {
+                    AppLog.extensions.error(
+                        "MCP server removal could not be applied on the backend; the registry was kept"
+                    )
+                    status = .failure("“\(name)” could not be removed on the backend.")
+                    return
+                }
             }
             status = .info("“\(name)” removed.")
         }

@@ -10,6 +10,10 @@ import SwiftUI
 /// text or a code block.
 struct PlanDocumentView: View {
     let markdown: String
+    /// Akış sırasında gövde kare kare büyür; bitmiş turda boş çit model
+    /// hatasıdır. Boş gövde iki durumda da aynı karttır, yalnız satırın dili
+    /// duruma göre seçilir.
+    let isStreaming: Bool
 
     @Environment(SettingsStore.self) private var settingsStore: SettingsStore?
     @Environment(\.colorScheme) private var systemColorScheme
@@ -38,14 +42,25 @@ struct PlanDocumentView: View {
                 .fill(preset.border(isDark: isDark))
                 .frame(height: 1)
 
-            // The body is parsed with plan documents disabled: a stray fence
-            // inside a plan is a code block, never a nested sheet.
-            MarkdownContentView(markdown: markdown, allowsPlanDocuments: false)
-                .padding(.horizontal, 18)
-                .padding(.vertical, 14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .foregroundStyle(.primary)
+            if hasVisibleContent {
+                // The body is parsed with plan documents disabled: a stray fence
+                // inside a plan is a code block, never a nested sheet.
+                MarkdownContentView(markdown: markdown, allowsPlanDocuments: false)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .foregroundStyle(.primary)
+            } else {
+                loadingRow
+            }
         }
+        // Kart yalnız içeriği kadar yer tutar: boş gövde dalı (`loadingRow`)
+        // esnek boy önerisini dolduracak genişleyen çocuk bırakmaz, o yüzden
+        // ayrıca ideal-boy kilidi gerekmez. `.fixedSize(vertical: true)` burada
+        // AppKit destekli satırların ideal boyunu yerleşim döngüsünün içine
+        // sokuyordu: ölçü → kısıt turu → yeniden ölçü zinciri ana iş
+        // parçacığını döndürüp "Yanıt Vermiyor"a ve 367-turlu kısıt istisnasına
+        // (bug 309) gidiyordu. Dal değişimi görsel davranışı aynen korur.
         .background(
             pageBackground,
             in: RoundedRectangle(cornerRadius: 12, style: .continuous)
@@ -76,6 +91,30 @@ struct PlanDocumentView: View {
         )
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Plan document")
+    }
+
+    /// Görünür karakter yoksa (akışta çit yeni açıldı ya da model boş
+    /// kapattı) ölçülecek gövde yoktur: boş metin görünümü esnek boyda
+    /// şişmek yerine sabit küçük satıra düşer. Tanım transkripttekiyle
+    /// aynıdır, tek yerde durur.
+    private var hasVisibleContent: Bool {
+        ConversationDetailView.containsVisibleText(markdown)
+    }
+
+    private var loadingRow: some View {
+        HStack(spacing: 8) {
+            if isStreaming {
+                ProgressView()
+                    .controlSize(.small)
+            }
+
+            Text(isStreaming ? "Plan hazırlanıyor…" : "Plan içeriği boş.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var header: some View {

@@ -99,8 +99,10 @@ protocol ComputerUseSetupRunning: Sendable {
 
 /// Spawns `npm` for a setup step and streams its output.
 ///
-/// `/usr/bin/env` resolves `npm` from `PATH`, so Homebrew and `nvm` installs
-/// both work without the app guessing a path — and no shell is involved.
+/// `npm` mutlak yoldan koşar (`locateNpm` + temizlenmiş PATH): `/usr/bin/env`
+/// ile PATH'ten çözüm, kullanıcı-yazılabilir dizindeki bir shimi uygulama
+/// yetkisiyle çalıştırırdı. Temiz dizinlerde `npm` yoksa adım başlatılmaz
+/// (127) ve kartta söylenir; sessizce düşülmez. Kabuk hiç kullanılmaz.
 final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Sendable {
     private let lock = NSLock()
     private var currentProcess: Process?
@@ -117,11 +119,34 @@ final class SystemComputerUseSetupRunner: ComputerUseSetupRunning, @unchecked Se
         in directoryURL: URL,
         onLine: @escaping @Sendable (String) -> Void
     ) async -> ComputerUseSetupOutcome {
+        var environment = FoundationOpenCodeProcessLauncher.childEnvironment(overrides: [:])
+        let bundlePath = Bundle.main.bundlePath
+        guard
+            let npmURL = ComputerUseConfiguration.locateNpm(
+                environment: environment,
+                fileManager: .default,
+                bundlePath: bundlePath
+            )
+        else {
+            onLine("npm bulunamadı (temizlenmiş sistem dizinlerinde yok); adım başlatılmadı.")
+            return ComputerUseSetupOutcome(
+                step: step,
+                exitCode: 127,
+                didLaunch: false,
+                didCancel: false
+            )
+        }
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["npm"] + step.arguments
+        process.executableURL = npmURL
+        process.arguments = step.arguments
         process.currentDirectoryURL = directoryURL
-        process.environment = FoundationOpenCodeProcessLauncher.childEnvironment(overrides: [:])
+        // Çocuk, temizlenmiş PATH ile koşar: npm betikleri de aynı kısıtlı
+        // kümeyi görür.
+        environment["PATH"] = ComputerUseConfiguration.sanitizedSearchDirectories(
+            environment: environment,
+            bundlePath: bundlePath
+        ).joined(separator: ":")
+        process.environment = environment
         // npm must never wait for input; the app has no terminal to answer with.
         process.standardInput = FileHandle.nullDevice
 

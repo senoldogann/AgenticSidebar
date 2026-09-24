@@ -118,91 +118,91 @@ final class VerificationPreflightTests: XCTestCase {
         XCTAssertFalse(failure.message.contains("Bozuk"))
     }
 
-// MARK: - Denetçi okuma uyarısı (M3)
+    // MARK: - Denetçi okuma uyarısı (M3)
 
-private struct ThrowingAcceptanceEvidence: TaskAcceptanceEvidenceProviding {
-    func acceptanceEvidence(taskID: UUID) async throws -> TaskAcceptanceEvidence {
-        throw TaskEvidenceLedgerError.evidenceNotLoadedInThisProcess
-    }
-}
-
-/// M3: "henüz koşmadı" ile "yükleme patladı" aynı `nil` değildir; koşmuş
-/// görevin kaybolan girdisi `warning` ile yüzeye çıkar, koşmamış görevde
-/// yokluk normaldir ve uyarı üretilmez.
-final class InspectorWarningTests: XCTestCase {
-    private func makeService(
-        evidence: any TaskAcceptanceEvidenceProviding,
-        harness: ServiceTestHarness
-    ) -> CodingTaskService {
-        let recovery = TaskRecovery(
-            repository: harness.repository,
-            providers: NoProviderSessions(),
-            workspaces: NoWorkspaceOwnership(),
-            processes: NoProcesses(),
-            clock: harness.clock,
-            recoveryID: "recovery-inspector-warning"
-        )
-        return CodingTaskService(
-            repository: harness.repository,
-            scheduler: harness.scheduler,
-            recovery: recovery,
-            providers: harness.providers,
-            acceptanceEvidence: evidence,
-            executionFingerprints: FixedExecutionFingerprints(fingerprint: "fingerprint-1", failure: nil, gate: nil),
-            clock: harness.clock,
-            requiredSteps: ["build"],
-            liveDispatchAvailable: false
-        )
+    private struct ThrowingAcceptanceEvidence: TaskAcceptanceEvidenceProviding {
+        func acceptanceEvidence(taskID: UUID) async throws -> TaskAcceptanceEvidence {
+            throw TaskEvidenceLedgerError.evidenceNotLoadedInThisProcess
+        }
     }
 
-    func testInspectorWarnsWhenRanTaskEvidenceCannotLoad() async throws {
-        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
-        let plain = harness.makeService()
-        let project = try await plain.createProject(
-            name: "Board",
-            repositoryPath: "/tmp/agentic-sidebar-service-tests/repo",
-            gitIdentity: "dev@example.com",
-            protectedRefs: ["main"]
-        )
-        let seeded = try await harness.seedReviewTask(
-            projectID: project.id,
-            criteriaCompleted: true,
-            evidence: []
-        )
-        let service = makeService(evidence: ThrowingAcceptanceEvidence(), harness: harness)
+    /// M3: "henüz koşmadı" ile "yükleme patladı" aynı `nil` değildir; koşmuş
+    /// görevin kaybolan girdisi `warning` ile yüzeye çıkar, koşmamış görevde
+    /// yokluk normaldir ve uyarı üretilmez.
+    final class InspectorWarningTests: XCTestCase {
+        private func makeService(
+            evidence: any TaskAcceptanceEvidenceProviding,
+            harness: ServiceTestHarness
+        ) -> CodingTaskService {
+            let recovery = TaskRecovery(
+                repository: harness.repository,
+                providers: NoProviderSessions(),
+                workspaces: NoWorkspaceOwnership(),
+                processes: NoProcesses(),
+                clock: harness.clock,
+                recoveryID: "recovery-inspector-warning"
+            )
+            return CodingTaskService(
+                repository: harness.repository,
+                scheduler: harness.scheduler,
+                recovery: recovery,
+                providers: harness.providers,
+                acceptanceEvidence: evidence,
+                executionFingerprints: FixedExecutionFingerprints(fingerprint: "fingerprint-1", failure: nil, gate: nil),
+                clock: harness.clock,
+                requiredSteps: ["build"],
+                liveDispatchAvailable: false
+            )
+        }
 
-        let inputs = await service.inspectorInputs(taskID: seeded.task.id)
+        func testInspectorWarnsWhenRanTaskEvidenceCannotLoad() async throws {
+            let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+            let plain = harness.makeService()
+            let project = try await plain.createProject(
+                name: "Board",
+                repositoryPath: "/tmp/agentic-sidebar-service-tests/repo",
+                gitIdentity: "dev@example.com",
+                protectedRefs: ["main"]
+            )
+            let seeded = try await harness.seedReviewTask(
+                projectID: project.id,
+                criteriaCompleted: true,
+                evidence: []
+            )
+            let service = makeService(evidence: ThrowingAcceptanceEvidence(), harness: harness)
 
-        XCTAssertNil(inputs.evidence)
-        XCTAssertNotNil(inputs.workspaceID)
-        XCTAssertNotNil(inputs.warning)
-        XCTAssertTrue(inputs.warning?.contains("yeniden başlatıldı") == true)
+            let inputs = await service.inspectorInputs(taskID: seeded.task.id)
+
+            XCTAssertNil(inputs.evidence)
+            XCTAssertNotNil(inputs.workspaceID)
+            XCTAssertNotNil(inputs.warning)
+            XCTAssertTrue(inputs.warning?.contains("yeniden başlatıldı") == true)
+        }
+
+        func testInspectorStaysQuietForNeverRanTask() async throws {
+            let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
+            let plain = harness.makeService()
+            let project = try await plain.createProject(
+                name: "Board",
+                repositoryPath: "/tmp/agentic-sidebar-service-tests/repo",
+                gitIdentity: "dev@example.com",
+                protectedRefs: ["main"]
+            )
+            let task = try await plain.createTask(
+                projectID: project.id,
+                title: "Task",
+                objective: "Objective",
+                priority: 1,
+                criteria: []
+            )
+            let service = makeService(evidence: ThrowingAcceptanceEvidence(), harness: harness)
+
+            let inputs = await service.inspectorInputs(taskID: task.id)
+
+            XCTAssertNil(inputs.evidence)
+            XCTAssertNil(inputs.warning)
+        }
     }
-
-    func testInspectorStaysQuietForNeverRanTask() async throws {
-        let harness = try ServiceTestHarness(workspace: .owned(TaskBoardServiceFixtures.ownedWorkspace))
-        let plain = harness.makeService()
-        let project = try await plain.createProject(
-            name: "Board",
-            repositoryPath: "/tmp/agentic-sidebar-service-tests/repo",
-            gitIdentity: "dev@example.com",
-            protectedRefs: ["main"]
-        )
-        let task = try await plain.createTask(
-            projectID: project.id,
-            title: "Task",
-            objective: "Objective",
-            priority: 1,
-            criteria: []
-        )
-        let service = makeService(evidence: ThrowingAcceptanceEvidence(), harness: harness)
-
-        let inputs = await service.inspectorInputs(taskID: task.id)
-
-        XCTAssertNil(inputs.evidence)
-        XCTAssertNil(inputs.warning)
-    }
-}
 
     /// H2: çözümleme düşerse rapor `passed:false` döner, ham yol karta
     /// sızmaz ve başarısızlık kanıt satırı olarak mağazaya yazılır.

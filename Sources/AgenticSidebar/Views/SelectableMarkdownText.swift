@@ -468,7 +468,12 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
     /// block that lost its "last" status.
     ///
     /// The final block carries no paragraph spacing and every earlier one does, so
-    /// appending a block also changes the one before it. The rebuild starts there.
+    /// appending blocks also changes the one before them. The rebuild starts there.
+    /// `min(index, next.count - 2)` alone only pulls back when the change is
+    /// inside the last block; appending two or more blocks at once (a single
+    /// streaming flush) leaves `index == previous.count` and the old last block
+    /// keeps spacing 0, so the run measures 10 pt short per flush and its tail
+    /// clips. Growing runs therefore always pull back to the old last block.
     private static func firstChangedBlockIndex(
         previous: [MarkdownBlock],
         next: [MarkdownBlock]
@@ -478,7 +483,11 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             index += 1
         }
 
-        return max(0, min(index, next.count - 2))
+        var startIndex = max(0, min(index, next.count - 2))
+        if next.count > previous.count, !previous.isEmpty {
+            startIndex = min(startIndex, previous.count - 1)
+        }
+        return startIndex
     }
 
     func sizeThatFits(

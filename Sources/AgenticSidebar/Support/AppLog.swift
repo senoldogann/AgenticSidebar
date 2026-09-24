@@ -17,4 +17,7 @@ enum AppLog {
     static let settings = Logger(subsystem: subsystem, category: "Settings")
     static let credentials = Logger(subsystem: subsystem, category: "Credentials")
     static let extensions = Logger(subsystem: subsystem, category: "Extensions")
+    static let taskBoard = Logger(subsystem: subsystem, category: "TaskBoard")
+    /// Sağ panel sekmeleri: tarayıcı, iOS Simülatörü ve bilgisayar canlı görüntüsü.
+    static let panels = Logger(subsystem: subsystem, category: "Panels")
 }

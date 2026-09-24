@@ -43,7 +43,7 @@ final class PaneIsolationTests: XCTestCase {
     }
 
     @MainActor
-    func testRunningThinkingIsExpandedByDefaultWhileTurnRuns() {
+    func testRunningThinkingIsCollapsedByDefaultWhileTurnRuns() {
         let store = TimelineCollapseStore()
         let thinking = AgentActivity(
             id: ProviderActivityID(UUID().uuidString),
@@ -56,7 +56,7 @@ final class PaneIsolationTests: XCTestCase {
             startedAt: Date(),
             completedAt: nil
         )
-        XCTAssertTrue(store.isActivityExpanded(thinking, groupID: UUID(), sessionID: UUID(), isTurnRunning: true))
+        XCTAssertFalse(store.isActivityExpanded(thinking, groupID: UUID(), sessionID: UUID(), isTurnRunning: true))
     }
 
     @MainActor
@@ -94,7 +94,7 @@ final class PaneIsolationTests: XCTestCase {
             completedAt: nil
         )
         store.toggleActivity(running, groupID: group, sessionID: session, isTurnRunning: true)
-        XCTAssertFalse(store.isActivityExpanded(running, groupID: group, sessionID: session, isTurnRunning: true))
+        XCTAssertTrue(store.isActivityExpanded(running, groupID: group, sessionID: session, isTurnRunning: true))
         let completed = AgentActivity(
             id: id,
             kind: .thinking,
@@ -106,8 +106,9 @@ final class PaneIsolationTests: XCTestCase {
             startedAt: Date(),
             completedAt: Date()
         )
-        store.toggleActivity(completed, groupID: group, sessionID: session, isTurnRunning: true)
         XCTAssertTrue(store.isActivityExpanded(completed, groupID: group, sessionID: session, isTurnRunning: true))
+        store.toggleActivity(completed, groupID: group, sessionID: session, isTurnRunning: true)
+        XCTAssertFalse(store.isActivityExpanded(completed, groupID: group, sessionID: session, isTurnRunning: true))
     }
 
     @MainActor

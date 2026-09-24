@@ -72,11 +72,14 @@ enum PromptEnhancer {
         )
         let tags = Array(tagNames.prefix(maximumContextNames)).filter { !$0.isEmpty }
         if !tags.isEmpty {
-            sections.append("Turn context the user already tagged: \(tags.joined(separator: ", ")). Refer to them, do not ask for them again.")
+            sections.append(
+                "Turn context the user already tagged: \(tags.joined(separator: ", ")). Refer to them, do not ask for them again.")
         }
         let attachments = Array(attachmentNames.prefix(maximumContextNames)).filter { !$0.isEmpty }
         if !attachments.isEmpty {
-            sections.append("Attached files the assistant can already read: \(attachments.joined(separator: ", ")). Refer to them by name, do not ask for their content.")
+            sections.append(
+                "Attached files the assistant can already read: \(attachments.joined(separator: ", ")). Refer to them by name, do not ask for their content."
+            )
         }
         sections.append("User draft:\n\(trimmed)")
         return sections.joined(separator: "\n\n")

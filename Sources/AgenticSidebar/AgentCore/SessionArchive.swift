@@ -22,6 +22,9 @@ struct SessionSnapshot: Codable, Equatable, Sendable {
     /// Eski arşivlerde yoktur; yoklukları "henüz özetlenmedi" demektir.
     var contextSummary: String = ""
     var summarizedThroughMessageID: UUID? = nil
+    /// Oturumun bağlı olduğu klasörün dosya yolu; `nil` = klasörsüz oturum.
+    /// Eski arşivlerde yoktur, yokluğu seçimsiz davranıştır.
+    var workingDirectoryPath: String? = nil
 }
 
 extension SessionSnapshot {
@@ -45,7 +48,8 @@ extension SessionSnapshot {
             isPinned: try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false,
             queuedPrompts: try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? [],
             contextSummary: try container.decodeIfPresent(String.self, forKey: .contextSummary) ?? "",
-            summarizedThroughMessageID: try container.decodeIfPresent(UUID.self, forKey: .summarizedThroughMessageID)
+            summarizedThroughMessageID: try container.decodeIfPresent(UUID.self, forKey: .summarizedThroughMessageID),
+            workingDirectoryPath: try container.decodeIfPresent(String.self, forKey: .workingDirectoryPath)
         )
     }
 
@@ -292,8 +296,16 @@ struct SessionArchiveStore: Sendable {
             .deletingPathExtension()
             .appendingPathExtension("corrupt.json")
 
-        try? fileManager.removeItem(at: damagedURL)
-        try? fileManager.moveItem(at: fileURL, to: damagedURL)
+        do {
+            if fileManager.fileExists(atPath: damagedURL.path) {
+                try fileManager.removeItem(at: damagedURL)
+            }
+            try fileManager.moveItem(at: fileURL, to: damagedURL)
+        } catch {
+            AppLog.agentSession.error(
+                "Session archive could not be moved aside; the unreadable file was left in place"
+            )
+        }
     }
 
     private static func makeDecoder() -> JSONDecoder {

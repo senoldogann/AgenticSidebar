@@ -15,24 +15,43 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
     /// servisini (`Sendable` olmayan) yakalar.
     var onSelectSession: (@MainActor (UUID) -> Void)?
 
-    private let center: UNUserNotificationCenter
+    private var center: UNUserNotificationCenter?
+    /// İzin isteği bir kez yapılır; sonrası kayıtlı kararla sürer. `post`
+    /// eşzamanlı kaldığı için ilk istek ateşle-unut bir görevde koşar, ekleme
+    /// iznin arkasına zincirlenir — ilk bildirim izin yarışına girmez.
+    private var authorizationRequested = false
 
     /// Son bitiş zilinin zamanı; 3-4 oturum aynı anda bitince her zil
     /// AudioToolbox HAL kurulumunu senkron tetikler ve ana iş parçacığı
     /// üst üste tutulur (örneklemde ~220ms). Patlama anında tek zil çalar.
     private var lastCompletionSoundAt: Date?
 
-    override init() {
-        self.center = UNUserNotificationCenter.current()
-        super.init()
+    /// Merkezi ilk kullanımda kurar; `init` saf kalır.
+    ///
+    /// `UNUserNotificationCenter.current()` açılışta eşzamanlı çağrıldığında
+    /// yakalanamaz bir ObjC istisnasıyla süreci öldürüyordu (bug 309:
+    /// `currentNotificationCenter` içindeki `NSCalendarDate initWithCoder`
+    /// çözümü patlıyor, `SessionNotificationService.init:26`,
+    /// `AgenticSidebarApp.init:137`). Swift ObjC istisnasını yakalayamaz, o
+    /// yüzden savunma çağrıyı açılış yolundan çekmektir: ilk dokunuş ilk
+    /// biten turun bildirimiyle olur. Temsilci, bildirimin akabileceği ilk
+    /// andan önce atanır; davranış korunur.
+    private func ensureCenter() -> UNUserNotificationCenter {
+        if let center {
+            return center
+        }
+        let center = UNUserNotificationCenter.current()
         center.delegate = self
+        self.center = center
+        return center
     }
 
     /// Requests macOS user notification permissions if not yet granted.
     @discardableResult
     func requestAuthorization() async -> Bool {
+        authorizationRequested = true
         do {
-            return try await center.requestAuthorization(options: [.alert, .sound, .badge])
+            return try await ensureCenter().requestAuthorization(options: [.alert, .sound, .badge])
         } catch {
             return false
         }
@@ -99,8 +118,17 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
             trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
         )
 
-        center.add(request) { error in
-            if let error {
+        // İzin açılışta değil ilk bildirimde istenir: açılış yolunda Apple
+        // API'sine hiç dokunulmaz (yukarıdaki çökme), istek hâlâ eklemeden
+        // önce tamamlanır. İmza eşzamanlı kalır, arayan değişmez.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if !self.authorizationRequested {
+                _ = await self.requestAuthorization()
+            }
+            do {
+                try await self.ensureCenter().add(request)
+            } catch {
                 AppLog.agentSession.error("Failed to deliver session notification: \(error.localizedDescription, privacy: .public)")
             }
         }

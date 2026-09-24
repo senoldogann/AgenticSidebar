@@ -463,7 +463,7 @@ struct TaskDetailView: View {
     private func loadedPane(_ detail: TaskBoardTaskDetail) -> some View {
         VStack(spacing: 0) {
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 14) {
+                LazyVStack(alignment: .leading, spacing: 12) {
                     headerSection(detail)
 
                     if !detail.criteria.isEmpty {
@@ -483,21 +483,25 @@ struct TaskDetailView: View {
                     )
                     approvalSection(detail)
                 }
-                .padding(12)
+                .padding(14)
             }
 
-            Divider().opacity(0.35)
+            VStack(spacing: 0) {
+                Divider().opacity(0.35)
 
-            actorField
+                actorField
 
-            TaskActionBar(
-                store: store,
-                taskID: detail.card.id,
-                actor: actor,
-                feedback: feedback,
-                preset: preset,
-                isDark: isDark
-            )
+                TaskActionBar(
+                    store: store,
+                    taskID: detail.card.id,
+                    actor: actor,
+                    feedback: feedback,
+                    preset: preset,
+                    isDark: isDark
+                )
+            }
+            .background((isDark ? preset.surfaceDark : preset.surfaceLight).opacity(0.85))
+            .padding(.bottom, 4)
         }
     }
 
@@ -553,13 +557,19 @@ struct TaskDetailView: View {
 
     private func headerSection(_ detail: TaskBoardTaskDetail) -> some View {
         let card = TaskBoardPresenter.card(detail.card, verification: .notLoaded)
-        return VStack(alignment: .leading, spacing: 6) {
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Text(card.statusLabel)
                     .font(.system(size: 10.5, weight: .semibold))
                     .foregroundStyle(preset.accentGradient.first ?? .accentColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        (preset.accentGradient.first ?? .accentColor).opacity(isDark ? 0.20 : 0.12),
+                        in: Capsule()
+                    )
                 Text(card.stageLabel)
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
                 Text("sürüm \(detail.card.version)")
@@ -568,10 +578,11 @@ struct TaskDetailView: View {
             }
 
             Text(detail.card.title)
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 17, weight: .semibold))
+                .lineSpacing(1)
 
             Text(detail.card.objective)
-                .font(.system(size: 11.5))
+                .font(.system(size: 12.5))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
@@ -659,14 +670,15 @@ struct TaskDetailView: View {
                     .accessibilityLabel("Ölçüt güncellenemedi: \(criterionFailureMessage)")
             }
             ForEach(TaskDetailPresenter.criteria(detail)) { criterion in
-                HStack(alignment: .top, spacing: 6) {
+                HStack(alignment: .top, spacing: 8) {
                     Button {
                         toggleCriterion(detail.card.id, criterionID: criterion.id, isCompleted: criterion.isCompleted)
                     } label: {
                         Image(systemName: criterion.isCompleted ? "checkmark.circle.fill" : "circle")
-                            .font(.system(size: 11))
+                            .font(.system(size: 13))
                             .foregroundStyle(criterion.isCompleted ? Color.green : Color.secondary)
                             .contentShape(Rectangle())
+                            .frame(minWidth: 24, minHeight: 24)
                     }
                     .buttonStyle(.plain)
                     .disabled(store.isActionInFlight(for: detail.card.id))
@@ -677,15 +689,17 @@ struct TaskDetailView: View {
                             ? "\(criterion.text). Tamamlandı işaretini geri al"
                             : "\(criterion.text). Tamamlandı işaretle"
                     )
-                    VStack(alignment: .leading, spacing: 1) {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(criterion.text)
-                            .font(.system(size: 11.5))
+                            .font(.system(size: 12))
                             .strikethrough(criterion.isCompleted, color: .secondary)
                         Text(criterion.evidenceLabel)
-                            .font(.system(size: 10))
+                            .font(.system(size: 10.5))
                             .foregroundStyle(.tertiary)
                     }
+                    Spacer(minLength: 0)
                 }
+                .padding(.vertical, 3)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel(criterion.accessibilityLabel)
             }
@@ -777,13 +791,17 @@ struct TaskDetailView: View {
 
                 if !summary.isWired {
                     if detail.card.status == .review {
-                        Text("Bu görev incelemede ama kanıt bu süreçte görünmüyor — uygulama yeniden başlatıldıysa normaldir; kanıtı görmek için koşunun bu açılışta üretilmesi gerekir")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "Bu görev incelemede ama kanıt bu süreçte görünmüyor — uygulama yeniden başlatıldıysa normaldir; kanıtı görmek için koşunun bu açılışta üretilmesi gerekir"
+                        )
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
                     } else {
-                        Text("Henüz kanıt yok — görev çalışıp doğrulama ürettiğinde burada listelenir; o zamana dek yeşil rozet gösterilmez")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "Henüz kanıt yok — görev çalışıp doğrulama ürettiğinde burada listelenir; o zamana dek yeşil rozet gösterilmez"
+                        )
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
                     }
                 }
 
@@ -885,46 +903,59 @@ struct TaskDetailView: View {
     }
 
     private var actorField: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
                 Image(systemName: "person.crop.circle")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 TextField("İnceleyen adı", text: $actor)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 11.5))
+                    .font(.system(size: 12))
                     .help("Başlatma ve kabul, onayı size bağlamak için adınızı ister")
                     .accessibilityLabel("İnceleyen insan aktör adı")
-                Divider().frame(height: 14).opacity(0.4)
+                Divider().frame(height: 16).opacity(0.4)
                 Image(systemName: "text.bubble")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                 TextField("Değişiklik geri bildirimi", text: $feedback)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 11.5))
+                    .font(.system(size: 12))
                     .accessibilityLabel("Değişiklik isteği geri bildirimi")
             }
             if actor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text("Başlatma ve kabul için adınızı yazın — onay size bağlanır, bir kez yazmanız yeterli")
-                    .font(.system(size: 10))
+                    .font(.system(size: 10.5))
                     .foregroundStyle(.tertiary)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
     }
 
     private func section<Content: View>(
         title: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title.uppercased())
+                .font(.system(size: 10.5, weight: .semibold))
+                .tracking(0.4)
+                .foregroundStyle(.tertiary)
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            (isDark ? preset.surfaceDark : preset.surfaceLight).opacity(isDark ? 0.6 : 0.85),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(
+                    (isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.8),
+                    lineWidth: 1
+                )
+        )
         .accessibilityElement(children: .contain)
         .accessibilityLabel(title)
     }
@@ -996,9 +1027,9 @@ private struct TaskEditSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             Text("Görevi düzenle")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
 
             Text("Yalnızca üstveri değişir; durum, aşama ve ölçütler aynen kalır.")
                 .font(.system(size: 11))
@@ -1065,8 +1096,8 @@ private struct TaskEditSheet: View {
                     .accessibilityLabel(isSubmitting ? "Görev kaydediliyor" : "Değişiklikleri kaydet")
             }
         }
-        .padding(16)
-        .frame(width: 440)
+        .padding(20)
+        .frame(width: 460)
         .background(preset.background(isDark: isDark))
     }
 

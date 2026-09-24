@@ -10,9 +10,20 @@ struct InspectorTabsContainerView: View {
     /// Terminal sekmelerinin kabukları burada yaşar; sekme değişiminde kabuk
     /// kapanmaz, sekme kapanınca kapatılır.
     let terminalCenter: TerminalServiceCenter
+    /// Tarayıcı sekmelerinin sayfaları burada yaşar; terminal kabuklarıyla
+    /// aynı sözleşme.
+    let browserCenter: BrowserServiceCenter
+    /// iOS Simülatörü sekmesinin cihaz seçimi ve canlı görüntüsü.
+    let simulatorService: SimulatorService
+    /// Bilgisayar kullanımı canlı görüntüsünün kareleri.
+    let computerLiveService: ComputerLiveCaptureService
+    /// Canlı bilgisayar sekmesinin gösterdiği durum (odaklı oturumdan türetilir).
+    let computerLiveState: ComputerLiveState
     let onSelectTab: (String) -> Void
     let onCloseTab: (String) -> Void
     let onToggleExpand: () -> Void
+    /// Paneli dar ikon şeridine indirir; şeritteki ikon geri açar.
+    let onToggleCollapse: () -> Void
     let onCloseAll: () -> Void
 
     private var activeTab: InspectorTab? {
@@ -64,6 +75,19 @@ struct InspectorTabsContainerView: View {
                 .frame(height: 16)
                 .opacity(0.3)
                 .padding(.horizontal, 4)
+
+            Button {
+                onToggleCollapse()
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .interactiveHoverCircle()
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("Collapse side panel to icons")
 
             Button {
                 onToggleExpand()
@@ -221,6 +245,38 @@ struct InspectorTabsContainerView: View {
                 center: terminalCenter,
                 tabID: id,
                 workingDirectoryPath: workingDirectory,
+                preset: preset,
+                isDark: isDark,
+                onDismiss: {
+                    onCloseTab(tab.id)
+                }
+            )
+
+        case .browser:
+            BrowserPanelView(
+                center: browserCenter,
+                tabID: tab.id,
+                preset: preset,
+                isDark: isDark,
+                onDismiss: {
+                    onCloseTab(tab.id)
+                }
+            )
+
+        case .simulator:
+            SimulatorPanelView(
+                service: simulatorService,
+                preset: preset,
+                isDark: isDark,
+                onDismiss: {
+                    onCloseTab(tab.id)
+                }
+            )
+
+        case .computerLive:
+            ComputerLivePanelView(
+                service: computerLiveService,
+                state: computerLiveState,
                 preset: preset,
                 isDark: isDark,
                 onDismiss: {

@@ -291,7 +291,7 @@ struct MarkdownContentView: View {
             )
 
         case .plan(_, let content):
-            PlanDocumentView(markdown: content)
+            PlanDocumentView(markdown: content, isStreaming: isStreaming)
 
         case .solution(_, let content):
             SolutionDocumentView(markdown: content)

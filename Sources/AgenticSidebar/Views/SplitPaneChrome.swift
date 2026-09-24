@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
 /// (odakla/değiştir/kapat) burada durur.
 struct SplitPaneHeader: View {
     let title: String
+    /// Bağlı klasörün tam yolu; başlık ipucu ve erişilebilirlik için kullanılır.
+    var directoryPath: String? = nil
     let isBusy: Bool
     /// Birincil bölme zaten ana sohbettir: odakla/kapat düğmesi yoktur.
     var onFocus: (() -> Void)? = nil
@@ -20,6 +22,16 @@ struct SplitPaneHeader: View {
     /// İkincil bölmenin terminal düğmesi; pencere araç çubuğundaki düğme
     /// yalnız birincil bölmenindir, yoksa iki simge yan yana dizilir.
     var onOpenTerminal: (() -> Void)? = nil
+    /// İkincil bölmenin diğer inspector sekmeleri: araç çubuğu yalnız birincil
+    /// bölmeye düğme koyduğu için bu üçü bölme başlığından açılır.
+    var onOpenComputerLive: (() -> Void)? = nil
+    var onOpenSimulator: (() -> Void)? = nil
+    var onOpenBrowser: (() -> Void)? = nil
+    /// Bölmenin oturumundaki dosya değişikliklerini sağ panelde açar. Yalnız
+    /// değişiklik varken bağlıdır; düğme ve menü öğesi o zaman çizilir.
+    var onOpenSessionChanges: (() -> Void)? = nil
+    /// Oturumda review edilecek dosya değişikliği var mı (nokta/düğme kapısı).
+    var hasFileChanges: Bool = false
 
     @Environment(\.paneWidth) private var paneWidth
 
@@ -48,6 +60,7 @@ struct SplitPaneHeader: View {
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .help(directoryPath ?? title)
 
             Spacer(minLength: 0)
 
@@ -65,6 +78,44 @@ struct SplitPaneHeader: View {
                     .buttonStyle(.plain)
                     .pointingHandCursor()
                     .help("Open a terminal in this conversation's side panel")
+                }
+
+                if let onOpenSessionChanges, hasFileChanges {
+                    Button(action: onOpenSessionChanges) {
+                        Image(systemName: "doc.badge.plus")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, height: 24)
+                            .interactiveHoverCircle()
+                            .overlay(alignment: .topTrailing) {
+                                Circle()
+                                    .fill(Color.accentColor)
+                                    .frame(width: 6, height: 6)
+                                    .offset(x: -3, y: 3)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .pointingHandCursor()
+                    .help("Review this conversation's file changes in the side panel")
+                    .accessibilityLabel("Review file changes")
+                }
+
+                if hasPanelActions {
+                    Menu {
+                        panelActionItems
+                    } label: {
+                        Image(systemName: "sidebar.right")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24, height: 24)
+                            .interactiveHoverCircle()
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .pointingHandCursor()
+                    .help("Open a panel in this conversation's side panel")
+                    .accessibilityLabel("Open panel")
                 }
 
                 if showsSwap {
@@ -119,6 +170,38 @@ struct SplitPaneHeader: View {
         .accessibilityLabel("Side-by-side conversation: \(title)")
     }
 
+    /// Panel eylemlerinden en az biri bağlı mı? Menü düğmesi yoksa çizilmez.
+    private var hasPanelActions: Bool {
+        onOpenComputerLive != nil || onOpenSimulator != nil || onOpenBrowser != nil
+            || (onOpenSessionChanges != nil && hasFileChanges)
+    }
+
+    /// Bölme başlığındaki panel eylemleri: hem geniş başlığın menüsünde hem
+    /// dar başlığın taşma menüsünde aynı öğeler durur.
+    @ViewBuilder
+    private var panelActionItems: some View {
+        if let onOpenSessionChanges, hasFileChanges {
+            Button(action: onOpenSessionChanges) {
+                Label("Review file changes", systemImage: "doc.badge.plus")
+            }
+        }
+        if let onOpenComputerLive {
+            Button(action: onOpenComputerLive) {
+                Label("Watch computer use live", systemImage: "computermouse")
+            }
+        }
+        if let onOpenSimulator {
+            Button(action: onOpenSimulator) {
+                Label("Open iOS Simulator", systemImage: "iphone")
+            }
+        }
+        if let onOpenBrowser {
+            Button(action: onOpenBrowser) {
+                Label("Open browser", systemImage: "globe")
+            }
+        }
+    }
+
     /// Dar başlıkta görünen tek satır: kapat düğmesi + taşma menüsü.
     private var compactActions: some View {
         HStack(spacing: 2) {
@@ -128,6 +211,7 @@ struct SplitPaneHeader: View {
                         Label("Open terminal in side panel", systemImage: "terminal")
                     }
                 }
+                panelActionItems
                 if showsSwap {
                     Button(action: onSwap) {
                         Label("Swap the two conversations", systemImage: "arrow.left.arrow.right")

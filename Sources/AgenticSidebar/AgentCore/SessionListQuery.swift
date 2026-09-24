@@ -86,6 +86,8 @@ func filterSortSessions(
     if !trimmedQuery.isEmpty {
         filtered = filtered.filter {
             $0.displayTitle.localizedCaseInsensitiveContains(trimmedQuery)
+                || $0.qualifiedTitle.localizedCaseInsensitiveContains(trimmedQuery)
+                || ($0.workingDirectoryName?.localizedCaseInsensitiveContains(trimmedQuery) ?? false)
         }
     }
 

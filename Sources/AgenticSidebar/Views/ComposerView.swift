@@ -39,6 +39,9 @@ struct ComposerView: View {
     let onStartGoal: ((String, ResponseSpeedMode, AgentMode, [String]) -> Bool)?
     /// File manager injected for path filtering.
     let fileManager: FileManager
+    /// Oturumun klasöründeki git dalları: bestecideki dal seçici buradan
+    /// beslenir; git dışı klasörde ya da klasörsüz oturumda seçici gizlenir.
+    let gitBranchStore: GitBranchStore
     /// 2'li ve 4'lü düzende dikey alan bölünür: bölme genişliği tekli
     /// düzeni andırsa bile besteci minimal çizilir.
     let isDenseLayout: Bool
@@ -47,6 +50,7 @@ struct ComposerView: View {
         sessionService: any AgentSessionServiceProtocol,
         permissionApprovalCenter: PermissionApprovalCenter,
         focusedSessionID: UUID?,
+        gitBranchStore: GitBranchStore,
         onInspectFile: ((URL) -> Void)?,
         onSideQuestion: ((String, ResponseSpeedMode, AgentMode) -> Void)?,
         onStartGoal: ((String, ResponseSpeedMode, AgentMode, [String]) -> Bool)?,
@@ -62,6 +66,7 @@ struct ComposerView: View {
         self.sessionService = sessionService
         self.permissionApprovalCenter = permissionApprovalCenter
         self.focusedSessionID = focusedSessionID
+        self.gitBranchStore = gitBranchStore
         self.onInspectFile = onInspectFile
         self.onSideQuestion = onSideQuestion
         self.onStartGoal = onStartGoal
@@ -333,6 +338,14 @@ struct ComposerView: View {
             }
 
             composerBox
+
+            // Git bağlam şeridi: kutunun altında, içe gömülü ayrı bir
+            // sekme olarak durur; hapın içinde yer yemez, besteci daralmaz.
+            // Yalnız git deposuna bağlı oturumda görünür.
+            if gitBranchStore.isRepository == true {
+                composerContextStrip
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .animation(.easeOut(duration: 0.14), value: visibleTrigger)
         .animation(.easeOut(duration: 0.14), value: focusedSession.queuedPrompts.isEmpty)
@@ -417,8 +430,9 @@ struct ComposerView: View {
         // Dosya URL'si yanında ham görüntü de kabul edilir: macOS ekran
         // görüntüsü önizleme küçük resmi sürüklendiğinde pano dosya URL'si
         // vermez, yalnızca görüntü verisi verir; yalnız `.fileURL` dinlenirse
-        // bırakma sessizce reddedilir.
-        .onDrop(of: [.fileURL, .image], isTargeted: $isTargetedForDrop) { providers in
+        // bırakma sessizce reddedilir. Metin türleri soldaki sohbet
+        // listesinden sürüklenen oturum kimliğini taşır (özet devri).
+        .onDrop(of: [.fileURL, .image, .text, .utf8PlainText], isTargeted: $isTargetedForDrop) { providers in
             handleDrop(providers: providers)
         }
         .onChange(of: extensionStore.registry) { _, _ in
@@ -432,7 +446,13 @@ struct ComposerView: View {
             applyPendingRestore()
         }
         .onChange(of: sessionService.sessionList.map(\.id)) { _, ids in
-            let liveIDs = Set(ids)
+            // Bekleyen taslak listede yoktur ama bestecide yaşar: disk ve
+            // tercihlerden düşürülmez, yoksa başka oturumun her durum
+            // değişimi taslağın Plan/Hızlı seçimini globale sıfırlar.
+            var liveIDs = Set(ids)
+            if let pending = sessionService.pendingSessionID {
+                liveIDs.insert(pending)
+            }
             draftStore?.discardSessions(notIn: liveIDs)
             composerPrefs?.discardSessions(notIn: liveIDs)
             discardDraftsOfRemovedSessions()
@@ -451,6 +471,13 @@ struct ComposerView: View {
         .onAppear {
             restoreStoredDraftIfEmpty()
             applyPendingRestore()
+            gitBranchStore.refreshIfNeeded(directoryPath: focusedSession.workingDirectoryPath)
+        }
+        .onChange(of: focusedSession.id) { _, _ in
+            gitBranchStore.refreshIfNeeded(directoryPath: focusedSession.workingDirectoryPath)
+        }
+        .onChange(of: focusedSession.workingDirectoryPath) { _, _ in
+            gitBranchStore.refreshIfNeeded(directoryPath: focusedSession.workingDirectoryPath)
         }
         .onDisappear {
             // Pane kapanınca tanıyıcı öksüz kalmamalı: mikrofon açık kalır,
@@ -594,7 +621,7 @@ struct ComposerView: View {
                                 )
                             )
 
-                        Text("Drop image or file here")
+                        Text("Drop image, file, or conversation here")
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(.primary)
                     }
@@ -706,9 +733,49 @@ struct ComposerView: View {
                     }
                 }
                 handled = true
+            } else if provider.canLoadObject(ofClass: NSString.self) {
+                // Soldaki sohbet satırı oturum kimliğini düz metin taşır:
+                // kaynağın özeti/context'i taslağa eklenir. Kimlik değilse
+                // sessizce atlanır (başka metin akışı eklenmez).
+                _ = provider.loadObject(ofClass: NSString.self) { text, _ in
+                    let raw = (text as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard let sourceID = UUID(uuidString: raw) else {
+                        return
+                    }
+                    Task { @MainActor in
+                        self.insertSessionHandoff(from: sourceID)
+                    }
+                }
+                handled = true
             }
         }
         return handled
+    }
+
+    /// Soldaki sohbet listesinden bırakılan oturum kimlikleri: kaynağın
+    /// özeti/context'i hedef taslağa eklenir. Aynı sohbetin kendisine
+    /// bırakılması, bulunamayan kaynak ve içeriği boş kaynak yok sayılır.
+    /// Ham geçmiş taşınmaz, yalnız `SessionHandoff` özeti taşınır.
+    private func insertSessionHandoff(from sourceID: UUID) {
+        guard sourceID != focusedSession.id else {
+            return
+        }
+        guard let source = sessionService.session(for: sourceID) else {
+            return
+        }
+        guard
+            let handoff = SessionHandoff.handoffText(
+                sourceTitle: source.title,
+                contextSummary: source.contextSummary,
+                messages: source.state.messages,
+                todos: source.todos,
+                workingDirectoryPath: source.workingDirectoryPath
+            )
+        else {
+            return
+        }
+        draft = ComposerDraftPlacement.merged(existing: draft, restored: handoff)
+        pushDraftToStore()
     }
 
     /// Sağlayıcının sunduğu görüntü türlerinden kayıpsız olana öncelik verir;
@@ -767,6 +834,181 @@ struct ComposerView: View {
             approvalLevelSection
         }
         .fixedSize()
+    }
+
+    /// Git bağlam şeridi: kutunun altına yapışık, iki yanı içe gömülü dar
+    /// bir sekme. Solda klasör (çalışma dizini), sağda dal seçici durur.
+    /// Üst köşeler kareye yakın tutulur ki kutunun devamı gibi okunsun.
+    private var composerContextStrip: some View {
+        HStack(spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: "folder")
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.secondary)
+                Text(checkoutDisplayName)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .help(focusedSession.workingDirectoryPath ?? "")
+
+            Spacer(minLength: 8)
+
+            branchMenuSection
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(
+            currentTheme.surface(isDark: isDarkMode).opacity(0.92),
+            in: UnevenRoundedRectangle(
+                topLeadingRadius: 4,
+                bottomLeadingRadius: 10,
+                bottomTrailingRadius: 10,
+                topTrailingRadius: 4,
+                style: .continuous
+            )
+        )
+        .overlay(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 4,
+                bottomLeadingRadius: 10,
+                bottomTrailingRadius: 10,
+                topTrailingRadius: 4,
+                style: .continuous
+            )
+            .stroke(
+                currentTheme.border(isDark: isDarkMode).opacity(settingsStore.contrast),
+                lineWidth: 1
+            )
+        )
+        // İçe gömülü sekme görünümü: yanlardan dar, üstten kutuya yapışık.
+        .padding(.horizontal, 18)
+        .padding(.top, -composerStackSpacing)
+    }
+
+    /// Şeridin solundaki klasör adı: oturumun çalışma dizininin son
+    /// bileşeni; yol yoksa örnekteki gibi "Local checkout" yazar.
+    private var checkoutDisplayName: String {
+        if let path = focusedSession.workingDirectoryPath,
+            !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            let name = URL(fileURLWithPath: path).lastPathComponent
+            if !name.isEmpty, name != "/" {
+                return name
+            }
+        }
+        return "Local checkout"
+    }
+
+    /// Oturumun klasöründeki git dalı: listeler ve güvenli geçirir.
+    ///
+    /// Seçici yalnız git deposunda görünür (artık kutu altındaki bağlam
+    /// şeridinde). Turuncu nokta izlenen dosyada kayıtsız değişiklik demektir; o hâlde dal değişimi reddedilir
+    /// (yarım iş kaybolmasın), neden menüde yazılır.
+    private var branchMenuSection: some View {
+        let store = gitBranchStore
+
+        return ComposerDropdown(
+            isEnabled: !store.isSwitching,
+            helpText: branchHelpText,
+            accessibilityText: "Git branch: \(store.displayName ?? "unknown")"
+        ) {
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+
+                if !isCompactPane {
+                    Text(store.displayName ?? "…")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+
+                if store.hasDirtyChanges {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 6, height: 6)
+                        .help("\(store.dirtyCount) uncommitted change(s)")
+                }
+
+                if store.isSwitching || store.isRefreshing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.6)
+                        .frame(width: 14, height: 14)
+                } else if !isCompactPane {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, composerPillHorizontal)
+            .padding(.vertical, composerPillVertical)
+            .interactiveHoverPill(cornerRadius: 6)
+        } content: {
+            ComposerDropdownSectionHeader(title: "Branches")
+
+            if store.branches.isEmpty {
+                Text(store.isRefreshing ? "Reading branches…" : "No branches found")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5.5)
+            }
+            ForEach(store.branches, id: \.self) { branch in
+                ComposerDropdownRow(
+                    title: branch,
+                    isSelected: branch == store.currentBranch,
+                    helpText: branch == store.currentBranch
+                        ? "Current branch" : "Switch to \(branch)"
+                ) {
+                    Task {
+                        await store.checkout(branch: branch)
+                    }
+                } icon: {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let errorMessage = store.errorMessage {
+                Text(errorMessage)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5.5)
+            }
+
+            ComposerDropdownRow(
+                title: "Refresh branches",
+                isSelected: false,
+                helpText: "Re-read branches from git"
+            ) {
+                store.forceRefresh()
+            } icon: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var branchHelpText: String {
+        let store = gitBranchStore
+        var parts: [String] = []
+        if let name = store.displayName {
+            parts.append("Branch: \(name)")
+        }
+        if store.hasDirtyChanges {
+            parts.append("\(store.dirtyCount) uncommitted change(s) — switching is paused")
+        } else {
+            parts.append("Switch branches")
+        }
+        return parts.joined(separator: " · ")
     }
 
     /// How much the agent may do without asking, in one line.

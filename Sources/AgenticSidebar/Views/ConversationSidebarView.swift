@@ -75,45 +75,7 @@ struct ConversationSidebarView: View {
 
         List {
             Section("Sessions") {
-                Button {
-                    // Sohbet hemen doğmaz: bekleyen taslak açılır, ilk
-                    // gönderimde gerçek oturum olur. Taslak varsa aynı
-                    // anahtar döner, yazılan korunur.
-                    sessionService.beginPendingSession()
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 12.5, weight: .semibold))
-                            .foregroundStyle(.primary)
-
-                        Text("New session")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.primary)
-
-                        Spacer(minLength: 0)
-
-                        Text("⌘N")
-                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1.5)
-                            .background(
-                                isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.06),
-                                in: RoundedRectangle(cornerRadius: 4, style: .continuous)
-                            )
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 7)
-                    .padding(.horizontal, 10)
-                    .background(
-                        isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05),
-                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    )
-                    .interactiveHoverPill(cornerRadius: 8)
-                }
-                .buttonStyle(.plain)
-                .pointingHandCursor()
-                .help("Start a new session (⌘N)")
-                .accessibilityLabel("New session")
+                newSessionRow
 
                 searchAndFilterControls(
                     shownCount: sessions.all.count,
@@ -258,6 +220,112 @@ struct ConversationSidebarView: View {
         } message: {
             Text("Leave empty to return to the automatic title.")
         }
+    }
+
+    // MARK: - Yeni oturum ve aktif klasör etiketi
+
+    /// Yeni oturum satırı: ana düğme klasörsüz taslak açar (mevcut davranış),
+    /// klasör düğmesi opsiyonel klasör seçtirip taslağı o klasöre bağlar.
+    /// Klasör seçimi zorunlu değildir; seçimsiz kullanım aynen çalışır.
+    @ViewBuilder
+    private var newSessionRow: some View {
+        HStack(spacing: 8) {
+            Button {
+                // Sohbet hemen doğmaz: bekleyen taslak açılır, ilk
+                // gönderimde gerçek oturum olur. Taslak varsa aynı
+                // anahtar döner, yazılan korunur.
+                sessionService.beginPendingSession()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+
+                    Text("New session")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.primary)
+
+                    Spacer(minLength: 0)
+
+                    Text("⌘N")
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
+                        .background(
+                            isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.06),
+                            in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        )
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 7)
+                .padding(.horizontal, 10)
+                .background(
+                    isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .interactiveHoverPill(cornerRadius: 8)
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("Start a new session (⌘N)")
+            .accessibilityLabel("New session")
+
+            Button {
+                if pendingDraftHasDirectory {
+                    // Taslak klasörlüyken aynı düğme klasörü söker: ayrı satır
+                    // kalktığı için sökme işlevi burada yaşar, taslak metni korunur.
+                    sessionService.clearPendingSessionDirectory()
+                } else {
+                    presentSessionFolderPicker()
+                }
+            } label: {
+                Image(systemName: pendingDraftHasDirectory ? "folder.badge.minus" : "folder.badge.plus")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 30, height: 30)
+                    .background(
+                        isDarkMode ? Color.white.opacity(0.08) : Color.black.opacity(0.05),
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+                    .interactiveHoverPill(cornerRadius: 8)
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help(
+                pendingDraftHasDirectory
+                    ? "Remove the folder from this unsent draft (the draft text stays)"
+                    : "Start a new session in a chosen folder (optional)"
+            )
+            .accessibilityLabel(pendingDraftHasDirectory ? "Remove folder from draft" : "New session in folder")
+        }
+    }
+
+    /// Bekleyen taslak bir klasöre bağlı mı (düğme o zaman sökme kipindedir).
+    private var pendingDraftHasDirectory: Bool {
+        guard sessionService.isPendingSessionVisible,
+            let pending = sessionService.pendingSessionID,
+            let draft = sessionService.session(for: pending)
+        else {
+            return false
+        }
+        guard let path = draft.workingDirectoryPath else {
+            return false
+        }
+        return !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Klasör seçici yalnızca dizin kabul eder; seçim bekleyen taslağı o
+    /// klasöre bağlar, yazılan metin korunur. Vazgeçilirse hiçbir şey olmaz.
+    private func presentSessionFolderPicker() {
+        guard
+            let url = DirectoryPicker.chooseDirectory(
+                prompt: "Seç",
+                message: "Oturumun çalışacağı klasörü seçin (opsiyonel)"
+            )
+        else {
+            return
+        }
+        sessionService.beginPendingSession(workingDirectoryPath: url.path)
     }
 
     // MARK: - Arama, sıralama ve filtre
@@ -595,7 +663,7 @@ struct ConversationSidebarView: View {
             return "Delete session?"
         }
 
-        return "Delete “\(sessionPendingDeletion.displayTitle)”?"
+        return "Delete “\(sessionPendingDeletion.qualifiedTitle)”?"
     }
 
     private var isDeletionPromptPresented: Binding<Bool> {
@@ -678,11 +746,27 @@ struct ConversationSidebarView: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 4) {
+                        if let folderName = session.workingDirectoryName {
+                            Image(systemName: "folder.fill")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .accessibilityHidden(true)
+                            Text(folderName)
+                                .font(.system(size: 13, weight: isActive ? .semibold : .medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .layoutPriority(1)
+                            Text(">")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
+                        }
                         Text(session.displayTitle)
-                            .font(.system(size: 13, weight: isActive ? .medium : .regular))
+                            .font(.system(size: 13, weight: isActive ? .semibold : .medium))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
-                            .truncationMode(.middle)
+                            .truncationMode(.tail)
                         if session.isPinned {
                             Image(systemName: "pin.fill")
                                 .font(.system(size: 10, weight: .medium))
@@ -690,9 +774,10 @@ struct ConversationSidebarView: View {
                                 .help("Pinned session")
                         }
                     }
+                    .help(session.workingDirectoryPath ?? session.displayTitle)
 
                     Text(sessionSubtitle(session))
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -741,7 +826,7 @@ struct ConversationSidebarView: View {
             .contentShape(Rectangle())
             .interactiveHoverPill(cornerRadius: 8)
             .draggable(session.id.uuidString)
-            .help("Drag onto the open conversation to work side by side")
+            .help("Drag onto a composer to continue with its summary, or onto a pane to work side by side")
         }
         .buttonStyle(.plain)
         // Sağ tık odağı mavi çerçeve çizer; görsel odak efekti kapalı, işlev aynı.
@@ -797,7 +882,10 @@ struct ConversationSidebarView: View {
         isActive: Bool,
         isSelected: Bool
     ) -> String {
-        var parts = [session.displayTitle, sessionSubtitle(session)]
+        var parts = [session.qualifiedTitle, sessionSubtitle(session)]
+        if let folderName = session.workingDirectoryName {
+            parts.append("proje: \(folderName)")
+        }
         if session.isPinned {
             parts.append("pinned")
         }

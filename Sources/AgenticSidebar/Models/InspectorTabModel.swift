@@ -9,6 +9,17 @@ enum InspectorTabKind: Equatable, Hashable, Sendable {
     /// `TerminalServiceCenter` tarafında yaşar; sekme yalnız kimlik ve dizin
     /// taşır, kapanınca kabuk da kapatılır.
     case terminal(id: String, workingDirectory: String)
+    /// Sağ panelde açılan tarayıcı. Sayfa durumu (gezinme geçmişi, çerezler)
+    /// `BrowserServiceCenter` tarafında yaşar; sekme değişiminde sayfa yok
+    /// olmaz, sekme kapanınca görünüm de bırakılır.
+    case browser
+    /// Sağ panelde açılan iOS Simülatörü: cihaz seçimi ve canlı görüntü
+    /// `SimulatorService` tarafında yaşar.
+    case simulator
+    /// Bilgisayar kullanımının canlı görüntüsü: kareler
+    /// `ComputerLiveCaptureService` tarafında üretilir, oturum bitince boş
+    /// durum gösterilir.
+    case computerLive
 }
 
 /// Represents one tab in the right-side inspector panel.
@@ -86,16 +97,73 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
         )
     }
 
-    /// Bölme başına tek terminal sekmesi: kimlik bölmeye bağlıdır, böylece yan
-    /// yana iki sohbetin kabuğu birbirine karışmaz.
+    /// Oturumun canlı dosya değişiklikleri sekmesi: kimlik oturuma bağlıdır,
+    /// tura değil; akış sırasında tekrar tıklama aynı sekmeyi güncel özetle
+    /// tazeler, sekme çoğalmaz. İçerik tıklama anının fotoğrafıdır.
+    static func forSessionChanges(sessionID: UUID, summary: TurnFileChangesSummary) -> InspectorTab {
+        let count = summary.fileCount
+        return InspectorTab(
+            id: "session-changes:\(sessionID.uuidString)",
+            kind: .changesReview(
+                turnID: sessionID,
+                summary: summary,
+                initialFile: nil
+            ),
+            title: "Changes (\(count))",
+            iconName: "doc.badge.plus",
+            iconColorName: "accent"
+        )
+    }
+
+    /// Bölme+klasör başına tek terminal sekmesi: kimlik bölmeye ve
+    /// normalize dizine bağlıdır, böylece farklı klasörde çalışan sohbetin
+    /// terminali kendi klasöründe açılır. Aynı klasör aynı sekmeyi yeniden
+    /// kullanır, canlı kabuk korunur.
     static func forTerminal(paneID: String, workingDirectory: String) -> InspectorTab {
-        let id = "terminal:\(paneID)"
+        let normalized = URL(fileURLWithPath: workingDirectory, isDirectory: true).standardizedFileURL
+            .path
+        let id = "terminal:\(paneID):\(normalized)"
+        let folder = normalized == "/" ? "/" : normalized.split(separator: "/").last.map(String.init) ?? "Terminal"
         return InspectorTab(
             id: id,
             kind: .terminal(id: id, workingDirectory: workingDirectory),
-            title: "Terminal",
+            title: "Terminal · \(folder)",
             iconName: "terminal",
             iconColorName: "green"
+        )
+    }
+
+    /// Bölme başına tek tarayıcı sekmesi: kimlik bölmeye bağlıdır, böylece
+    /// yan yana iki sohbetin tarayıcısı birbirine karışmaz.
+    static func forBrowser(paneID: String) -> InspectorTab {
+        InspectorTab(
+            id: "browser:\(paneID)",
+            kind: .browser,
+            title: "Browser",
+            iconName: "globe",
+            iconColorName: "blue"
+        )
+    }
+
+    /// Bölme başına tek simülatör sekmesi.
+    static func forSimulator(paneID: String) -> InspectorTab {
+        InspectorTab(
+            id: "simulator:\(paneID)",
+            kind: .simulator,
+            title: "Simulator",
+            iconName: "iphone",
+            iconColorName: "purple"
+        )
+    }
+
+    /// Bölme başına tek canlı bilgisayar sekmesi.
+    static func forComputerLive(paneID: String) -> InspectorTab {
+        InspectorTab(
+            id: "computer:\(paneID)",
+            kind: .computerLive,
+            title: "Computer",
+            iconName: "computermouse",
+            iconColorName: "accent"
         )
     }
 
@@ -109,7 +177,7 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
             }
             let index = (agentTabs.firstIndex(where: { $0.id == tab.id }) ?? 0) + 1
             return "Agent \(index)"
-        case .file, .changesReview, .terminal:
+        case .file, .changesReview, .terminal, .browser, .simulator, .computerLive:
             let fileTabs = tabs.filter {
                 if case .subagentReport = $0.kind { return false }
                 return true
@@ -129,6 +197,9 @@ struct InspectorPaneState: Equatable, Sendable {
     var tabs: [InspectorTab] = []
     var selectedID: String?
     var expanded: Bool = false
+    /// Dar ikon şeridine inmiş mi (collapse): sekmeler korunur, içerik
+    /// gizlenir; tıklanan ikon sekmeyi seçip şeridi geri açar.
+    var collapsed: Bool = false
 
     /// Oturum değişimi: çıkanı sözlüğe kaldır, geleni sözlükten çıkar.
     /// Silinmiş oturumların kayıtları tutulmaz.

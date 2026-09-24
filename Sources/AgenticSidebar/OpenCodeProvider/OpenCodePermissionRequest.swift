@@ -111,6 +111,15 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
             }
         }
 
+        // `computer_run` toplu programdır: tek başlık N adımı gizlerdi.
+        // Onaydan önce her adımın türü + hedefi sınırlı özetle gösterilir;
+        // yazılan metin kırpılır, ham koordinat dökümü yapılmaz.
+        if let toolName, Self.isComputerRun(toolName),
+            let programSummary = Self.computerRunSummary(from: metadata)
+        {
+            parts.insert(programSummary, at: 0)
+        }
+
         guard !parts.isEmpty else {
             return nil
         }
@@ -119,6 +128,50 @@ struct OpenCodePermissionRequest: Equatable, Sendable {
         return joined.count > maximumDetailLength
             ? String(joined.prefix(maximumDetailLength)) + "…"
             : joined
+    }
+
+    /// `computer_run` (önekli/öneksiz) mi.
+    private static func isComputerRun(_ toolName: String) -> Bool {
+        toolName == "computer_run"
+            || toolName == ComputerUseConfiguration.toolPrefix + "computer_run"
+    }
+
+    /// Toplu programın sınırlı özeti: en fazla 8 adım, adım başına tek satır
+    /// (`tür + hedef`), yazılan metin 60 karaktere kırpılır. Ham girdi
+    /// dökülmez; amaç onayı kör olmaktan çıkarmaktır.
+    private static func computerRunSummary(from metadata: [String: Any]) -> String? {
+        guard let actions = metadata["actions"] as? [[String: Any]], !actions.isEmpty else {
+            return nil
+        }
+        var lines: [String] = ["program (\(actions.count) adım):"]
+        for action in actions.prefix(8) {
+            let type = (action["type"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let label = Self.computerRunActionLabel(type: type, action: action)
+            lines.append("• \(label)")
+        }
+        if actions.count > 8 {
+            lines.append("• …\(actions.count - 8) adım daha")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Tek adımın tek satırlık etiketi: tür ve göze çarpan hedef.
+    private static func computerRunActionLabel(type: String?, action: [String: Any]) -> String {
+        let kind = (type?.isEmpty == false) ? type! : "?"
+        var target = ""
+        if let app = action["app"] as? String, !app.isEmpty {
+            target = app
+        } else if let bundle = action["bundleIdentifier"] as? String, !bundle.isEmpty {
+            target = bundle
+        } else if let name = action["name"] as? String, !name.isEmpty {
+            target = name
+        } else if let key = action["key"] as? String, !key.isEmpty {
+            target = key
+        } else if let text = action["text"] as? String, !text.isEmpty {
+            let clipped = text.count > 60 ? String(text.prefix(60)) + "…" : text
+            target = "“\(clipped)”"
+        }
+        return target.isEmpty ? kind : "\(kind) \(target)"
     }
 
     /// Koordinatsız bir istek ("Click …") başlığa gürültüden başka şey katmaz;

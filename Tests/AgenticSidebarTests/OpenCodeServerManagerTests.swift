@@ -695,7 +695,8 @@ final class OpenCodeWorkspaceServerFactoryTests: XCTestCase {
         _ = try await factory.acquire(workspacePath: secondWorkspace.path)
 
         let stopped = await factory.stopAll()
-        XCTAssertEqual(stopped, 2)
+        XCTAssertEqual(stopped.stopped, 2)
+        XCTAssertFalse(stopped.timedOut)
         let handles = await launcher.recordedHandles()
         XCTAssertEqual(handles.count, 2)
         for handle in handles {
@@ -710,7 +711,8 @@ final class OpenCodeWorkspaceServerFactoryTests: XCTestCase {
         XCTAssertTrue(OpenCodeServerLedger.leases(in: secondState).isEmpty)
 
         let stoppedAgain = await factory.stopAll()
-        XCTAssertEqual(stoppedAgain, 0)
+        XCTAssertEqual(stoppedAgain.stopped, 0)
+        XCTAssertFalse(stoppedAgain.timedOut)
     }
 
     // MARK: - Yardımcılar

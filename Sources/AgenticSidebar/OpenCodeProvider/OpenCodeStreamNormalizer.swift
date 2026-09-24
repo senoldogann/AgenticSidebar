@@ -12,9 +12,36 @@ struct OpenCodeSubagentStep: Equatable, Sendable {
     var status: String
 }
 
+/// Denetim günlüğü için çocuk araç olayı: ham girdi taşınmaz, yalnızca
+/// sahiplik + araç adı + durum. Tüketici türü `sanitizedKind` ile çözer,
+/// komut metni günlüğe girmez.
+struct OpenCodeChildToolEvent: Sendable {
+    let owner: ProviderActivityID
+    let stepID: String
+    let tool: String
+    let status: String
+
+    /// Terminal durum mu (bitiş kaydı gerekir).
+    var isTerminal: Bool {
+        status == "completed" || status == "error" || status == "failed"
+    }
+
+    /// Terminal sonucun denetim karşılığı; terminal değilse `nil`.
+    var outcome: ProviderActivityOutcome? {
+        switch status {
+        case "completed": return .completed
+        case "error", "failed": return .failed
+        default: return nil
+        }
+    }
+}
+
 struct OpenCodeStreamNormalizer: Sendable {
     private let sessionID: String
     private let onPermissionRequest: (@Sendable (OpenCodePermissionRequest) -> Void)?
+    /// Çocuk araç adımı görüldüğünde (sahiplik biliniyorsa) çağrılır;
+    /// tüketici denetim kaydını buradan üretir. Ham girdi taşınmaz.
+    private let onChildToolStep: (@Sendable (OpenCodeChildToolEvent) -> Void)?
     private var partTypes: [String: String] = [:]
     private var bufferedTextDeltas: [String: String] = [:]
     private var bufferedPartOrder: [String] = []
@@ -83,11 +110,17 @@ struct OpenCodeStreamNormalizer: Sendable {
     init(sessionID: String) {
         self.sessionID = sessionID
         self.onPermissionRequest = nil
+        self.onChildToolStep = nil
     }
 
-    init(sessionID: String, onPermissionRequest: (@Sendable (OpenCodePermissionRequest) -> Void)?) {
+    init(
+        sessionID: String,
+        onPermissionRequest: (@Sendable (OpenCodePermissionRequest) -> Void)?,
+        onChildToolStep: (@Sendable (OpenCodeChildToolEvent) -> Void)? = nil
+    ) {
         self.sessionID = sessionID
         self.onPermissionRequest = onPermissionRequest
+        self.onChildToolStep = onChildToolStep
     }
 
     /// Akış gürültüsü turu öldürmez: JSON olmayan `data:` satırı (sentinel,
@@ -638,6 +671,14 @@ struct OpenCodeStreamNormalizer: Sendable {
             return []
         }
 
+        // Denetim: delege çocuk araçları üst aktivitenin çıktısına gömülür;
+        // kayıt burada üretilir, yoksa delege `rm -rf` görünmez kalır.
+        // Tampon-sonrası öğrenilen adımlar ham araç adını taşımaz, o yüzden
+        // yalnız sahipli adımlar bildirilir (kısıt yorumda durur).
+        onChildToolStep?(
+            OpenCodeChildToolEvent(owner: owner, stepID: partID, tool: tool, status: status)
+        )
+
         return stepsUpdateEvents(for: owner)
     }
 
@@ -690,6 +731,9 @@ struct OpenCodeStreamNormalizer: Sendable {
             // Hangi oturumun düşeceği önemsiz: sahiplenilmeyenler zaten yalnız
             // bu turda yaşar. Sıralama deterministik olsun diye ilk anahtar.
             if let oldest = bufferedChildSteps.keys.sorted().first {
+                AppLog.openCode.error(
+                    "Evicting buffered child steps for an unowned session under storm pressure"
+                )
                 bufferedChildSteps.removeValue(forKey: oldest)
             }
         }
@@ -704,12 +748,18 @@ struct OpenCodeStreamNormalizer: Sendable {
         }
         pending.append(request)
         if pending.count > Self.maximumBufferedPermissionsPerSession {
+            AppLog.openCode.error(
+                "Dropping an unowned child permission under storm pressure; it will never surface"
+            )
             pending.removeFirst(pending.count - Self.maximumBufferedPermissionsPerSession)
         }
         bufferedChildPermissions[request.remoteSessionID] = pending
         if bufferedChildPermissions.count > Self.maximumBufferedChildSessions,
             let evicted = bufferedChildPermissions.keys.sorted().first
         {
+            AppLog.openCode.error(
+                "Evicting buffered child permissions for an unowned session under storm pressure"
+            )
             bufferedChildPermissions.removeValue(forKey: evicted)
         }
     }

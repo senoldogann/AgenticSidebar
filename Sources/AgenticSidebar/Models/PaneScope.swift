@@ -49,4 +49,11 @@ extension Notification.Name {
     /// `["slot": yuvanın ham değeri, "session": dalın kimliği]` taşır; her
     /// bölme konağı yalnız kendi yuvasını dinler.
     static let adoptForkedBranch = Notification.Name("AgenticSidebar.adoptForkedBranch")
+
+    /// Bekleyen taslağın aynı kimlikle gerçek oturuma dönüşmesi. `object`
+    /// dönüşen oturumun kimliğidir (`UUID`). Kimlik değişmediği için
+    /// `onChange(of: focusedSession.id)` tetiklenmez; doğum anına bağlı
+    /// işler (kaydırma sıfırlama, inspector geçişi, goal bildirimi) bu
+    /// bildirimi dinler.
+    static let didMaterializePendingSession = Notification.Name("AgenticSidebar.didMaterializePendingSession")
 }

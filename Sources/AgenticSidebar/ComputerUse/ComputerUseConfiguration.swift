@@ -225,6 +225,29 @@ struct ComputerUseConfiguration: Equatable, Sendable {
         return kept
     }
 
+    /// `npm` ikilisini temizlenmiş arama dizinlerinde çözer. Kurulum
+    /// koşucusu `/usr/bin/env` ile PATH'ten çözmesin diye: kullanıcı-yazılabilir
+    /// dizindeki (`~/.local/bin` vb.) bir `npm` shimi uygulama yetkisiyle
+    /// koşardı. Bulunamazsa `nil` döner, çağıran adımı başlatmaz.
+    static func locateNpm(
+        environment: [String: String],
+        fileManager: FileManager,
+        bundlePath: String
+    ) -> URL? {
+        let pathEntries = sanitizedSearchDirectories(
+            environment: environment,
+            bundlePath: bundlePath
+        )
+        for entry in pathEntries {
+            let candidate = URL(fileURLWithPath: entry, isDirectory: true)
+                .appendingPathComponent("npm")
+            if fileManager.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     static func locateNode(
         environment: [String: String],
         fileManager: FileManager,

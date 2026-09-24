@@ -21,6 +21,8 @@ struct SessionSummary: Identifiable, Equatable, Sendable {
     let customTitle: String?
     /// Sabitlenen oturumlar listenin üstünde durur ve budamada en son düşer.
     let isPinned: Bool
+    /// Oturumun bağlı olduğu klasörün dosya yolu; `nil` = klasörsüz oturum.
+    let workingDirectoryPath: String?
 
     init(
         id: UUID,
@@ -31,7 +33,8 @@ struct SessionSummary: Identifiable, Equatable, Sendable {
         lastMessageAt: Date?,
         createdAt: Date = Date(),
         customTitle: String? = nil,
-        isPinned: Bool = false
+        isPinned: Bool = false,
+        workingDirectoryPath: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -42,6 +45,7 @@ struct SessionSummary: Identifiable, Equatable, Sendable {
         self.createdAt = createdAt
         self.customTitle = customTitle
         self.isPinned = isPinned
+        self.workingDirectoryPath = workingDirectoryPath
     }
 
     /// Ekranda gösterilen başlık: özel başlık varsa o, yoksa otomatik başlık.
@@ -69,5 +73,17 @@ struct SessionSummary: Identifiable, Equatable, Sendable {
     /// gösterilir; koşan turda ilerleme göstergesi bunun yerini alır.
     var showsDoneBadge: Bool {
         !isBusy && status == .completed
+    }
+
+    /// Bağlı klasörün görünen adı; klasörsüz oturumda `nil`.
+    /// Türetim `WorkingDirectoryDisplay` tek kaynağındadır.
+    var workingDirectoryName: String? {
+        WorkingDirectoryDisplay.name(for: workingDirectoryPath)
+    }
+
+    /// Proje önekli başlık; klasörsüzde `displayTitle` ile aynı.
+    /// Örnek: `AgenticSidebar > Merhaba`.
+    var qualifiedTitle: String {
+        WorkingDirectoryDisplay.qualifiedTitle(title: displayTitle, directoryPath: workingDirectoryPath)
     }
 }

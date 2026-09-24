@@ -171,9 +171,10 @@ struct AgenticSidebarApp: App {
             permissionApprovalCenter?.endTurn(appSessionID: sessionID, turnID: turnID)
         }
 
-        Task {
-            await notificationService.requestAuthorization()
-        }
+        // Bildirim izni açılışta istenmez: `UNUserNotificationCenter.current()`
+        // açılış yolunda yakalanamaz bir istisna atıp süreci öldürebiliyor
+        // (bug 309). İlk istek, kapalıysa hiç dokunulmadan, ilk biten turun
+        // bildirimiyle yapılır (`SessionNotificationService.ensureCenter`).
 
         let initialClipboardMonitor = ClipboardMonitorService(
             sessionService: initialSessionService,
@@ -362,7 +363,7 @@ struct AgenticSidebarApp: App {
             // yoksa yan sohbetteki bilgisayar adımları HUD'a hiç düşmezdi.
             .background {
                 FloatingHUDHostView(
-                    activities: hudActivities
+                    items: HUDActivityMapper.items(from: hudActivities)
                 )
             }
             // Yetenek keşfi yalnızca burada yapılır; `RootChatView` de çağırdığında
@@ -571,7 +572,15 @@ final class TaskBoardComposition {
     /// Yeniden başlatma sonrası pano boş kalmasın diye açılış uzlaştırmasından
     /// önce çağrılır; kayıt defteri artık yalnız bellek içi değildir.
     func restoreKnownProjects() async {
-        guard let stored = try? await repository.listProjects() else { return }
+        let stored: [CodingProject]
+        do {
+            stored = try await repository.listProjects()
+        } catch {
+            AppLog.lifecycle.error(
+                "Stored projects could not be listed at launch; the board starts empty"
+            )
+            return
+        }
         for project in stored {
             knownProjectIDs.insert(project.id)
         }

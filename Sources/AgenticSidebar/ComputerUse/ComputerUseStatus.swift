@@ -268,8 +268,13 @@ final class ComputerUseStatus {
         }
     }
 
+    /// Kurulum komutunu panoya kopyalar. Yol tek tırnakla alıntılanır:
+    /// alıntısız `cd` kötücül klasör adında (`x; rm -rf ~`) yapıştırma anında
+    /// komut enjeksiyonu demekti. Yürütme zaten argv-tabanlıdır, bu yalnızca
+    /// panodaki metindir.
     func copySetupCommand(for step: ComputerUseSetupStep, rootPath: String) {
-        let command = "cd \(rootPath) && \(step.command)"
+        let escaped = rootPath.replacingOccurrences(of: "'", with: "'\\''")
+        let command = "cd '\(escaped)' && \(step.command)"
         Pasteboard.copy(command)
     }
 

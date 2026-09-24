@@ -32,9 +32,17 @@ protocol OpenCodeServerManaging: Sendable {
     func currentConnection() async -> OpenCodeServerConnection?
     func stop() async
     func workingDirectory() async -> URL?
+    /// Parola taşıyan isteklerden önce portun hâlâ bu yöneticinin çocuğuna
+    /// ait olduğunu doğrular. Startup'taki dinleyici denetiminin steady-state
+    /// karşılığıdır; `false` ise parola yabancı ele geçmesin diye istek
+    /// fail-closed düşer. Varsayılan `true` döner, üretim yöneticisi ezer.
+    func verifyCurrentListener() async -> Bool
 }
 
 extension OpenCodeServerManaging {
+    func verifyCurrentListener() async -> Bool {
+        true
+    }
     func workingDirectory() async -> URL? {
         nil
     }

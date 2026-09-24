@@ -203,6 +203,24 @@ struct TurnFileChangesSummary: Identifiable, Equatable, Hashable, Sendable, Coda
         )
     }
 
+    /// Oturumda review edilecek dosya değişikliği var mı: başlık rozeti ve
+    /// düğme görünürlüğü için ucuz ön kontrol. Sayım ve diff birleştirme
+    /// yapmaz, ilk bulguda durur; bu yüzden akış sırasında her gövdede
+    /// çağrılabilir. Tam özet gerekiyorsa `sessionReviewSummary(from:)`.
+    static func hasFileChanges(in groups: [AgentTurnActivityGroup]) -> Bool {
+        for group in groups {
+            for activity in group.activities {
+                guard let rawPath = activity.detail, !rawPath.isEmpty, isFilePathDetail(rawPath) else {
+                    continue
+                }
+                if activity.kind == .edit || activity.kind == .update || activity.diff != nil {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     /// Oturum sonu toplu kartın özeti: oturumda herhangi bir dosya değişikliği
     /// varsa birleştirilmiş özet, yoksa `nil`. Oturum bitince (boşta) bu kart
     /// transkriptin en altında tek review yüzeyi olarak çizilir ve satır içi

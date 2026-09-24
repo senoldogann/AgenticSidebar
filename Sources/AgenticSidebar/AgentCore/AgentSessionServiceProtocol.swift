@@ -29,6 +29,9 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
 
     @discardableResult
     func createSession() -> UUID
+    /// Klasör bağlı yeni oturum açar; `nil` klasörsüz davranıştır.
+    @discardableResult
+    func createSession(workingDirectoryPath: String?) -> UUID
     func selectSession(_ id: UUID)
     /// Gönderilmemiş yeni-sohbet taslağının kimliği (`nil` = bekleyen yok).
     /// Liste/arşiv dışıdır: `+ New session` sohbet oluşturmaz.
@@ -38,6 +41,14 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     /// Bekleyen taslağı açar (yoksa kurar), kimliğini döner.
     @discardableResult
     func beginPendingSession() -> UUID
+    /// Klasör bağlı bekleyen taslak açar. `nil` mevcut taslağı olduğu gibi
+    /// gösterir (klasörü silmez); klasörü kaldırmak için
+    /// `clearPendingSessionDirectory()` kullanılır. Mevcut taslak varsa
+    /// klasörü günceller, yazılan metni korur.
+    @discardableResult
+    func beginPendingSession(workingDirectoryPath: String?) -> UUID
+    /// Bekleyen taslağın klasör bağını kaldırır; taslak metni korunur.
+    func clearPendingSessionDirectory()
     /// Bekleyen taslağı aynı kimlikle gerçek oturuma dönüştürür.
     func materializePendingSession(_ id: UUID)
     /// Gönderilmemiş taslağı siler.
@@ -99,6 +110,11 @@ extension AgentSessionServiceProtocol {
     var isPendingSessionVisible: Bool { false }
     @discardableResult
     func beginPendingSession() -> UUID { UUID() }
+    @discardableResult
+    func beginPendingSession(workingDirectoryPath: String?) -> UUID { beginPendingSession() }
+    func clearPendingSessionDirectory() {}
+    @discardableResult
+    func createSession(workingDirectoryPath: String?) -> UUID { createSession() }
     func materializePendingSession(_ id: UUID) {}
     func discardPendingSession() {}
     func setPendingSessionVisible(_ visible: Bool) {}

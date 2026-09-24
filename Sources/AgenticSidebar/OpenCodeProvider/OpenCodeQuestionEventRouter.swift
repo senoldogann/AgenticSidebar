@@ -111,12 +111,20 @@ struct OpenCodeQuestionEventRouter: Sendable {
         guard !requests.contains(where: { $0.requestID == request.requestID }) else { return }
         requests.append(request)
         if requests.count > Self.maximumUnknownQuestionsPerSession {
+            // Sessiz düşürme yok: atılan soru, modelin yanıt beklediği bir
+            // soru olabilir; turun asılı kalması logda iz bırakır.
+            AppLog.openCode.error(
+                "Dropping an unowned session question under storm pressure; the model may wait for an answer that never arrives"
+            )
             requests.removeFirst()
         }
         unknownQuestions[request.remoteSessionID] = requests
         if unknownQuestions.count > Self.maximumUnknownSessions,
             let evicted = unknownQuestions.keys.sorted().first
         {
+            AppLog.openCode.error(
+                "Evicting buffered questions for an unowned session under storm pressure"
+            )
             unknownQuestions.removeValue(forKey: evicted)
         }
     }

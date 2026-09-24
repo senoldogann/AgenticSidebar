@@ -30,6 +30,11 @@ enum DroppedImageAttachment {
     }
 
     /// `screenshot-20260916-171300-a1b2c3.png`: sıralanabilir, yazı başına tekil.
+    ///
+    /// `suggestedName` sürükleme kaynağından gelir (saldırgan-etkili olabilir):
+    /// `lastPathComponent` alınır, izinli karakterler dışındakiler `_` olur,
+    /// uzunluk sınırlanır. `/` ve `..` korunmaz, yalıtım klasörü dışına
+    /// yazılamaz.
     static func fileName(
         suggestedName: String? = nil,
         typeIdentifier: String? = nil,
@@ -45,10 +50,24 @@ enum DroppedImageAttachment {
             !suggested.isEmpty
         {
             let base = (suggested as NSString).deletingPathExtension
-            let clean = base.isEmpty ? "screenshot" : base
+            let clean = sanitizedFileStem(base)
             return "\(clean)-\(stamp)-\(uniquifier).\(ext)"
         }
         return "screenshot-\(stamp)-\(uniquifier).\(ext)"
+    }
+
+    /// Dosya gövdesini güvenli kümeye indirger: yol ayraçları ve `..`
+    /// elenir, boş sonuç `"screenshot"` olur, uzunluk 64 karakterle sınırlıdır.
+    static func sanitizedFileStem(_ raw: String) -> String {
+        let leaf = (raw as NSString).lastPathComponent
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let mapped = leaf.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let collapsed = String(mapped).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = collapsed.trimmingCharacters(in: CharacterSet(charactersIn: "._"))
+        guard !trimmed.isEmpty else {
+            return "screenshot"
+        }
+        return String(trimmed.prefix(64))
     }
 
     static func defaultUniquifier() -> String {

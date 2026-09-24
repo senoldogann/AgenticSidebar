@@ -388,6 +388,36 @@ enum TaskBoardPresenter {
     }
 }
 
+/// Pano yerleşiminin sayısal sözleşmesi: kolon genişliği kullanılabilir
+/// alandan türetilir, sabit 248 pt değildir.
+///
+/// Dar pencerede kolonlar taban genişliğe iner ve yatay kaydırma devreye
+/// girer; geniş pencerede beş kolon da kaydırmasız sığar. Saf fonksiyondur,
+/// görünüm çalıştırmadan test edilir.
+enum TaskBoardLayout {
+    /// Kolonun inebileceği en dar genişlik; altında kart metni okunmaz.
+    static let minimumColumnWidth: CGFloat = 220
+    /// Kolonlar arası boşluk (`LazyHStack` aralığıyla aynı).
+    static let columnSpacing: CGFloat = 12
+    /// Pano iç boşluğu (`.padding(12)` ile aynı).
+    static let boardPadding: CGFloat = 12
+
+    /// Kullanılabilir genişliğe göre kolon genişliği: yer varsa kolonlar
+    /// esneyip tamamı sığar, yoksa tabana inip yatay kaydırmaya bırakır.
+    static func columnWidth(availableWidth: CGFloat, columnCount: Int) -> CGFloat {
+        let count = max(1, columnCount)
+        let gaps = columnSpacing * CGFloat(count - 1) + boardPadding * 2
+        let fitted = (availableWidth - gaps) / CGFloat(count)
+        return max(minimumColumnWidth, fitted)
+    }
+
+    /// Beş kolonun kaydırmasız sığdığı en dar pano genişliği.
+    static func fittingWidth(columnCount: Int) -> CGFloat {
+        let count = max(1, columnCount)
+        return minimumColumnWidth * CGFloat(count) + columnSpacing * CGFloat(count - 1) + boardPadding * 2
+    }
+}
+
 // MARK: - Pano görünümü
 
 /// Görev panosu: beş kolon, belirgin engellenen filtresi ve iptal geçmişi.
@@ -549,8 +579,8 @@ struct TaskBoardView: View {
             .help("Panoyu yenile")
             .accessibilityLabel("Panoyu yenile")
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
     }
 
     private var blockedFilterButton: some View {
@@ -564,13 +594,22 @@ struct TaskBoardView: View {
                     .font(.system(size: 11, weight: presentation.blockedFilter.isProminent ? .semibold : .regular))
             }
             .foregroundStyle(presentation.blockedFilter.isProminent ? Color.orange : Color.secondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
             .background(
                 presentation.blockedFilter.isProminent
                     ? Color.orange.opacity(isDark ? 0.18 : 0.12)
                     : Color.primary.opacity(0.05),
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(
+                        presentation.blockedFilter.isProminent
+                            ? Color.orange.opacity(0.35)
+                            : (isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.8),
+                        lineWidth: 1
+                    )
             )
         }
         .buttonStyle(.plain)
@@ -598,46 +637,97 @@ struct TaskBoardView: View {
     }
 
     private var columns: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(alignment: .top, spacing: 10) {
-                ForEach(presentation.columns) { section in
-                    columnView(section)
+        GeometryReader { proxy in
+            let width = TaskBoardLayout.columnWidth(
+                availableWidth: proxy.size.width,
+                columnCount: presentation.columns.count
+            )
+            // Kolon yüksekliği KESİN verilir. Eskiden yükseklik belirsizken
+            // dıştaki `LazyHStack` kolonun ideal boyunu soruyor, o da içteki
+            // `ScrollView`'a tüm kartları ölçtürüyordu (`ScrollViewUtilities.
+            // sizeThatFits` + `LazyStack.measureEstimates`): kart sayısıyla
+            // büyüyen bu ölçüm her yerleşim turunda (özellikle animasyonlu
+            // kart hareketlerinde) ana iş parçacığını kilitliyordu. Kesin
+            // yükseklikte iç liste yalnız görünen kartları ölçer.
+            //
+            // Kolon sayısı bir elin parmakları kadar; `LazyHStack` yerine
+            // düz `HStack` kullanılır. Tembel yerleşimin `initialPlacement`
+            // turu tamamen kalkar, kartlar yine `LazyVStack` ile tembel kalır.
+            let height = max(0, proxy.size.height - TaskBoardLayout.boardPadding * 2)
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(alignment: .top, spacing: TaskBoardLayout.columnSpacing) {
+                    ForEach(presentation.columns) { section in
+                        columnView(section, width: width, height: height)
+                    }
                 }
+                .padding(TaskBoardLayout.boardPadding)
             }
-            .padding(10)
         }
         .frame(maxHeight: .infinity)
     }
 
-    private func columnView(_ section: TaskBoardColumnSection) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private func columnView(_ section: TaskBoardColumnSection, width: CGFloat, height: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
+                Circle()
+                    .fill(columnTint(section.kind))
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
                 Text(section.kind.title)
                     .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.primary)
                 Text("\(section.cards.count)")
-                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 2)
+            .padding(.horizontal, 4)
 
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(spacing: 6) {
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(spacing: 8) {
                     ForEach(section.cards) { card in
                         cardButton(card)
                     }
                 }
+                .padding(.vertical, 2)
             }
         }
-        .frame(width: 236)
+        .frame(width: width)
+        .padding(8)
+        .frame(height: height)
+        .background(
+            (isDark ? preset.surfaceDark : preset.surfaceLight).opacity(isDark ? 0.45 : 0.7),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(
+                    (isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.7),
+                    lineWidth: 1
+                )
+        )
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(section.kind.title) kolonu, \(section.cards.count) görev")
     }
 
+    /// Kolon başındaki durum noktası kart rozetiyle aynı dili konuşur;
+    /// bilgi zaten metinle taşındığı için nokta yalnızca görsel destektir.
+    private func columnTint(_ kind: TaskBoardColumnKind) -> Color {
+        switch kind {
+        case .backlog: .secondary
+        case .ready: .blue
+        case .running: preset.accentGradient.first ?? .accentColor
+        case .review: .purple
+        case .done: .green
+        }
+    }
+
     private var blockedLane: some View {
-        ScrollView(.vertical, showsIndicators: false) {
-            LazyVStack(alignment: .leading, spacing: 6) {
+        ScrollView(.vertical, showsIndicators: true) {
+            LazyVStack(alignment: .leading, spacing: 8) {
                 Text(presentation.blockedFilter.label)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.orange)
@@ -648,8 +738,9 @@ struct TaskBoardView: View {
                     cardButton(card)
                 }
             }
-            .frame(maxWidth: 320, alignment: .leading)
-            .padding(.horizontal, 10)
+            .frame(maxWidth: 336, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
         }
         .frame(maxHeight: .infinity)
         .accessibilityElement(children: .contain)
@@ -658,19 +749,23 @@ struct TaskBoardView: View {
 
     private var cancelledHistory: some View {
         DisclosureGroup(isExpanded: $showsCancelledHistory) {
-            LazyVStack(spacing: 6) {
-                ForEach(presentation.cancelledCards) { card in
-                    cardButton(card)
+            ScrollView(.vertical, showsIndicators: true) {
+                LazyVStack(spacing: 8) {
+                    ForEach(presentation.cancelledCards) { card in
+                        cardButton(card)
+                    }
                 }
+                .padding(.top, 8)
             }
-            .padding(.top, 6)
+            // Sınırsız büyümesin: açık tarihçe kolonları ezmesin, kendi içinde kaysın.
+            .frame(maxHeight: 260)
         } label: {
             Text(presentation.cancelledHistoryLabel)
                 .font(.system(size: 11.5, weight: .medium))
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
         .accessibilityLabel(presentation.cancelledHistoryLabel)
     }
 
@@ -688,12 +783,12 @@ struct TaskBoardView: View {
     }
 
     private func emptyState(_ message: String, callToAction: String?) -> some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 12) {
             Image(systemName: "rectangle.split.3x1")
-                .font(.system(size: 22, weight: .light))
+                .font(.system(size: 28, weight: .light))
                 .foregroundStyle(.tertiary)
             Text(message)
-                .font(.system(size: 12))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
             if loadState == .idle {
                 Text("Başlayın: aşağıdaki satırdan projenizin Git klasörünü ekleyin")
@@ -717,13 +812,13 @@ struct TaskBoardView: View {
     }
 
     private func bannerView(_ banner: TaskBoardBanner) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Image(systemName: banner.kind == .failure ? "exclamationmark.triangle.fill" : "arrow.triangle.2.circlepath")
-                .font(.system(size: 10.5, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(banner.kind == .failure ? Color.red : Color.secondary)
 
             Text(banner.message)
-                .font(.system(size: 11))
+                .font(.system(size: 11.5))
                 .foregroundStyle(banner.kind == .failure ? .primary : .secondary)
                 .lineLimit(2)
 
@@ -740,9 +835,16 @@ struct TaskBoardView: View {
                 .accessibilityLabel("Panoyu yeniden yükle")
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Color.red.opacity(banner.kind == .failure ? 0.08 : 0.0))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            (banner.kind == .failure ? Color.red : Color.primary).opacity(
+                banner.kind == .failure ? (isDark ? 0.12 : 0.07) : 0.04
+            ),
+            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(banner.accessibilityLabel)
     }
@@ -764,62 +866,72 @@ private struct TaskBoardCardView: View {
 
     var body: some View {
         Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(presentation.title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
 
                 Text(presentation.objective)
-                    .font(.system(size: 10.5))
+                    .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
 
-                HStack(spacing: 5) {
+                HStack(spacing: 6) {
                     statusChip
                     Text(presentation.stageLabel)
-                        .font(.system(size: 9.5, weight: .medium))
-                        .foregroundStyle(.tertiary)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
                     Text(presentation.criteriaLabel)
-                        .font(.system(size: 9.5, design: .monospaced))
+                        .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.tertiary)
                 }
 
                 if let blockReasonText = presentation.blockReasonText {
                     Label(blockReasonText, systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 10))
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.orange)
                         .lineLimit(2)
                 }
 
                 if let dependencyLabel = presentation.dependencyLabel {
-                    Text(dependencyLabel)
-                        .font(.system(size: 10))
+                    Label(dependencyLabel, systemImage: "link")
+                        .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(9)
+            .padding(12)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .pointingHandCursor()
         .background(
-            (isDark ? preset.surfaceDark : preset.surfaceLight).opacity(isDark ? 0.9 : 0.98),
-            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            (isDark ? preset.surfaceDark : preset.surfaceLight).opacity(isDark ? 0.9 : 1.0),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(
                     isSelected
-                        ? (preset.accentGradient.first ?? .accentColor).opacity(0.8)
-                        : (isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.7),
-                    lineWidth: isSelected ? 1.5 : 1
+                        ? (preset.accentGradient.first ?? .accentColor).opacity(0.85)
+                        : (isDark ? preset.borderSubtleDark : preset.borderSubtleLight).opacity(0.9),
+                    lineWidth: isSelected ? 2 : 1
                 )
         )
+        .shadow(color: .black.opacity(isSelected ? 0.14 : 0.07), radius: isSelected ? 10 : 6, x: 0, y: 1)
+        .overlay(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(statusTint)
+                .frame(width: 3)
+                .padding(.vertical, 12)
+                .padding(.leading, 0.5)
+                .accessibilityHidden(true)
+        }
+        .animation(.easeInOut(duration: 0.18), value: isSelected)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(presentation.accessibilityLabel)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
@@ -828,11 +940,11 @@ private struct TaskBoardCardView: View {
 
     private var statusChip: some View {
         Text(presentation.statusLabel)
-            .font(.system(size: 9.5, weight: .semibold))
+            .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(statusTint)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1.5)
-            .background(statusTint.opacity(0.14), in: Capsule())
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .background(statusTint.opacity(isDark ? 0.20 : 0.12), in: Capsule())
     }
 
     private var statusTint: Color {
@@ -931,9 +1043,9 @@ private struct TaskCreationSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             Text("Yeni görev")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 16, weight: .semibold))
 
             Text("Başlık ve amaç zorunlu; ölçütler her satırda bir tane. Öncelik pano sırasını belirler.")
                 .font(.system(size: 11))
@@ -995,8 +1107,8 @@ private struct TaskCreationSheet: View {
                     .accessibilityLabel(isSubmitting ? "Görev oluşturuluyor" : "Görevi oluştur")
             }
         }
-        .padding(16)
-        .frame(width: 440)
+        .padding(20)
+        .frame(width: 460)
         .background(preset.background(isDark: isDark))
     }
 

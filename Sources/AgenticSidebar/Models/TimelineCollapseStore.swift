@@ -16,7 +16,6 @@ import Observation
 final class TimelineCollapseStore {
     private(set) var collapsedIDs: Set<String> = []
     private(set) var expandedIDs: Set<String> = []
-    private(set) var thinkingManuallyCollapsedGroups: Set<String> = []
 
     /// Kimlikler UUID olduğu için küme kendiliğinden küçülmez; sınır aşılınca
     /// rastgele budanır. Düşen kayıt yalnız bir kartın açık/kapalı varsayılanı
@@ -131,23 +130,9 @@ final class TimelineCollapseStore {
         if activity.kind == .subagent, activity.phase == .running {
             return true
         }
-        // Boş düşünme varsayılan-açık değildir: içeriksiz kartın otomatik
-        // açılması, boş gri "Thought" kutusunu her turda flaşlatıyordu.
-        // Biten düşünme de varsayılan-kapalıdır: tur koşarken biten her
-        // düşünme açık kalsaydı liste açık kartlarla dolar, kullanıcı her
-        // birini tek tek kapatmak zorunda kalırdı. Açık kalması istenen
-        // kart kullanıcı tarafından açıkça açılır (`expandedIDs`).
-        if activity.kind == .thinking,
-            activity.phase == .running,
-            ThinkingDurationPresentation.hasVisibleContent(output: activity.output),
-            !contains(
-                thinkingManuallyCollapsedGroups,
-                key: Self.groupKey(groupID, sessionID: sessionID),
-                legacyKey: Self.groupKey(groupID)
-            )
-        {
-            return true
-        }
+        // Düşünme varsayılan-kapalıdır: koşarken de bitince de kart yalnız
+        // kullanıcı açarsa açılır. Açık kalması istenen kart kullanıcı
+        // tarafından açıkça açılır (`expandedIDs`).
         return false
     }
 
@@ -158,7 +143,6 @@ final class TimelineCollapseStore {
         isTurnRunning: Bool
     ) {
         let key = Self.activityKey(activity.id.rawValue, sessionID: sessionID)
-        let namespacedGroup = Self.groupKey(groupID, sessionID: sessionID)
         if isActivityExpanded(
             activity,
             groupID: groupID,
@@ -167,15 +151,9 @@ final class TimelineCollapseStore {
         ) {
             expandedIDs.remove(key)
             collapsedIDs.insert(key)
-            if activity.kind == .thinking, isTurnRunning {
-                thinkingManuallyCollapsedGroups.insert(namespacedGroup)
-            }
         } else {
             collapsedIDs.remove(key)
             expandedIDs.insert(key)
-            if activity.kind == .thinking, isTurnRunning {
-                thinkingManuallyCollapsedGroups.remove(namespacedGroup)
-            }
         }
         pruneIfNeeded()
     }
@@ -190,9 +168,6 @@ final class TimelineCollapseStore {
             } else {
                 expandedIDs.removeFirst()
             }
-        }
-        while thinkingManuallyCollapsedGroups.count > Self.maximumStoredKeys / 2 {
-            thinkingManuallyCollapsedGroups.removeFirst()
         }
     }
 }
