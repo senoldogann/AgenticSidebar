@@ -44,9 +44,10 @@ final class ScreenshotMonitorServiceTests: XCTestCase {
         let service = await makeService(recorder: recorder)
         let (monitor, _) = makeMonitor(service: service, recognizer: "Solve for x: 2x + 4 = 10")
 
-        monitor.start()
-        monitor.stop()
-
+        // Do NOT call start()/stop(). The monitor's tick() will do the initial
+        // scan when lastScannedDirectoryModDate is nil, and the test drives
+        // ticks manually. This avoids the race between start()'s background
+        // seeding and the test's file write.
         _ = try writeScreenshot(named: "Screenshot 2026-09-16 at 10.00.00.png")
 
         await monitor.tick()
