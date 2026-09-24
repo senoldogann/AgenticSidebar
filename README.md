@@ -435,3 +435,4 @@ hermetic suite. `swift-format lint` runs as a third step and **is a gate**: the
 ## License
 
 MIT — see `LICENSE`.
+# CI trigger
