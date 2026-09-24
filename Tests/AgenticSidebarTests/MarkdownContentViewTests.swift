@@ -79,7 +79,7 @@ final class MarkdownContentViewTests: XCTestCase {
         XCTAssertEqual(step2, "Step two")
     }
 
-    func testUnclosedPlanFenceParsesAsEmptyPlan() {
+    func testUnclosedPlanFenceParsesAsEmptyPlan() async {
         // Akışın ilk karesi: çit açıldı, içerik henüz yok. Kart boş gövdeyle
         // kurulur; yükleniyor satırı bu şekle bakar.
         let blocks = parseMarkdownBlocks(from: "```plan\n")
@@ -88,13 +88,17 @@ final class MarkdownContentViewTests: XCTestCase {
             XCTFail("Expected a single empty plan block, got \(blocks)")
             return
         }
-        XCTAssertFalse(ConversationDetailView.containsVisibleText(content))
+        await MainActor.run {
+            XCTAssertFalse(ConversationDetailView.containsVisibleText(content))
+        }
     }
 
-    func testContainsVisibleTextTreatsBlankAsEmpty() {
-        XCTAssertFalse(ConversationDetailView.containsVisibleText(""))
-        XCTAssertFalse(ConversationDetailView.containsVisibleText("   \n  \n "))
-        XCTAssertTrue(ConversationDetailView.containsVisibleText("Plan"))
-        XCTAssertTrue(ConversationDetailView.containsVisibleText("  ```plan\n "))
+    func testContainsVisibleTextTreatsBlankAsEmpty() async {
+        await MainActor.run {
+            XCTAssertFalse(ConversationDetailView.containsVisibleText(""))
+            XCTAssertFalse(ConversationDetailView.containsVisibleText("   \n  \n "))
+            XCTAssertTrue(ConversationDetailView.containsVisibleText("Plan"))
+            XCTAssertTrue(ConversationDetailView.containsVisibleText("  ```plan\n "))
+        }
     }
 }
