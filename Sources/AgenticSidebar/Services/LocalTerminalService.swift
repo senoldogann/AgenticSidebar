@@ -16,10 +16,14 @@ final class LocalTerminalService {
     ///
     /// Her eklemede O(n) kopyadan kaçınmak için üst sınıra (220K) varınca
     /// alt hedefe (150K) inilir, arada budama yapılmaz.
-    private static let trimHighWaterMark = 220_000
-    private static let trimTargetLength = 150_000
+    private nonisolated static let trimHighWaterMark = 220_000
+    private nonisolated static let trimTargetLength = 150_000
     /// Geçersiz bayt sayılmasın diye UTF-8 kuyruğu en fazla bu kadar tutulur.
-    private static let maximumIncompleteTail = 3
+    private nonisolated static let maximumIncompleteTail = 3
+    /// Çözülmeyi bekleyen ham çıktı tavanı: tek drain dilimi en fazla bu
+    /// kadar bayt çözer; taşan en eski bayt düşer ve not düşülür. MB'lık tek
+    /// patlama (`cat` büyük dosya) yoksa tek MainActor diliminde çözülürdü.
+    private nonisolated static let maximumBufferedOutputBytes = 1_048_576
 
     private(set) var output = ""
     /// Renkli/biçimli çıktı: `output` ile aynı metin, SGR koşularıyla.
@@ -50,8 +54,16 @@ final class LocalTerminalService {
     private var outputHandle: FileHandle?
     /// Henüz çözülmemiş ham çıktı; `drainTask` boşaltır.
     private var pendingRawOutput = Data()
+    /// Tavan aşımında düşen bayt olduysa bir sonraki drain'de not düşülür.
+    private var didTruncateBufferedOutput = false
     private var drainTask: Task<Void, Never>?
     private var pendingBytes = Data()
+    /// Arkada çözülen tek uçuş: iki Task.detached çıktıyı yarışıp sırayı bozmaz.
+    private var isDecoding = false
+    /// Ekran temizleme/yeniden başlatma arkadan gelen çözümü hükümsüz kılar.
+    private var outputGeneration = 0
+    /// Süreç biterken çözüm uçuşuyorsa çıkış notu sona kalır, çıktıdan öne geçmez.
+    private var pendingExitNotice = false
     private var cachedAnsiPattern: NSRegularExpression?
     /// Biçim durumu parça sınırlarını aşar; SGR kapanışı sonraki parçada
     /// gelebilir, bu yüzden ayrıştırıcı örnek kabuğun ömrü boyunca yaşar.
@@ -81,6 +93,9 @@ final class LocalTerminalService {
     }
 
     /// Kabuk çalışmıyorsa başlatır; çalışıyorsa dokunmaz.
+    ///
+    /// Tek oturum tek kabuk: aynı sekme aynı pty'yi kullanır, komut başına
+    /// süreç doğmaz. Dizin değişince merkez eski kabuğu kapatır, yenisi kurulur.
     func start() {
         guard !isRunning else {
             return
@@ -131,6 +146,9 @@ final class LocalTerminalService {
         isRunning = true
         styleParser = AnsiStyleParser()
         styleTail = ""
+        // Eski kabuğun artığı varsa başlıktan önce düşer; uçuşan zincir varsa
+        // sırayı bozmamak için dokunulmaz, zincir bitirir.
+        flushRawOutput()
         appendNotice("Terminal ready · \(directory.path)\n")
         let outputHandle = outputPipe.fileHandleForReading
         self.outputHandle = outputHandle
@@ -147,8 +165,22 @@ final class LocalTerminalService {
     }
 
     /// Ham çıktıyı tampona alır ve çözmeyi kadanslar.
+    ///
+    /// Tek kabuk oturum boyu yaşar: komut başına süreç doğmaz, yazılar aynı
+    /// pty borusuna kuyruklanır (`TerminalQueuedInput`). Dış dizine yazışlarda
+    /// onay kartı akışı bu katmanın dışındadır, burada baypas yoktur.
     private func enqueueOutput(_ data: Data) {
         pendingRawOutput.append(data)
+        if pendingRawOutput.count > Self.maximumBufferedOutputBytes {
+            let overflow = pendingRawOutput.count - Self.maximumBufferedOutputBytes
+            pendingRawOutput.removeSubrange(..<overflow)
+            didTruncateBufferedOutput = true
+        }
+        scheduleDrain()
+    }
+
+    /// Çözme kadansını kurar: 40 ms'de bir drain koşar.
+    private func scheduleDrain() {
         guard drainTask == nil else {
             return
         }
@@ -165,28 +197,127 @@ final class LocalTerminalService {
         }
     }
 
+    /// Ham baytı MainActor dışında yazıya çevirir: pahalı UTF-8 taraması burada,
+    /// yalnız ekleme+budama MainActor'da kalır.
+    ///
+    /// Saf fonksiyondur; durum tutmaz, Task.detached içinden çağrılır. Dönen
+    /// `leftover` tamamlanmamış kuyruktur (en fazla 3 bayt), sonraki parçayla
+    /// birleşmeyi bekler.
+    nonisolated static func decodeBytes(_ combined: Data) -> (text: String, leftover: Data) {
+        var buffer = combined
+        var out = ""
+        out.reserveCapacity(min(buffer.count, maximumBufferedOutputBytes))
+        while !buffer.isEmpty {
+            let split = UTF8Chunker.longestValidPrefix(in: buffer)
+            if split == 0 {
+                guard buffer.count > maximumIncompleteTail else {
+                    break
+                }
+                buffer.removeFirst(buffer.count - maximumIncompleteTail)
+                continue
+            }
+            out += String(decoding: buffer.prefix(split), as: UTF8.self)
+            buffer.removeSubrange(..<split)
+        }
+        return (out, buffer)
+    }
+
     private func drainOutput() {
         drainTask?.cancel()
         drainTask = nil
         guard !pendingRawOutput.isEmpty else {
             return
         }
-        let data = pendingRawOutput
+        // Tek uçuş: çözme sürerken yeni veri birikir, bitince yeniden kadanslanır.
+        // Yoksa iki Task.detached çıktıyı yarışıp sırayı bozardı.
+        guard !isDecoding else {
+            scheduleDrain()
+            return
+        }
+        let raw = pendingRawOutput
         pendingRawOutput.removeAll(keepingCapacity: true)
-        appendOutput(data)
+        let showTruncated = didTruncateBufferedOutput
+        didTruncateBufferedOutput = false
+        // Yarım UTF-8 kuyruğu çözüme katılır: sahiplik göreve geçer.
+        let tail = pendingBytes
+        pendingBytes.removeAll()
+        let generation = outputGeneration
+        isDecoding = true
+        Task.detached(priority: .utility) { [weak self, tail, raw] in
+            let decoded = Self.decodeBytes(tail + raw)
+            await MainActor.run { [weak self] in
+                self?.applyDecoded(
+                    text: decoded.text,
+                    leftover: decoded.leftover,
+                    showTruncated: showTruncated,
+                    generation: generation
+                )
+            }
+        }
+    }
+
+    /// Arkada çözülen yazıyı ekrana işler: yalnız ekleme+budama.
+    ///
+    /// Temizlikten sonra dönen eski çözüm hükümsüzdür, atılır; yoksa temizlenen
+    /// ekran dirilirdi. Kuyruk boşalınca bekleyen kapanış artıkları ve çıkış
+    /// notu sona düşer.
+    private func applyDecoded(text: String, leftover: Data, showTruncated: Bool, generation: Int) {
+        isDecoding = false
+        guard generation == outputGeneration else {
+            if !pendingRawOutput.isEmpty {
+                scheduleDrain()
+            }
+            return
+        }
+        pendingBytes = leftover
+        if showTruncated {
+            appendNotice("[…earlier output truncated: burst exceeded 1 MB buffer…]\n")
+        }
+        if !text.isEmpty {
+            emitText(text)
+            trimOutput()
+        }
+        if !pendingRawOutput.isEmpty {
+            scheduleDrain()
+            return
+        }
+        if pendingExitNotice {
+            pendingExitNotice = false
+            flushPendingBytes()
+            appendNotice("\n[process exited]\n")
+        }
     }
 
     /// Bekleyen ham çıktıyı hemen çözer: son satırlar kaybolmasın diye süreç
     /// biterken ve kabuk durdurulurken çağrılır.
+    ///
+    /// Kapanış yolu eşzamanlı kalır; çözüm saf fonksiyondadır, sıcak yol yine
+    /// Task.detached içinden aynı işlevi çağırır. Uçuşan çözüm varsa ham veri
+    /// zincire kalır, sıra bozulmaz.
     private func flushRawOutput() {
+        guard !isDecoding else {
+            return
+        }
         drainTask?.cancel()
         drainTask = nil
         guard !pendingRawOutput.isEmpty else {
             return
         }
-        let data = pendingRawOutput
+        let raw = pendingRawOutput
         pendingRawOutput.removeAll(keepingCapacity: true)
-        appendOutput(data)
+        let showTruncated = didTruncateBufferedOutput
+        didTruncateBufferedOutput = false
+        let combined = pendingBytes + raw
+        pendingBytes.removeAll()
+        let decoded = Self.decodeBytes(combined)
+        pendingBytes = decoded.leftover
+        if showTruncated {
+            appendNotice("[…earlier output truncated: burst exceeded 1 MB buffer…]\n")
+        }
+        if !decoded.text.isEmpty {
+            emitText(decoded.text)
+            trimOutput()
+        }
     }
 
     /// Bekleyen ham çıktıyı atar: ekran temizlenirken eski çıktı yazılmaz.
@@ -194,6 +325,8 @@ final class LocalTerminalService {
         drainTask?.cancel()
         drainTask = nil
         pendingRawOutput.removeAll()
+        // Atılan verinin tavan notu yeni çıktıya sızmaz.
+        didTruncateBufferedOutput = false
     }
 
     /// Satırı kabuğa gönderir; sonuna yeni satır eklenir.
@@ -224,7 +357,12 @@ final class LocalTerminalService {
     }
 
     /// Ekranı temizler; kabuk çalışmaya devam eder.
+    ///
+    /// Kuşak artar: arkadan dönen eski çözüm hükümsüz kalır, temizlenen ekrana
+    /// dirilmez.
     func clear() {
+        outputGeneration += 1
+        pendingExitNotice = false
         discardRawOutput()
         output = ""
         accumulatedStyledOutput = NSMutableAttributedString()
@@ -236,8 +374,12 @@ final class LocalTerminalService {
 
     /// Kabuğu kapatıp aynı dizinde yeniden başlatır; eski çıktı silinir,
     /// çünkü yeni kabuğun ekranı boş başlar.
+    ///
+    /// Eski kabuğun uçuşan çözümü kuşağa takılır, yeni kabuğun ekranına sızmaz.
     func restart() {
         stop()
+        outputGeneration += 1
+        pendingExitNotice = false
         discardRawOutput()
         output = ""
         accumulatedStyledOutput = NSMutableAttributedString()
@@ -251,6 +393,10 @@ final class LocalTerminalService {
     private var retiringProcesses: [Process] = []
 
     /// Kabuğu durdurur; `exit` yazılmışsa süreç zaten bitmiştir.
+    ///
+    /// Tek oturum tek kabuk: durdurma boruları kapatır, biriken ham veri zincirle
+    /// ekrana düşer; komut başına süreç doğmaz. Uçuşan çözüm varsa kuyruk
+    /// sahipliği görevdedir, burada temizlenmez.
     func stop() {
         // Kabuk kapanmadan önce üretilmiş son satırlar ekranda kalmalı.
         flushRawOutput()
@@ -280,11 +426,30 @@ final class LocalTerminalService {
         }
         process = nil
         inputPipe = nil
-        pendingBytes.removeAll()
+        // Uçuşan çözüm kuyruğu sahiplendi: temizlemek sırayı bozar, zincir bitirir.
+        if !isDecoding {
+            pendingBytes.removeAll()
+        }
         isRunning = false
     }
 
+    /// Kabuk kendiliğinden bitti: borular kapanır, kalan çıktı zincirle düşer.
+    ///
+    /// Çözüm uçuşuyorsa çıkış notu kuyruklanır; yoksa ham veri eşzamanlı çözülür.
+    /// Çıkış notu her zaman en sonda, tek parça düşer.
     private func handleTermination() {
+        if isDecoding {
+            pendingExitNotice = isRunning
+            outputHandle?.readabilityHandler = nil
+            try? outputHandle?.close()
+            outputHandle = nil
+            inputWriter?.close()
+            inputWriter = nil
+            process = nil
+            inputPipe = nil
+            isRunning = false
+            return
+        }
         flushRawOutput()
         outputHandle?.readabilityHandler = nil
         try? outputHandle?.close()
@@ -305,30 +470,6 @@ final class LocalTerminalService {
     /// boş ekran + gri nokta olarak görünürdü.
     private func appendNotice(_ text: String) {
         emitText(text)
-    }
-
-    /// Gelen baytlar UTF-8 sınırında bölünebilir: tüm tampon çözülene kadar
-    /// son birkaç bayt bekletilir, yalnız tamamlanmış yazı ekrana çıkar.
-    /// Düz ve biçimli hatlar aynı metinden beslenir, ikisi de aynı yerde budanır.
-    private func appendOutput(_ data: Data) {
-        pendingBytes.append(data)
-        while !pendingBytes.isEmpty {
-            let split = UTF8Chunker.longestValidPrefix(in: pendingBytes)
-            if split == 0 {
-                // Geçersiz UTF-8 kuyruğu sınırı astı: fazlası bir kerede
-                // düşürülür. Eskiden burada her turda tek bayt düşürülür ve
-                // hiçbir şey yapmayan bir `emitText("")` çağrılırdı.
-                guard pendingBytes.count > Self.maximumIncompleteTail else {
-                    break
-                }
-                pendingBytes.removeFirst(pendingBytes.count - Self.maximumIncompleteTail)
-                continue
-            }
-            let head = pendingBytes.prefix(split)
-            emitText(String(decoding: head, as: UTF8.self))
-            pendingBytes.removeSubrange(..<split)
-        }
-        trimOutput()
     }
 
     /// Ham yazıyı iki hatta da işler; satır-düzenleme baytları uçbirim

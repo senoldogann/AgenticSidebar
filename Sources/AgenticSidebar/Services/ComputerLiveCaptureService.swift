@@ -128,10 +128,20 @@ final class ComputerLiveCaptureService {
             AppLog.panels.info(
                 "Computer live view: the Screen Recording request came back as \(granted ? "granted" : "not granted yet", privacy: .public)"
             )
+            // İzin verildiyse döngü kendiliğinden başlar: `start()` zaten
+            // koşuyorsa no-op'tur, koşmuyorsa panel kapat-aç gerekmez.
+            if granted {
+                self.start()
+            }
         }
     }
 
     // MARK: - Kare üretimi
+
+    /// Üst üste yakalama hatalarında log selini önleyen sayaç: ilk hata ve
+    /// her 10. hata loglanır, aradakiler yalnız durum satırında görünür.
+    @ObservationIgnored
+    private var consecutiveCaptureFailures = 0
 
     private func captureOnce() async {
         let displayID = Self.focusedDisplayID()
@@ -140,14 +150,19 @@ final class ComputerLiveCaptureService {
             frame = captured.image
             lastDisplayID = captured.displayID
             failureMessage = nil
+            consecutiveCaptureFailures = 0
             refreshPointerPosition()
         } catch {
             // Ekran uyurken ya da izin yeni kaldırıldığında görülen olağan
             // durum: döngü ölmez, son kare kalır, durum satırı söyler.
             failureMessage = "The screen could not be captured right now."
-            AppLog.panels.error(
-                "Computer live view capture failed: \(error.localizedDescription, privacy: .public)"
-            )
+            consecutiveCaptureFailures += 1
+            let failureStreak = consecutiveCaptureFailures
+            if failureStreak == 1 || failureStreak % 10 == 0 {
+                AppLog.panels.error(
+                    "Computer live view capture failed (\(failureStreak, privacy: .public) in a row): \(error.localizedDescription, privacy: .public)"
+                )
+            }
         }
     }
 

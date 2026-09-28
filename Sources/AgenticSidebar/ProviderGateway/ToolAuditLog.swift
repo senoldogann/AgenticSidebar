@@ -193,14 +193,22 @@ actor ToolAuditLog {
 
     /// Anahtarsız sırlar: boşlukla ayrılmış değerler (`--password hunter2`),
     /// şema önekliler (`Bearer abc123`) ve bilinen belirteç biçimleri
-    /// (`AKIA…`, `ghp_…`). Anahtar-tabanlı maskeleme bunları yakalayamaz;
-    /// desenler `VerificationOutputRedactor` ile aynı kümedir.
+    /// (`AKIA…`, `ghp_…`, `xoxb-…`, PEM blokları). Anahtar-tabanlı maskeleme
+    /// bunları yakalayamaz; desenler `VerificationOutputRedactor` ile aynı
+    /// kümedir.
     private static func maskBareTokens(in text: String) -> String {
         let patterns: [(pattern: String, template: String)] = [
             (#"(?i)((?:basic|bearer)\s+)[A-Za-z0-9._~+/=-]{4,}"#, "$1[REDACTED]"),
             (#"AKIA[0-9A-Z]{16}"#, "[REDACTED]"),
             (#"gh[pousr]_[A-Za-z0-9]{20,}"#, "[REDACTED]"),
+            (#"github_pat_[A-Za-z0-9_]{20,}"#, "[REDACTED]"),
+            (#"glpat-[A-Za-z0-9._~-]{10,}"#, "[REDACTED]"),
             (#"sk-(?:proj|live)-[A-Za-z0-9._~-]{8,}"#, "[REDACTED]"),
+            (#"sk-ant-[A-Za-z0-9._~-]{8,}"#, "[REDACTED]"),
+            (#"AIza[0-9A-Za-z._~-]{20,}"#, "[REDACTED]"),
+            (#"xox[bpas]-[A-Za-z0-9-]{10,}"#, "[REDACTED]"),
+            (#"xox[oqr]-[A-Za-z0-9-]{10,}"#, "[REDACTED]"),
+            (#"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"#, "[REDACTED PRIVATE KEY]"),
         ]
         var result = text
         for entry in patterns {

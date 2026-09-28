@@ -85,6 +85,15 @@ cat >"$INFO_PLIST" <<PLIST
   <string>NSApplication</string>
   <key>NSRequiresAquaSystemAppearance</key>
   <false/>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoadsInWebContent</key>
+    <true/>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>AgenticSidebar's side-panel browser opens development servers on your local network when you enter their address.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>AgenticSidebar uses the microphone only when you tap the dictation button, to transcribe your speech into the composer draft.</string>
   <key>NSSpeechRecognitionUsageDescription</key>

@@ -420,9 +420,13 @@ actor ManagedOpenCodeServerManager: OpenCodeServerManaging {
     private func resolveServerPassword() async throws -> String {
         do {
             // Her başlatmada rotasyon: eski şifre süresiz geçerli kalmasın.
-            // `opencode serve` harici binary'si stdin ile şifre almadığı için
-            // şifre `OPENCODE_SERVER_PASSWORD` ortam değişkeniyle taşınmaya
-            // devam eder; daralan pencere rotasyondan gelir, aktarımdan değil.
+            // Kabul edilen risk: `opencode serve` harici binary'si stdin ile
+            // şifre almadığı için şifre `OPENCODE_SERVER_PASSWORD` ortam
+            // değişkeniyle taşınmaya devam eder; aynı kullanıcıdaki bir süreç
+            // `ps e` ile çocuğun env'ini okuyabilir. Daralan pencere
+            // rotasyondan gelir, aktarımdan değil; parola ilk kez taşınmadan
+            // önce `verifyCurrentListener` bağlantının hâlâ çocuğa ait
+            // olduğunu doğrular (fail-closed).
             let generated = try await passwordGenerator()
             guard !generated.isEmpty else {
                 throw ProviderRuntimeError.authenticationFailure

@@ -44,9 +44,8 @@ struct SplitPaneHeader: View {
         HStack(spacing: isCompactHeader ? 4 : 8) {
             if isBusy {
                 ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.6)
-                    .frame(minWidth: 12, minHeight: 12)
+                    .controlSize(.mini)
+                    .frame(width: 12, height: 12)
                     .help("This session is running")
             } else {
                 Circle()
@@ -82,7 +81,7 @@ struct SplitPaneHeader: View {
 
                 if let onOpenSessionChanges, hasFileChanges {
                     Button(action: onOpenSessionChanges) {
-                        Image(systemName: "doc.badge.plus")
+                        Image(systemName: "plus.forwardslash.minus")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.secondary)
                             .frame(width: 24, height: 24)
@@ -182,7 +181,7 @@ struct SplitPaneHeader: View {
     private var panelActionItems: some View {
         if let onOpenSessionChanges, hasFileChanges {
             Button(action: onOpenSessionChanges) {
-                Label("Review file changes", systemImage: "doc.badge.plus")
+                Label("Review file changes", systemImage: "plus.forwardslash.minus")
             }
         }
         if let onOpenComputerLive {

@@ -937,8 +937,7 @@ struct ComposerView: View {
 
                 if store.isSwitching || store.isRefreshing {
                     ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.6)
+                        .controlSize(.mini)
                         .frame(width: 14, height: 14)
                 } else if !isCompactPane {
                     Image(systemName: "chevron.down")
@@ -1745,13 +1744,28 @@ struct ComposerView: View {
             sessionService.materializePendingSession(pending)
         }
 
-        // İçeriksiz komut (`/btw`, `/goal`): transkripte yazılmaz, ipucu
-        // gösterilir, taslak korunur.
+        // İçeriksiz komut (`/btw`, `/goal`, `/model`): transkripte yazılmaz,
+        // ipucu gösterilir, taslak korunur.
         if let bare = SlashCommand.bareCommandName(from: effectivePrompt) {
-            focusedSession.presentNotice(
-                .slashCommandHint("Type a question after /\(bare), e.g. /\(bare) what does this do?"),
-                autoDismissAfter: .seconds(6)
-            )
+            if bare == SlashCommand.model.name {
+                let names = focusedSession.availableModels.prefix(5).map(\.displayName).joined(separator: ", ")
+
+                let hint: String
+                if names.isEmpty {
+                    hint = "Type a model name after /model, e.g. /model gpt."
+                } else {
+                    hint = "Type a model name after /model, e.g. /model gpt. Available: \(names)."
+                }
+                focusedSession.presentNotice(
+                    .slashCommandHint(hint),
+                    autoDismissAfter: .seconds(6)
+                )
+            } else {
+                focusedSession.presentNotice(
+                    .slashCommandHint("Type a question after /\(bare), e.g. /\(bare) what does this do?"),
+                    autoDismissAfter: .seconds(6)
+                )
+            }
             return
         }
 
@@ -1794,6 +1808,22 @@ struct ComposerView: View {
             return
         }
 
+        // Model önek yakalama: `/model sorgu` normal kuyruğa girmez, bu
+        // sohbetin modelini değiştirir. Veri kaynağı model menüsüyle aynı
+        // listedir (`availableModels`, `ProviderGateway` yetenekleri).
+        // Transkripte yazılmaz; başarıda taslak temizlenir, rette korunur.
+        if let modelQuery = SlashCommand.parseModelQuery(from: effectivePrompt) {
+            guard attachedURLs.isEmpty, selectedTags.isEmpty else {
+                focusedSession.presentNotice(
+                    .slashCommandHint("/model does not take attachments or tags; remove them or pick the model from the menu."),
+                    autoDismissAfter: .seconds(6)
+                )
+                return
+            }
+            applyModelCommand(query: modelQuery)
+            return
+        }
+
         let attachmentPaths = attachedURLs.map { $0.path }
         let acceptance = focusedSession.send(
             effectivePrompt,
@@ -1827,6 +1857,49 @@ struct ComposerView: View {
         }
         let question = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
         return question.isEmpty ? nil : question
+    }
+
+    /// `/model sorgu` uygular: menüyle aynı listeden tek eşleşme seçilir.
+    /// Başarıda taslak temizlenir, her rette taslak korunur ve ipucu gösterilir.
+    /// Çok eşleşmede ya da eşleşmesizlikte transkripte yazılmaz.
+    private func applyModelCommand(query: String) {
+        let models = focusedSession.availableModels
+        guard !models.isEmpty else {
+            focusedSession.presentNotice(
+                .slashCommandHint("No models available — configure a provider first."),
+                autoDismissAfter: .seconds(6)
+            )
+            return
+        }
+        let matches = SlashCommand.matchingModels(query: query, in: models)
+        if matches.count == 1, let target = matches.first {
+            do {
+                try focusedSession.selectModel(target.id)
+                draft = ""
+                attachedURLs = []
+                selectedTags = []
+                draftStore?.clear(sessionID: focusedSession.id)
+            } catch {
+                focusedSession.presentNotice(
+                    .slashCommandHint("Could not select model \(target.displayName)."),
+                    autoDismissAfter: .seconds(6)
+                )
+            }
+            return
+        }
+        if matches.isEmpty {
+            let names = models.prefix(5).map(\.displayName).joined(separator: ", ")
+            focusedSession.presentNotice(
+                .slashCommandHint("No model matches \"\(query)\". Available: \(names)."),
+                autoDismissAfter: .seconds(6)
+            )
+            return
+        }
+        let names = matches.prefix(5).map(\.displayName).joined(separator: ", ")
+        focusedSession.presentNotice(
+            .slashCommandHint("Multiple models match \"\(query)\": \(names). Be more specific."),
+            autoDismissAfter: .seconds(6)
+        )
     }
 
     /// Codex/ChatGPT davranışı: eşik üstü bir yapıştırma metin alanını şişirmez,

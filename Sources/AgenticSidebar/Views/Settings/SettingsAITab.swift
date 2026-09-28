@@ -638,14 +638,22 @@ extension SettingsView {
             )
 
         case .select:
-            Picker(
-                prompt.message,
-                selection: metadataBinding(for: prompt.key)
-            ) {
-                ForEach(prompt.options ?? [], id: \.value) { option in
-                    Text(option.hint.map { "\(option.label) — \($0)" } ?? option.label)
-                        .tag(option.value)
+            // Seçeneksiz istemde etiketsiz seçici çizilmez: seçim `""` olur ve
+            // SwiftUI geçersiz seçim uyarısı verir.
+            if let options = prompt.options, !options.isEmpty {
+                Picker(
+                    prompt.message,
+                    selection: metadataBinding(for: prompt.key)
+                ) {
+                    ForEach(options, id: \.value) { option in
+                        Text(option.hint.map { "\(option.label) — \($0)" } ?? option.label)
+                            .tag(option.value)
+                    }
                 }
+            } else {
+                Text("\(prompt.message): no options are available from the provider.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -667,7 +675,7 @@ extension SettingsView {
     func metadataBinding(for key: String) -> Binding<String> {
         Binding(
             get: { openCodeSettings.metadataDrafts[key] ?? "" },
-            set: { openCodeSettings.metadataDrafts[key] = $0 }
+            set: { openCodeSettings.setMetadataDraft($0, for: key) }
         )
     }
 

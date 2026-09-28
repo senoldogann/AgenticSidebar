@@ -96,6 +96,22 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
     func clearQueuedPrompts()
     func drainQueuedPrompts()
     func cancel() async
+    /// Ekrandaki oturumun alt ajan delegasyonları, yeniden eskiye.
+    var activeSubagents: [SubagentRecord] { get }
+    /// Verilen oturumun alt ajan delegasyonları; bulunamazsa boş döner.
+    func subagents(for id: UUID) -> [SubagentRecord]
+    /// Çalışan bir alt ajanı durdurur. Bir tur iptal edildiyse `true` döner.
+    func cancelSubagent(sessionID: UUID, activityID: ProviderActivityID) async -> Bool
+    /// Verilen oturumun tur başı kayıtları; bulunamazsa boş döner.
+    func checkpoints(for id: UUID) -> [SessionTurnCheckpoint]
+    /// Depo HEAD'ini oturuma yazar; sonraki tur başı kaydı onu gömer.
+    func noteRepositoryHead(_ sha: String?, for id: UUID)
+    /// Oturumu verilen tur başı kaydına döndürür; uygulandıysa `true` döner.
+    @discardableResult
+    func rewind(sessionID: UUID, to checkpointID: UUID) -> Bool
+    /// Ekrandaki oturumu verilen tur başı kaydına döndürür.
+    @discardableResult
+    func rewindActiveSession(to checkpointID: UUID) -> Bool
     func flushPendingSave() async
     func saveNow() async
 
@@ -106,6 +122,15 @@ protocol AgentSessionServiceProtocol: AnyObject, Observable {
 
 extension AgentSessionServiceProtocol {
     func sideQuestionContext(for id: UUID) -> SideQuestionContext? { nil }
+    var activeSubagents: [SubagentRecord] { [] }
+    func subagents(for id: UUID) -> [SubagentRecord] { [] }
+    func cancelSubagent(sessionID: UUID, activityID: ProviderActivityID) async -> Bool { false }
+    func checkpoints(for id: UUID) -> [SessionTurnCheckpoint] { [] }
+    func noteRepositoryHead(_ sha: String?, for id: UUID) {}
+    @discardableResult
+    func rewind(sessionID: UUID, to checkpointID: UUID) -> Bool { false }
+    @discardableResult
+    func rewindActiveSession(to checkpointID: UUID) -> Bool { false }
     var pendingSessionID: UUID? { nil }
     var isPendingSessionVisible: Bool { false }
     @discardableResult

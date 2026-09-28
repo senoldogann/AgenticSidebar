@@ -103,7 +103,7 @@ struct FileChangesSummaryCard: View {
                 onOpenReview(summary, nil)
             } label: {
                 HStack(spacing: 4) {
-                    Image(systemName: "doc.badge.plus")
+                    Image(systemName: "plus.forwardslash.minus")
                         .font(.system(size: 10.5, weight: .medium))
 
                     if !PaneResponsive.isCompact(width: paneWidth) {

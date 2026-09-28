@@ -61,7 +61,8 @@ final class SideQuestionService {
             question: question,
             speedMode: speedMode,
             mode: mode,
-            contextSummary: context.contextSummary
+            contextSummary: context.contextSummary,
+            workingDirectoryPath: context.workingDirectoryPath
         )
         active = ActiveSideQuestion(
             id: UUID(),

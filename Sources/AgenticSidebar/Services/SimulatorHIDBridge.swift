@@ -1,6 +1,7 @@
 import CoreGraphics
 import Darwin
 import Foundation
+import Synchronization
 
 /// Koşan bir simülatör cihazına dokunma olayı gönderir.
 ///
@@ -39,6 +40,9 @@ final class SimulatorHIDBridge: @unchecked Sendable {
 
     /// Indigo mesaj yerleşimi: `SimulatorKit`'in C yapıları `#pragma pack(4)`
     /// ile hizalıdır. Alan adları bilinmediği için bayt ofsetleriyle kurulur.
+    /// Tel düzeni facebook/idb `PrivateHeaders/SimulatorApp/Indigo.h` ile
+    /// aynıdır: tek yüklü ileti 0xC0 (192) bayt, ikinci yük 0xC0 ofsetinde.
+    /// Bu yüzden aşağıdaki sabitlerin hiçbiri değiştirilmedi.
     private enum IndigoLayout {
         /// Mach başlığı (24) + iç boyut (4) + olay tipi (1) + dolgu (3) + yük (160).
         static let messageSize = 192
@@ -54,9 +58,9 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         static let secondPayloadOffset = messageSize
         static let totalSize = messageSize + payloadSize
         static let eventTypeTouch: UInt8 = 2
-        static let touchTarget: Int32 = 0x32
-        static let touchDown: Int32 = 0x1
-        static let touchUp: Int32 = 0x2
+        static let touchTarget: UInt32 = 0x32
+        static let touchDown: UInt32 = 0x1
+        static let touchUp: UInt32 = 0x2
         static let payloadField1: UInt32 = 0x0000_000b
     }
 
@@ -66,15 +70,32 @@ final class SimulatorHIDBridge: @unchecked Sendable {
     private var clients: [String: AnyObject] = [:]
     private var simulatorKitHandle: UnsafeMutableRawPointer?
     private var mouseMessageFunction: MouseMessageFunction?
-    private var failedAttachments: [String: String] = [:]
+    /// Başarısız kurulumların süreli önbelleği: 30 sn dolmadan aynı cihaza
+    /// yeniden kurulum denenmez, süre dolunca yeniden denemeye açılır.
+    private var failedAttachments = SimulatorHIDFailureCache()
+    /// Birleştirilmiş taşıma turu sürüyor mu; sürerken gelen taşıma
+    /// cihaz başına bekler (yalnız her cihazın en yenisi). Sözlük yapısı
+    /// iki cihazın koordinatlarının birbirine karışmasını önler.
+    private var moveInFlight = false
+    private var pendingMoves: [String: (x: Double, y: Double)] = [:]
+    /// Birleşen turda yutulan çağrıların tamamlanmaları: tur bitince hepsi
+    /// son sonuçla çağrılır, hiçbir çağıran yanıtsız kalmaz.
+    private var pendingMoveCompletions: [(Result<Void, Error>) -> Void] = []
 
+    /// `IndigoHIDMessageForMouseNSEvent` gerçek C imzası 6 argümanlıdır:
+    /// `(CGPoint*, CGPoint*, hedef, olayTipi, NSSize, kenar)`. Kaynak:
+    /// serve-sim `HIDInjector` (`g_mouse_fn(&pt, NULL, 0x32, ns_type,
+    /// screen, 0)` çağrısı) ve baguette 7-arg ABI çözümü (kenar baytı
+    /// `NSSize` çiftiyle birlikte taşınır). Eski 5-arg `Bool` kuyruklu
+    /// imza yığını kaydırıp tanımsız davranışa yol açardı.
     private typealias MouseMessageFunction =
         @convention(c) (
             UnsafeMutablePointer<CGPoint>,
             UnsafeMutablePointer<CGPoint>?,
-            Int32,
-            Int32,
-            Bool
+            UInt32,
+            UInt32,
+            CGSize,
+            UInt32
         ) -> UnsafeMutableRawPointer?
 
     private typealias ClientInitFunction =
@@ -99,26 +120,29 @@ final class SimulatorHIDBridge: @unchecked Sendable {
             @escaping @convention(block) (NSError?) -> Void
         ) -> Void
 
-    private typealias ErrorGetter =
-        @convention(c) (
-            AnyObject,
-            Selector,
-            AutoreleasingUnsafeMutablePointer<NSError?>?
-        ) -> AnyObject?
-
-    private typealias ContextGetter =
-        @convention(c) (
-            AnyObject,
-            Selector,
-            NSString,
-            AutoreleasingUnsafeMutablePointer<NSError?>?
-        ) -> AnyObject?
-
     // MARK: - Genel arayüz
 
-    /// Cihazın eşzamansız tuttuğu boş tamamlama bloğu: uygulama ömrü boyunca
-    /// yaşar, yakalama yapmaz; her dokunuşta yeniden üretilmez.
-    nonisolated(unsafe) private static let noopCompletion: @convention(block) (NSError?) -> Void = { _ in }
+    /// Teslim tamamlaması: cihaz bir dokunuşu reddederse hata günlüğe düşer
+    /// ve önbellekteki istemci bırakılır; bir sonraki dokunuş bağlantıyı
+    /// yeniden kurar. Önceki boş blok düşen dokunuşları görünmez kılıyordu.
+    /// Blok `queue` üzerinde çağrılır (tamamlama kuyruğu odur), istemci
+    /// sözlüğüne erişim o yüzden güvenlidir.
+    /// Yalnız hatayı veren istemci bırakılır: geç gelen hata, arada yeniden
+    /// kurulmuş taze istemciyi silmez.
+    private func deliveryCompletion(udid: String, client: AnyObject) -> @convention(block) (NSError?) -> Void {
+        { [weak self, weak client] error in
+            guard let error else {
+                return
+            }
+            AppLog.panels.error(
+                "Simulator touch delivery failed: \(error.localizedDescription, privacy: .public)"
+            )
+            guard let self, let client, self.clients[udid] === client else {
+                return
+            }
+            self.clients.removeValue(forKey: udid)
+        }
+    }
 
     /// Normalize koordinata (0..1) parmak indirir.
     func touch(
@@ -147,6 +171,9 @@ final class SimulatorHIDBridge: @unchecked Sendable {
     }
 
     /// Tek dokunuş: indir, kısa tut, kaldır.
+    ///
+    /// Tutma süresi kuyruğu bloklamaz: `down` sonrası `up` 45 ms gecikmeyle
+    /// aynı kuyruğa zamanlanır, arada gelen başka cihaz olayları işler.
     func tap(
         udid: String,
         xRatio: Double,
@@ -159,9 +186,56 @@ final class SimulatorHIDBridge: @unchecked Sendable {
                 DispatchQueue.main.async { completion(down) }
                 return
             }
-            usleep(45_000)
-            let up = sendTouch(udid: udid, xRatio: xRatio, yRatio: yRatio, down: false)
-            DispatchQueue.main.async { completion(up) }
+            queue.asyncAfter(deadline: .now() + 0.045) { [self] in
+                let up = sendTouch(udid: udid, xRatio: xRatio, yRatio: yRatio, down: false)
+                DispatchQueue.main.async { completion(up) }
+            }
+        }
+    }
+
+    /// Sürükleme taşıma olayı: yüksek frekanslı `pressMoveTo` akışında kuyruk
+    /// şişmesin diye cihaz başına birleştirilir. Gönderim sürerken gelen
+    /// taşıma kuyruğa dizilmez, yalnız o cihazın en yenisi bekler; tur
+    /// bitince o koşar. Her çağıranın tamamlanması tur sonunda son sonuçla
+    /// çağrılır. Parmak basılı kaldığı için taşıma her zaman `down`
+    /// gönderir (`touch` ile aynı). `touch`/`tap`/`release` her zaman
+    /// birebir koşar, buradan geçmez.
+    func move(
+        udid: String,
+        xRatio: Double,
+        yRatio: Double,
+        completion: @escaping @Sendable (Result<Void, Error>) -> Void
+    ) {
+        queue.async { [self] in
+            if moveInFlight {
+                pendingMoves[udid] = (x: xRatio, y: yRatio)
+                pendingMoveCompletions.append(completion)
+                return
+            }
+            moveInFlight = true
+            var current: (udid: String, x: Double, y: Double)? = (udid: udid, x: xRatio, y: yRatio)
+            var waiting: [(Result<Void, Error>) -> Void] = [completion]
+            var lastResult: Result<Void, Error> = .success(())
+            while let job = current {
+                lastResult = sendTouch(udid: job.udid, xRatio: job.x, yRatio: job.y, down: true)
+                if let next = pendingMoves.removeValue(forKey: job.udid) {
+                    current = (udid: job.udid, x: next.x, y: next.y)
+                } else if let otherKey = pendingMoves.keys.first, let other = pendingMoves.removeValue(forKey: otherKey) {
+                    current = (udid: otherKey, x: other.x, y: other.y)
+                } else {
+                    current = nil
+                }
+            }
+            moveInFlight = false
+            waiting.append(contentsOf: pendingMoveCompletions)
+            pendingMoveCompletions.removeAll()
+            let result = lastResult
+            let callbacks = waiting
+            DispatchQueue.main.async {
+                for callback in callbacks {
+                    callback(result)
+                }
+            }
         }
     }
 
@@ -169,7 +243,7 @@ final class SimulatorHIDBridge: @unchecked Sendable {
     func detach(udid: String) {
         queue.async { [self] in
             clients.removeValue(forKey: udid)
-            failedAttachments.removeValue(forKey: udid)
+            failedAttachments.removeFailure(udid: udid)
         }
     }
 
@@ -205,7 +279,8 @@ final class SimulatorHIDBridge: @unchecked Sendable {
                 nil,
                 IndigoLayout.touchTarget,
                 eventType,
-                false
+                CGSize(width: 1, height: 1),
+                0
             )
         else {
             return .failure(BridgeError.sendFailed(detail: "Indigo returned no message"))
@@ -280,7 +355,7 @@ final class SimulatorHIDBridge: @unchecked Sendable {
                     message,
                     true,
                     queue,
-                    Self.noopCompletion
+                    deliveryCompletion(udid: udid, client: resolvedClient)
                 )
                 return .success(())
             }
@@ -290,7 +365,9 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         let clientClass: AnyClass? = object_getClass(resolvedClient)
         if let cls = clientClass, cls.responds(to: selector) {
             // Class method IMP'sini al ve class objesiyle çağır
-            if let method = class_getClassMethod(cls, selector) {
+            if let method = class_getClassMethod(cls, selector),
+                Self.isSendMessageSignatureValid(method)
+            {
                 let imp = unsafeBitCast(method_getImplementation(method), to: ClientSendFunction.self)
                 imp(
                     cls,
@@ -298,7 +375,7 @@ final class SimulatorHIDBridge: @unchecked Sendable {
                     message,
                     true,
                     queue,
-                    Self.noopCompletion
+                    deliveryCompletion(udid: udid, client: resolvedClient)
                 )
                 return .success(())
             }
@@ -308,7 +385,11 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         // yeniden denenir (attachClient tekrar çalışır).
         free(message)
         clients.removeValue(forKey: udid)
-        failedAttachments[udid] = "sendWithMessage: unavailable (instance & class)"
+        failedAttachments.recordFailure(
+            udid: udid,
+            detail: "sendWithMessage: unavailable (instance & class)",
+            at: Date()
+        )
         return .failure(BridgeError.clientUnavailable(detail: "sendWithMessage: unavailable on this SimulatorKit version"))
     }
 
@@ -317,7 +398,89 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         guard let method = class_getInstanceMethod(type(of: client), selector) else {
             return nil
         }
+        // İmza doğrulaması: `unsafeBitCast` ile çağrılan IMP'nin aritesi
+        // ve parametre türleri tutmazsa süreç `EXC_BAD_ACCESS` ile ölür ve
+        // Swift'te ObjC istisnası yakalanamaz. Beklenen şekil
+        // `self + _cmd + 4 parametre` (gösterge, bayrak, kuyruk, blok) ve
+        // `void` dönüşüdür; uymayan sürümde dokunuş graceful-disable olur.
+        guard Self.isSendMessageSignatureValid(method) else {
+            return nil
+        }
         return unsafeBitCast(method_getImplementation(method), to: ClientSendFunction.self)
+    }
+
+    /// `sendWithMessage:freeWhenDone:completionQueue:completion:` imzasının
+    /// beklenen şekilde olduğunu doğrular: arite yetmez, çünkü ObjC
+    /// istisnası Swift'te yakalanamaz ve `unsafeBitCast` ile çağrılan
+    /// uymayan IMP süreci `EXC_BAD_ACCESS` ile öldürür. Bu yüzden dönüş
+    /// (`void`) ve her parametrenin tür kodu da denetlenir: ileti göstergesi,
+    /// bayrak (`B`, eski çalışmalarda `c`), kuyruk nesnesi, tamamlama bloğu.
+    /// Uymayan sürümde dokunuş graceful-disable olur, süreç yaşamaz sorunu
+    /// yaşamaz.
+    static func isSendMessageSignatureValid(_ method: Method) -> Bool {
+        // self, _cmd + message, freeWhenDone, completionQueue, completion.
+        guard method_getNumberOfArguments(method) == 6 else {
+            return false
+        }
+        guard returnType(of: method) == "v" else {
+            return false
+        }
+        guard let message = argumentType(of: method, at: 2), message.hasPrefix("^") else {
+            return false
+        }
+        guard let flag = argumentType(of: method, at: 3), flag == "B" || flag == "c" else {
+            return false
+        }
+        guard let queue = argumentType(of: method, at: 4), queue.hasPrefix("@") else {
+            return false
+        }
+        guard let completion = argumentType(of: method, at: 5), completion.hasPrefix("@") else {
+            return false
+        }
+        return true
+    }
+
+    /// `initWithDevice:error:` imzasını doğrular: (self, _cmd, cihaz
+    /// nesnesi, hata-çıkış göstergesi) → nesne. Gönderim yolundakiyle aynı
+    /// gerekçe: doğrulamasız `unsafeBitCast` süreci öldürür.
+    static func isInitWithDeviceSignatureValid(_ method: Method) -> Bool {
+        guard method_getNumberOfArguments(method) == 4 else {
+            return false
+        }
+        // Nesne dönüş `@"SınıfAdı"` diye kodlanabilir; önek yeterlidir.
+        guard returnType(of: method).hasPrefix("@") else {
+            return false
+        }
+        guard let device = argumentType(of: method, at: 2), device.hasPrefix("@") else {
+            return false
+        }
+        guard let errorOut = argumentType(of: method, at: 3), errorOut.hasPrefix("^") else {
+            return false
+        }
+        return true
+    }
+
+    /// Yöntemin dönüş tür kodunu okur.
+    private static func returnType(of method: Method) -> String {
+        var code = [CChar](repeating: 0, count: 32)
+        method_getReturnType(method, &code, code.count)
+        return code.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else {
+                return ""
+            }
+            return String(cString: base)
+        }
+    }
+
+    /// Yöntemin verilen sıradaki parametresinin tür kodunu okur; sınıf adı
+    /// eki (`@"NSString"`) ve blok işareti (`@?`) olduğu gibi taşınır,
+    /// çağıran önekle karşılaştırır.
+    private static func argumentType(of method: Method, at index: UInt32) -> String? {
+        guard let raw = method_copyArgumentType(method, index) else {
+            return nil
+        }
+        defer { free(UnsafeMutableRawPointer(raw)) }
+        return String(cString: raw)
     }
 
     // MARK: - İstemci kurulumu
@@ -326,15 +489,18 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         if let existing = clients[udid] {
             return .success(existing)
         }
-        if let failure = failedAttachments[udid] {
+        // Taze kayıt varken kurulum denenmez; 30 sn dolmuşsa kayıt yok
+        // sayılır ve kurulum yeniden denenir.
+        if let failure = failedAttachments.failure(forUDID: udid, now: Date()) {
             return .failure(BridgeError.clientUnavailable(detail: failure))
         }
         do {
             let created = try attachClient(udid: udid)
             clients[udid] = created
+            failedAttachments.removeFailure(udid: udid)
             return .success(created)
         } catch {
-            failedAttachments[udid] = error.localizedDescription
+            failedAttachments.recordFailure(udid: udid, detail: error.localizedDescription, at: Date())
             return .failure(error)
         }
     }
@@ -360,6 +526,13 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         guard let method = class_getInstanceMethod(clientClass, selector) else {
             throw BridgeError.clientUnavailable(detail: "initWithDevice:error: is missing")
         }
+        // Kurulum IMP'si de bitcast ile çağrılır; imza uymazsa süreç ölür.
+        // Gönderim yoluyla aynı kural burada da uygulanır.
+        guard Self.isInitWithDeviceSignatureValid(method) else {
+            throw BridgeError.clientUnavailable(
+                detail: "initWithDevice:error: has an unexpected signature on this SimulatorKit version"
+            )
+        }
         // `alloc` adımı atlanırsa mesaj sınıfa gider ve "unrecognized selector"
         // istisnası süreci öldürür; örnek önce yaratılır.
         guard let allocated = class_createInstance(clientClass, 0) as AnyObject? else {
@@ -381,24 +554,11 @@ final class SimulatorHIDBridge: @unchecked Sendable {
             return
         }
 
-        let developerDirectory = Self.developerDirectory()
-        let candidates = [
-            "\(developerDirectory)/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit",
-            "\(developerDirectory)/../SharedFrameworks/SimulatorKit.framework/SimulatorKit",
-            "/Applications/Xcode.app/Contents/SharedFrameworks/SimulatorKit.framework/SimulatorKit",
-            "/Applications/Xcode.app/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit",
-        ]
-        var loaded: UnsafeMutableRawPointer?
-        for candidate in candidates {
-            if let handle = dlopen(candidate, RTLD_NOW) {
-                loaded = handle
-                break
-            }
-        }
-        guard let handle = loaded else {
-            throw BridgeError.frameworksUnavailable(
-                detail: dlerror().map { String(cString: $0) } ?? "SimulatorKit was not found"
-            )
+        let handle: UnsafeMutableRawPointer
+        do {
+            handle = try SimulatorPrivateFrameworks.loadSimulatorKit()
+        } catch let error as SimulatorPrivateFrameworks.FrameworkError {
+            throw BridgeError.frameworksUnavailable(detail: error.detail)
         }
 
         guard
@@ -406,77 +566,39 @@ final class SimulatorHIDBridge: @unchecked Sendable {
         else {
             throw BridgeError.frameworksUnavailable(detail: "IndigoHIDMessageForMouseNSEvent is missing")
         }
+        // Sembolün gerçekten SimulatorKit görüntüsünden geldiği doğrulanır:
+        // araya giren (interpose) ya da yanlış çerçeveden gelen aynı adlı
+        // sembol, 6-arg çağrı düzenini bozup tanımsız davranışa yol açardı.
+        var info = Dl_info(dli_fname: nil, dli_fbase: nil, dli_sname: nil, dli_saddr: nil)
+        let imagePath: String
+        if dladdr(symbol, &info) != 0, let fname = info.dli_fname {
+            imagePath = String(cString: fname)
+        } else {
+            imagePath = ""
+        }
+        guard imagePath.contains("SimulatorKit") else {
+            throw BridgeError.frameworksUnavailable(
+                detail: "IndigoHIDMessageForMouseNSEvent resolved outside SimulatorKit (\(imagePath))"
+            )
+        }
         simulatorKitHandle = handle
         mouseMessageFunction = unsafeBitCast(symbol, to: MouseMessageFunction.self)
     }
 
-    /// CoreSimulator'ın servis bağlamından cihazı UDID ile bulur.
+    /// CoreSimulator'ın servis bağlamından cihazı UDID ile bulur (ortak yükleyici).
     private func resolveDevice(udid: String) throws -> AnyObject? {
-        let coreSimulatorPath = "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator"
-        guard dlopen(coreSimulatorPath, RTLD_NOW) != nil else {
-            throw BridgeError.frameworksUnavailable(
-                detail: dlerror().map { String(cString: $0) } ?? "CoreSimulator was not found"
-            )
+        do {
+            return try SimulatorPrivateFrameworks.resolveDevice(udid: udid)
+        } catch let error as SimulatorPrivateFrameworks.FrameworkError {
+            throw BridgeError.frameworksUnavailable(detail: error.detail)
         }
-        guard let contextClass = NSClassFromString("SimServiceContext") else {
-            throw BridgeError.frameworksUnavailable(detail: "SimServiceContext is missing")
-        }
-
-        let contextSelector = NSSelectorFromString("sharedServiceContextForDeveloperDir:error:")
-        guard let contextMethod = class_getClassMethod(contextClass, contextSelector) else {
-            throw BridgeError.frameworksUnavailable(detail: "sharedServiceContextForDeveloperDir: is missing")
-        }
-        let makeContext = unsafeBitCast(method_getImplementation(contextMethod), to: ContextGetter.self)
-        var contextError: NSError?
-        let context = makeContext(contextClass, contextSelector, Self.developerDirectory() as NSString, &contextError)
-        guard let context else {
-            throw BridgeError.frameworksUnavailable(
-                detail: contextError?.localizedDescription ?? "The service context could not be created"
-            )
-        }
-
-        let setSelector = NSSelectorFromString("defaultDeviceSetWithError:")
-        guard let setMethod = class_getInstanceMethod(type(of: context), setSelector) else {
-            throw BridgeError.frameworksUnavailable(detail: "defaultDeviceSetWithError: is missing")
-        }
-        let makeSet = unsafeBitCast(method_getImplementation(setMethod), to: ErrorGetter.self)
-        var setError: NSError?
-        let deviceSet = makeSet(context, setSelector, &setError)
-        guard let deviceSet else {
-            throw BridgeError.frameworksUnavailable(
-                detail: setError?.localizedDescription ?? "The device set could not be created"
-            )
-        }
-
-        guard let devices = deviceSet.value(forKey: "devices") as? [AnyObject] else {
-            return nil
-        }
-
-        for device in devices {
-            guard
-                let handle = device as? NSObject,
-                let identifier = handle.value(forKey: "UDID") as? NSUUID
-            else {
-                continue
-            }
-            if identifier.uuidString.caseInsensitiveCompare(udid) == .orderedSame {
-                return handle
-            }
-        }
-        return nil
     }
 
     private func isBooted(device: AnyObject) -> Bool {
         guard let handle = device as? NSObject else {
             return false
         }
-        // CoreSimulator'ın `SimDeviceState` değeri KVC ile NSNumber'a köprülenir;
-        // 3 = booted. Seçici doğrudan çağrılırsa Swift enum'u nesne sanılıp
-        // çökülür, bu yüzden okuma KVC'den yapılır.
-        guard let state = handle.value(forKey: "state") as? NSNumber else {
-            return false
-        }
-        return state.intValue == 3
+        return SimulatorPrivateFrameworks.isBooted(device: handle)
     }
 
     /// Oranı 0..1 aralığına kırpar; NaN ve sonsuz sıfıra düşer.
@@ -485,28 +607,5 @@ final class SimulatorHIDBridge: @unchecked Sendable {
             return 0
         }
         return min(1, max(0, value))
-    }
-
-    /// Etkin geliştirici dizini; `xcode-select` yoksa bilinen kurulum.
-    private static func developerDirectory() -> String {
-        if let configured = ProcessInfo.processInfo.environment["DEVELOPER_DIR"], !configured.isEmpty {
-            return configured
-        }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
-        process.arguments = ["-p"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        if (try? process.run()) != nil {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            let path = String(decoding: data, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !path.isEmpty {
-                return path
-            }
-        }
-        return "/Applications/Xcode.app/Contents/Developer"
     }
 }

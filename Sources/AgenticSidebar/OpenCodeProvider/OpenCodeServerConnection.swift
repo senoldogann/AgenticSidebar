@@ -11,6 +11,14 @@ struct OpenCodeServerConnection: Equatable, Sendable {
     }
 }
 
+extension OpenCodeServerConnection: CustomDebugStringConvertible {
+    /// Hata ayıklama çıktısı parolayı asla taşımaz: gelecekte eklenecek bir
+    /// `String(describing:)` günlüğü bile sırrı sızdırmaz.
+    var debugDescription: String {
+        "OpenCodeServerConnection(baseURL: \(baseURL), username: \(username), password: [REDACTED])"
+    }
+}
+
 enum OpenCodeServerStatus: Equatable, Sendable {
     case stopped
     case starting

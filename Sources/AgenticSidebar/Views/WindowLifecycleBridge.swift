@@ -83,10 +83,40 @@ final class WindowSharingObservationView: NSView {
 /// would terminate the process (even though `applicationShouldTerminateAfterLastWindowClosed`
 /// returns `false`, closing the *only* window can still trigger a quit path
 /// depending on the macOS version and the `LSUIElement` flag).
+///
+/// SwiftUI kendi sahne penceresine bir delege takar ve boyut, odak ve yaşam
+/// döngüsü bildirimlerini oradan alır. Bu sınıf o delegenin yerini almaz,
+/// önüne geçer: yalnız `windowShouldClose` burada yanıtlanır, geri kalan her
+/// seçici Objective-C mesaj iletimiyle özgün delegeye gider.
 @MainActor
 final class HideOnCloseWindowDelegate: NSObject, NSWindowDelegate {
+    /// Özgün (SwiftUI) delege. `NSWindow.delegate` zayıf tutulduğu için güçlü
+    /// tutulur; vekil yaşadıkça hedef de yaşar. AppKit ileti sorgularını
+    /// (`responds(to:)`, `forwardingTarget(for:)`) ana iş parçacığında yapar;
+    /// değer yalnız kurulumda yazılır, sonra hiç değişmez.
+    nonisolated(unsafe) private let forwardTarget: NSWindowDelegate?
+
+    init(forwardingTo forwardTarget: NSWindowDelegate?) {
+        self.forwardTarget = forwardTarget
+        super.init()
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         sender.orderOut(nil)
         return false
+    }
+
+    nonisolated override func responds(to aSelector: Selector!) -> Bool {
+        if super.responds(to: aSelector) {
+            return true
+        }
+        return forwardTarget?.responds(to: aSelector) ?? false
+    }
+
+    nonisolated override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if let forwardTarget, forwardTarget.responds(to: aSelector) {
+            return forwardTarget
+        }
+        return super.forwardingTarget(for: aSelector)
     }
 }

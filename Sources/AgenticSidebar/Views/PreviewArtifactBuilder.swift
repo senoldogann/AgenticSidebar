@@ -42,14 +42,24 @@ enum PreviewArtifactBuilder {
     }
 
     /// Ham model çıktısındaki etkin içeriği şeritler: betik ve gömülü
-    /// çerçeve öğeleri, on* olay öznitelikleri ve javascript: adresleri.
-    /// CSP ve izolasyon katmanları yerinde durur; bu, tek katman hatasında
-    /// aktifleşecek vektörleri baştan kaldırır.
+    /// çerçeve öğeleri, vektör taşıyabilen gömülü ortam öğeleri (`math`,
+    /// `video`/`audio`+`source`, `link`/`base`), on* olay öznitelikleri ve
+    /// javascript: adresleri. `svg` bilerek listede değildir: `.svg`
+    /// yapıtları statik çizim önizlemesidir, test kilitlidir
+    /// (`LivePreviewTests.testSVGDocumentCentersArtwork`); svg içindeki
+    /// olay öznitelikleri (`onbegin` dahil) genel on* deseniyle, dış
+    /// yükler CSP (`default-src 'none'`) ile tutulur. CSP ve izolasyon
+    /// katmanları yerinde durur; bu, tek katman hatasında aktifleşecek
+    /// vektörleri baştan kaldırır.
     /// Desenler çağrı başına derlenmez: aynı belge her satırda yeniden
     /// taranır, derleme maliyeti her seferinde ödenmezdi.
-    private static let elementPairPatterns: [(element: String, regex: NSRegularExpression?)] = [
+    private static let strippedElements = [
         "script", "iframe", "object", "embed", "form", "foreignobject",
-    ].map { element in
+        "math", "body", "video", "audio", "source", "track",
+        "link", "base",
+    ]
+
+    private static let elementPairPatterns: [(element: String, regex: NSRegularExpression?)] = strippedElements.map { element in
         (
             element: element,
             regex: try? NSRegularExpression(
@@ -59,9 +69,7 @@ enum PreviewArtifactBuilder {
         )
     }
 
-    private static let elementOpenPatterns: [(element: String, regex: NSRegularExpression?)] = [
-        "script", "iframe", "object", "embed", "form", "foreignobject",
-    ].map { element in
+    private static let elementOpenPatterns: [(element: String, regex: NSRegularExpression?)] = strippedElements.map { element in
         (
             element: element,
             regex: try? NSRegularExpression(
@@ -83,7 +91,9 @@ enum PreviewArtifactBuilder {
     )
 
     static func sanitizedMarkup(_ markup: String) -> String {
-        var result = markup
+        // Sayısal karakter referansları (`&#106;`, `&#x6A;`) önce çözülür:
+        // kodlanmış `javascript:` ve olay öznitelikleri desenden kaçamazdı.
+        var result = decodingNumericCharacterReferences(markup)
         for entry in elementPairPatterns {
             result = replacingMatches(regex: entry.regex, in: result)
         }
@@ -105,6 +115,45 @@ enum PreviewArtifactBuilder {
             range: NSRange(text.startIndex..., in: text),
             withTemplate: ""
         )
+    }
+
+    /// Sayısal karakter referanslarını (`&#106;`, `&#x6A;`) çözer; geçersiz
+    /// ya da denetimsiz değerler olduğu gibi bırakılır. Çözüm yalnız
+    /// arındırma içindir, çıktıya kaçmaz: `javascript:` gizleme kalıbı
+    /// (`&#106;avascript:`) böylece yakalanır.
+    private static func decodingNumericCharacterReferences(_ text: String) -> String {
+        var result = ""
+        result.reserveCapacity(text.count)
+        var index = text.startIndex
+        while index < text.endIndex {
+            guard text[index] == "&", text[index...].hasPrefix("&#") else {
+                result.append(text[index])
+                index = text.index(after: index)
+                continue
+            }
+            guard let semicolon = text[index...].firstIndex(of: ";"),
+                semicolon < text.index(index, offsetBy: 10, limitedBy: text.endIndex) ?? text.endIndex
+            else {
+                result.append(text[index])
+                index = text.index(after: index)
+                continue
+            }
+            let body = String(text[text.index(index, offsetBy: 2)..<semicolon])
+            let scalarValue: UInt32? = {
+                if body.hasPrefix("x") || body.hasPrefix("X") {
+                    return UInt32(String(body.dropFirst()), radix: 16)
+                }
+                return UInt32(body, radix: 10)
+            }()
+            guard let value = scalarValue, let scalar = Unicode.Scalar(value) else {
+                result.append(contentsOf: text[index...semicolon])
+                index = text.index(after: semicolon)
+                continue
+            }
+            result.append(Character(scalar))
+            index = text.index(after: semicolon)
+        }
+        return result
     }
 
     // MARK: - Özel

@@ -365,4 +365,58 @@ final class FileChangesModelTests: XCTestCase {
         )
         XCTAssertTrue(TurnFileChangesSummary.hasFileChanges(in: [commandOnly, edited]))
     }
+
+    func testFingerprintStableWithoutChanges() {
+        let group = AgentTurnActivityGroup(
+            id: UUID(),
+            anchorMessageID: UUID(),
+            activities: [
+                AgentActivity(
+                    id: ProviderActivityID("edit-1"),
+                    kind: .edit,
+                    phase: .completed,
+                    title: "Edited A.swift",
+                    detail: "/workspace/A.swift",
+                    output: "Success",
+                    diff: "+ one",
+                    startedAt: Date(),
+                    completedAt: Date()
+                )
+            ]
+        )
+        let first = TurnFileChangesSummary.fileChangeFingerprint(groups: [group])
+        let second = TurnFileChangesSummary.fileChangeFingerprint(groups: [group])
+        XCTAssertEqual(first, second, "Değişmeyen gruplarda parmak izi sabit kalmalı")
+    }
+
+    func testFingerprintMovesWithStreamedContent() {
+        let groupID = UUID()
+        func group(diff: String) -> AgentTurnActivityGroup {
+            AgentTurnActivityGroup(
+                id: groupID,
+                anchorMessageID: UUID(),
+                activities: [
+                    AgentActivity(
+                        id: ProviderActivityID("edit-1"),
+                        kind: .edit,
+                        phase: .running,
+                        title: "Edited A.swift",
+                        detail: "/workspace/A.swift",
+                        output: nil,
+                        diff: diff,
+                        startedAt: Date(),
+                        completedAt: nil
+                    )
+                ]
+            )
+        }
+        let short = TurnFileChangesSummary.fileChangeFingerprint(groups: [group(diff: "+ one")])
+        let long = TurnFileChangesSummary.fileChangeFingerprint(groups: [group(diff: "+ one\n+ two")])
+        XCTAssertNotEqual(short, long, "Uzayan diff parmak izini değiştirmeli")
+        let appended = TurnFileChangesSummary.fileChangeFingerprint(groups: [
+            group(diff: "+ one\n+ two"),
+            group(diff: "+ three"),
+        ])
+        XCTAssertNotEqual(long, appended, "Yeni grup parmak izini değiştirmeli")
+    }
 }

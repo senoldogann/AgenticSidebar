@@ -60,6 +60,14 @@ struct MarkdownContentView: View {
     /// Önbellek görünüm kimliğine bağlıdır: küresel durum yok, ilk karede boş
     /// içerik yok, metin değişmedikçe yeniden ayrıştırma yok.
     @State private var cache = MarkdownParseCache()
+    /// Akışta atlanan son ayrıştırmayı tamamlayan sayaç.
+    ///
+    /// Önbellek, son ayrıştırmadan 120 ms geçmeden gelen küçük ekleri atlar.
+    /// Akış o ekle durursa (araç çalışıyor, model düşünüyor) gövdeyi yeniden
+    /// koşturacak başka hiçbir girdi değişmez ve yanıtın sonu dakikalarca
+    /// eksik görünürdü. Metin sabit kaldıktan kısa süre sonra sayaç artar,
+    /// gövde yeniden koşar ve atlanan kuyruk ayrıştırılır.
+    @State private var trailingParseTick = 0
 
     init(
         markdown: String,
@@ -129,6 +137,7 @@ struct MarkdownContentView: View {
     }
 
     var body: some View {
+        let _ = trailingParseTick
         VStack(alignment: .leading, spacing: 10) {
             ForEach(rows) { row in
                 switch row {
@@ -143,6 +152,24 @@ struct MarkdownContentView: View {
         }
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .task(id: trailingParseKey) {
+            guard isStreaming else {
+                return
+            }
+            do {
+                try await Task.sleep(for: MarkdownParseCache.trailingParseDelay)
+            } catch {
+                return
+            }
+            trailingParseTick &+= 1
+        }
+    }
+
+    /// Akışta metin her büyüdüğünde bekleyen tamamlama görevi yeniden
+    /// kurulur; akış bitince görev hiç koşmaz. `utf8.count` yerel dizgide
+    /// O(1)'dir, metnin tamamı karşılaştırılmaz.
+    private var trailingParseKey: Int {
+        isStreaming ? markdown.utf8.count : -1
     }
 
     /// A run of prose, or a block that has to be its own view.
@@ -538,6 +565,17 @@ final class MarkdownParseCache {
     private var source: String?
     private var allowsPlanDocuments: Bool?
     private var parsed: [MarkdownBlock] = []
+    /// Son akış-çözümlemesinin zamanı: hızlı flush yağmuru her karede tam
+    /// parse üretmesin diye akışta küçük büyümeler kısa pencerede atlanır.
+    private var lastStreamingParseDate: Date?
+    /// Akışta atlanan pencere: bu aralıktan sık gelen küçük ekler bir sonraki
+    /// flush'un parse'una kalır, çıktı kaybolmaz, ana iş parçacığı nefes alır.
+    private static let streamingParseCoalesceInterval: TimeInterval = 0.12
+    /// Birleştirilen büyüme üst sınırı: büyük ek her zaman hemen parse edilir.
+    private static let streamingParseCoalesceCharacters = 400
+    /// Akış durduktan sonra atlanmış kuyruğun ayrıştırılma gecikmesi;
+    /// birleştirme penceresinden uzun olmalı ki tamamlama turu atlanmasın.
+    static let trailingParseDelay: Duration = .milliseconds(160)
 
     func blocks(
         for markdown: String,
@@ -545,6 +583,20 @@ final class MarkdownParseCache {
         isStreaming: Bool
     ) -> [MarkdownBlock] {
         if source == markdown, self.allowsPlanDocuments == allowsPlanDocuments {
+            return parsed
+        }
+        // Akış kısayolu: metin yalnız küçük bir ekle büyüdüyse ve son parse
+        // çok yeniyse önceki bloklar döner. Flush kadansı (~40 ms) parse
+        // maliyetinden (~10-40 ms uzun cevapta) hızlıyken ana iş parçacığı
+        // hiç boşa çıkamıyordu; atlanan ek bir sonraki flush'ta parse edilir.
+        if isStreaming,
+            let previous = source,
+            self.allowsPlanDocuments == allowsPlanDocuments,
+            markdown.utf8.count - previous.utf8.count < Self.streamingParseCoalesceCharacters,
+            markdown.hasPrefix(previous),
+            let lastDate = lastStreamingParseDate,
+            Date().timeIntervalSince(lastDate) < Self.streamingParseCoalesceInterval
+        {
             return parsed
         }
 
@@ -573,6 +625,8 @@ final class MarkdownParseCache {
                 for: markdown,
                 allowsPlanDocuments: allowsPlanDocuments
             )
+        } else {
+            lastStreamingParseDate = Date()
         }
 
         source = markdown

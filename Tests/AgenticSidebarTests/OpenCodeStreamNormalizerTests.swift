@@ -486,6 +486,43 @@ final class OpenCodeStreamNormalizerTests: XCTestCase {
         XCTAssertEqual(box.requests.first?.isDelegatedSession, true)
     }
 
+    /// Torun oturumu hiçbir `task` parçası tanıtmaz; sahiplik `parentID`
+    /// zincirinden öğrenilmezse izni hiç yayınlanmaz ve tur sonsuza dek bekler.
+    func testGrandchildPermissionSurfacesThroughSessionParentChain() throws {
+        final class RequestBox: @unchecked Sendable {
+            var requests: [OpenCodePermissionRequest] = []
+        }
+        let box = RequestBox()
+        var normalizer = OpenCodeStreamNormalizer(
+            sessionID: "ses_target",
+            onPermissionRequest: { box.requests.append($0) }
+        )
+
+        _ = try normalizer.consume(
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_grandchild","id":"per_grandchild","permission":"bash","patterns":["swift build"]}}"#
+        )
+        XCTAssertTrue(box.requests.isEmpty)
+
+        _ = try normalizer.consume(
+            line: #"data: {"type":"session.created","properties":{"info":{"id":"ses_child","parentID":"ses_target"}}}"#
+        )
+        _ = try normalizer.consume(
+            line: #"data: {"type":"session.created","properties":{"info":{"id":"ses_grandchild","parentID":"ses_child"}}}"#
+        )
+        XCTAssertEqual(box.requests.map(\.id), ["per_grandchild"])
+
+        // Yabancı bir sohbetin alt oturumu yine sahiplenilmez.
+        _ = try normalizer.consume(
+            line: #"data: {"type":"session.created","properties":{"info":{"id":"ses_foreign_child","parentID":"ses_foreign"}}}"#
+        )
+        _ = try normalizer.consume(
+            line:
+                #"data: {"type":"permission.asked","properties":{"sessionID":"ses_foreign_child","id":"per_foreign_child","permission":"bash","patterns":["ls"]}}"#
+        )
+        XCTAssertEqual(box.requests.map(\.id), ["per_grandchild"])
+    }
+
     func testPermissionAskedWithoutPermissionNameIsIgnored() throws {
         final class RequestBox: @unchecked Sendable {
             var value: OpenCodePermissionRequest?

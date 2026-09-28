@@ -26,11 +26,45 @@ final class BrowserURLNormalizerTests: XCTestCase {
         )
     }
 
-    func testHostWithPortGetsHTTPS() {
+    func testLocalDevelopmentHostsGetPlainHTTP() {
         XCTAssertEqual(
             BrowserURLNormalizer.normalizedURL(from: "localhost:3000")?.absoluteString,
-            "https://localhost:3000"
+            "http://localhost:3000"
         )
+        XCTAssertEqual(
+            BrowserURLNormalizer.normalizedURL(from: "localhost")?.absoluteString,
+            "http://localhost"
+        )
+        XCTAssertEqual(
+            BrowserURLNormalizer.normalizedURL(from: "127.0.0.1:8080/app")?.absoluteString,
+            "http://127.0.0.1:8080/app"
+        )
+        XCTAssertEqual(
+            BrowserURLNormalizer.normalizedURL(from: "192.168.1.5:3000")?.absoluteString,
+            "http://192.168.1.5:3000"
+        )
+        XCTAssertEqual(
+            BrowserURLNormalizer.normalizedURL(from: "[::1]:5173")?.absoluteString,
+            "http://[::1]:5173"
+        )
+    }
+
+    func testPublicHostWithPortGetsHTTPS() {
+        XCTAssertEqual(
+            BrowserURLNormalizer.normalizedURL(from: "example.com:8443")?.absoluteString,
+            "https://example.com:8443"
+        )
+        XCTAssertEqual(
+            BrowserURLNormalizer.normalizedURL(from: "8.8.8.8")?.absoluteString,
+            "https://8.8.8.8"
+        )
+    }
+
+    func testAbsolutePathBecomesFileURL() {
+        let url = BrowserURLNormalizer.normalizedURL(from: "/tmp/site/index.html")
+
+        XCTAssertEqual(url?.isFileURL, true)
+        XCTAssertEqual(url?.path, "/tmp/site/index.html")
     }
 
     func testPlainTextBecomesSearchQuery() {

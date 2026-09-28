@@ -40,6 +40,28 @@ final class SelectableMarkdownTextIncrementalTests: XCTestCase {
         )
     }
 
+    /// Satırın artımlı ölçüm aynası, her flush sonrası tam (baştan) ölçümle
+    /// aynı boyu vermeli; kısa ölçüm yanıtın kuyruğunu kırpar.
+    func testIncrementalMeasurerMatchesFullMeasurementWhileStreaming() {
+        let typography = MarkdownRunTypography.default
+        let width: CGFloat = 520
+        let live = SelectableMarkdownTextView.makeTextView()
+        let coordinator = SelectableMarkdownTextView.Coordinator()
+
+        for count in [1, 2, 5, 6, 11] {
+            SelectableMarkdownTextView.apply(
+                blocks: Self.paragraphs(count: count), typography: typography, to: live, coordinator: coordinator
+            )
+            XCTAssertEqual(
+                coordinator.measurer.size(forWidth: width).height,
+                SelectableMarkdownTextView.measuredSize(of: live, width: width).height,
+                accuracy: 0.5,
+                "\(count) paragraf sonrası artımlı ölçüm sapmamalı"
+            )
+        }
+        XCTAssertEqual(coordinator.measurer.length, live.textStorage?.length)
+    }
+
     func testSingleBlockAppendStaysIncremental() {
         let typography = MarkdownRunTypography.default
         let width: CGFloat = 724

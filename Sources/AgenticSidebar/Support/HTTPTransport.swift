@@ -154,8 +154,15 @@ struct URLSessionHTTPTransport: ProviderHTTPTransport {
         let channel = BoundedChannel<String>(capacity: Self.lineBufferCapacity)
         let forwardingTask = Task {
             do {
-                for try await line in bytes.lines {
+                var splitter = SSELineSplitter()
+                for try await byte in bytes {
+                    guard let line = splitter.feed(byte) else {
+                        continue
+                    }
                     try Task.checkCancellation()
+                    try await channel.send(line)
+                }
+                if let line = splitter.finish() {
                     try await channel.send(line)
                 }
                 await channel.finish()
@@ -174,5 +181,52 @@ struct URLSessionHTTPTransport: ProviderHTTPTransport {
                 await channel.finish(throwing: CancellationError())
             }
         )
+    }
+}
+
+/// Akış baytlarını SSE satırlarına böler.
+///
+/// Satır sonu yalnız CR, LF ya da CRLF'dir (WHATWG SSE). `AsyncBytes.lines`
+/// Unicode satır ayırıcılarını (U+2028, U+2029, U+0085) da satır sonu sayar:
+/// model çıktısındaki bir U+2028, JSON taşıyan `data:` satırını ikiye böler,
+/// iki yarım da ayrıştırılamayıp olay (metin parçası ya da araç sonucu)
+/// sessizce kaybolurdu. Bölme yalnız ASCII baytlarda yapıldığı için çok
+/// baytlı UTF-8 karakterleri asla ortadan kesilmez. Boş satırlar
+/// üretilmez: tüketiciler her `data:` satırını tek başına işler.
+struct SSELineSplitter {
+    private var buffer: [UInt8] = []
+    private var previousWasCarriageReturn = false
+
+    /// Bir bayt ekler; boş olmayan bir satır tamamlandıysa onu döndürür.
+    mutating func feed(_ byte: UInt8) -> String? {
+        switch byte {
+        case 0x0A:
+            if previousWasCarriageReturn {
+                previousWasCarriageReturn = false
+                return nil
+            }
+            return takeLine()
+        case 0x0D:
+            previousWasCarriageReturn = true
+            return takeLine()
+        default:
+            previousWasCarriageReturn = false
+            buffer.append(byte)
+            return nil
+        }
+    }
+
+    /// Akış bittiğinde sonlandırıcısız kalan son satır.
+    mutating func finish() -> String? {
+        takeLine()
+    }
+
+    private mutating func takeLine() -> String? {
+        guard !buffer.isEmpty else {
+            return nil
+        }
+        let line = String(decoding: buffer, as: UTF8.self)
+        buffer.removeAll(keepingCapacity: true)
+        return line
     }
 }

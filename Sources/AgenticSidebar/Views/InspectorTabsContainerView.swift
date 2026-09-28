@@ -19,6 +19,12 @@ struct InspectorTabsContainerView: View {
     let computerLiveService: ComputerLiveCaptureService
     /// Canlı bilgisayar sekmesinin gösterdiği durum (odaklı oturumdan türetilir).
     let computerLiveState: ComputerLiveState
+    /// Odaklı oturumun canlı dosya özeti: `session-changes` sekmesi açıkken
+    /// anlık fotoğraf yerine bunu gösterir, sekme akışla birlikte tazelenir.
+    /// Tur sekmeleri (`review:`) tarihsel fotoğraf olarak donuk kalır.
+    /// `nil` = canlı özet yok (sekme kapalı ya da değişiklik yok).
+    let liveSessionID: UUID?
+    let liveSessionChanges: TurnFileChangesSummary?
     let onSelectTab: (String) -> Void
     let onCloseTab: (String) -> Void
     let onToggleExpand: () -> Void
@@ -229,8 +235,19 @@ struct InspectorTabsContainerView: View {
             )
 
         case .changesReview(_, let summary, let initialFile):
+            // Oturum sekmesi canlı özeti gösterir: akış sırasında yeni dosya
+            // düşünce sekme kendini tazeler. Kimlik sekme kimliğine bağlıdır
+            // (özet kimliğine değil), bu yüzden seçim/kaydırma korunur.
+            let effectiveSummary: TurnFileChangesSummary = {
+                if let liveSessionID, let live = liveSessionChanges,
+                    tab.id == "session-changes:\(liveSessionID.uuidString)"
+                {
+                    return live
+                }
+                return summary
+            }()
             FileChangesReviewPanelView(
-                summary: summary,
+                summary: effectiveSummary,
                 initialSelectedFile: initialFile,
                 preset: preset,
                 isDark: isDark,
@@ -238,7 +255,7 @@ struct InspectorTabsContainerView: View {
                     onCloseTab(tab.id)
                 }
             )
-            .id("review:\(summary.id.uuidString):\(initialFile?.id.uuidString ?? "all")")
+            .id("\(tab.id):\(initialFile?.id.uuidString ?? "all")")
 
         case .terminal(let id, let workingDirectory):
             TerminalHostView(

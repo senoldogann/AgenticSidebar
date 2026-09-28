@@ -20,7 +20,7 @@ extension SettingsView {
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
 
                 Text(
-                    "Whenever you copy text anywhere on macOS using Command+C, AgenticSidebar automatically receives it and prompts the agent, even when running in the background."
+                    "Whenever you copy text anywhere on macOS using Command+C, AgenticSidebar automatically receives it and prompts the agent, even when running in the background. Copied passwords, 2FA codes and keys are sent to the model like any other text — keep this off when handling secrets."
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -40,7 +40,7 @@ extension SettingsView {
                 .tint(currentTheme.accentGradient.first ?? .accentColor)
 
                 Text(
-                    "Automatically detect newly saved desktop screenshots or clipboard captures, perform on-device OCR, and let the agent deduce problem solutions or descriptions."
+                    "Automatically detect newly saved desktop screenshots or clipboard captures, perform on-device OCR, and let the agent deduce problem solutions or descriptions. Screen content — including visible secrets — is sent to the model; concealed pasteboard items are skipped on a best-effort basis."
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)

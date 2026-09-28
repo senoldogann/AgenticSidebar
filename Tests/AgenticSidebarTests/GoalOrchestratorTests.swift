@@ -1308,4 +1308,104 @@ final class GoalOrchestratorTests: XCTestCase {
         XCTAssertTrue(orchestrator.engine?.run.isTerminal ?? false)
         XCTAssertEqual(orchestrator.engine?.run.phase, .failed)
     }
+
+    /// Doğrulama öncesi dizin tazeleme: köprü yeni proje iskelesini önerirse
+    /// kapılar orada koşar; ileti ve disk güncellenir.
+    func testVerifyAdoptsSuggestedProjectDirectory() async {
+        let orchestrator = GoalOrchestrator()
+        let session = FakeGoalSession()
+        let stale = packageDirectory()
+        let fresh = packageDirectory()
+        var bridge = session.bridge()
+        bridge.suggestedWorkingDirectory = { _ in fresh }
+        XCTAssertTrue(
+            orchestrator.start(
+                objective: "Hedef",
+                sessionID: UUID(),
+                speedMode: .normal,
+                mode: .build,
+                workingDirectory: stale,
+                runners: runners(),
+                bridge: bridge,
+                storeURL: temporaryURLs.last
+            ))
+        XCTAssertEqual(orchestrator.workingDirectoryPath, stale.path)
+        orchestrator.setAutoContinue(false)
+        orchestrator.handleTurnFinished()
+        orchestrator.handleTurnFinished()
+        await waitFor { orchestrator.lastReport != nil }
+        XCTAssertEqual(orchestrator.workingDirectoryPath, fresh.path)
+        XCTAssertTrue(orchestrator.message?.contains("Doğrulama dizini güncellendi") ?? false)
+    }
+
+    /// Öneri yoksa ya da aynı dizinse doğrulama mevcut dizinde koşar.
+    func testVerifyKeepsDirectoryWithoutSuggestion() async {
+        let orchestrator = GoalOrchestrator()
+        let session = FakeGoalSession()
+        let package = packageDirectory()
+        XCTAssertTrue(start(orchestrator, session: session, package: package, store: temporaryURLs.last!))
+        await driveToReview(orchestrator, session: session)
+        XCTAssertEqual(orchestrator.workingDirectoryPath, package.path)
+    }
+
+    /// Geçersiz öneri (proje işareti yok) sessizce düşer, koşu etkilenmez.
+    func testVerifyIgnoresInvalidSuggestedDirectory() async {
+        let orchestrator = GoalOrchestrator()
+        let session = FakeGoalSession()
+        let package = packageDirectory()
+        let invalid = scratchDirectory()
+        var bridge = session.bridge()
+        bridge.suggestedWorkingDirectory = { _ in invalid }
+        XCTAssertTrue(
+            orchestrator.start(
+                objective: "Hedef",
+                sessionID: UUID(),
+                speedMode: .normal,
+                mode: .build,
+                workingDirectory: package,
+                runners: runners(),
+                bridge: bridge,
+                storeURL: temporaryURLs.last
+            ))
+        await driveToReview(orchestrator, session: session)
+        XCTAssertEqual(orchestrator.workingDirectoryPath, package.path)
+    }
+
+    /// Bütçe aşım iletisi hangi kapağın dolduğunu söyler.
+    func testBudgetExhaustionReasonNamesTrippedCaps() {
+        let now = Date()
+        let budget = GoalBudget(maxIterations: 5, maxDurationSeconds: 3_600, maxToolCalls: 300)
+        func engine(iteration: Int, toolCalls: Int, startedAt: Date) -> GoalEngine {
+            let run = GoalRun(
+                id: UUID(),
+                objective: "Hedef",
+                criteria: [],
+                phase: .building,
+                iteration: iteration,
+                startedAt: startedAt,
+                toolCallCount: toolCalls,
+                log: [],
+                failureReason: nil
+            )
+            return GoalEngine(restoring: run, budget: budget)
+        }
+        let timedOut = GoalOrchestrator.budgetExhaustionReason(
+            engine: engine(iteration: 1, toolCalls: 10, startedAt: now.addingTimeInterval(-7_200)),
+            budget: budget,
+            now: now
+        )
+        XCTAssertTrue(timedOut.contains("time budget"), "Süre kapağı adlandırılmalı: \(timedOut)")
+        let iterated = GoalOrchestrator.budgetExhaustionReason(
+            engine: engine(iteration: 6, toolCalls: 10, startedAt: now),
+            budget: budget,
+            now: now
+        )
+        XCTAssertTrue(iterated.contains("iteration budget"), "Tur kapağı adlandırılmalı: \(iterated)")
+        let toolCapped = GoalOrchestrator.budgetExhaustionReason(
+            engine: engine(iteration: 1, toolCalls: 301, startedAt: now),
+            budget: budget,
+            now: now
+        )
+        XCTAssertTrue(toolCapped.contains("tool-call budget"), "Araç kapağı adlandırılmalı: \(toolCapped)")
+    }
 }

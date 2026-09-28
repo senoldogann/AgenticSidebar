@@ -84,6 +84,10 @@ struct ProviderRequest: Equatable, Sendable {
     /// Yuvarlanan bağlam özeti (`/compact`): pencere dışına düşen ön ekin
     /// yoğunlaştırılmışı. Boşken maliyet yoktur; doluyken istek başına eklenir.
     let contextSummary: String
+    /// Sohbetin bağlı olduğu klasörün dosya yolu; `nil` = klasörsüz oturum.
+    /// Ajanın dosya araçlarını hangi dizinde çalıştıracağını söyler, her turda
+    /// istemle taşınır (backend kendi oturumunda saklamaz).
+    let workingDirectoryPath: String?
 
     init(
         sessionID: UUID,
@@ -93,7 +97,8 @@ struct ProviderRequest: Equatable, Sendable {
         mode: AgentMode = .build,
         extensionContext: String? = nil,
         activityGroups: [AgentTurnActivityGroup] = [],
-        contextSummary: String = ""
+        contextSummary: String = "",
+        workingDirectoryPath: String? = nil
     ) {
         self.sessionID = sessionID
         self.configuration = configuration
@@ -103,6 +108,7 @@ struct ProviderRequest: Equatable, Sendable {
         self.extensionContext = extensionContext
         self.activityGroups = activityGroups
         self.contextSummary = contextSummary
+        self.workingDirectoryPath = workingDirectoryPath
     }
 }
 

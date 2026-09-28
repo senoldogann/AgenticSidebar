@@ -48,6 +48,7 @@ struct BrowserPanelView: View {
 
                 ZStack {
                     BrowserWebSurface(model: page)
+                        .id(pageID)
 
                     if !page.hasPage {
                         startHint(status: page.profileStatus)
@@ -330,8 +331,7 @@ private struct BrowserToolbar: View {
 
             if model.isLoading {
                 ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.7)
+                    .controlSize(.mini)
                     .frame(width: 20, height: 20)
             }
 
@@ -393,12 +393,53 @@ private struct BrowserToolbar: View {
 
 /// Modelin `WKWebView`'ini yerleştirir. Görünüm web görünümüne sahip
 /// olmadığı için sekme değişiminde sayfa yok olmaz.
+///
+/// Web görünümü doğrudan döndürülmez, bir kapsayıcıya konur: aynı
+/// `WKWebView` yeni bir kapsayıcıya taşındıktan sonra eski temsilci
+/// sökülürken SwiftUI kendi görünümünü üst görünümden çıkarır — döndürülen
+/// görünüm web görünümünün kendisi olsaydı yeni yerinden koparılır, panel
+/// boş kalırdı. Kapsayıcı yalnız hâlâ kendisinde duran görünümü bırakır.
+/// Güncellemede model değiştiyse (sayfa şeridinde başka sayfa seçildi) yeni
+/// sayfanın görünümü takılır.
 private struct BrowserWebSurface: NSViewRepresentable {
     let model: BrowserTabModel
 
-    func makeNSView(context: Context) -> WKWebView {
-        model.webView
+    func makeNSView(context: Context) -> BrowserWebContainerView {
+        let container = BrowserWebContainerView()
+        container.host(model.webView)
+        return container
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {}
+    func updateNSView(_ container: BrowserWebContainerView, context: Context) {
+        container.host(model.webView)
+    }
+
+    static func dismantleNSView(_ container: BrowserWebContainerView, coordinator: ()) {
+        container.releaseHostedView()
+    }
+}
+
+/// Tek bir web görünümünü tam boy taşıyan kapsayıcı.
+final class BrowserWebContainerView: NSView {
+    private weak var hostedView: NSView?
+
+    func host(_ view: NSView) {
+        if view.superview === self {
+            return
+        }
+        if let hostedView, hostedView !== view, hostedView.superview === self {
+            hostedView.removeFromSuperview()
+        }
+        view.frame = bounds
+        view.autoresizingMask = [.width, .height]
+        addSubview(view)
+        hostedView = view
+    }
+
+    func releaseHostedView() {
+        if let hostedView, hostedView.superview === self {
+            hostedView.removeFromSuperview()
+        }
+        hostedView = nil
+    }
 }

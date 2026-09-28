@@ -45,7 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private lazy var snapHotKeyController = GlobalHotKeyController(
         action: { [weak self] in
-            self?.snapCoordinator?.handleSnapHotKey()
+            guard let coordinator = self?.snapCoordinator else {
+                return
+            }
+            Task {
+                await coordinator.handleSnapHotKey()
+            }
         }, hotKeyID: 2)
 
     func applicationDidFinishLaunching(_ notification: Notification) {

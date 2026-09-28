@@ -79,7 +79,8 @@ enum OpenCodePromptBuilder {
         mode: AgentMode = .build,
         historyPreamble: String? = nil,
         fileManager: FileManager = .default,
-        maximumInlineBytes: Int = OpenCodePromptBuilder.maximumInlineAttachmentBytes
+        maximumInlineBytes: Int = OpenCodePromptBuilder.maximumInlineAttachmentBytes,
+        workingDirectoryPath: String? = nil
     ) -> [OpenCodePromptPart] {
         var parts: [OpenCodePromptPart] = []
         var quotedDocuments: [QuotedDocument] = []
@@ -120,7 +121,8 @@ enum OpenCodePromptBuilder {
             speedMode: speedMode,
             mode: mode,
             historyPreamble: historyPreamble,
-            extensionTags: message.extensionTags
+            extensionTags: message.extensionTags,
+            workingDirectoryPath: workingDirectoryPath
         )
         guard !text.isEmpty else {
             return parts
@@ -249,9 +251,20 @@ enum OpenCodePromptBuilder {
         speedMode: ResponseSpeedMode,
         mode: AgentMode,
         historyPreamble: String? = nil,
-        extensionTags: [ExtensionTag] = []
+        extensionTags: [ExtensionTag] = [],
+        workingDirectoryPath: String? = nil
     ) -> String {
         var sections: [String] = text.isEmpty ? [] : [text]
+
+        if let directory = workingDirectoryPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !directory.isEmpty
+        {
+            sections.append(
+                """
+                Working directory: \(directory)
+                Read and edit files with absolute paths inside this directory; do not ask the user for the project path when it is given here.
+                """)
+        }
 
         sections.append(contentsOf: quotedDocuments.map(quotedSection))
 

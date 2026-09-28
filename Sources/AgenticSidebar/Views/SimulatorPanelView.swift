@@ -3,8 +3,9 @@ import SwiftUI
 /// Sağ paneldeki iOS Simülatörü sekmesi: cihaz seçilir, açılır ve cihazın
 /// ekranı uygulamanın içinde izlenir.
 ///
-/// Görüntü önce canlı pencere akışından (`SCStream`, ~12 fps) gelir; akış
-/// kurulamazsa (izin/pencere yok) `SimulatorService` `simctl` karelerine
+/// Görüntü önce cihazın kendi ekran yüzeyinden (CoreSimulator framebuffer,
+/// ~30 fps, pencere ve izin gerektirmez) gelir; kurulamazsa `SimulatorService`
+/// pencere akışına (`SCStream`, yalnız Simulator.app) ve `simctl` karelerine
 /// düşer. Panel yalnız görünürken akış koşar. Dokunma ve sürükleme görüntünün
 /// üstünden cihaza gider (Indigo HID); yazı için "Open window" cihazı
 /// gösteren uygulamayı (Simulator/DeviceHub) öne getirir.
@@ -13,10 +14,6 @@ struct SimulatorPanelView: View {
     let preset: AppThemePreset
     let isDark: Bool
     let onDismiss: () -> Void
-
-    /// Sürüklemenin ilk `onChanged` çağrısında parmak indirilir, sonrakiler
-    /// taşıma olur; bayrak ikisini ayırır.
-    @State private var isPressing = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,8 +61,7 @@ struct SimulatorPanelView: View {
 
             if isBusy {
                 ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.7)
+                    .controlSize(.mini)
                     .frame(width: 20, height: 20)
             }
 
@@ -200,10 +196,49 @@ struct SimulatorPanelView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
+            streamFallbackNotice
+
             Divider()
                 .opacity(0.4)
 
             footer
+        }
+    }
+
+    /// Canlı akış tutunamadığında nedenini çerçevenin altında gösterir:
+    /// daha önce bu ileti yalnız yardım balonundaydı, kullanıcı `simctl`
+    /// rozetini görüp sebebini öğrenemiyordu. Yanında tek denemelik
+    /// yeniden kurma düğmesi durur; pencere kapalıysa "Open window" yolu
+    /// footer'dadır.
+    @ViewBuilder
+    private var streamFallbackNotice: some View {
+        if !service.isFramebufferActive,
+            case .unavailable(let message) = service.liveStream.phase,
+            service.selectedDevice?.isBooted == true
+        {
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.orange)
+                Text(message)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+                Button {
+                    service.retryLiveStream()
+                } label: {
+                    Label("Retry stream", systemImage: "arrow.counterclockwise.circle")
+                        .font(.system(size: 10.5))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+                .pointingHandCursor()
+                .help("Try attaching the live window stream again")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
         }
     }
 
@@ -219,28 +254,41 @@ struct SimulatorPanelView: View {
     /// yalnız piksel değişimi kalır. Bu, ~12 fps canlı akışta layout thrashing
     /// (örn. 200+ `NSView _layoutSubtreeWithOldSize:` çerçevesi) engeller.
     private func iPhoneDeviceFrame(frame: CGImage) -> some View {
-        ZStack {
+        // Framebuffer karesi cihazın gerçek ekranıdır: Dynamic Island ve ana
+        // ekran göstergesini iOS kendisi çizer. Taklit kapsüller yalnız
+        // `simctl`/pencere karelerinde çizilir; yoksa ikişer görünürlerdi.
+        let drawsHardwareChrome = !service.isFramebufferActive
+        return ZStack {
             Image(decorative: frame, scale: 1)
                 .resizable()
+                .interpolation(.high)
                 .aspectRatio(contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 38, style: .continuous))
                 .overlay {
-                    touchSurface
-                        .clipShape(RoundedRectangle(cornerRadius: 38, style: .continuous))
+                    SimulatorTouchSurface(
+                        onPressDown: { service.pressDownAt(normalizedX: $0, normalizedY: $1) },
+                        onPressMove: { service.pressMoveTo(normalizedX: $0, normalizedY: $1) },
+                        onPressUp: { service.pressUpAt(normalizedX: $0, normalizedY: $1) }
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 38, style: .continuous))
                 }
                 .overlay(alignment: .top) {
-                    Capsule()
-                        .fill(Color.black)
-                        .frame(width: 92, height: 26)
-                        .padding(.top, 12)
-                        .allowsHitTesting(false)
+                    if drawsHardwareChrome {
+                        Capsule()
+                            .fill(Color.black)
+                            .frame(width: 92, height: 26)
+                            .padding(.top, 12)
+                            .allowsHitTesting(false)
+                    }
                 }
                 .overlay(alignment: .bottom) {
-                    Capsule()
-                        .fill(Color.white.opacity(0.9))
-                        .frame(width: 112, height: 4.5)
-                        .padding(.bottom, 9)
-                        .allowsHitTesting(false)
+                    if drawsHardwareChrome {
+                        Capsule()
+                            .fill(Color.white.opacity(0.9))
+                            .frame(width: 112, height: 4.5)
+                            .padding(.bottom, 9)
+                            .allowsHitTesting(false)
+                    }
                 }
         }
         .padding(11)
@@ -280,46 +328,6 @@ struct SimulatorPanelView: View {
         .drawingGroup()
     }
 
-    /// Görüntünün üstündeki saydam dokunma katmanı: katman görüntüyle aynı
-    /// boyda olduğu için konum doğrudan normalize koordinata bölünür.
-    private var touchSurface: some View {
-        GeometryReader { proxy in
-            Color.clear
-                .contentShape(Rectangle())
-                .onTapGesture { location in
-                    service.tapAt(
-                        normalizedX: SimulatorTouchMapper.normalized(location: location, in: proxy.size).x,
-                        normalizedY: SimulatorTouchMapper.normalized(location: location, in: proxy.size).y
-                    )
-                }
-                .gesture(
-                    DragGesture(minimumDistance: 4)
-                        .onChanged { value in
-                            if !isPressing {
-                                isPressing = true
-                                service.pressDownAt(
-                                    normalizedX: SimulatorTouchMapper.normalized(location: value.startLocation, in: proxy.size).x,
-                                    normalizedY: SimulatorTouchMapper.normalized(location: value.startLocation, in: proxy.size).y
-                                )
-                            }
-                            service.pressMoveTo(
-                                normalizedX: SimulatorTouchMapper.normalized(location: value.location, in: proxy.size).x,
-                                normalizedY: SimulatorTouchMapper.normalized(location: value.location, in: proxy.size).y
-                            )
-                        }
-                        .onEnded { value in
-                            isPressing = false
-                            service.pressUpAt(
-                                normalizedX: SimulatorTouchMapper.normalized(location: value.location, in: proxy.size).x,
-                                normalizedY: SimulatorTouchMapper.normalized(location: value.location, in: proxy.size).y
-                            )
-                        }
-                )
-                .pointingHandCursor()
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
     private var footer: some View {
         HStack(spacing: 8) {
             liveBadge
@@ -333,6 +341,7 @@ struct SimulatorPanelView: View {
 
             if let device = service.selectedDevice {
                 bootButton(device: device)
+                retryTouchButton
                 openWindowButton
             }
         }
@@ -340,17 +349,41 @@ struct SimulatorPanelView: View {
         .padding(.vertical, 6)
     }
 
-    /// Akış kaynağı rozeti: canlı akış aktifken yeşil "Canlı", izin yoksa
-    /// izin düğmesi, `simctl` yolundayken hiçbir şey (ekran zaten gelir).
+    /// Akış ve dokunma rozetleri: canlı akış aktifken yeşil "Canlı", izin
+    /// yoksa izin düğmesi, `simctl` yolundayken kare hızı notu; köprü
+    /// hatasındayken dokunma rozeti ayrıca belirir. Dördünün yardım metni
+    /// farklıdır, kullanıcı hangi yolun neden devrede olduğunu görür.
+    @ViewBuilder
+    private var liveBadge: some View {
+        streamBadge
+        hidBadge
+    }
+
+    /// Pencere akışının rozeti: canlı akış aktifken yeşil "Canlı", izin
+    /// yoksa izin düğmesi, `simctl` yolundayken kare hızı notu.
     ///
     /// `Equatable` conformance sayesinde phase aynı kaldığında View kimliği
     /// değişmez, aniden yeniden render olmaz. Bu, canlı akış başladığında/
     /// bittiğinde tek seferlik geçişe indirger.
     @ViewBuilder
-    private var liveBadge: some View {
+    private var streamBadge: some View {
         let phase = service.liveStream.phase
         let isBooted = service.selectedDevice?.isBooted == true
 
+        if service.isFramebufferActive {
+            Label("Canlı · 30 fps", systemImage: "bolt.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.green)
+                .help(
+                    "The device screen is read directly from the simulator (~30 fps); no window or Screen Recording permission is needed."
+                )
+        } else {
+            windowStreamBadge(phase: phase, isBooted: isBooted)
+        }
+    }
+
+    @ViewBuilder
+    private func windowStreamBadge(phase: SimulatorLiveStreamPhase, isBooted: Bool) -> some View {
         switch phase {
         case .active:
             Label("Canlı", systemImage: "bolt.fill")
@@ -370,15 +403,50 @@ struct SimulatorPanelView: View {
             .help("Grant Screen Recording for a fluid live stream; until then frames come from simctl.")
         case .idle, .starting, .unavailable:
             if isBooted {
-                Label("simctl · ~2 fps", systemImage: "camera.fill")
+                Label("simctl · ~1 fps", systemImage: "camera.fill")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
                     .help(
-                        "Live window stream is not running, so frames come from simctl (~2 fps). Open the device window or grant Screen Recording for the fluid stream."
+                        "The direct screen stream is not available with this Xcode, so frames come from simctl (about 1 fps)."
                     )
             } else {
                 EmptyView()
             }
+        }
+    }
+
+    /// Dokunma köprüsü rozeti: son dokunuş düştüyse belirir, hatayı ve
+    /// yeniden deneme yolunu gösterir. Akış rozetinden bağımsızdır, ikisi
+    /// yan yana durabilir.
+    @ViewBuilder
+    private var hidBadge: some View {
+        if !service.hidReady {
+            Label("Dokunma kapalı", systemImage: "hand.raised.slash")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.orange)
+                .help(
+                    "The last touch could not be sent\(service.lastHIDError.map { ": \($0)" } ?? ""). The device session may have changed; use Retry touch to send it again."
+                )
+        }
+    }
+
+    /// Son dokunuş düştüyse görünen düğme: aynı koordinata tek dokunuşu
+    /// tekrar gönderir, ölmüş köprü istemcisinin yeniden kurulmasını tetikler.
+    @ViewBuilder
+    private var retryTouchButton: some View {
+        if service.failureMessage != nil {
+            Button {
+                service.retryLastTouch()
+            } label: {
+                Label("Retry touch", systemImage: "arrow.counterclockwise.circle")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .pointingHandCursor()
+            .help(
+                "Send the last touch again\(service.failureMessage.map { " (last error: \($0))" } ?? "")"
+            )
         }
     }
 
@@ -398,7 +466,7 @@ struct SimulatorPanelView: View {
             .help("Shut the simulator device down")
         } else {
             Button {
-                Task { await service.boot(deviceID: device.id) }
+                Task { await service.boot(deviceID: device.id, headless: false) }
             } label: {
                 Label("Boot", systemImage: "play.circle")
                     .font(.system(size: 11))
@@ -407,13 +475,15 @@ struct SimulatorPanelView: View {
             .controlSize(.small)
             .pointingHandCursor()
             .disabled(service.busyDeviceIDs.contains(device.id))
-            .help("Boot the simulator device; its window opens in the background for the live view")
+            .help("Boot the simulator device; its screen appears here without opening a simulator window")
         }
     }
 
     private var openWindowButton: some View {
         Button {
-            service.openDeviceWindow()
+            // Açık istek: pencere öne ve bu Space'e gelir, akış gizli
+            // pencere kovalamaz.
+            service.openDeviceWindow(activate: true)
         } label: {
             Label("Open window", systemImage: "macwindow.on.rectangle")
                 .font(.system(size: 11))

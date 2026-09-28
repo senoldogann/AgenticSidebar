@@ -409,6 +409,15 @@ final class OpenCodeSettings {
         seedSelectPromptDefaults()
     }
 
+    /// Kimlik doğrulama istemine yazılan değer. Bir seçim, `when` koşuluyla
+    /// başka bir seçim istemini görünür kılabilir; o istem varsayılanını hemen
+    /// alır — boş kalsaydı seçici etiketsiz `""` gösterir, gönderilen
+    /// metadata'da da alan eksik kalırdı.
+    func setMetadataDraft(_ value: String, for key: String) {
+        metadataDrafts[key] = value
+        seedSelectPromptDefaults()
+    }
+
     private func seedSelectPromptDefaults() {
         for prompt in activePrompts where prompt.type == .select {
             guard metadataDrafts[prompt.key] == nil,
