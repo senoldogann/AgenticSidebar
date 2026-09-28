@@ -130,9 +130,15 @@ final class TimelineCollapseStore {
         if activity.kind == .subagent, activity.phase == .running {
             return true
         }
+        // Koşan araç canlı görünür: akış sırasında çıktısı kart açılmadan
+        // izlenir; bitince varsayılan kapalıya döner (kullanıcı açıkça
+        // açmadıysa). Açıkça kapatılan karta dokunulmaz (yukarıdaki kontrol).
         // Düşünme varsayılan-kapalıdır: koşarken de bitince de kart yalnız
         // kullanıcı açarsa açılır. Açık kalması istenen kart kullanıcı
         // tarafından açıkça açılır (`expandedIDs`).
+        if activity.kind != .thinking, activity.phase == .running {
+            return true
+        }
         return false
     }
 

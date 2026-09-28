@@ -677,8 +677,7 @@ final class SkillInstallerTests: XCTestCase {
             ]
         )
 
-        let record = try installer.install(fetched: fetched, source: .manual)
-
+        let record = try installer.install(fetched: fetched, source: .manual, allowExecutableScripts: true)
         XCTAssertEqual(record.name, "code-review")
         XCTAssertEqual(record.description, "Reviews a diff properly.")
         XCTAssertTrue(record.isManaged)
@@ -708,7 +707,7 @@ final class SkillInstallerTests: XCTestCase {
                 FetchedSkillFile(relativePath: "scripts/run.sh", content: Data("echo v1".utf8)),
             ]
         )
-        try installer.install(fetched: versionOne, source: .manual)
+        try installer.install(fetched: versionOne, source: .manual, allowExecutableScripts: true)
 
         let staleScript = directory.appendingPathComponent("code-review/scripts/run.sh")
         XCTAssertTrue(FileManager.default.fileExists(atPath: staleScript.path))
@@ -1209,6 +1208,386 @@ final class ExtensionStoreTests: XCTestCase {
             globalConfig: GlobalOpenCodeConfigReader(configURLs: []),
             applyConfiguration: { _ in }
         )
+    }
+}
+
+// MARK: - Lane A7: pazar yeri + güvenlik
+
+/// Tek tıkla katalog kurulumu, SHA/pin sürekliliği, `scripts/` onayı ve MCP
+/// `cwd` ilkesi. Salt yerel dosya + sahte taşıyıcı; ağa çıkılmaz.
+final class MarketplaceSecurityTests: XCTestCase {
+    private let manifest = """
+        ---
+        name: code-review
+        description: Reviews a diff properly.
+        ---
+
+        Look for real defects.
+        """
+
+    private func skillFiles(extra: [FetchedSkillFile] = []) -> [FetchedSkillFile] {
+        [FetchedSkillFile(relativePath: "SKILL.md", content: Data(manifest.utf8))] + extra
+    }
+
+    // MARK: Özet
+
+    func testDigestIsStableAcrossFileOrderAndChangesWithContent() {
+        let first = skillFiles(extra: [FetchedSkillFile(relativePath: "a.md", content: Data("y".utf8))])
+        let reordered = first.reversed()
+
+        let digest = SkillInstaller.contentSHA256(of: first)
+        XCTAssertEqual(digest.count, 64)
+        XCTAssertEqual(SkillInstaller.contentSHA256(of: Array(reordered)), digest)
+
+        let changed = skillFiles(extra: [FetchedSkillFile(relativePath: "a.md", content: Data("z".utf8))])
+        XCTAssertNotEqual(SkillInstaller.contentSHA256(of: changed), digest)
+    }
+
+    func testScriptPathsListsOnlyTheScriptsTree() {
+        let files = skillFiles(extra: [
+            FetchedSkillFile(relativePath: "scripts/run.sh", content: Data("x".utf8)),
+            FetchedSkillFile(relativePath: "reference.md", content: Data("x".utf8)),
+        ])
+        XCTAssertEqual(SkillInstaller.scriptPaths(in: files), ["scripts/run.sh"])
+        XCTAssertTrue(SkillInstaller.scriptPaths(in: skillFiles()).isEmpty)
+    }
+
+    // MARK: Kurucu yaptırımı
+
+    func testScriptsWithoutApprovalAreRefusedBeforeAnythingIsWritten() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let installer = SkillInstaller(
+            rootDirectoryURL: directory,
+            transport: StubExtensionTransport(responses: [:])
+        )
+        let fetched = FetchedSkill(
+            name: "code-review",
+            repository: "acme/skills",
+            files: skillFiles(extra: [
+                FetchedSkillFile(relativePath: "scripts/run.sh", content: Data("echo hi".utf8))
+            ])
+        )
+
+        XCTAssertThrowsError(try installer.install(fetched: fetched, source: .manual)) { error in
+            XCTAssertEqual(
+                error as? SkillInstallSecurityError,
+                .scriptsRequireConfirmation(skillName: "code-review", scriptPaths: ["scripts/run.sh"])
+            )
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("code-review").path)
+        )
+    }
+
+    func testWrongSHABlocksAndRightSHAPasses() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let installer = SkillInstaller(
+            rootDirectoryURL: directory,
+            transport: StubExtensionTransport(responses: [:])
+        )
+        let fetched = FetchedSkill(name: "code-review", repository: "acme/skills", files: skillFiles())
+        let digest = SkillInstaller.contentSHA256(of: fetched.files)
+
+        XCTAssertThrowsError(
+            try installer.install(
+                fetched: fetched,
+                source: .manual,
+                expectedSHA256: String(repeating: "0", count: 64)
+            )
+        ) { error in
+            guard case .shaMismatch = error as? SkillInstallSecurityError else {
+                return XCTFail("expected shaMismatch, got \(error)")
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent("code-review").path)
+        )
+
+        let record = try installer.install(fetched: fetched, source: .manual, expectedSHA256: digest)
+        XCTAssertEqual(record.expectedSHA256?.lowercased(), digest.lowercased())
+    }
+
+    // MARK: cwd ilkesi
+
+    func testCWDPolicyKeepsServersInsideTheWorkspace() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let inside = root.appendingPathComponent("proj", isDirectory: true)
+        let other = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: other) }
+        try FileManager.default.createDirectory(at: inside, withIntermediateDirectories: true)
+
+        XCTAssertEqual(
+            MCPWorkingDirectoryPolicy.validated(cwd: nil, serverName: "x", workspaceRoot: root),
+            .success(nil)
+        )
+        XCTAssertEqual(
+            MCPWorkingDirectoryPolicy.validated(cwd: "  ", serverName: "x", workspaceRoot: root),
+            .success(nil)
+        )
+        XCTAssertEqual(
+            MCPWorkingDirectoryPolicy.validated(
+                cwd: root.appendingPathComponent("yok").path,
+                serverName: "x",
+                workspaceRoot: root
+            ),
+            .failure(.notDirectory(path: root.appendingPathComponent("yok").path))
+        )
+        XCTAssertEqual(
+            MCPWorkingDirectoryPolicy.validated(
+                cwd: inside.path,
+                serverName: "x",
+                workspaceRoot: root
+            ).map { $0 ?? "" }.map { URL(fileURLWithPath: $0).lastPathComponent },
+            .success("proj")
+        )
+        XCTAssertEqual(
+            MCPWorkingDirectoryPolicy.validated(cwd: other.path, serverName: "x", workspaceRoot: root),
+            .failure(.outsideAllowedRoots(path: other.path, resolved: other.resolvingSymlinksInPath().path))
+        )
+        // Açık izin listesi alanı genişletir.
+        XCTAssertNotNil(
+            try MCPWorkingDirectoryPolicy.validated(
+                cwd: other.path,
+                serverName: "x",
+                workspaceRoot: root,
+                extraAllowedRoots: [other]
+            ).get()
+        )
+        // Bilgisayar kullanımı kendi proje dizininde koşar, alan dışı olabilir.
+        XCTAssertNotNil(
+            try MCPWorkingDirectoryPolicy.validated(
+                cwd: other.path,
+                serverName: ComputerUseConfiguration.serverName,
+                workspaceRoot: root
+            ).get()
+        )
+    }
+
+    func testCWDPolicyResolvesSymlinksBeforeChecking() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let link = root.appendingPathComponent("kestirme")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let result = MCPWorkingDirectoryPolicy.validated(
+            cwd: link.path,
+            serverName: "x",
+            workspaceRoot: root
+        )
+        guard case .failure(.outsideAllowedRoots) = result else {
+            return XCTFail("symlink escape must be rejected, got \(result)")
+        }
+    }
+
+    // MARK: Mağaza: eklenti pini
+
+    @MainActor
+    func testPluginPinContinuityBlocksSilentVersionDrift() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ExtensionStore(
+            registryStore: ExtensionRegistryStore(
+                fileURL: directory.appendingPathComponent("extensions-registry.json")
+            ),
+            catalog: SkillsCatalogCache(catalog: SkillsCatalog(roots: [])),
+            globalConfig: GlobalOpenCodeConfigReader(configURLs: []),
+            applyConfiguration: { _ in }
+        )
+
+        XCTAssertTrue(store.addPlugin(module: "opencode-foo@1.0.0", source: .manual))
+        XCTAssertEqual(store.registry.plugins.first?.pinnedVersion, "1.0.0")
+
+        XCTAssertFalse(store.addPlugin(module: "opencode-foo@2.0.0", source: .manual))
+        XCTAssertEqual(store.status?.isFailure, true)
+        XCTAssertFalse(store.addPlugin(module: "opencode-foo", source: .manual))
+        XCTAssertEqual(store.registry.plugins.count, 1)
+    }
+
+    @MainActor
+    func testMarketplacePluginInstallPinsTheCatalogVersion() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ExtensionStore(
+            registryStore: ExtensionRegistryStore(
+                fileURL: directory.appendingPathComponent("extensions-registry.json")
+            ),
+            catalog: SkillsCatalogCache(catalog: SkillsCatalog(roots: [])),
+            globalConfig: GlobalOpenCodeConfigReader(configURLs: []),
+            applyConfiguration: { _ in }
+        )
+        let entry = CuratedPluginEntry(
+            name: "opencode-foo",
+            displayName: "Foo",
+            description: "Does foo.",
+            version: "1.2.3",
+            author: "acme",
+            tags: []
+        )
+
+        XCTAssertTrue(store.installMarketplacePlugin(entry))
+        let record = try XCTUnwrap(store.registry.plugins.first)
+        XCTAssertEqual(record.module, "opencode-foo@1.2.3")
+        XCTAssertEqual(record.pinnedVersion, "1.2.3")
+        XCTAssertFalse(record.isEnabled)
+    }
+
+    // MARK: Mağaza: cwd + betik onayı
+
+    @MainActor
+    func testOutsideCWDIsRejectedButComputerUseKeepsItsOwnDirectory() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ExtensionStore(
+            registryStore: ExtensionRegistryStore(
+                fileURL: directory.appendingPathComponent("extensions-registry.json")
+            ),
+            catalog: SkillsCatalogCache(catalog: SkillsCatalog(roots: [])),
+            globalConfig: GlobalOpenCodeConfigReader(configURLs: []),
+            applyConfiguration: { _ in }
+        )
+        let outside = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        XCTAssertFalse(
+            store.addMCPServer(
+                name: "dısarısı",
+                definition: MCPDefinition(
+                    transport: .local,
+                    command: ["npx", "bir-sey"],
+                    cwd: outside.path
+                )
+            )
+        )
+        XCTAssertEqual(store.status?.isFailure, true)
+        XCTAssertTrue(store.registry.mcpServers.isEmpty)
+
+        XCTAssertTrue(
+            store.addMCPServer(
+                name: ComputerUseConfiguration.serverName,
+                definition: MCPDefinition(
+                    transport: .local,
+                    command: ["node", "cli.js"],
+                    cwd: outside.path
+                )
+            )
+        )
+        XCTAssertEqual(store.registry.mcpServers.map(\.name), [ComputerUseConfiguration.serverName])
+    }
+
+    @MainActor
+    func testScriptedSkillWaitsForExplicitConfirmation() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let skillsDirectory = directory.appendingPathComponent("skills", isDirectory: true)
+        let tree = """
+            {"tree":[
+              {"path":"skills/code-review/SKILL.md","type":"blob"},
+              {"path":"skills/code-review/scripts/run.sh","type":"blob"}
+            ]}
+            """
+        let transport = StubExtensionTransport(responses: [
+            "https://api.github.com/repos/acme/skills/git/trees/HEAD?recursive=1": Data(tree.utf8),
+            "https://raw.githubusercontent.com/acme/skills/HEAD/skills/code-review/SKILL.md": Data(manifest.utf8),
+            "https://raw.githubusercontent.com/acme/skills/HEAD/skills/code-review/scripts/run.sh": Data("echo hi".utf8),
+        ])
+        let store = ExtensionStore(
+            registryStore: ExtensionRegistryStore(
+                fileURL: directory.appendingPathComponent("extensions-registry.json")
+            ),
+            catalog: SkillsCatalogCache(catalog: SkillsCatalog(roots: [])),
+            globalConfig: GlobalOpenCodeConfigReader(configURLs: []),
+            installer: SkillInstaller(rootDirectoryURL: skillsDirectory, transport: transport),
+            applyConfiguration: { _ in }
+        )
+
+        await store.installSkill(named: "code-review", from: "acme/skills")
+        let pending = try XCTUnwrap(store.pendingScriptApproval)
+        XCTAssertEqual(pending.skillName, "code-review")
+        XCTAssertEqual(pending.scriptPaths, ["scripts/run.sh"])
+        XCTAssertEqual(store.status?.isFailure, true)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: skillsDirectory.appendingPathComponent("code-review").path)
+        )
+
+        await store.confirmPendingScriptApproval()
+        XCTAssertNil(store.pendingScriptApproval)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: skillsDirectory.appendingPathComponent("code-review/scripts/run.sh").path
+            )
+        )
+        XCTAssertNotNil(store.registry.skills.first?.expectedSHA256)
+    }
+
+    @MainActor
+    func testCancelledScriptApprovalWritesNothing() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let skillsDirectory = directory.appendingPathComponent("skills", isDirectory: true)
+        let tree = """
+            {"tree":[
+              {"path":"skills/code-review/SKILL.md","type":"blob"},
+              {"path":"skills/code-review/scripts/run.sh","type":"blob"}
+            ]}
+            """
+        let transport = StubExtensionTransport(responses: [
+            "https://api.github.com/repos/acme/skills/git/trees/HEAD?recursive=1": Data(tree.utf8),
+            "https://raw.githubusercontent.com/acme/skills/HEAD/skills/code-review/SKILL.md": Data(manifest.utf8),
+            "https://raw.githubusercontent.com/acme/skills/HEAD/skills/code-review/scripts/run.sh": Data("echo hi".utf8),
+        ])
+        let store = ExtensionStore(
+            registryStore: ExtensionRegistryStore(
+                fileURL: directory.appendingPathComponent("extensions-registry.json")
+            ),
+            catalog: SkillsCatalogCache(catalog: SkillsCatalog(roots: [])),
+            globalConfig: GlobalOpenCodeConfigReader(configURLs: []),
+            installer: SkillInstaller(rootDirectoryURL: skillsDirectory, transport: transport),
+            applyConfiguration: { _ in }
+        )
+
+        await store.installSkill(named: "code-review", from: "acme/skills")
+        XCTAssertNotNil(store.pendingScriptApproval)
+        store.cancelPendingScriptApproval()
+        XCTAssertNil(store.pendingScriptApproval)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: skillsDirectory.appendingPathComponent("code-review").path)
+        )
+        XCTAssertTrue(store.registry.skills.isEmpty)
+    }
+
+    // MARK: Geriye uyumluluk
+
+    func testRecordsWithoutPinsStillDecode() throws {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let skillJSON =
+            #"{"name":"s","description":"d","isEnabled":true,"source":{"manual":{}},"installedAt":"2026-01-01T00:00:00Z","path":"/tmp/s/SKILL.md","isManaged":true}"#
+        let skill = try decoder.decode(
+            SkillRecord.self,
+            from: Data(skillJSON.utf8)
+        )
+        XCTAssertNil(skill.expectedSHA256)
+
+        let plugin = try decoder.decode(
+            PluginRecord.self,
+            from: Data(
+                #"{"module":"x","isEnabled":false,"source":{"manual":{}},"installedAt":"2026-01-01T00:00:00Z","requiresTrust":true}"#.utf8
+            )
+        )
+        XCTAssertNil(plugin.pinnedVersion)
+
+        // Yeni kaynak türü gidip gelir.
+        let roundTripped = try decoder.decode(
+            ExtensionSource.self,
+            from: JSONEncoder().encode(ExtensionSource.marketplace(id: "mcp:github"))
+        )
+        XCTAssertEqual(roundTripped, .marketplace(id: "mcp:github"))
     }
 }
 

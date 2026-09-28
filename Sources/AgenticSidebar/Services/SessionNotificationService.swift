@@ -36,9 +36,17 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
     /// yüzden savunma çağrıyı açılış yolundan çekmektir: ilk dokunuş ilk
     /// biten turun bildirimiyle olur. Temsilci, bildirimin akabileceği ilk
     /// andan önce atanır; davranış korunur.
-    private func ensureCenter() -> UNUserNotificationCenter {
+    ///
+    /// `.app` paketi dışında (`swift run`, test koşucusu) merkez hiç
+    /// istenmez: `currentNotificationCenter` paket kimliği olmayan süreçte
+    /// yakalanamaz bir iddia istisnasıyla süreci sonlandırır. O durumda
+    /// `nil` döner ve bildirim atlanır.
+    private func ensureCenter() -> UNUserNotificationCenter? {
         if let center {
             return center
+        }
+        guard Self.isRunningFromAppBundle() else {
+            return nil
         }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -46,13 +54,24 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
         return center
     }
 
+    nonisolated static func isRunningFromAppBundle() -> Bool {
+        Bundle.main.bundleURL.pathExtension == "app" && Bundle.main.bundleIdentifier != nil
+    }
+
     /// Requests macOS user notification permissions if not yet granted.
     @discardableResult
     func requestAuthorization() async -> Bool {
         authorizationRequested = true
+        guard let center = ensureCenter() else {
+            AppLog.agentSession.info("Notifications skipped: the process is not running from an app bundle")
+            return false
+        }
         do {
-            return try await ensureCenter().requestAuthorization(options: [.alert, .sound, .badge])
+            return try await center.requestAuthorization(options: [.alert, .sound, .badge])
         } catch {
+            AppLog.agentSession.error(
+                "Notification authorization failed: \(error.localizedDescription, privacy: .public)"
+            )
             return false
         }
     }
@@ -73,7 +92,10 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
     ) {
         guard enabled else { return }
 
-        // Play the chosen completion sound via NSSound for immediate, reliable macOS audio
+        // Seçilen zil uygulamanın kendisinden çalar; bildirim sessiz kalır.
+        // İkisi birden çaldığında her tur sonunda çift zil duyuluyordu.
+        // İlk `NSSound` çalımı ses donanımını eşzamanlı kurar (ana iş
+        // parçacığında ~100-240 ms); zil bu yüzden ayrık görevde çalar.
         if playSound {
             if soundName == "Default" {
                 NSSound.beep()
@@ -81,7 +103,10 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
                 let now = Date()
                 if shouldPlayCompletionSound(now: now) {
                     lastCompletionSoundAt = now
-                    NSSound(named: soundName)?.play()
+                    let name = soundName
+                    Task.detached(priority: .utility) {
+                        NSSound(named: name)?.play()
+                    }
                 }
             }
         }
@@ -108,10 +133,6 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
 
         content.userInfo = ["sessionID": sessionID.uuidString]
 
-        if playSound {
-            content.sound = .default
-        }
-
         let request = UNNotificationRequest(
             identifier: "session-complete-\(sessionID.uuidString)-\(Date().timeIntervalSince1970)",
             content: content,
@@ -126,8 +147,11 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
             if !self.authorizationRequested {
                 _ = await self.requestAuthorization()
             }
+            guard let center = self.ensureCenter() else {
+                return
+            }
             do {
-                try await self.ensureCenter().add(request)
+                try await center.add(request)
             } catch {
                 AppLog.agentSession.error("Failed to deliver session notification: \(error.localizedDescription, privacy: .public)")
             }
@@ -175,8 +199,9 @@ final class SessionNotificationService: NSObject, UNUserNotificationCenterDelega
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // Present banner and sound even when the app is active/focused
-        completionHandler([.banner, .sound])
+        // Uygulama öndeyken de afiş gösterilir; zil uygulamanın kendisinden
+        // çaldığı için bildirim sesi istenmez.
+        completionHandler([.banner, .list])
     }
 
     nonisolated func userNotificationCenter(

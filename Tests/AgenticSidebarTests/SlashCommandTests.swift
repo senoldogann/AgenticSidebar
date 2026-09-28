@@ -8,7 +8,7 @@ import XCTest
 /// hiç keşfedemez.
 final class SlashCommandTests: XCTestCase {
     func testAllListsGoalBeforeBtw() {
-        XCTAssertEqual(SlashCommand.all.map(\.name), ["goal", "btw"])
+        XCTAssertEqual(SlashCommand.all.map(\.name), ["goal", "btw", "model"])
     }
 
     func testMatchingEmptyQueryReturnsAll() {
@@ -27,6 +27,7 @@ final class SlashCommandTests: XCTestCase {
     func testPrefixEndsWithSpace() {
         XCTAssertEqual(SlashCommand.btw.prefix, "/btw ")
         XCTAssertEqual(SlashCommand.goal.prefix, "/goal ")
+        XCTAssertEqual(SlashCommand.model.prefix, "/model ")
     }
 
     func testParseGoalExtractsObjective() {
@@ -45,5 +46,27 @@ final class SlashCommandTests: XCTestCase {
 
     func testParseGoalIsCaseInsensitive() {
         XCTAssertEqual(SlashCommand.parseGoal(from: "/GOAL Do it"), "Do it")
+    }
+
+    func testParseModelQueryExtractsQuery() {
+        XCTAssertEqual(SlashCommand.parseModelQuery(from: "/model gpt-5"), "gpt-5")
+        XCTAssertEqual(SlashCommand.parseModelQuery(from: "/MODEL Claude"), "Claude")
+    }
+
+    func testParseModelQueryRejectsBareAndGlued() {
+        XCTAssertNil(SlashCommand.parseModelQuery(from: "/model"))
+        XCTAssertNil(SlashCommand.parseModelQuery(from: "/model "))
+        XCTAssertNil(SlashCommand.parseModelQuery(from: "/modelx gpt"))
+    }
+
+    func testMatchingModelsFiltersByDisplayNameOrID() {
+        let models = [
+            ProviderModelCapability(id: ProviderModelID("openai/gpt-5"), displayName: "GPT-5", variants: []),
+            ProviderModelCapability(id: ProviderModelID("anthropic/claude-sonnet-4"), displayName: "Claude Sonnet 4", variants: []),
+        ]
+        XCTAssertEqual(SlashCommand.matchingModels(query: "", in: models), models)
+        XCTAssertEqual(SlashCommand.matchingModels(query: "gpt", in: models).map(\.displayName), ["GPT-5"])
+        XCTAssertEqual(SlashCommand.matchingModels(query: "CLAUDE", in: models).map(\.displayName), ["Claude Sonnet 4"])
+        XCTAssertTrue(SlashCommand.matchingModels(query: "zzz", in: models).isEmpty)
     }
 }

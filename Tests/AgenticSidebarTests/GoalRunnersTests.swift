@@ -512,6 +512,45 @@ final class GoalRunnersTests: XCTestCase {
             swift.path
         )
     }
+
+    func testProjectVotesCountsFilesPerProject() {
+        let alpha = temporaryDirectory()
+        let beta = temporaryDirectory()
+        for root in [alpha, beta] {
+            try? "// swift-tools-version: 6.0".write(
+                to: root.appendingPathComponent("Package.swift"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let nested = alpha.appendingPathComponent("Sources")
+        try? FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let fileA = nested.appendingPathComponent("A.swift")
+        let fileB = nested.appendingPathComponent("B.swift")
+        let fileC = beta.appendingPathComponent("C.swift")
+        for file in [fileA, fileB, fileC] {
+            try? "// empty".write(to: file, atomically: true, encoding: .utf8)
+        }
+        let votes = GoalRunners.projectVotes(for: [
+            fileA.path,
+            fileB.path,
+            fileC.path,
+            "/definitely-not-here-goal-test/X.swift",
+            "",
+        ])
+        XCTAssertEqual(votes.count, 2)
+        XCTAssertEqual(votes.first?.directory.path, alpha.path)
+        XCTAssertEqual(votes.first?.votes, 2)
+        XCTAssertEqual(votes.last?.directory.path, beta.path)
+        XCTAssertEqual(votes.last?.votes, 1)
+    }
+
+    func testProjectVotesEmptyWithoutProjectPaths() {
+        XCTAssertTrue(GoalRunners.projectVotes(for: []).isEmpty)
+        XCTAssertTrue(
+            GoalRunners.projectVotes(for: ["", "/definitely-not-here-goal-test/X.swift"]).isEmpty
+        )
+    }
 }
 
 /// `verify` stub'unda komut kaydı: `execute` eşzamanlı-kısıtlı kapanıştır,

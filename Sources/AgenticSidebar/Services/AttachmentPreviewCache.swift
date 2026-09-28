@@ -131,21 +131,25 @@ final class AttachmentPreviewCache {
         }
         // `key` (NSString) detach edilmiş gövdeye taşınmaz: çalışma-anında
         // `NSMutableString` olabilir; anahtar içeride saf girdilerden üretilir.
-        Task.detached(priority: .userInitiated) {
+        // Yazım `self`'edir, `shared` değil: başka örnek bu dekodu bekliyorsa
+        // onun `inflight`/`generation`u ilerler, paylaşılanınki değil.
+        Task.detached(priority: .userInitiated) { [weak self] in
             let decoded = Self.decodedImageThumbnail(url: url, maxPixelSize: maxPixelSize)
-            await MainActor.run {
-                let cache = AttachmentPreviewCache.shared
-                cache.inflight.remove(keyString)
+            await MainActor.run { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.inflight.remove(keyString)
                 guard let decoded else {
                     return
                 }
                 let image = NSImage(cgImage: decoded, size: NSSize(width: decoded.width, height: decoded.height))
-                cache.imageCache.setObject(
+                self.imageCache.setObject(
                     image,
                     forKey: Self.cacheKey(for: url, maxPixelSize: maxPixelSize),
                     cost: decoded.width * decoded.height * 4
                 )
-                cache.generation += 1
+                self.generation += 1
             }
         }
     }
@@ -155,22 +159,24 @@ final class AttachmentPreviewCache {
         guard inflight.insert(keyString).inserted else {
             return
         }
-        Task.detached(priority: .userInitiated) {
+        Task.detached(priority: .userInitiated) { [weak self] in
             let decoded = Self.decodedPDFThumbnail(url: url, maxPixelSize: maxPixelSize)
-            await MainActor.run {
-                let cache = AttachmentPreviewCache.shared
-                cache.inflight.remove(keyString)
+            await MainActor.run { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.inflight.remove(keyString)
                 guard let (image, pageCount) = decoded else {
                     return
                 }
-                cache.storePDFPageCount(pageCount, for: url)
+                self.storePDFPageCount(pageCount, for: url)
                 let size = image.size
-                cache.imageCache.setObject(
+                self.imageCache.setObject(
                     image,
                     forKey: Self.cacheKey(for: url, maxPixelSize: maxPixelSize),
                     cost: Int(size.width * size.height * 4)
                 )
-                cache.generation += 1
+                self.generation += 1
             }
         }
     }
@@ -180,17 +186,19 @@ final class AttachmentPreviewCache {
         guard inflight.insert(keyString).inserted else {
             return
         }
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
             let document = PDFDocument(url: url)
             let count = document?.pageCount
-            await MainActor.run {
-                let cache = AttachmentPreviewCache.shared
-                cache.inflight.remove(keyString)
+            await MainActor.run { [weak self] in
+                guard let self else {
+                    return
+                }
+                self.inflight.remove(keyString)
                 guard let count else {
                     return
                 }
-                cache.storePDFPageCount(count, for: url)
-                cache.generation += 1
+                self.storePDFPageCount(count, for: url)
+                self.generation += 1
             }
         }
     }

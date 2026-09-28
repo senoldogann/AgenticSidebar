@@ -86,6 +86,12 @@ struct OpenCodeStreamNormalizer: Sendable {
     /// Global SSE may expose foreign permissions before a child's ownership is
     /// known. Never dispatch them until the parent task identifies the child.
     private var bufferedChildPermissions: [String: [OpenCodePermissionRequest]] = [:]
+    /// Bu turun oturumundan doğan (çocuk, torun…) oturumlar; `session.created`
+    /// / `session.updated` olaylarındaki `parentID` zincirinden öğrenilir.
+    /// `task` parçası yalnız doğrudan çocuğu tanıtır ve kendi olayı izin
+    /// patlamasından sonra gelebilir; torun oturum ise hiç tanıtılmaz. İzin
+    /// bekleyen alt ajan o durumda hiç yanıt alamaz, tur sonsuza dek dönerdi.
+    private var descendantSessionIDs: Set<String> = []
 
     /// Tek bir alt ajan için tutulan en fazla adım; taşan en eskiden düşer.
     private static let maximumSubagentSteps = 64
@@ -196,10 +202,14 @@ struct OpenCodeStreamNormalizer: Sendable {
                 )
             }
             throw failure
+        case "session.created", "session.updated":
+            learnDescendant(from: properties)
+            return []
         case "permission.asked":
             if let request = OpenCodePermissionRequest.make(from: properties) {
                 if request.remoteSessionID == sessionID
                     || subagentOwnerByChildSession[request.remoteSessionID] != nil
+                    || descendantSessionIDs.contains(request.remoteSessionID)
                 {
                     onPermissionRequest?(request.marked(ownedBy: sessionID))
                 } else {
@@ -739,20 +749,60 @@ struct OpenCodeStreamNormalizer: Sendable {
         }
     }
 
+    /// `session.created` / `session.updated`: oturumun ebeveyni bu tur ya da
+    /// bilinen bir alt oturumsa oturum soya eklenir ve tamponda bekleyen
+    /// izinleri geliş sırasıyla yayınlanır. Ebeveyni bir alt ajan kartına
+    /// bağlıysa torun da aynı karta bağlanır; adımları o kartta görünür.
+    private mutating func learnDescendant(from properties: [String: Any]) {
+        guard
+            let info = properties["info"] as? [String: Any],
+            let childSessionID = info["id"] as? String,
+            let parentSessionID = info["parentID"] as? String,
+            !childSessionID.isEmpty,
+            childSessionID != sessionID,
+            !descendantSessionIDs.contains(childSessionID)
+        else {
+            return
+        }
+        let parentIsOwned =
+            parentSessionID == sessionID
+            || descendantSessionIDs.contains(parentSessionID)
+            || subagentOwnerByChildSession[parentSessionID] != nil
+        guard parentIsOwned else {
+            return
+        }
+        descendantSessionIDs.insert(childSessionID)
+        if subagentOwnerByChildSession[childSessionID] == nil,
+            let owner = subagentOwnerByChildSession[parentSessionID]
+        {
+            subagentOwnerByChildSession[childSessionID] = owner
+        }
+        if let requests = bufferedChildPermissions.removeValue(forKey: childSessionID) {
+            for request in requests {
+                onPermissionRequest?(request.marked(ownedBy: sessionID))
+            }
+        }
+    }
+
     /// Unknown sessions are held briefly and never replied to by this turn.
     /// A verified parent task will flush its child's requests in arrival order.
+    ///
+    /// Tampon dolunca yeni istek geri çevrilir, en eskiler korunur: bir alt
+    /// ajanın beklediği ilk izinler en eskileridir; onları atmak, sahiplik
+    /// sonradan öğrenildiğinde bile ajanı kilitli bırakırdı. Sahipsiz
+    /// oturumların çoğu başka bir sohbete aittir, düşürme olağandır.
     private mutating func bufferChildPermission(_ request: OpenCodePermissionRequest) {
         var pending = bufferedChildPermissions[request.remoteSessionID] ?? []
         guard !pending.contains(where: { $0.id == request.id }) else {
             return
         }
-        pending.append(request)
-        if pending.count > Self.maximumBufferedPermissionsPerSession {
-            AppLog.openCode.error(
-                "Dropping an unowned child permission under storm pressure; it will never surface"
+        guard pending.count < Self.maximumBufferedPermissionsPerSession else {
+            AppLog.openCode.debug(
+                "Ignoring a permission for an unowned session: its buffer is full"
             )
-            pending.removeFirst(pending.count - Self.maximumBufferedPermissionsPerSession)
+            return
         }
+        pending.append(request)
         bufferedChildPermissions[request.remoteSessionID] = pending
         if bufferedChildPermissions.count > Self.maximumBufferedChildSessions,
             let evicted = bufferedChildPermissions.keys.sorted().first
@@ -1017,6 +1067,7 @@ struct OpenCodeStreamNormalizer: Sendable {
         subagentStepIndexes.removeAll()
         bufferedChildSteps.removeAll()
         bufferedChildPermissions.removeAll()
+        descendantSessionIDs.removeAll()
 
         return pendingText + [.completed]
     }

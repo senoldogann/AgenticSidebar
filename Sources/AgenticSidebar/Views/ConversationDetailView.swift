@@ -124,6 +124,11 @@ struct ConversationDetailView: View {
     /// koşu kuralıyla aynı sohbette ikinci başlatmayı reddeder; farklı
     /// sohbetler eşzamanlı goal koşar.
     @State private var goalOrchestrator = GoalOrchestrator()
+    /// Oturum sekmesinin (`session-changes:`) canlı özeti: akış sırasında
+    /// parmak izi değişince pahalı birleştirme yalnız sekme açıkken ve
+    /// seyreltilerek koşar; içerik+başlık aynı kimlikle tazelenir.
+    @State private var liveChangesSummary: TurnFileChangesSummary?
+    @State private var liveChangesComputedAt: Date = .distantPast
     @Environment(ComposerDraftMemory.self) private var draftMemory: ComposerDraftMemory?
 
     private let contentMaxWidth: CGFloat = 820
@@ -142,6 +147,12 @@ struct ConversationDetailView: View {
     var body: some View {
         let preset = settingsStore.currentThemePreset
         let isDark = isDarkMode
+        // Dosya değişikliği parmak izi: ucuz skaler tarama, her gövdede koşar.
+        // Değişince `refreshLiveSessionChanges` pahalı özeti seyreltilmiş
+        // tazeler; sekme kapalıyken izleyici erken çıkar, maliyet sıfırdır.
+        let changesFingerprint = TurnFileChangesSummary.fileChangeFingerprint(
+            groups: focusedSession.state.activityGroups
+        )
 
         ZStack(alignment: .bottom) {
             HStack(spacing: 0) {
@@ -298,6 +309,8 @@ struct ConversationDetailView: View {
                             simulatorService: simulatorService,
                             computerLiveService: computerLiveService,
                             computerLiveState: computerLiveState,
+                            liveSessionID: focusedSession.id,
+                            liveSessionChanges: liveChangesSummary,
                             onSelectTab: { tabID in
                                 withAnimation(.easeInOut(duration: 0.18)) {
                                     selectedInspectorTabID = tabID
@@ -373,6 +386,9 @@ struct ConversationDetailView: View {
             guard let targetPane = notification.object as? String else { return }
             guard targetPane == (paneID ?? "primary") else { return }
             openSessionChangesInInspector()
+        }
+        .onChange(of: changesFingerprint) { _, fingerprint in
+            refreshLiveSessionChanges(fingerprint: fingerprint)
         }
         .onChange(of: computerLiveState) { _, state in
             // Bilgisayar turu kendiliğinden başladığında panel de kendiliğinden
@@ -1066,8 +1082,44 @@ struct ConversationDetailView: View {
                     return true
                 }
                 return !permissionApprovalCenter.pendingRequests(for: id).isEmpty
+            },
+            suggestedWorkingDirectory: { [sessionService] id in
+                Self.suggestedGoalDirectory(sessionService: sessionService, sessionID: id)
             }
         )
+    }
+
+    /// Koşu-sırası proje önerisi: oturum aktivitelerindeki dosya yollarının
+    /// oyu tek ve baskın bir projeye işaret ediyorsa orası döner, yoksa `nil`.
+    /// Kararsız dağılımda (birden çok proje, kafa kafaya oy) tahmin yürütülmez.
+    /// Oturum servisi ana aktöre bağlı olduğu için bu yöntem de ana aktördedir;
+    /// köprü kapanışı içinden çağrılır. Oy çekirdeği (`projectVotes`) saf ve
+    /// doğrudan test edilir.
+    @MainActor
+    static func suggestedGoalDirectory(
+        sessionService: any AgentSessionServiceProtocol,
+        sessionID: UUID
+    ) -> URL? {
+        guard let session = sessionService.session(for: sessionID) else {
+            return nil
+        }
+        var paths: [String] = []
+        for group in session.state.activityGroups {
+            for activity in group.activities {
+                if let detail = activity.detail {
+                    paths.append(detail)
+                }
+            }
+        }
+        let votes = GoalRunners.projectVotes(for: paths)
+        guard let top = votes.first, top.votes > 0 else {
+            return nil
+        }
+        let total = votes.reduce(0) { $0 + $1.votes }
+        guard votes.count == 1 || top.votes * 2 > total else {
+            return nil
+        }
+        return top.directory
     }
 
     private func openFileInInspector(url: URL) {
@@ -1156,6 +1208,41 @@ struct ConversationDetailView: View {
                 inspectorTabs.append(tab)
             }
             selectedInspectorTabID = tab.id
+        }
+        liveChangesSummary = summary
+        liveChangesComputedAt = Date()
+    }
+
+    /// Parmak izi değişiminde oturum sekmesini canlandırır: pahalı birleştirme
+    /// yalnız sekme açıkken koşar, meşgul akışta saniyede en çok bir kez
+    /// (diff dizileri her gövdede yeniden katılmaz). Boşta her zaman tazelenir
+    /// ki akışın son parçası sekmede görünsün. Sekme aynı kimlikle değişir,
+    /// içerik ve başlıktaki sayı güncellenirken seçim/kaydırma korunur.
+    /// Sekme kapalıysa canlı durum sıfırlanır (birleşmiş diff bellekte tutulmaz).
+    private func refreshLiveSessionChanges(fingerprint: Int) {
+        let tabID = "session-changes:\(focusedSession.id.uuidString)"
+        guard inspectorTabs.contains(where: { $0.id == tabID }) else {
+            liveChangesSummary = nil
+            return
+        }
+        let now = Date()
+        if focusedSession.isBusy, now.timeIntervalSince(liveChangesComputedAt) < 1.0 {
+            return
+        }
+        guard
+            let summary = TurnFileChangesSummary.sessionReviewSummary(
+                from: focusedSession.state.activityGroups
+            )
+        else {
+            liveChangesSummary = nil
+            liveChangesComputedAt = now
+            return
+        }
+        liveChangesSummary = summary
+        liveChangesComputedAt = now
+        let tab = InspectorTab.forSessionChanges(sessionID: focusedSession.id, summary: summary)
+        if let idx = inspectorTabs.firstIndex(where: { $0.id == tab.id }), inspectorTabs[idx] != tab {
+            inspectorTabs[idx] = tab
         }
     }
 
@@ -1335,13 +1422,9 @@ struct ConversationDetailView: View {
                     .frame(width: 1)
             )
             .contentShape(Rectangle())
-            .onHover { hovering in
-                if hovering {
-                    NSCursor.resizeLeftRight.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
+            // İmleç SwiftUI'a bırakılır: `onHover` push/pop'u, panel imleç
+            // üzerindeyken kapanınca dengesiz kalıyordu.
+            .pointerStyle(.columnResize)
             .gesture(
                 DragGesture(minimumDistance: 1)
                     .onChanged { value in
@@ -1877,7 +1960,9 @@ struct ConversationDetailView: View {
                     proxy.scrollTo("bottom_anchor", anchor: .bottom)
                 }
             }
-            .onChange(of: focusedSession.state.messages.last?.text) { _, _ in
+            // Anahtar metnin kendisi değil uzunluğu: her flush'ta akan yanıtın
+            // tamamı kopyalanıp karşılaştırılmasın (`utf8.count` O(1)).
+            .onChange(of: focusedSession.state.messages.last?.text.utf8.count) { _, _ in
                 handleStreamingTextChange(proxy: proxy)
             }
             .onChange(of: focusedSession.state.activityGroups.last?.activities.count) { _, _ in
@@ -2132,15 +2217,30 @@ private struct PromptOffsetProbe: ViewModifier {
     let space: String
     let onOffset: (UUID, CGFloat) -> Void
 
+    /// Devre dışıyken ölçülen yerine konan değer: eylem bu değeri raporlamaz.
+    nonisolated private static let disabledOffset = -CGFloat.greatestFiniteMagnitude
+
+    /// Dal yalnız mesajın rolüne bağlıdır (bir satır için hiç değişmez).
+    /// `isEnabled` ölçümün içinde okunur: koşula girseydi bölme her yeniden
+    /// boyutlandığında dal değişir, tüm kullanıcı satırları kimliğini
+    /// kaybedip (metin görünümleriyle birlikte) yeniden kurulurdu — bu da
+    /// kaydırma çapasını oynatıp ölçüm fırtınasını besliyordu. Devre dışıyken
+    /// değer sabittir (yeniden boyutlandırmada kare kare değişmez); yeniden
+    /// açılınca gerçek konum sabit değerden farklı olduğundan eylem hemen
+    /// tetiklenir ve ray güncel konumu alır.
     @ViewBuilder
     func body(content: Content) -> some View {
-        if isUserMessage && isEnabled {
+        if isUserMessage {
             content.onGeometryChange(
                 for: CGFloat.self,
                 of: { proxy in
-                    (proxy.frame(in: .named(space)).minY / 8).rounded() * 8
+                    guard isEnabled else {
+                        return Self.disabledOffset
+                    }
+                    return (proxy.frame(in: .named(space)).minY / 8).rounded() * 8
                 },
                 action: { offset in
+                    guard offset != Self.disabledOffset else { return }
                     onOffset(messageID, offset)
                 }
             )

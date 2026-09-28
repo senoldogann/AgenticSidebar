@@ -35,21 +35,6 @@ struct AgenticSidebarApp: App {
     /// sırasında kayıt defterine erişmek için burada tutulur.
     @State private var taskBoardComposition: TaskBoardComposition?
 
-    /// HUD'un gördüğü bilgisayar adımları: odaklı bölmenin oturumu. Dört akış
-    /// üst üste bindirilmez; odaksız bölme başlığındaki meşgul noktasıyla yetinir.
-    private var hudActivities: [AgentActivity] {
-        let focusID = splitStore.resolvedFocusSessionID(
-            activeID: sessionService.activeSessionID,
-            liveIDs: Set(sessionService.sessionList.map(\.id))
-        )
-        guard focusID != sessionService.activeSessionID,
-            let focused = sessionService.session(for: focusID)
-        else {
-            return sessionService.state.activityGroups.flatMap(\.activities)
-        }
-        return focused.state.activityGroups.flatMap(\.activities)
-    }
-
     init() {
         let credentialStore = KeychainCredentialStore()
         let initialSettingsStore = SettingsStore()
@@ -363,7 +348,8 @@ struct AgenticSidebarApp: App {
             // yoksa yan sohbetteki bilgisayar adımları HUD'a hiç düşmezdi.
             .background {
                 FloatingHUDHostView(
-                    items: HUDActivityMapper.items(from: hudActivities)
+                    sessionService: sessionService,
+                    splitStore: splitStore
                 )
             }
             // Yetenek keşfi yalnızca burada yapılır; `RootChatView` de çağırdığında

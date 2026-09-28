@@ -60,7 +60,7 @@ final class InspectorTabModelTests: XCTestCase {
 
         let tab = InspectorTab.forReview(summary: summary, initialFile: item)
         XCTAssertEqual(tab.title, "Changes (1)")
-        XCTAssertEqual(tab.iconName, "doc.badge.plus")
+        XCTAssertEqual(tab.iconName, "plus.forwardslash.minus")
         XCTAssertEqual(tab.id, "review:\(turnID.uuidString)")
 
         if case .changesReview(let tid, let sum, let initFile) = tab.kind {

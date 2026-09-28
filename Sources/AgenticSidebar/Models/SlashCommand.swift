@@ -27,8 +27,14 @@ struct SlashCommand: Identifiable, Equatable, Sendable {
         name: "btw",
         detail: "Ask a side question without interrupting the turn"
     )
-    /// Paneldeki sabit sıra: önce hedef, sonra yan soru.
-    static let all: [SlashCommand] = [.goal, .btw]
+    /// `/model` model seçimi: bestecideki model menüsüyle aynı listeden
+    /// (`ProviderGateway` model listesi) beslenir, tura yazılmaz.
+    static let model = SlashCommand(
+        name: "model",
+        detail: "Switch the model for this conversation"
+    )
+    /// Paneldeki sabit sıra: önce hedef, sonra yan soru, sonra model.
+    static let all: [SlashCommand] = [.goal, .btw, .model]
 
     /// Sorguyla süzme: boş sorgu hepsini verir, dolu sorgu adın içinde
     /// geçer (büyük/küçük harf duyarsız). `query` eğik çizgisiz gelir
@@ -77,5 +83,38 @@ struct SlashCommand: Identifiable, Equatable, Sendable {
         }
         let objective = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
         return objective.isEmpty ? nil : objective
+    }
+
+    /// `/model sorgu` önekini ayıklar: `/model` + boşluk + boş-olmayan sorgu.
+    /// İçeriksiz `/model` `bareCommandName` yoluna düşer (ipucu gösterilir).
+    /// Büyük/küçük harf duyarsızdır, eşleşmezse `nil` döner.
+    static func parseModelQuery(from text: String) -> String? {
+        let prefix = "/model"
+        guard text.count > prefix.count else {
+            return nil
+        }
+        guard text.lowercased().hasPrefix(prefix) else {
+            return nil
+        }
+        let remainder = text.dropFirst(prefix.count)
+        guard remainder.first?.isWhitespace == true else {
+            return nil
+        }
+        let query = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+        return query.isEmpty ? nil : query
+    }
+
+    /// Model veri kaynağı: `ProviderGateway` model listesinde (`availableModels`)
+    /// sorguyla süzme yapar. Boş sorgu hepsini verir; dolu sorgu görünen ad ya
+    /// da kimlikte geçer (büyük/küçük harf duyarsız). Saf ve test edilebilir.
+    static func matchingModels(query: String, in models: [ProviderModelCapability]) -> [ProviderModelCapability] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else {
+            return models
+        }
+        return models.filter {
+            $0.displayName.localizedCaseInsensitiveContains(needle)
+                || $0.id.rawValue.localizedCaseInsensitiveContains(needle)
+        }
     }
 }

@@ -524,14 +524,31 @@ actor BrowserProfileImporter {
     }
 
     private var cached: Summary?
+    /// Süren aktarım: aktör yeniden girişlidir, ikinci sekme ilk aktarım
+    /// sürerken gelirse ikinci bir aktarım (ve ikinci Anahtar Zinciri onayı)
+    /// başlatmak yerine aynı işi bekler.
+    private var inFlight: Task<Summary, Never>?
+
+    /// Aktarım bittiyse özeti, bitmediyse `nil` verir; aktarım başlatmaz.
+    func completedSummary() -> Summary? {
+        cached
+    }
 
     /// Uygulama ömründe bir kez çalışır; sonraki çağrılar kayıtlı özeti verir.
     func ensureImported() async -> Summary {
         if let cached {
             return cached
         }
-        let summary = await Self.performImport(store: WKWebsiteDataStore.default())
+        if let inFlight {
+            return await inFlight.value
+        }
+        let task = Task<Summary, Never> {
+            await Self.performImport(store: WKWebsiteDataStore.default())
+        }
+        inFlight = task
+        let summary = await task.value
         cached = summary
+        inFlight = nil
         return summary
     }
 

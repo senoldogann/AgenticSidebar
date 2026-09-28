@@ -16,30 +16,64 @@ import Foundation
 enum MainThreadHangWatchdog {
     nonisolated static let hangPrefix = "hang-"
     nonisolated static let hangExtension = "log"
+    nonisolated static let samplePrefix = "sample-"
     nonisolated static let heartbeatInterval: Duration = .seconds(1)
     nonisolated static let hangThresholdSeconds = 5.0
+    /// `sample` çıktısının üst sınırı (sn): simgeleme takılırsa bekçi
+    /// görevini hapsetmez, süreç sonlandırılır.
+    nonisolated static let sampleTimeoutSeconds = 30.0
+
+    /// Eşzamanlı tek `sample` koşar: üst üste donma bölümleri örnekleyiciyi
+    /// üst üste yığmaz. Kilit yalnız bayrak içindir, `sample` kilitsiz koşar.
+    private static let sampleLock = NSLock()
+    nonisolated(unsafe) private static var sampleInFlight = false
 
     /// Nabız ile izleme arasındaki paylaşılan durum. Aktör olduğu için iki
     /// görev de kilitsiz ve yarışsız okur/yazar.
+    ///
+    /// Geçen süre monoton saatle (`SuspendingClock`) ölçülür, duvar saatiyle
+    /// (`Date`) değil: Mac uyuyup uyanınca duvar saati ileri fırlar, uyku
+    /// süresi "999 sn donma" diye raporlanırdı. `SuspendingClock` uykuda
+    /// ilerlemez (`ContinuousClock` ilerler — sahte 999/1973 sn raporları
+    /// oradan geliyordu), o yüzden rapor yalnız gerçekten yanıt vermeyen ana
+    /// iş parçacığı için yazılır. Raporun tarih damgası duvar saatiyle kalır.
     private actor State {
-        private var lastPingCompletedAt = Date()
+        private var lastPingCompleted: SuspendingClock.Instant
         private var hangActive = false
 
+        init() {
+            lastPingCompleted = SuspendingClock().now
+        }
+
         func notePingCompleted() {
-            lastPingCompletedAt = Date()
+            lastPingCompleted = SuspendingClock().now
             hangActive = false
         }
 
         /// Eşik aşıldıysa geçen süreyi döndürür ve olayı "bildirildi" işaretler;
         /// aynı donma için ikinci kez rapor yazılmaz.
-        func noteUnresponsive(now: Date, threshold: TimeInterval) -> TimeInterval? {
-            let elapsed = now.timeIntervalSince(lastPingCompletedAt)
+        func noteUnresponsive(now: SuspendingClock.Instant, threshold: TimeInterval) -> TimeInterval? {
+            let elapsed = MainThreadHangWatchdog.monotonicSeconds(since: lastPingCompleted, until: now)
             guard elapsed >= threshold, !hangActive else {
                 return nil
             }
             hangActive = true
             return elapsed
         }
+    }
+
+    /// İki monoton an arasındaki saniye: uyku şişirmez, geriye kaymaz
+    /// (negatif fark sıfıra kırpılır). Saf tutulur, doğrudan test edilir.
+    nonisolated static func monotonicSeconds(
+        since start: SuspendingClock.Instant,
+        until end: SuspendingClock.Instant
+    ) -> Double {
+        let duration = end - start
+        guard duration >= .zero else {
+            return 0
+        }
+        let components = duration.components
+        return Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 
     /// Üretimde `AgenticSidebarApp` açılışında bir kez çağrılır; testler
@@ -77,13 +111,58 @@ enum MainThreadHangWatchdog {
             try? await Task.sleep(for: heartbeatInterval)
             guard
                 let elapsed = await state.noteUnresponsive(
-                    now: Date(),
+                    now: SuspendingClock().now,
                     threshold: hangThresholdSeconds
                 )
             else {
                 continue
             }
             writeHangReport(elapsed: elapsed, in: directory)
+            // Donma anındaki ana iş parçacığı yığını `sample` ile alınır:
+            // kendi sürecini örneklemek ayrıcalık istemez. Raporun yanına
+            // düşer, bir sonraki donmada tıkanıklığın adı dosyadan okunur.
+            captureSample(into: directory)
+        }
+    }
+
+    /// Donma anında ana iş parçacığının yığınını yakalar. Eşzamanlı tek
+    /// örnek koşar; `sample` yoksa ya da zaman aşımına uğrarsa sessizce düşer
+    /// (donma raporu zaten yazılmıştır).
+    private static func captureSample(into directory: URL) {
+        let claimed: Bool = sampleLock.withLock {
+            guard !sampleInFlight else {
+                return false
+            }
+            sampleInFlight = true
+            return true
+        }
+        guard claimed else {
+            return
+        }
+        Task.detached(priority: .background) {
+            defer {
+                sampleLock.withLock { sampleInFlight = false }
+            }
+            let stamp = CrashReporter.filenameStamp(for: Date())
+            let pid = ProcessInfo.processInfo.processIdentifier
+            let url = directory.appendingPathComponent(
+                "\(samplePrefix)\(stamp)-\(pid).txt"
+            )
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+            process.arguments = [String(pid), "1", "-file", url.path]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else {
+                return
+            }
+            let deadline = Date().addingTimeInterval(sampleTimeoutSeconds)
+            while process.isRunning, Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            if process.isRunning {
+                process.terminate()
+            }
         }
     }
 
@@ -120,7 +199,7 @@ enum MainThreadHangWatchdog {
             "date: \(ISO8601DateFormatter().string(from: date))",
             "app: \(appVersion)",
             String(format: "main-thread unresponsive for: %.1fs", unresponsiveSeconds),
-            "note: main-thread stack requires `sample`; this file proves the hang episode.",
+            "note: the matching sample-<stamp>-<pid>.txt (if present) holds the main-thread stack.",
         ].joined(separator: "\n") + "\n"
     }
 }

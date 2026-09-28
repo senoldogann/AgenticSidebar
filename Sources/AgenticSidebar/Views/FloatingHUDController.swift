@@ -190,9 +190,31 @@ enum HUDActivityMapper {
 /// Boşken panel gizlenir, doluyken `orderFrontRegardless` ile odak çalmadan
 /// gösterilir.
 struct FloatingHUDHostView: View {
-    let items: [HUDActivityItem]
+    let sessionService: AgentSessionService
+    let splitStore: SplitLayoutStore
 
     @State private var controller = FloatingHUDController()
+
+    /// HUD'un gördüğü bilgisayar adımları: odaklı bölmenin oturumu. Dört akış
+    /// üst üste bindirilmez; odaksız bölme başlığındaki meşgul noktasıyla
+    /// yetinir.
+    ///
+    /// Oturum durumu burada, sıfır boyutlu bu görünümün kendi gövdesinde
+    /// okunur. Sahne gövdesinde okunduğunda her akış parçası (40 ms) tüm
+    /// pencere içeriğini — kenar çubuğu, araç çubuğu, bütün bölmeler —
+    /// yeniden hesaplatıyordu.
+    private var items: [HUDActivityItem] {
+        let focusID = splitStore.resolvedFocusSessionID(
+            activeID: sessionService.activeSessionID,
+            liveIDs: Set(sessionService.sessionList.map(\.id))
+        )
+        guard focusID != sessionService.activeSessionID,
+            let focused = sessionService.session(for: focusID)
+        else {
+            return HUDActivityMapper.items(from: sessionService.state.activityGroups.flatMap(\.activities))
+        }
+        return HUDActivityMapper.items(from: focused.state.activityGroups.flatMap(\.activities))
+    }
 
     var body: some View {
         Color.clear

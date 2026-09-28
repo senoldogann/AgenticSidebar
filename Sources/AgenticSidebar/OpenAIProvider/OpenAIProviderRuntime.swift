@@ -133,6 +133,7 @@ struct OpenAIProviderRuntime: ProviderRuntime {
         }
 
         let questionMessage = ChatMessage(role: .user, text: query.question)
+        let trimmedDirectory = query.workingDirectoryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let synthetic = ProviderRequest(
             sessionID: UUID(),
             configuration: query.configuration,
@@ -142,7 +143,8 @@ struct OpenAIProviderRuntime: ProviderRuntime {
             speedMode: query.speedMode,
             mode: query.mode,
             activityGroups: query.activityGroups,
-            contextSummary: query.contextSummary
+            contextSummary: query.contextSummary,
+            workingDirectoryPath: trimmedDirectory.isEmpty ? nil : trimmedDirectory
         )
         return try await startStream(for: synthetic)
     }

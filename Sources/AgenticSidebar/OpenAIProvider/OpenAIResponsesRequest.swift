@@ -14,6 +14,18 @@ enum OpenAIResponsesRequest {
         {
             inputMessages.insert(summaryMessage, at: 0)
         }
+        let directoryNote: String? = {
+            guard
+                let directory = providerRequest.workingDirectoryPath?.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ),
+                !directory.isEmpty
+            else {
+                return nil
+            }
+            return
+                "Working directory: \(directory). Answer about files inside this directory; do not ask the user for the project path when it is given here."
+        }()
         let body = Body(
             model: providerRequest.configuration.modelID.rawValue,
             input: inputMessages.map(InputMessage.init),
@@ -29,10 +41,16 @@ enum OpenAIResponsesRequest {
                 }
                 return nil
             }(),
-            instructions: providerRequest.mode.instructions(
-                speedMode: providerRequest.speedMode,
-                extensionContext: providerRequest.extensionContext
-            )
+            instructions: {
+                let combined = [
+                    directoryNote,
+                    providerRequest.mode.instructions(
+                        speedMode: providerRequest.speedMode,
+                        extensionContext: providerRequest.extensionContext
+                    ),
+                ].compactMap { $0 }.joined(separator: "\n\n")
+                return combined.isEmpty ? nil : combined
+            }()
         )
 
         var request = URLRequest(

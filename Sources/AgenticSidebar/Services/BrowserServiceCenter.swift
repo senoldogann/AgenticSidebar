@@ -4,9 +4,11 @@ import WebKit
 
 /// Adres çubuğuna yazılanı yüklenecek URL'ye çevirir.
 ///
-/// Saf: ağ ya da görünüm durumu okumaz. Bilinen şema aynen kalır; nokta ya da
-/// `host:port` taşıyan şemasız metin `https://` ile tamamlanır; kalan her şey
-/// arama sorgusudur (boşluk içeren metin dahil).
+/// Saf: ağ ya da görünüm durumu okumaz. Bilinen şema aynen kalır; `/` ya da
+/// `~` ile başlayan yol yerel dosyadır; nokta ya da `host:port` taşıyan
+/// şemasız metin `https://` ile tamamlanır — yerel geliştirme sunucuları
+/// (loopback, `.local`, özel ağ IPv4) düz TLS konuşmadığı için `http://` alır;
+/// kalan her şey arama sorgusudur (boşluk içeren metin dahil).
 enum BrowserURLNormalizer {
     /// Varsayılan arama motoru ve başlangıç sayfası: Google.
     static let searchEngineURL = URL(string: "https://www.google.com/")!
@@ -29,15 +31,24 @@ enum BrowserURLNormalizer {
             return url
         }
 
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~/") {
+            return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
+        }
+
         if !trimmed.contains(" "), looksLikeHost(trimmed) {
-            return URL(string: "https://\(trimmed)")
+            let scheme = isLocalDevelopmentHost(hostPart(of: trimmed)) ? "http" : "https"
+            return URL(string: "\(scheme)://\(trimmed)")
         }
 
         return searchURL(for: trimmed)
     }
 
-    /// `example.com` ya da `localhost:3000` gibi şemasız ana bilgisayar metni.
+    /// `example.com`, `localhost`, `localhost:3000` ya da `[::1]:8080` gibi
+    /// şemasız ana bilgisayar metni.
     static func looksLikeHost(_ text: String) -> Bool {
+        if isLocalDevelopmentHost(hostPart(of: text)) {
+            return true
+        }
         if text.contains(".") {
             return true
         }
@@ -45,6 +56,42 @@ enum BrowserURLNormalizer {
             of: "^[A-Za-z0-9-]+(:[0-9]+)(/.*)?$",
             options: .regularExpression
         ) != nil
+    }
+
+    /// Şemasız metnin ana bilgisayar kısmı: ilk `/`, `?` ya da `#` öncesi,
+    /// port hariç, küçük harf. IPv6 literali köşeli parantezleriyle döner.
+    static func hostPart(of text: String) -> String {
+        let authority: Substring = text.prefix { !"/?#".contains($0) }
+        if authority.hasPrefix("["), let close = authority.firstIndex(of: "]") {
+            return String(authority[...close]).lowercased()
+        }
+        let host: Substring = authority.split(separator: ":", maxSplits: 1).first ?? ""
+        return String(host).lowercased()
+    }
+
+    /// Yerel geliştirme sunucusu mu: loopback, `.localhost`/`.local` adları ve
+    /// özel ağ IPv4 blokları (RFC 1918, link-local). Bunlar TLS sertifikası
+    /// taşımaz; `https://` ile açmak bağlantıyı SSL hatasıyla düşürür.
+    static func isLocalDevelopmentHost(_ host: String) -> Bool {
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
+            return true
+        }
+        if host == "[::1]" {
+            return true
+        }
+        let parts: [Substring] = host.split(separator: ".", omittingEmptySubsequences: false)
+        let octets: [Int] = parts.compactMap { Int($0) }
+        guard parts.count == 4, octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else {
+            return false
+        }
+        switch (octets[0], octets[1]) {
+        case (127, _), (10, _), (0, _), (192, 168), (169, 254):
+            return true
+        case (172, 16...31):
+            return true
+        default:
+            return false
+        }
     }
 
     static func searchURL(for query: String) -> URL? {
@@ -80,18 +127,28 @@ final class BrowserTabModel: NSObject, WKNavigationDelegate, WKUIDelegate, WKDow
     private(set) var downloadNotice: String?
     private var pendingDownloadName: String?
 
+    /// Web görünümünün güncel adresi. `webView.url` gözlem çerçevesine
+    /// görünmez; KVO ile buraya yansıtılır ki başlangıç ipucu ve sekme
+    /// başlıkları SPA gezinmesinde (`pushState`, hash) de tazelensin.
+    private(set) var currentURL: URL?
+
     /// Henüz bir sayfaya gidilmedi mi? Panel başlangıç ipucunu buna göre çizer.
     var hasPage: Bool {
-        webView.url != nil
+        currentURL != nil
     }
 
     /// "Chrome'da aç" düğmesinin hedeflediği kişisel profil adı; Chrome
     /// yoksa `nil` kalır, düğme ipucu buna göre yazılır.
     private(set) var chromeProfileName: String?
 
-    var currentURL: URL? {
-        webView.url
-    }
+    /// Adres çubuğuna en son yansıtılan URL: başlık ya da geri/ileri
+    /// değişiminde kullanıcının yazmakta olduğu metin ezilmez.
+    @ObservationIgnored private var lastSyncedURL: URL?
+    /// Web görünümü özelliklerinin KVO kayıtları; model yaşadıkça durur.
+    @ObservationIgnored private var observations: [NSKeyValueObservation] = []
+    /// Sekme kapandı mı: geç biten profil aktarımı kapanmış sekmeye yükleme
+    /// yapmasın.
+    @ObservationIgnored private var isStopped = false
 
     override init() {
         // Kişisel profil: uygulamanın kalıcı deposu. İzole depo her açılışı
@@ -111,20 +168,61 @@ final class BrowserTabModel: NSObject, WKNavigationDelegate, WKUIDelegate, WKDow
         webView.allowsBackForwardNavigationGestures = true
         // Sekmeler arası geçişte sayfa kaydırma konusu korunsun.
         webView.allowsMagnification = true
+        observeWebView()
 
         Task { await loadPersonalProfile() }
     }
 
-    /// Kişisel çerezleri kalıcı depoya bir kez taşır; durum panele yansır.
-    /// Ardından sekme hâlâ boşsa başlangıç sayfası yüklenir: panel hiçbir
-    /// zaman boş ipucu olarak kalmaz, tarayıcı çalıştığını gösterir.
+    /// Gezinme temsilcisi yalnız belge yüklemelerini bildirir; SPA gezinmesi
+    /// (`pushState`, hash) ve arka plan yükleme değişimleri KVO'dan gelir.
+    /// WebKit bu KVO'ları ana iş parçacığında yayınlar; yine de izolasyon
+    /// varsayılmaz, senkron ana aktöre sıraya alınır.
+    private func observeWebView() {
+        let sync: @Sendable (WKWebView) -> Void = { [weak self] _ in
+            Task { @MainActor in
+                self?.syncFromWebView()
+            }
+        }
+        observations = [
+            webView.observe(\.url, options: [.new]) { view, _ in sync(view) },
+            webView.observe(\.title, options: [.new]) { view, _ in sync(view) },
+            webView.observe(\.canGoBack, options: [.new]) { view, _ in sync(view) },
+            webView.observe(\.canGoForward, options: [.new]) { view, _ in sync(view) },
+            webView.observe(\.isLoading, options: [.new]) { view, _ in sync(view) },
+        ]
+    }
+
+    /// Başlangıç sayfası hemen yüklenir; kişisel çerez aktarımı arkada koşar.
+    /// Aktarım Anahtar Zinciri onayı bekleyebilir — sayfayı ona bağlamak
+    /// paneli onay gelene kadar boş bırakıyordu. Aktarım yeni çerez getirdiyse
+    /// ve sekme hâlâ başlangıç sayfasındaysa sayfa bir kez tazelenir.
     private func loadPersonalProfile() async {
-        let summary = await BrowserProfileImporter.shared.ensureImported()
-        profileStatus = summary.displayText
-        chromeProfileName = ChromeProfileResolver.personalProfileFromDisk()?.name
+        let importer = BrowserProfileImporter.shared
+        if let summary = await importer.completedSummary() {
+            applyProfile(summary)
+            if webView.url == nil {
+                load(BrowserURLNormalizer.searchEngineURL)
+            }
+            return
+        }
         if webView.url == nil {
             load(BrowserURLNormalizer.searchEngineURL)
         }
+        let summary = await importer.ensureImported()
+        guard !isStopped else {
+            return
+        }
+        applyProfile(summary)
+        if summary.imported > 0,
+            webView.url?.host() == BrowserURLNormalizer.searchEngineURL.host()
+        {
+            webView.reload()
+        }
+    }
+
+    private func applyProfile(_ summary: BrowserProfileImporter.Summary) {
+        profileStatus = summary.displayText
+        chromeProfileName = ChromeProfileResolver.personalProfileFromDisk()?.name
     }
 
     // MARK: - Eylemler
@@ -136,8 +234,15 @@ final class BrowserTabModel: NSObject, WKNavigationDelegate, WKUIDelegate, WKDow
         load(url)
     }
 
+    /// Yerel dosya `loadFileURL` ile açılır: düz `URLRequest` dosya okuma
+    /// izni vermez ve sayfa boş kalır. Okuma izni dosyanın klasörüyle
+    /// sınırlıdır, göreli CSS/JS yolları çalışır.
     func load(_ url: URL) {
         loadError = nil
+        if url.isFileURL {
+            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+            return
+        }
         webView.load(URLRequest(url: url))
     }
 
@@ -171,6 +276,11 @@ final class BrowserTabModel: NSObject, WKNavigationDelegate, WKUIDelegate, WKDow
 
     /// Sekme kapanınca yükleme de durur; görünüm zaten bırakılır.
     func stop() {
+        isStopped = true
+        for observation in observations {
+            observation.invalidate()
+        }
+        observations = []
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
@@ -231,22 +341,51 @@ final class BrowserTabModel: NSObject, WKNavigationDelegate, WKUIDelegate, WKDow
         handleFailure(error)
     }
 
-    /// Kullanıcı gezinmesi iptal edildiğinde (ör. yeni yükleme) hata gösterilmez.
+    /// Web içerik süreci çöktü ya da bellek baskısıyla kapatıldı: görünüm boş
+    /// beyaz kalırdı. Son adres yeniden yüklenir.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        if webView.url != nil {
+            webView.reload()
+        } else if let lastSyncedURL {
+            load(lastSyncedURL)
+        }
+    }
+
+    /// Hata olmayan kesintiler sessiz geçer: kullanıcının başlattığı yeni
+    /// yükleme eskisini iptal eder (-999), indirmeye dönen yanıt çerçeve
+    /// yüklemesini keser (WebKit 102). Kesinti kontrolü yükleme durumuna
+    /// dokunmadan yapılır; yoksa eski gezinmenin geç iptali yeni yüklemenin
+    /// göstergesini söndürürdü.
     private func handleFailure(_ error: Error) {
-        isLoading = false
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled {
+            return
+        }
+        if nsError.domain == Self.webKitErrorDomain, nsError.code == Self.frameLoadInterruptedCode {
+            syncFromWebView()
             return
         }
         loadError = error.localizedDescription
         syncFromWebView()
     }
 
+    /// `WebKitErrorFrameLoadInterruptedByPolicyChange`: Swift'e sabit olarak
+    /// aktarılmaz. Etki alanı `WebKitErrorDomain`'dir (`WKError.errorDomain`
+    /// yani `WKErrorDomain` değil).
+    private static let frameLoadInterruptedCode = 102
+    private static let webKitErrorDomain = "WebKitErrorDomain"
+
     private func syncFromWebView() {
+        guard !isStopped else {
+            return
+        }
+        isLoading = webView.isLoading
         canGoBack = webView.canGoBack
         canGoForward = webView.canGoForward
         pageTitle = webView.title
-        if let url = webView.url {
+        currentURL = webView.url
+        if let url = webView.url, url != lastSyncedURL {
+            lastSyncedURL = url
             addressText = url.absoluteString
         }
     }
@@ -265,6 +404,83 @@ final class BrowserTabModel: NSObject, WKNavigationDelegate, WKUIDelegate, WKDow
             webView.load(navigationAction.request)
         }
         return nil
+    }
+
+    /// `alert()`: uygulanmadığında sayfa diyaloğu hiç göstermez.
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptAlertPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo
+    ) async {
+        let alert = Self.pageAlert(message: message, frame: frame)
+        alert.addButton(withTitle: "OK")
+        _ = await Self.present(alert, over: webView)
+    }
+
+    /// `confirm()`: uygulanmadığında her onay sessizce `false` dönerdi
+    /// (ör. "silmek istediğine emin misin" düğmeleri hiç çalışmaz).
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo
+    ) async -> Bool {
+        let alert = Self.pageAlert(message: message, frame: frame)
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        return await Self.present(alert, over: webView) == .alertFirstButtonReturn
+    }
+
+    /// `prompt()`: metin alanlı diyalog; vazgeçilirse `nil` döner.
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptTextInputPanelWithPrompt prompt: String,
+        defaultText: String?,
+        initiatedByFrame frame: WKFrameInfo
+    ) async -> String? {
+        let alert = Self.pageAlert(message: prompt, frame: frame)
+        let field = NSTextField(string: defaultText ?? "")
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let response = await Self.present(alert, over: webView)
+        return response == .alertFirstButtonReturn ? field.stringValue : nil
+    }
+
+    /// `<input type="file">`: uygulanmadığında dosya seçici hiç açılmaz.
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo
+    ) async -> [URL]? {
+        // Gizli sekme (penceresiz) dosya seçici açamaz: uygulama çapında
+        // kip, kullanıcının bakmadığı bir sayfadan fırlardı.
+        guard let window = webView.window else {
+            return nil
+        }
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.canChooseFiles = true
+        let response = await panel.beginSheetModal(for: window)
+        return response == .OK ? panel.urls : nil
+    }
+
+    private static func pageAlert(message: String, frame: WKFrameInfo) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = frame.securityOrigin.host.isEmpty ? "This page says" : frame.securityOrigin.host
+        alert.informativeText = message
+        return alert
+    }
+
+    /// Diyalog, web görünümünün penceresine sayfa olarak bağlanır. Pencere
+    /// yoksa (sekme gizli) diyalog gösterilmez ve "vazgeçildi" sayılır:
+    /// uygulama çapında kip, kullanıcının bakmadığı bir sayfadan fırlardı.
+    private static func present(_ alert: NSAlert, over webView: WKWebView) async -> NSApplication.ModalResponse {
+        guard let window = webView.window else {
+            return .cancel
+        }
+        return await alert.beginSheetModal(for: window)
     }
 
     // MARK: - İndirme (WKDownloadDelegate)

@@ -791,9 +791,8 @@ struct ConversationSidebarView: View {
                     // "has a maximum length that doesn't satisfy min <= max"
                     // diye hata basar — ölçü alt sınırla verilir.
                     ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.6)
-                        .frame(minWidth: 12, minHeight: 12)
+                        .controlSize(.mini)
+                        .frame(width: 12, height: 12)
                 } else if session.showsDoneBadge {
                     // Tamamlanan tur: okunmadı parlaklığında mavi nokta + Done.
                     HStack(spacing: 4) {

@@ -107,16 +107,16 @@ final class ContextSnapServiceTests: XCTestCase {
     }
 
     @MainActor
-    func testDisabledSettingSwallowsHotKey() {
+    func testDisabledSettingSwallowsHotKey() async {
         let (coordinator, drafts) = coordinator(enabled: false)
 
-        coordinator.handleSnapHotKey()
+        await coordinator.handleSnapHotKey()
 
         XCTAssertNil(drafts.pending)
     }
 
     @MainActor
-    func testEnabledSettingRestoresDraftForActiveSession() {
+    func testEnabledSettingRestoresDraftForActiveSession() async {
         let sessionID = UUID()
         let settings = SettingsStore(defaults: UserDefaults(suiteName: "test.context-snap")!)
         settings.contextSnapEnabled = true
@@ -128,17 +128,17 @@ final class ContextSnapServiceTests: XCTestCase {
             activeSessionID: { sessionID }
         )
 
-        coordinator.handleSnapHotKey()
+        await coordinator.handleSnapHotKey()
 
         XCTAssertEqual(drafts.pending?.sessionID, sessionID)
         XCTAssertTrue(drafts.pending?.text.contains("Safari") == true)
     }
 
     @MainActor
-    func testHotKeyWithoutFrontmostAppLeavesNoDraft() {
+    func testHotKeyWithoutFrontmostAppLeavesNoDraft() async {
         let (coordinator, drafts) = coordinator(enabled: true, app: nil)
 
-        coordinator.handleSnapHotKey()
+        await coordinator.handleSnapHotKey()
 
         XCTAssertNil(drafts.pending)
     }

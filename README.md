@@ -207,18 +207,61 @@ shared cache keeps markdown parses across conversation switches. See
 The right-hand **iOS Simulator** tab shows a booted device's screen inside the
 app and lets you tap and drag on it directly:
 
-- The fluid path is a live window stream (`SCStream`, ~12 fps, capped at 900 px
-  wide) of the Simulator/DeviceHub window for the selected device. It needs the
-  device window on screen and **Screen Recording** granted to AgenticSidebar;
-  without either, frames fall back to `simctl io screenshot` (~2 fps). The
-  footer badge says which path is active (`Canlı`, `simctl · ~2 fps`, or an
+- The primary path reads the device's own display surface from CoreSimulator
+  (the framebuffer `IOSurface`, ~30 fps, capped at 1400 px on the long edge).
+  It needs no simulator window and no Screen Recording permission, shows only
+  the device screen (so taps land where you click), and keeps working for a
+  device booted headless — the panel's **Boot** no longer opens a window when
+  this path is available. If the device shuts down, the panel notices and
+  returns to the boot state.
+- When the framebuffer cannot be read (an Xcode whose private display API does
+  not match), frames fall back to a live window stream (`SCStream`, only for
+  Simulator.app — Xcode 27's DeviceHub window carries its own sidebar and
+  toolbars) and then to `simctl io screenshot` (about 1 fps). The footer badge
+  says which path is active (`Canlı · 30 fps`, `Canlı`, `simctl · ~1 fps`, or an
   `Ekran Kaydı` prompt), so a slow view is never a mystery.
 - Capture runs only while the panel is visible and only for the selected booted
   device. Touches go to the device over the HID bridge; typing still wants the
-  real device window (`Open window` brings it forward without stealing focus
-  when booting).
+  real device window (`Open window` brings it forward).
 - The same on-visibility rule holds for the Computer live view: no hidden
   screen capture while its panel is closed.
+
+### When the simulator view misbehaves
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Stuck on `simctl · ~1 fps` although Screen Recording is on (Simulator.app only) | The fallback window stream captures the device window with `SCStream` (`onScreenWindowsOnly`), so a window on another Space is invisible to it | Bring the device window to this Space — **Open window** opens it in the background without stealing focus |
+| `Ekran Kaydı` prompt never clears, even after granting | Screen Recording is enforced on AgenticSidebar itself, not on the helper's row, and macOS caches the decision per process | Grant it from the panel's request button (System Settings ▸ Privacy & Security ▸ Screen Recording); if the row is already on and still reads as missing, quit and reopen the app — see `docs/verification/2026-09-16-screen-recording-attribution-fix.md` |
+| Taps do nothing and the panel shows an input error | The HID client is attached once per device; a failed attach fails fast instead of retry-looping | Press refresh in the panel header (this drops the cached client) and tap again; a device that was rebooted needs the same |
+| `Neither Simulator nor DeviceHub was found` | The window host follows the Xcode generation: Xcode 26 and earlier use Simulator.app (`com.apple.iphonesimulator`), Xcode 27+ uses DeviceHub (`com.apple.dt.Devices` / `com.apple.dt.DeviceHub`) | Install Xcode, or open the matching host once by hand |
+| No way to type into the device from the panel | In-panel input is tap and drag over the HID bridge only | Use **Open window** to bring the real device window forward for typing — the footer says it: hold the keys there, tap and drag here |
+
+## Keyboard shortcuts and slash commands
+
+- **Show/hide the window from anywhere** — `⇧⌘B` by default, changed in
+  Settings → General → Global Shortcut between `⌘B`, `⇧⌘B`, `⌥⌘B` and `⌃⌘B`.
+  Plain `⌘B` is offered but steals bold from every other app while registered.
+  If the chord cannot be registered (another app owns it), Settings says so
+  instead of failing silently.
+- **Snap Context** — `⇧⌘D`, opt-in in Settings → Automation. It copies the
+  frontmost app's name, window title, browser URL and selected text into the
+  composer as a reviewable draft. The URL needs Automation permission and the
+  selected text needs Accessibility permission; without them the snap degrades
+  to app and window title only.
+- **Composer** — `Return` sends, `Shift-Return` inserts a newline,
+  `⌘/⌃/⌥-Return` falls back to the platform default. `Esc` dismisses the
+  `@`/`/` suggestion panel (and the side-question panel); retyping the same
+  token does not reopen it. `⌘,` opens Settings.
+- **Slash commands** — the built-ins are `/goal` (runs the autonomous
+  goal loop until its gates are green), `/btw` (asks a side question without
+  interrupting the turn or writing to the transcript) and `/model` (switches
+  this conversation's model from the same list as the model menu: exactly one
+  match switches, zero or several matches show a hint instead). None of them
+  take attachments or tags, and none is written to the transcript. A bare
+  `/goal`, `/btw` or `/model` with nothing after it is not sent either; the
+  composer shows a hint of what to type instead. In the composer `/` lists
+  these commands followed by skills, and `@` lists the MCP servers and plugins
+  a turn may use.
 
 ## Extensions: MCP, plugins and skills
 
@@ -244,6 +287,17 @@ In the composer, `@` lists the MCP servers and plugins a turn may use and `/`
 lists the skills. Choosing one turns the typed token into a chip that rides with
 the message; the tag adds a few lines of instruction to that turn only, and an
 untagged turn adds nothing.
+
+Installing an MCP server is explicit. The MCP tab has **Marketplace** and
+**Installed** segments: **Add to Agent** on a marketplace card installs it
+directly, or opens a configure sheet first when the entry needs environment
+keys. **Add Custom MCP Server** takes a name plus either a **Local Command** (a
+bare executable with arguments — shell operators are refused) or a **Remote
+URL** (https). A newly added server arrives switched off and stays off until it
+is reviewed: switching it on registers it with the running agent, switching it
+off disconnects it again. The Installed list shows each server's live backend
+status, and **Restart Agent** at the top of the tab restarts the managed server
+so configuration changes take effect.
 
 MCP servers and plugins are loaded when the agent starts, so a change there
 applies on the next start — the tab has a **Restart agent** button for exactly
@@ -350,7 +404,10 @@ deletes its own throwaway item in the login keychain.
   asking (see above), and Plan mode refuses `task` itself, so delegating is
   unavailable there rather than merely asked about — a child session runs with its
   own definition's tools, which would otherwise be a way around the read-only
-  boundary.
+  boundary. While a subagent runs, its timeline card streams the child's inner
+   steps (the newest 20, with earlier ones counted); a finished one offers
+   **Read report** — or **Read output** — to open the full text in the side
+   panel.
 - **Audit trail**: permission decisions and observed tool execution events are
   distinct JSONL records in
   `~/Library/Application Support/AgenticSidebar/OpenCode/audit.jsonl` (rotated at

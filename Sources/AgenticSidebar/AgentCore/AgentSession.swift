@@ -207,6 +207,19 @@ final class AgentSession {
     private(set) var configuration: SessionConfiguration?
     private(set) var todos: [AgentTodo] = []
     private(set) var activeQuestion: AgentQuestion?
+    /// Oturumda dosya değişikliği var mı. Araç çubuğu ve bölme başlığı yalnız
+    /// bunu okur: `state` her akış parçasında değişir, oradan okumak kök
+    /// pencereyi (araç çubuğu dahil) her flush'ta yeniden hesaplatıyordu.
+    private(set) var hasFileChanges = false
+    /// Son dosya değişikliği taramasındaki grup sayısı: değişiklik bir kez
+    /// bulunduktan sonra yalnız grup sayısı değişince yeniden taranır.
+    @ObservationIgnored
+    private var fileChangeScanGroupCount = 0
+    /// Son görülen bildirim. `didSet` içinde `oldValue` okumak, her akış
+    /// yazımında eski durumun kopyasını tutup mesaj dizisini ve akan metni
+    /// yazma-anında-kopyalamaya zorluyordu (flush başına O(transkript)).
+    @ObservationIgnored
+    private var lastObservedNotice: AgentSessionNotice?
     /// Yuvarlanan bağlam özeti (`/compact`): pencere dışına düşen ön ekin
     /// yoğunlaştırılmışı. Ekrandaki transkripti değiştirmez; istek başına
     /// eklenir. Arşivde yaşar, yeniden başlatmada geri gelir.
@@ -256,6 +269,13 @@ final class AgentSession {
     @ObservationIgnored
     private var compactionTask: Task<Void, Never>?
     var isCompacting: Bool { compactionTask != nil }
+    /// Tur başı kayıtları, eskiden yeniye (`SessionTurnCheckpoint`).
+    /// Tur başına bir kayıt düşer, tavan eklentidedir; yalnız bellekte yaşar.
+    @ObservationIgnored
+    var checkpointStorage: [SessionTurnCheckpoint] = []
+    /// Servis katmanının verdiği son depo HEAD'i; tur başı kaydına gömülür.
+    @ObservationIgnored
+    var lastKnownRepositoryHead: String?
 
     /// Compact düğmesinin engeli (`nil` = basılabilir). `requestCompaction`
     /// içindeki koruma sırasının okunur izdüşümüdür; düğme ile eylem aynı
@@ -315,7 +335,23 @@ final class AgentSession {
                 lastObservedMessageCount = state.messages.count
                 summaryChanged = true
             }
-            if state.notice != oldValue.notice {
+            // Grup sayısı değiştiyse (yeni tur, geri alma, budama) tamamı
+            // taranır; değişmediyse yalnız son grup — akış yazımları oraya
+            // düşer ve her flush'ta tüm geçmişi taramak O(etkinlik) olurdu.
+            let groupCount = state.activityGroups.count
+            if groupCount != fileChangeScanGroupCount {
+                fileChangeScanGroupCount = groupCount
+                let detected = TurnFileChangesSummary.hasFileChanges(in: state.activityGroups)
+                if detected != hasFileChanges {
+                    hasFileChanges = detected
+                }
+            } else if !hasFileChanges, let lastGroup = state.activityGroups.last,
+                TurnFileChangesSummary.hasFileChanges(in: [lastGroup])
+            {
+                hasFileChanges = true
+            }
+            if state.notice != lastObservedNotice {
+                lastObservedNotice = state.notice
                 if state.notice != nil {
                     scheduleNoticeAutoDismiss(after: .seconds(6))
                 } else {
@@ -380,6 +416,9 @@ final class AgentSession {
         self.activeQuestion = state.activeQuestion
         self.lastCompletedAt = state.completedAt
         self.lastObservedMessageCount = state.messages.count
+        self.lastObservedNotice = state.notice
+        self.fileChangeScanGroupCount = state.activityGroups.count
+        self.hasFileChanges = TurnFileChangesSummary.hasFileChanges(in: state.activityGroups)
     }
 
     init(
@@ -418,6 +457,9 @@ final class AgentSession {
         self.state.activityGroups = snapshot.activityGroups.map {
             $0.normalizedForRestore()
         }
+        self.lastObservedNotice = self.state.notice
+        self.fileChangeScanGroupCount = self.state.activityGroups.count
+        self.hasFileChanges = TurnFileChangesSummary.hasFileChanges(in: self.state.activityGroups)
     }
 
     /// A running turn cannot survive a relaunch, so a snapshot never carries one;
@@ -525,8 +567,16 @@ final class AgentSession {
         noteSummaryChange()
     }
 
-    private func noteSummaryChange() {
+    /// Özet değişimini duyurur; eklentiler (`SessionTurnCheckpoint`) de
+    /// geri sarma sonrası listeyi tazelemek için çağırır.
+    func noteSummaryChange() {
         onSummaryChange?()
+    }
+
+    /// Geri alınan turların sağlayıcı sayımını düşürür: bayat pay yeni
+    /// paydaya vurulmaz. Ömür boyu sayaçlara dokunulmaz.
+    func clearReportedUsageForRewind() {
+        lastTurnUsage = nil
     }
 
     var isBusy: Bool {
@@ -1363,6 +1413,10 @@ final class AgentSession {
             fileManager: FileManager.default,
             baseURL: AttachmentStager.liveBaseURL()
         )
+        // Tur başı kaydı kullanıcı mesajından önce alınır: geri sarma bu
+        // noktaya döner, turun mesajı da budanır.
+        let turnID = UUID()
+        recordCheckpoint(turnID: turnID)
         let userMessage = ChatMessage(
             role: .user,
             text: queuedPrompt.text,
@@ -1386,7 +1440,6 @@ final class AgentSession {
         // Düşünme satırı tembeldir: ilk `thinkingDelta` gelene kadar grup boş
         // durur. Reasoning paylaşmayan modellerde `output` hiç dolmadığı için
         // her turda boş bir "Thought" satırı çiziliyordu.
-        let turnID = UUID()
         state.activityGroups.append(
             AgentTurnActivityGroup(
                 id: turnID,
@@ -1426,7 +1479,8 @@ final class AgentSession {
             mode: queuedPrompt.mode,
             extensionContext: queuedPrompt.extensionTags.turnInstruction,
             activityGroups: state.activityGroups,
-            contextSummary: contextSummary
+            contextSummary: contextSummary,
+            workingDirectoryPath: workingDirectoryPath
         )
         activeTurnID = turnID
         activeTurnSpeedMode = queuedPrompt.speedMode
@@ -1933,7 +1987,9 @@ final class AgentSession {
             currentTurnAnchorMessageID = message.id
             state.messages.append(message)
         }
-        state.status = .streaming
+        if state.status != .streaming {
+            state.status = .streaming
+        }
     }
 
     private func discardPendingAssistantText() {

@@ -25,19 +25,23 @@ struct AcceptanceCriterion: Equatable, Sendable, Codable {
 }
 
 /// Döngünün kendini durdurma kapakları: sonsuz döngü ve maliyet patlaması
-/// bu üç sınırla imkânsız hale gelir.
+/// tur ve araç-çağrısı sınırlarıyla imkânsız hale gelir. Süre kapağı
+/// bilinçli olarak yoktur (`maxDurationSeconds == 0` = süresiz): hedef,
+/// ajan bitti diyene kadar sürer; güvenlik korkuluğu tur ve çağrı
+/// sayaçlarıdır.
 struct GoalBudget: Equatable, Sendable, Codable {
     /// İzin verilen en fazla düzeltme turu.
     let maxIterations: Int
-    /// Saniye cinsinden en fazla toplam süre.
+    /// Saniye cinsinden en fazla toplam süre; `0` süre sınırı yok demektir.
     let maxDurationSeconds: TimeInterval
     /// En fazla araç çağrısı.
     let maxToolCalls: Int
 
-    /// Üç sınırdan biri aşılırsa `true` döner.
+    /// Sınırlardan biri aşılırsa `true` döner. Süre sınırı kapalıysa (`0`)
+    /// geçen süre ne olursa olsun bu kapaktan düşülmez.
     func isExceeded(iterations: Int, elapsedSeconds: TimeInterval, toolCalls: Int) -> Bool {
         iterations > maxIterations
-            || elapsedSeconds > maxDurationSeconds
+            || (maxDurationSeconds > 0 && elapsedSeconds > maxDurationSeconds)
             || toolCalls > maxToolCalls
     }
 }

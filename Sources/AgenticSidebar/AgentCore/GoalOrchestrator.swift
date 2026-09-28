@@ -50,6 +50,12 @@ final class GoalOrchestrator {
         /// `true` iken zaman aşımı saati işlemez — kullanıcı AFK diye hedef
         /// ölmez. Öntanımlı `false`, eski kurulumlar bozulmaz.
         var isWaitingForUser: @MainActor (UUID) -> Bool = { _ in false }
+        /// Koşu sırasında iskele kurulan projenin dizini (`nil` = öneri yok):
+        /// ajan "yeni klasörde X yap" hedefinde başlangıç dizininden başka
+        /// yerde çalışırsa doğrulama yanlış projede koşardı. Üretimde oturum
+        /// aktivitelerindeki dosya yollarının oyuyla bulunur; test ve eski
+        /// kurulumlarda `nil` döner, davranış değişmez.
+        var suggestedWorkingDirectory: @MainActor (UUID) -> URL? = { _ in nil }
 
         static var inert: Bridge {
             Bridge(
@@ -96,7 +102,7 @@ final class GoalOrchestrator {
 
     static let defaultBudget = GoalBudget(
         maxIterations: 5,
-        maxDurationSeconds: 3_600,
+        maxDurationSeconds: 0,
         maxToolCalls: 300
     )
     /// Tek turun üst sınırı: aşan tur hedefi terminal hataya düşürür.
@@ -662,13 +668,14 @@ final class GoalOrchestrator {
             return
         }
         if engine.isOverBudget(now: now) {
+            let reason = Self.budgetExhaustionReason(engine: engine, budget: budget, now: now)
             engine.fail(
-                .budgetExceeded(detail: "budget exceeded"),
+                .budgetExceeded(detail: reason),
                 message: "Budget exceeded, stopping",
                 date: now
             )
             self.engine = engine
-            message = "Goal stopped: budget exceeded."
+            message = "Goal stopped: \(reason)."
             persist(now: now)
             return
         }
@@ -731,6 +738,48 @@ final class GoalOrchestrator {
         )
     }
 
+    /// Doğrulama öncesi dizin tazeleme: ajan koşu sırasında yeni proje iskelesi
+    /// kurduysa başlangıç dizini bayattır ve kapılar yanlış projede koşar.
+    /// Köprünün önerisi geçerli proje ve mevcut dizinden farklıysa geçilir;
+    /// ileti ve disk güncellenir. Öneri yoksa ya da aynıysa no-op — mevcut
+    /// koşular etkilenmez.
+    private func adoptSuggestedDirectoryIfNeeded(sessionID: UUID, now: Date) {
+        guard let suggested = bridge.suggestedWorkingDirectory(sessionID) else {
+            return
+        }
+        let current = URL(fileURLWithPath: workingDirectoryPath).standardizedFileURL.path
+        guard suggested.standardizedFileURL.path != current,
+            GoalRunners.supportedProject(at: suggested) != nil
+        else {
+            return
+        }
+        workingDirectoryPath = suggested.path
+        message = "Doğrulama dizini güncellendi: \(suggested.path)"
+        persist(now: now)
+    }
+
+    /// Bütçe aşımının hangi kapaklardan taştığını söyler: "budget exceeded"
+    /// hangisinin (süre/tur/araç çağrısı) dolduğunu gizlerdi, kullanıcı neden
+    /// durduğunu anlamazdı. Dolanların tamamı raporlanır.
+    nonisolated static func budgetExhaustionReason(engine: GoalEngine, budget: GoalBudget, now: Date) -> String {
+        var parts: [String] = []
+        let elapsed = engine.elapsedSeconds(now: now)
+        if budget.maxDurationSeconds > 0, elapsed > budget.maxDurationSeconds {
+            let minutes = Int((budget.maxDurationSeconds / 60).rounded())
+            parts.append("time budget exceeded (\(minutes) min)")
+        }
+        if engine.run.iteration > budget.maxIterations {
+            parts.append("iteration budget exceeded (\(engine.run.iteration)/\(budget.maxIterations))")
+        }
+        if engine.run.toolCallCount > budget.maxToolCalls {
+            parts.append("tool-call budget exceeded (\(engine.run.toolCallCount)/\(budget.maxToolCalls))")
+        }
+        guard !parts.isEmpty else {
+            return "budget exceeded"
+        }
+        return parts.joined(separator: "; ")
+    }
+
     private func perform(_ action: GoalPendingAction, now: Date) {
         guard let sessionID, var engine else {
             return
@@ -773,6 +822,7 @@ final class GoalOrchestrator {
                 now: now
             )
         case .verify:
+            adoptSuggestedDirectoryIfNeeded(sessionID: sessionID, now: now)
             pendingAction = nil
             isVerifying = true
             self.engine = engine

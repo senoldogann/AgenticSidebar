@@ -155,7 +155,8 @@ final class AgentSessionService {
             configuration: configuration,
             messages: session.state.messages,
             activityGroups: session.state.activityGroups,
-            contextSummary: session.contextSummary
+            contextSummary: session.contextSummary,
+            workingDirectoryPath: session.workingDirectoryPath ?? ""
         )
     }
 
@@ -753,6 +754,61 @@ final class AgentSessionService {
 
     func cancel() async {
         await activeSession.cancel()
+    }
+
+    // MARK: - Alt ajanlar ve geri sarma
+
+    /// Ekrandaki oturumun alt ajan delegasyonları, yeniden eskiye.
+    var activeSubagents: [SubagentRecord] {
+        activeSession.subagents
+    }
+
+    /// Verilen oturumun alt ajan delegasyonları; bulunamazsa boş döner.
+    func subagents(for id: UUID) -> [SubagentRecord] {
+        session(for: id)?.subagents ?? []
+    }
+
+    /// Çalışan bir alt ajanı durdurur (koşan turu iptal eder).
+    ///
+    /// - Returns: Bir tur iptal edildiyse `true`.
+    func cancelSubagent(sessionID: UUID, activityID: ProviderActivityID) async -> Bool {
+        guard let session = session(for: sessionID) else {
+            return false
+        }
+        return await session.cancelSubagent(activityID)
+    }
+
+    /// Verilen oturumun tur başı kayıtları; bulunamazsa boş döner.
+    func checkpoints(for id: UUID) -> [SessionTurnCheckpoint] {
+        session(for: id)?.checkpoints ?? []
+    }
+
+    /// Depo HEAD'ini oturuma yazar; sonraki tur başı kaydı onu gömer.
+    /// Kabuk yoktur: HEAD'i `SessionCheckpointGit` okur, buraya hazır gelir.
+    func noteRepositoryHead(_ sha: String?, for id: UUID) {
+        session(for: id)?.noteRepositoryHead(sha)
+    }
+
+    /// Oturumu verilen tur başı kaydına döndürür.
+    ///
+    /// - Returns: Geri sarma uygulandıysa `true`.
+    @discardableResult
+    func rewind(sessionID: UUID, to checkpointID: UUID) -> Bool {
+        guard let session = session(for: sessionID) else {
+            return false
+        }
+        guard session.rewind(to: checkpointID) else {
+            return false
+        }
+        refreshSessionList()
+        saveImmediately()
+        return true
+    }
+
+    /// Ekrandaki oturumu verilen tur başı kaydına döndürür.
+    @discardableResult
+    func rewindActiveSession(to checkpointID: UUID) -> Bool {
+        rewind(sessionID: activeSessionID, to: checkpointID)
     }
 
     // MARK: - Interactive Questions

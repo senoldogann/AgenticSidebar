@@ -28,6 +28,9 @@ struct SideQuestionQuery: Equatable, Sendable {
     /// Varsayılan değerli `let` memberwise init'e girmediği için `var`:
     /// üretim yolları özeti geçer, çağırmayan çağrı yerleri varsayılanı alır.
     var contextSummary: String = ""
+    /// Sorunun sorulduğu sohbetin bağlı klasörü; boşken maliyet yoktur.
+    /// Yanıtın hangi dizindeki dosyalardan bahsettiğini söyler.
+    var workingDirectoryPath: String = ""
 }
 
 /// Bellekte tutulan tek yan değişim: soru ve düz-metin cevabı.
@@ -63,4 +66,6 @@ struct SideQuestionContext: Sendable {
     /// Sorunun sorulduğu andaki yuvarlanan özet; yan soru da unutmasın diye.
     /// `let` + varsayılan memberwise init'ten düşürürdü (bkz. SideQuestionQuery).
     var contextSummary: String = ""
+    /// Sorunun sorulduğu sohbetin bağlı klasörü; boşken maliyet yoktur.
+    var workingDirectoryPath: String = ""
 }

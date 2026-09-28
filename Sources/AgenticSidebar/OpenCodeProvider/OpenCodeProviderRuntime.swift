@@ -2,6 +2,9 @@ import Foundation
 import Synchronization
 
 actor OpenCodeProviderRuntime: ProviderRuntime {
+    /// Hata ya da iptal sonrası uzak turu durdurma isteğinin en uzun beklemesi.
+    nonisolated static let remoteAbortTimeout: Duration = .seconds(3)
+
     nonisolated let id = ProviderID("opencode")
 
     /// Kullanıcı kararını bekler; işleyici yoksa istek güvenli biçimde reddedilir.
@@ -154,7 +157,8 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                     maximumCharacters: preambleBudget,
                     contextSummary: request.contextSummary
                 )
-                : nil
+                : nil,
+            workingDirectoryPath: request.workingDirectoryPath
         )
         // Plan, Review, Exam ve Ask salt-okunur backend ajanıyla çalışır: dördü de dosya
         // değiştirmeyen işlerdir (plan önerir, review denetler, exam çözer, ask yanıtlar).
@@ -219,7 +223,8 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                         newMessageID: lastUserMessage.id,
                         maximumCharacters: preambleBudget,
                         contextSummary: request.contextSummary
-                    )
+                    ),
+                    workingDirectoryPath: request.workingDirectoryPath
                 )
                 await lineStream.cancel()
                 do {
@@ -368,6 +373,31 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             }
         }
 
+        // Uzak turu durdurur: etkin bağlantıya gider (retry sonrası taze
+        // sunucudaki oturum kapatılır, ölü sokete değil). İptal ve hata
+        // yollarının ikisi de kullanır; en iyi çaba, hata yutulur çünkü
+        // sunucu zaten gitmiş olabilir. Bekleme `remoteAbortTimeout` ile
+        // sınırlıdır: takılı bir sunucu hata bandını ya da iptali istek zaman
+        // aşımı kadar geciktirmez. Kanal bundan sonra kapanır; sıradaki tur
+        // ancak o zaman başlayabildiği için gecikmiş bir abort yeni turu
+        // öldüremez.
+        let abortRemoteTurn: @Sendable () async -> Void = {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    if let freshConnection = await permissionServerManager.currentConnection() {
+                        try? await permissionClientFactory(freshConnection).abort(sessionID: activeSessionID)
+                    } else {
+                        try? await activeClient.abort(sessionID: activeSessionID)
+                    }
+                }
+                group.addTask {
+                    try? await Task.sleep(for: Self.remoteAbortTimeout)
+                }
+                await group.next()
+                group.cancelAll()
+            }
+        }
+
         let forwardingTask = Task {
             var auditActivities: [ProviderActivityID: ProviderActivityDescriptor] = [:]
             var auditedChildStepKeys: Set<String> = []
@@ -472,12 +502,23 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 await activeLineStream.cancel()
                 await channel.finish(throwing: CancellationError())
             } catch let error as ProviderRuntimeError {
+                // Akış hatayla bitti (kopuş, ayrıştırılamayan yanıt, sunucu
+                // hatası): uzak tur durdurulur. Yoksa sunucuda koşmaya devam
+                // eder ve sıradaki prompt görünmez bir turun arkasında bekler.
                 reconciliationTask.cancel()
                 await activeLineStream.cancel()
+                // Kullanıcı iptali taşıma hatası olarak da yüzeye çıkabilir;
+                // iptal yolu abort'u zaten yapar, ikinci kez gönderilmez.
+                if !Task.isCancelled {
+                    await abortRemoteTurn()
+                }
                 await channel.finish(throwing: error)
             } catch {
                 reconciliationTask.cancel()
                 await activeLineStream.cancel()
+                if !Task.isCancelled {
+                    await abortRemoteTurn()
+                }
                 await channel.finish(throwing: ProviderRuntimeError.transport)
             }
         }
@@ -489,13 +530,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 reconciliationTask.cancel()
                 await self.noteTurnCancelled(appSessionID: appSessionID)
                 await self.cancelPendingPermissions?(activeSessionID, appSessionID)
-                // Etkin bağlantıya abort: retry sonrası taze sunucudaki
-                // oturum kapatılır, ölü sokete değil.
-                if let freshConnection = await permissionServerManager.currentConnection() {
-                    try? await permissionClientFactory(freshConnection).abort(sessionID: activeSessionID)
-                } else {
-                    try? await activeClient.abort(sessionID: activeSessionID)
-                }
+                await abortRemoteTurn()
                 await activeLineStream.cancel()
                 await channel.finish(throwing: CancellationError())
             },
@@ -567,6 +602,7 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
             20_000,
             OpenCodeHistoryPreamble.maximumCharacters - questionMessage.text.count
         )
+        let trimmedDirectory = query.workingDirectoryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = OpenCodePromptBuilder.parts(
             for: questionMessage,
             speedMode: query.speedMode,
@@ -577,7 +613,8 @@ actor OpenCodeProviderRuntime: ProviderRuntime {
                 newMessageID: questionMessage.id,
                 maximumCharacters: preambleBudget,
                 contextSummary: query.contextSummary
-            )
+            ),
+            workingDirectoryPath: trimmedDirectory.isEmpty ? nil : trimmedDirectory
         )
 
         // Subscribe before submitting so fast backend events cannot be missed.

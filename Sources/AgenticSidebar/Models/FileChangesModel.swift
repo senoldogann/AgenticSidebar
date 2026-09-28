@@ -221,6 +221,32 @@ struct TurnFileChangesSummary: Identifiable, Equatable, Hashable, Sendable, Coda
         return false
     }
 
+    /// Dosya değişikliği parmak izi: tam `merged` birleştirmenin ucuz öncüsü.
+    /// Yalnız kimlik, adet ve metin uzunluklarını `Hasher`da toplar; diff
+    /// dizilerini bölmez, birleştirmez, SHA çalıştırmaz. Akış sırasında her
+    /// gövdede çağrılabilir; değer değiştiyse altta yeni içerik vardır ve
+    /// yalnız o zaman pahalı özet hesaplanır. Süreç-içi değişim algısı
+    /// içindir, kalıcı değildir (`Hasher` her çalışta farklı tohumlanır).
+    /// Görünüm dışı saf fonksiyondur.
+    nonisolated static func fileChangeFingerprint(groups: [AgentTurnActivityGroup]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(groups.count)
+        for group in groups {
+            hasher.combine(group.id)
+            hasher.combine(group.activities.count)
+            for activity in group.activities {
+                hasher.combine(activity.id)
+                hasher.combine(activity.kind.rawValue)
+                // `utf8.count` yerel dizgide O(1); `count` (grafem sayımı) her
+                // gövdede 64 KB'a varan her diff'i baştan sona tarıyordu.
+                hasher.combine(activity.title?.utf8.count ?? 0)
+                hasher.combine(activity.detail?.utf8.count ?? 0)
+                hasher.combine(activity.diff?.utf8.count ?? 0)
+            }
+        }
+        return hasher.finalize()
+    }
+
     /// Oturum sonu toplu kartın özeti: oturumda herhangi bir dosya değişikliği
     /// varsa birleştirilmiş özet, yoksa `nil`. Oturum bitince (boşta) bu kart
     /// transkriptin en altında tek review yüzeyi olarak çizilir ve satır içi

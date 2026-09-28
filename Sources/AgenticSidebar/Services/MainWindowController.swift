@@ -26,9 +26,15 @@ final class MainWindowController {
         self.window = window
         window.isReleasedWhenClosed = false
 
-        let delegate = HideOnCloseWindowDelegate()
-        hideOnCloseDelegate = delegate
-        window.delegate = delegate
+        // SwiftUI'ın pencere delegesi korunur: kapatma dışındaki her mesaj
+        // ona iletilir. Delegeyi düpedüz değiştirmek, sahnenin boyut, odak ve
+        // yaşam döngüsü bildirimlerini kesiyordu. Aynı pencere yeniden kayıt
+        // olursa (görünüm pencereye tekrar girer) vekil kendini sarmaz.
+        if !(window.delegate is HideOnCloseWindowDelegate) {
+            let delegate = HideOnCloseWindowDelegate(forwardingTo: window.delegate)
+            hideOnCloseDelegate = delegate
+            window.delegate = delegate
+        }
 
         applyOpacity(currentOpacity, to: window)
         window.appearance = colorSchemeMode.windowAppearance

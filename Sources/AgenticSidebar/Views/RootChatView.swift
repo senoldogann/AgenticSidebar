@@ -581,8 +581,10 @@ struct RootChatView: View {
                 }
                 // Canlı review düğmesi yalnız değişiklik varken çizilir:
                 // klasörsüz ya da dokunulmamış sohbette araç çubuğu şişmez.
+                // `state` değil `hasFileChanges` okunur: kök gövde akış
+                // parçalarında değil, yalnız bu karar değişince yeniden koşar.
                 if let activeSession = sessionService.session(for: sessionService.activeSessionID),
-                    TurnFileChangesSummary.hasFileChanges(in: activeSession.state.activityGroups)
+                    activeSession.hasFileChanges
                 {
                     ToolbarItem(placement: .primaryAction) {
                         Button {
@@ -591,7 +593,7 @@ struct RootChatView: View {
                                 object: PaneSlot.primary.rawValue
                             )
                         } label: {
-                            Image(systemName: "doc.badge.plus")
+                            Image(systemName: "plus.forwardslash.minus")
                         }
                         .help("Review this conversation's file changes in the side panel")
                         .accessibilityLabel("Review file changes")
@@ -842,11 +844,10 @@ struct RootChatView: View {
     private func conversationPane(scope: PaneScope, sessionID: UUID, activeID: UUID, showHeader: Bool, showSwap: Bool, focusID: UUID?)
         -> some View
     {
-        // Başlık rozeti için ucuz ön kontrol: sayım/diff birleştirme yok,
-        // ilk dosya bulgusunda durur; tam özet tıklama anında hesaplanır.
+        // Başlık rozeti oturumun ayrı yayınlanan kararını okur; tam özet
+        // tıklama anında hesaplanır.
         let paneSession = sessionService.session(for: sessionID)
-        let paneHasFileChanges =
-            paneSession.map { TurnFileChangesSummary.hasFileChanges(in: $0.state.activityGroups) } ?? false
+        let paneHasFileChanges = paneSession?.hasFileChanges ?? false
         return VStack(spacing: 0) {
             if showHeader {
                 SplitPaneHeader(
@@ -1000,13 +1001,10 @@ struct RootChatView: View {
                     .frame(width: isVertical ? 1 : nil, height: isVertical ? nil : 1)
             )
             .contentShape(Rectangle())
-            .onHover { hovering in
-                if hovering {
-                    (isVertical ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
+            // İmleç SwiftUI'a bırakılır: `onHover` içinde push/pop, görünüm
+            // üzerindeyken kaldırılınca (düzen değişimi) dengesiz kalıp
+            // yeniden boyutlandırma imlecini takılı bırakıyordu.
+            .pointerStyle(isVertical ? .columnResize : .rowResize)
             .gesture(
                 DragGesture(minimumDistance: 1)
                     .onChanged { value in

@@ -92,14 +92,16 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
                 initialFile: initialFile
             ),
             title: "Changes (\(count))",
-            iconName: "doc.badge.plus",
+            iconName: "plus.forwardslash.minus",
             iconColorName: "accent"
         )
     }
 
     /// Oturumun canlı dosya değişiklikleri sekmesi: kimlik oturuma bağlıdır,
     /// tura değil; akış sırasında tekrar tıklama aynı sekmeyi güncel özetle
-    /// tazeler, sekme çoğalmaz. İçerik tıklama anının fotoğrafıdır.
+    /// tazeler, sekme çoğalmaz. Açıkken içerik parmak iziyle canlanır
+    /// (`ConversationDetailView.refreshLiveSessionChanges`), kapandıktan
+    /// sonra kalan fotoğraf donuktur.
     static func forSessionChanges(sessionID: UUID, summary: TurnFileChangesSummary) -> InspectorTab {
         let count = summary.fileCount
         return InspectorTab(
@@ -110,7 +112,7 @@ struct InspectorTab: Identifiable, Equatable, Sendable {
                 initialFile: nil
             ),
             title: "Changes (\(count))",
-            iconName: "doc.badge.plus",
+            iconName: "plus.forwardslash.minus",
             iconColorName: "accent"
         )
     }

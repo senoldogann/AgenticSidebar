@@ -351,6 +351,62 @@ enum MarkdownTextRunBuilder {
     }
 }
 
+/// Bir markdown satırının yüksekliğini ölçen, pencereye hiç girmeyen
+/// TextKit 1 yığını; canlı metin görünümünün depolamasını artımlı aynalar.
+///
+/// Önceki paylaşılan ölçücü her ölçümde satırın tüm metnini kopyalayıp
+/// (`setAttributedString`) baştan yerleştiriyordu: akan bir yanıtta her
+/// flush O(yanıt uzunluğu) ana iş parçacığı işiydi ve takılma yanıt
+/// uzadıkça büyüyordu. Burada yalnız kuyruk değişir; `NSLayoutManager`
+/// düzenleme noktasından önceki yerleşimi korur, `ensureLayout` yalnız
+/// geçersizleşen kısmı yerleştirir. Canlı görünüme dokunulmaz (bkz.
+/// `SelectableMarkdownTextView.measuredSize`). Yalnız ana iş parçacığında
+/// kullanılır.
+final class RunTextMeasurer {
+    private let storage = NSTextStorage()
+    private let layoutManager = NSLayoutManager()
+    private let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+
+    init() {
+        container.lineFragmentPadding = 0
+        layoutManager.addTextContainer(container)
+        storage.addLayoutManager(layoutManager)
+    }
+
+    var length: Int {
+        storage.length
+    }
+
+    func replaceCharacters(in range: NSRange, with replacement: NSAttributedString) {
+        storage.beginEditing()
+        storage.replaceCharacters(in: range, with: replacement)
+        storage.endEditing()
+    }
+
+    func reset(to source: NSAttributedString) {
+        storage.beginEditing()
+        storage.setAttributedString(source)
+        storage.endEditing()
+    }
+
+    /// Verilen genişlikte satırın kapladığı boy (canlı görünümle aynı
+    /// yapılandırma: dolgu yok, iç boşluk yok).
+    func size(forWidth width: CGFloat) -> CGSize {
+        guard width > 0 else {
+            return CGSize(width: max(0, width), height: 0)
+        }
+        guard storage.length > 0 else {
+            return CGSize(width: width, height: 0)
+        }
+        if container.size.width != width {
+            container.size = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
+        }
+        layoutManager.ensureLayout(for: container)
+        let used = layoutManager.usedRect(for: container)
+        return CGSize(width: width, height: ceil(used.height))
+    }
+}
+
 /// A run of markdown in a single selectable AppKit text view.
 struct SelectableMarkdownTextView: NSViewRepresentable {
     let blocks: [MarkdownBlock]
@@ -448,6 +504,17 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             with: replacement
         )
         storage.endEditing()
+        // Ölçüm yığını aynı düzenlemeyi alır: yalnız değişen kuyruk yeniden
+        // yerleşir. Uzunluklar ayrıştıysa (beklenmez) yığın canlı metinden
+        // baştan kurulur.
+        if coordinator.measurer.length == oldLength {
+            coordinator.measurer.replaceCharacters(
+                in: NSRange(location: replacementStart, length: replacedLength),
+                with: replacement
+            )
+        } else {
+            coordinator.measurer.reset(to: storage)
+        }
 
         coordinator.blocks = blocks
         coordinator.typography = typography
@@ -508,7 +575,7 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
             return coordinator.lastMeasuredSize
         }
 
-        let size = Self.measuredSize(of: nsView, width: width)
+        let size = coordinator.measurer.size(forWidth: width)
         coordinator.lastMeasuredWidth = width
         coordinator.lastMeasuredGeneration = coordinator.measureGeneration
         coordinator.lastMeasuredSize = size
@@ -634,6 +701,8 @@ struct SelectableMarkdownTextView: NSViewRepresentable {
         var lastMeasuredGeneration = -1
         var lastMeasuredWidth: CGFloat = 0
         var lastMeasuredSize = CGSize.zero
+        /// Satırın ölçüm yığını: canlı metnin artımlı aynası.
+        let measurer = RunTextMeasurer()
 
         func textView(
             _ textView: NSTextView,

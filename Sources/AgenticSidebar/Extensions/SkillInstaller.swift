@@ -1,4 +1,25 @@
+import CryptoKit
 import Foundation
+
+/// Kurulumun tedarik zinciri reddi: özet uyuşmazlığı ya da onaysız betik.
+///
+/// `message` durum satırına aynen yazılır; her iki durum da neyin, neden
+/// reddedildiğini ve kullanıcının ne yapacağını söyler.
+enum SkillInstallSecurityError: Error, Equatable, Sendable {
+    /// Kayıtlı özetle indirilen içerik uyuşmuyor: yukarıda sessiz değişim.
+    case shaMismatch(skillName: String, expected: String, actual: String)
+    /// `scripts/` çalıştırılabilir içerik taşıyor, açık onay yok.
+    case scriptsRequireConfirmation(skillName: String, scriptPaths: [String])
+
+    var message: String {
+        switch self {
+        case .shaMismatch(let name, let expected, let actual):
+            "“\(name)” içeriği kayıtlı özetle uyuşmuyor (beklenen \(expected), gelen \(actual)). Kaynak yukarıda değişmiş olabilir; inceleyip yeniden kurun."
+        case .scriptsRequireConfirmation(let name, let scripts):
+            "“\(name)” çalıştırılabilir betik taşıyor (\(scripts.sorted().joined(separator: ", "))); kurulum onayı bekliyor."
+        }
+    }
+}
 
 /// Installs a skill, and refuses anything OpenCode would silently ignore.
 ///
@@ -40,21 +61,36 @@ struct SkillInstaller: Sendable {
     }
 
     /// Fetches, validates and installs one skill.
+    ///
+    /// - Parameters:
+    ///   - expectedSHA256: Biliniyorsa aranan içerik özeti; uyuşmazlık
+    ///     kurulumu durdurur (`shaMismatch`). `nil` ise denetim atlanır.
+    ///   - allowExecutableScripts: `scripts/` onayı; `false` iken betikli
+    ///     beceri yazılmadan reddedilir (`scriptsRequireConfirmation`).
     @discardableResult
     func install(
         skillNamed name: String,
         from reference: GitHubRepositoryReference,
-        source: ExtensionSource
+        source: ExtensionSource,
+        expectedSHA256: String? = nil,
+        allowExecutableScripts: Bool = false
     ) async throws -> SkillRecord {
         let fetcher = GitHubSkillFetcher(transport: transport)
         let fetched = try await fetcher.fetch(skillNamed: name, from: reference)
-        return try install(fetched: fetched, source: source)
+        return try install(
+            fetched: fetched,
+            source: source,
+            expectedSHA256: expectedSHA256,
+            allowExecutableScripts: allowExecutableScripts
+        )
     }
 
     @discardableResult
     func install(
         fetched: FetchedSkill,
-        source: ExtensionSource
+        source: ExtensionSource,
+        expectedSHA256: String? = nil,
+        allowExecutableScripts: Bool = false
     ) throws -> SkillRecord {
         guard let skillFile = fetched.skillFile,
             let markdown = String(data: skillFile.content, encoding: .utf8)
@@ -67,6 +103,24 @@ struct SkillInstaller: Sendable {
         // looks installed is worse than from a refusal.
         let manifest = try SkillManifestParser.parse(markdown)
         try SkillManifestParser.validate(manifest, directoryName: fetched.name)
+
+        // Özet ve betik denetimi yazmadan ÖNCE: reddedilen kurulum diskte iz
+        // bırakmaz, kayıt defteri de kirlenmez.
+        let digest = Self.contentSHA256(of: fetched.files)
+        if let expectedSHA256, expectedSHA256.lowercased() != digest.lowercased() {
+            throw SkillInstallSecurityError.shaMismatch(
+                skillName: manifest.name,
+                expected: expectedSHA256,
+                actual: digest
+            )
+        }
+        let scripts = Self.scriptPaths(in: fetched.files)
+        if !scripts.isEmpty, !allowExecutableScripts {
+            throw SkillInstallSecurityError.scriptsRequireConfirmation(
+                skillName: manifest.name,
+                scriptPaths: scripts
+            )
+        }
 
         let destination = directoryURL(for: fetched.name)
         // Staged in a sibling directory, then swapped into place.
@@ -118,11 +172,11 @@ struct SkillInstaller: Sendable {
             )
             try swap(staging, into: destination)
 
-            // Betik klasörü tek başına engel değildir ama çalıştırılabilir
-            // içerik taşıdığı için uyarı günlüğe düşer.
-            if fetched.files.contains(where: { $0.relativePath == "scripts" || $0.relativePath.hasPrefix("scripts/") }) {
+            // Betik klasörü onayla kuruldu; çalıştırılabilir içerik taşıdığı
+            // için uyarı günlüğe düşer.
+            if !scripts.isEmpty {
                 AppLog.extensions.warning(
-                    "Installed skill \(manifest.name, privacy: .public) contains scripts/"
+                    "Installed skill \(manifest.name, privacy: .public) contains scripts/ with user confirmation"
                 )
             }
             AppLog.extensions.info(
@@ -141,7 +195,8 @@ struct SkillInstaller: Sendable {
             source: source,
             installedAt: Date(),
             path: destination.appendingPathComponent("SKILL.md").path,
-            isManaged: true
+            isManaged: true,
+            expectedSHA256: digest
         )
     }
 
@@ -211,5 +266,27 @@ struct SkillInstaller: Sendable {
         return components.reduce(destination) { url, component in
             url.appendingPathComponent(component)
         }
+    }
+
+    /// Kurulumun içerik özeti: yola göre sıralı her dosya için
+    /// `yol + 0x00 + içerik` baytlarının SHA-256 değeri (hex).
+    ///
+    /// Sıralama ve ayraç sabittir; aynı dosya kümesi her makinede aynı özeti
+    /// verir, dosya adı-içerik eşleşmesi birbirine karışamaz.
+    static func contentSHA256(of files: [FetchedSkillFile]) -> String {
+        var hasher = SHA256()
+        for file in files.sorted(by: { $0.relativePath < $1.relativePath }) {
+            hasher.update(data: Data(file.relativePath.utf8))
+            hasher.update(data: Data([0]))
+            hasher.update(data: file.content)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Onaya sunulacak çalıştırılabilir listesi (`scripts` ve altı), sıralı.
+    static func scriptPaths(in files: [FetchedSkillFile]) -> [String] {
+        files.map(\.relativePath)
+            .filter { $0 == "scripts" || $0.hasPrefix("scripts/") }
+            .sorted()
     }
 }

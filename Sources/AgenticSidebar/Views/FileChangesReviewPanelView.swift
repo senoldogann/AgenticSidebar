@@ -16,12 +16,23 @@ struct FileChangesReviewPanelView: View {
     @State private var viewMode: ReviewViewMode = .diff
     @State private var diskFileContent: String?
     @State private var isLoadingDiskContent = false
+    /// Dosya başına inceleme kararı: yalnız panel görünümünde yaşar, diske
+    /// yazmaz. Mevcut `FileChangeItem.diff` modeli yeniden kullanılır, yeni
+    /// ayrıştırıcı kurulmaz.
+    @State private var reviewDecisions: [UUID: FileReviewDecision] = [:]
 
     private enum ReviewViewMode: String, CaseIterable, Identifiable {
         case diff = "Diff"
         case fullFile = "Full File"
 
         var id: String { rawValue }
+    }
+
+    /// Dosya başına kabul/ret kararı: `nil` bekliyor demektir. Ayrı tip
+    /// kararın üç hâlini açık taşır, `Bool?` karışıklığı olmaz.
+    enum FileReviewDecision: String, Sendable {
+        case accepted
+        case rejected
     }
 
     init(
@@ -136,7 +147,7 @@ struct FileChangesReviewPanelView: View {
                     }
                 }
             } else {
-                Image(systemName: "doc.badge.plus")
+                Image(systemName: "plus.forwardslash.minus")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(preset.accentGradient.first ?? .accentColor)
                     .frame(width: 20, height: 20)
@@ -244,93 +255,228 @@ struct FileChangesReviewPanelView: View {
 
     // MARK: - File List (Screenshot 2)
 
+    /// Dosya listesi: satır içi karar rozetiyle. Karar yalnızca görünüm
+    /// durumudur, `summary.files` değişmez; diff metni aynen taşınır.
     private var fileListView: some View {
-        ScrollView {
-            LazyVStack(spacing: 2) {
-                ForEach(summary.files) { file in
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            selectedFileID = file.id
-                            viewMode = .diff
-                            diskFileContent = nil
+        VStack(spacing: 0) {
+            if reviewedCount > 0 {
+                HStack(spacing: 6) {
+                    Text(reviewProgressText)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    if reviewedCount < summary.fileCount {
+                        Button("Clear") {
+                            reviewDecisions = [:]
                         }
-                    } label: {
-                        HStack(spacing: 8) {
-                            fileIcon(for: file.fileExtension)
-                                .frame(width: 16, height: 16)
-
-                            Text(file.fileName)
-                                .font(.system(size: 12.5, weight: .medium))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-
-                            Text(file.directoryPath)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-
-                            Spacer(minLength: 6)
-
-                            HStack(spacing: 4) {
-                                Text("+\(file.additions)")
-                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(.green)
-
-                                Text("-\(file.deletions)")
-                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                    .foregroundStyle(.red)
-                            }
-
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.secondary.opacity(0.7))
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .contentShape(Rectangle())
-                        .interactiveHoverPill(cornerRadius: 6)
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .pointingHandCursor()
+                        .help("Clear all review decisions")
                     }
-                    .buttonStyle(.plain)
-                    .pointingHandCursor()
-                    .help("View diff for \(file.fileName)")
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                Divider().opacity(0.25)
             }
-            .padding(.vertical, 8)
+            ScrollView {
+                LazyVStack(spacing: 2) {
+                    ForEach(summary.files) { file in
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                selectedFileID = file.id
+                                viewMode = .diff
+                                diskFileContent = nil
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                fileIcon(for: file.fileExtension)
+                                    .frame(width: 16, height: 16)
+
+                                Text(file.fileName)
+                                    .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+
+                                Text(file.directoryPath)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+
+                                Spacer(minLength: 6)
+
+                                // Karar rozeti: liste kararın özetidir, eylem
+                                // diff görünümündedir (iç içe düğme zıplamasın).
+                                if let decision = reviewDecisions[file.id] {
+                                    reviewBadge(for: decision)
+                                }
+
+                                HStack(spacing: 4) {
+                                    Text("+\(file.additions)")
+                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.green)
+
+                                    Text("-\(file.deletions)")
+                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.red)
+                                }
+
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(Color.secondary.opacity(0.7))
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                            .interactiveHoverPill(cornerRadius: 6)
+                        }
+                        .buttonStyle(.plain)
+                        .pointingHandCursor()
+                        .help("View diff for \(file.fileName)")
+                    }
+                }
+                .padding(.vertical, 8)
+            }
         }
     }
 
     // MARK: - Diff & Content View
 
+    /// Dosya diff görünümü: üstte dosya başına kabul/ret şeridi, altta
+    /// mevcut diff modeli (`file.diff`) aynen çizilir. Yeni ayrıştırıcı yok.
     @ViewBuilder
     private func fileDiffView(for file: FileChangeItem) -> some View {
-        if viewMode == .diff {
-            if let diff = file.diff, !diff.isEmpty {
-                diffLinesView(diff: diff)
-            } else {
-                VStack(spacing: 12) {
-                    Image(systemName: "doc.text.magnifyingglass")
-                        .font(.system(size: 28))
-                        .foregroundStyle(.secondary)
+        VStack(spacing: 0) {
+            reviewActionBar(for: file)
+            Divider().opacity(0.25)
+            if viewMode == .diff {
+                if let diff = file.diff, !diff.isEmpty {
+                    diffLinesView(diff: diff)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.secondary)
 
-                    Text("No inline diff recorded for this change.")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
+                        Text("No inline diff recorded for this change.")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
 
-                    Button("View Full File") {
-                        viewMode = .fullFile
-                        loadDiskContent(for: file.path)
+                        Button("View Full File") {
+                            viewMode = .fullFile
+                            loadDiskContent(for: file.path)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("View the full file from disk")
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("View the full file from disk")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(32)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(32)
+            } else {
+                fullFileContentView(for: file)
             }
+        }
+    }
+
+    /// Satır içi kabul/ret şeridi: karar görünüm durumudur, dosyayı diske
+    /// yazmaz ya da geri almaz. Etkin düğmeye yeniden basmak kararı temizler.
+    @ViewBuilder
+    private func reviewActionBar(for file: FileChangeItem) -> some View {
+        let decision = reviewDecisions[file.id]
+        HStack(spacing: 8) {
+            if let decision {
+                reviewBadge(for: decision)
+                Text(decision == .accepted ? "Accepted" : "Rejected")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Needs review")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button {
+                toggleDecision(.accepted, for: file.id)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: decision == .accepted ? "checkmark.circle.fill" : "checkmark.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Accept")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .foregroundStyle(decision == .accepted ? .green : .secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(
+                    (decision == .accepted ? Color.green.opacity(0.14) : Color.primary.opacity(0.06)),
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("Mark this file as accepted")
+            .accessibilityLabel("Accept \(file.fileName)")
+            Button {
+                toggleDecision(.rejected, for: file.id)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: decision == .rejected ? "xmark.circle.fill" : "xmark.circle")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("Reject")
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .foregroundStyle(decision == .rejected ? .red : .secondary)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(
+                    (decision == .rejected ? Color.red.opacity(0.14) : Color.primary.opacity(0.06)),
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
+            }
+            .buttonStyle(.plain)
+            .pointingHandCursor()
+            .help("Mark this file as rejected")
+            .accessibilityLabel("Reject \(file.fileName)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+
+    /// Karar rozeti: liste ve şeritte aynı dil.
+    @ViewBuilder
+    private func reviewBadge(for decision: FileReviewDecision) -> some View {
+        if decision == .accepted {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.green)
+                .help("Accepted")
         } else {
-            fullFileContentView(for: file)
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.red)
+                .help("Rejected")
+        }
+    }
+
+    /// Karar sayımları ve ilerleme metni: salt görünüm türetmesidir.
+    private var reviewedCount: Int { reviewDecisions.count }
+    private var reviewProgressText: String {
+        let accepted = reviewDecisions.values.filter { $0 == .accepted }.count
+        let rejected = reviewDecisions.values.filter { $0 == .rejected }.count
+        return "\(reviewedCount)/\(summary.fileCount) reviewed · \(accepted) accepted · \(rejected) rejected"
+    }
+
+    /// Aynı karara yeniden basmak beklemeye döndürür, karşı karara basmak
+    /// yön değiştirir. Sözlük yazımı tektir, yan etki yoktur.
+    private func toggleDecision(_ decision: FileReviewDecision, for fileID: UUID) {
+        if reviewDecisions[fileID] == decision {
+            reviewDecisions.removeValue(forKey: fileID)
+        } else {
+            reviewDecisions[fileID] = decision
         }
     }
 

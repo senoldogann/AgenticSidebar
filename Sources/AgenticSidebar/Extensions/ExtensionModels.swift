@@ -64,6 +64,9 @@ enum ExtensionSource: Codable, Equatable, Sendable {
     case gitHub(repository: String)
     /// An npm module name, installed by the agent at startup.
     case npm(module: String)
+    /// Tek tıkla katalog kartından kurulanlar (MCP/eklenti): kartın kimliği
+    /// taşınır ki satır "elle eklendi" demesin, kart söylensin.
+    case marketplace(id: String)
 
     var displayName: String {
         switch self {
@@ -75,6 +78,8 @@ enum ExtensionSource: Codable, Equatable, Sendable {
             "github.com/\(repository)"
         case .npm(let module):
             "npm · \(module)"
+        case .marketplace(let id):
+            "Marketplace · \(id)"
         }
     }
 }
@@ -234,6 +239,11 @@ struct PluginRecord: Codable, Equatable, Sendable, Identifiable {
 
     var id: String { module }
     var name: String { module }
+    /// Katalogdan tek tıkla kurulumda sabitlenen npm sürümü (`ad@1.2.3` →
+    /// `1.2.3`). Aynı taban ad yeniden eklenirken pin farklıysa kurulum
+    /// reddedilir; sessiz sürüm kayması olmaz. Eski kayıtlarda yoktur (`nil`),
+    /// kodlanabilirlik geriye uyumludur.
+    var pinnedVersion: String? = nil
 }
 
 struct SkillRecord: Codable, Equatable, Sendable, Identifiable {
@@ -250,6 +260,11 @@ struct SkillRecord: Codable, Equatable, Sendable, Identifiable {
     /// False for a skill the app did not install (one found in the user's own
     /// `~/.claude/skills` and friends): it can be listed and enabled, not moved.
     var isManaged: Bool
+    /// Kurulum anında hesaplanan içerik özeti (SHA-256 hex). İlk kurulumda
+    /// mühürlenir (TOFU); yeniden kurulumda beklenen değerle uyuşmazsa içerik
+    /// yukarıda sessizce değişmiş demektir ve kurulum reddedilir. Eski
+    /// kayıtlarda yoktur (`nil`), kodlanabilirlik geriye uyumludur.
+    var expectedSHA256: String? = nil
 
     var id: String { name }
 }
@@ -309,4 +324,90 @@ struct ExtensionSuggestion: Identifiable, Equatable, Sendable {
     var tag: ExtensionTag {
         ExtensionTag(kind: kind, name: name)
     }
+}
+
+// MARK: - Lane A7: pazar yeri kurulum güvenliği
+
+/// Yerel MCP sunucusunun çalışma dizini ilkesi.
+///
+/// `cwd` önce sembolik bağlardan arındırılır (görünen yol değil gerçek hedef
+/// denetlenir), sonra çalışma alanı ya da açık izin listesi altında mı diye
+/// bakılır. Alan dışı dizin, sunucunun ajan yetkisiyle keyfi klasörde süreç
+/// çalıştırması demektir; reddedilir. Kalıtılmış sunucular (kullanıcının kendi
+/// `opencode.json` dosyasındakiler) listelenir ama düzenlenmez, bu denetim
+/// onlara işlemez — yalnızca yeni eklemelere.
+enum MCPWorkingDirectoryPolicy {
+    /// Doğrulanmış `cwd`: boş girdi `nil` döner (kısıtlama yok, OpenCode'un
+    /// kendi dizininde koşar). Başarısızlıkta reddin nedeni taşınır.
+    static func validated(
+        cwd raw: String?,
+        serverName: String,
+        workspaceRoot: URL,
+        extraAllowedRoots: [URL] = []
+    ) -> Result<String?, MCPWorkingDirectoryError> {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !trimmed.isEmpty
+        else {
+            return .success(nil)
+        }
+        // Symlink çözülür: `cwd` görünen yol değil gerçek hedef üzerinden
+        // denetlenir, yoksa bağ ile alan dışına kaçılırdı.
+        let resolved = URL(fileURLWithPath: trimmed).resolvingSymlinksInPath().standardized.path
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        else {
+            return .failure(.notDirectory(path: trimmed))
+        }
+        // Bilgisayar kullanımı kendi proje dizininde koşar (`--root` ile
+        // başlatılır); alan denetimi onu engellememelidir.
+        if serverName == ComputerUseConfiguration.serverName {
+            return .success(resolved)
+        }
+        let allowed = [workspaceRoot] + extraAllowedRoots
+        let inside = allowed.contains { root in
+            let canonical = root.resolvingSymlinksInPath().standardized.path
+            let prefix = canonical.hasSuffix("/") ? canonical : canonical + "/"
+            return resolved == canonical || resolved.hasPrefix(prefix)
+        }
+        guard inside else {
+            return .failure(.outsideAllowedRoots(path: trimmed, resolved: resolved))
+        }
+        return .success(resolved)
+    }
+}
+
+/// `cwd` reddinin nedeni; `message` durum satırına aynen yazılır.
+enum MCPWorkingDirectoryError: Error, Equatable, Sendable {
+    case notDirectory(path: String)
+    case outsideAllowedRoots(path: String, resolved: String)
+
+    var message: String {
+        switch self {
+        case .notDirectory(let path):
+            "Çalışma dizini bulunamadı ya da dizin değil: \(path)"
+        case .outsideAllowedRoots(let path, _):
+            "Çalışma dizini çalışma alanı dışında: \(path). Sunucu yalnızca çalışma alanı ya da izinli dizinler altında koşabilir."
+        }
+    }
+}
+
+/// `scripts/` taşıdığı için beklemeye alınan beceri kurulumu.
+///
+/// Kurulum yarıda kesilmez, hiç yazılmaz; kullanıcı onaylayana (`confirm`) ya
+/// da vazgeçene (`cancel`) kadar burada durur. Onay kartı
+/// (`PermissionApprovalCenter`) bağlıysa soru oraya düşer, bağlı değilse durum
+/// satırı ve bu kayıt açık onay yoludur.
+struct PendingScriptApproval: Equatable, Sendable {
+    /// Kurulacak becerinin klasör adı.
+    let skillName: String
+    /// Kartın gösterdiği kaynak (`owner/repo`).
+    let repository: String
+    /// Onaya sunulan çalıştırılabilir dosya listesi (`scripts/...`).
+    let scriptPaths: [String]
+    /// Kurulumda aranacak içerik özeti; `nil` ise ilk kurulum mühürler.
+    let expectedSHA256: String?
+    /// Onay sonrası kurulumun kaldığı yerden sürmesi için saklanır.
+    let reference: GitHubRepositoryReference
+    let source: ExtensionSource
 }

@@ -25,6 +25,9 @@ final class ExtensionStore {
     /// One line about what is happening, or what went wrong.
     private(set) var status: ExtensionStatus?
     private(set) var isWorking = false
+    /// `scripts/` yüzünden yazılmadan bekleyen kurulum. Onay kartı bağlıysa
+    /// soru oraya düşer; değilse bu kayıt + durum satırı açık onay yoludur.
+    private(set) var pendingScriptApproval: PendingScriptApproval?
 
     private let registryStore: ExtensionRegistryStore
     private let catalogSource: SkillsCatalogCache
@@ -45,6 +48,9 @@ final class ExtensionStore {
     /// runtime itself: the server is started and stopped by the settings screen,
     /// and this store must not keep a client that outlives its server.
     private let clientProvider: @MainActor () async -> (any OpenCodeClientProtocol)?
+    /// Betikli beceri kurulumunun açık onay kartı. Bağlı değilse kurulum
+    /// fail-closed durur: bekleyen kayıt + durum satırı açık onay yoludur.
+    private let approvalCenterProvider: @MainActor () async -> PermissionApprovalCenter?
 
     init(
         registryStore: ExtensionRegistryStore = .live(),
@@ -55,7 +61,8 @@ final class ExtensionStore {
         installer: SkillInstaller = SkillInstaller(),
         applyConfiguration: @escaping @MainActor (ExtensionRuntimeSnapshot) async -> Void,
         restartAgent: @escaping @MainActor () async -> Void = {},
-        clientProvider: @escaping @MainActor () async -> (any OpenCodeClientProtocol)? = { nil }
+        clientProvider: @escaping @MainActor () async -> (any OpenCodeClientProtocol)? = { nil },
+        approvalCenterProvider: @escaping @MainActor () async -> PermissionApprovalCenter? = { nil }
     ) {
         self.registryStore = registryStore
         self.catalogSource = catalog
@@ -66,6 +73,7 @@ final class ExtensionStore {
         self.applyConfiguration = applyConfiguration
         self.restartAgent = restartAgent
         self.clientProvider = clientProvider
+        self.approvalCenterProvider = approvalCenterProvider
 
         // The stored registry is loaded here rather than only in `refresh()`: the
         // snapshot the server asks for at start time has to be right the first
@@ -168,7 +176,8 @@ final class ExtensionStore {
     func addMCPServer(
         name: String,
         definition: MCPDefinition,
-        source: ExtensionSource = .manual
+        source: ExtensionSource = .manual,
+        allowedDirectories: [String] = []
     ) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, definition.isRunnable else {
@@ -181,11 +190,30 @@ final class ExtensionStore {
         }
         // Kabuk meta karakterleri komut tanımında yasaktır: sunucu doğrudan
         // çalıştırılır, kabuk üzerinden değil.
+        var normalized = definition
         if definition.transport == .local {
             let forbidden: Set<Character> = [";", "&", "|", ">", "<", "`", "$", "(", ")", "{", "}", "\\", "\n", "\r"]
             let joined = definition.command.joined(separator: " ")
             if joined.contains(where: { forbidden.contains($0) }) {
                 status = .failure("Komut kabuk işleci içeremez; tek çalıştırılabilir ve argümanları yazın.")
+                return false
+            }
+            // `cwd` doğrulanır: symlink çözülür, var olmayan dizin reddedilir ve
+            // hedef çalışma alanı ya da açık izin listesi altında olmalıdır.
+            // Bilgisayar kullanımı kendi proje dizininde koşar, alan denetimi
+            // dışındadır. Kalıtılmış sunucular bu yoldan geçmez (listelenir,
+            // düzenlenmez).
+            let extraRoots = allowedDirectories.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            switch MCPWorkingDirectoryPolicy.validated(
+                cwd: definition.cwd,
+                serverName: trimmed,
+                workspaceRoot: ManagedAppDirectories.openCodeWorkingDirectory(),
+                extraAllowedRoots: extraRoots
+            ) {
+            case .success(let resolved):
+                normalized.cwd = resolved
+            case .failure(let error):
+                status = .failure(error.message)
                 return false
             }
         }
@@ -201,7 +229,7 @@ final class ExtensionStore {
         registry.upsert(
             mcpServer: MCPServerRecord(
                 name: trimmed,
-                definition: definition,
+                definition: normalized,
                 isEnabled: false,
                 source: source,
                 isInherited: false,
@@ -363,6 +391,24 @@ final class ExtensionStore {
             return false
         }
 
+        // Sürüm pini sürekliliği: aynı taban ad farklı pinle yeniden
+        // eklenemez; sessiz sürüm kayması pin değişimiyle olur, yeniden
+        // yazmayla değil. Önce kaldırıp sonra eklemek bilinçli tercihtir.
+        let pin = Self.versionPin(of: trimmed)
+        if !isFilePath,
+            let conflict = registry.plugins.first(where: {
+                Self.baseModuleName(of: $0.module) == Self.baseModuleName(of: trimmed)
+                    && $0.pinnedVersion != pin
+            })
+        {
+            let want = pin ?? "sabistiz (en son sürüm)"
+            let have = conflict.pinnedVersion ?? "sabistiz (en son sürüm)"
+            status = .failure(
+                "“\(conflict.module)” sürümü sabitli (\(have)); “\(trimmed)” (\(want)) sessizce üzerine yazılmaz. Önce kaldırıp sonra ekleyin."
+            )
+            return false
+        }
+
         // Eklenti kod çalıştırır: varsayılan kapalı, güven onayı bekler.
         registry.upsert(
             plugin: PluginRecord(
@@ -370,7 +416,8 @@ final class ExtensionStore {
                 isEnabled: false,
                 source: source,
                 installedAt: Date(),
-                requiresTrust: true
+                requiresTrust: true,
+                pinnedVersion: isFilePath ? nil : pin
             )
         )
         persist()
@@ -452,7 +499,7 @@ final class ExtensionStore {
 
     /// Installs one directory of a repository and registers it, validating the
     /// manifest first so a skill OpenCode would refuse never lands on disk.
-    func installSkill(named name: String, from repository: String) async {
+    func installSkill(named name: String, from repository: String, expectedSHA256: String? = nil) async {
         guard let reference = GitHubRepositoryReference.parse(repository) else {
             status = .failure("“\(repository)” is not an owner/repository pair.")
             return
@@ -465,10 +512,88 @@ final class ExtensionStore {
         let record = await install(
             skillNamed: name,
             from: reference,
-            source: source
+            source: source,
+            expectedSHA256: expectedSHA256
         )
         await applyToAgent()
-        status = record.map { .info("“\($0.name)” installed.") }
+        // Başarısızlıkta `install` zaten durumu yazdı (özet/betik reddi);
+        // `nil` eşlemesi onu silmesin diye yalnız başarı yazılır.
+        if let record {
+            status = .info("“\(record.name)” installed.")
+        }
+    }
+
+    /// Katalog kartından tek tıkla beceri kurulumu: kartın kendi deposu
+    /// doğrudan kurucuya gider, yeni ağ istemcisi yoktur.
+    func installMarketplaceSkill(_ entry: CuratedSkillEntry, expectedSHA256: String? = nil) async {
+        await installSkill(named: entry.name, from: entry.repository, expectedSHA256: expectedSHA256)
+    }
+
+    /// Katalog kartından tek tıkla eklenti kurulumu: katalogdaki sürüm pine
+    /// işlenir (`ad@sürüm`) ki ajan tam o sürümü çözsün.
+    @discardableResult
+    func installMarketplacePlugin(_ entry: CuratedPluginEntry) -> Bool {
+        addPlugin(
+            module: "\(entry.name)@\(entry.version)",
+            source: .marketplace(id: "plugin:\(entry.name)")
+        )
+    }
+
+    /// Katalog kartından tek tıkla MCP kurulumu: kartın tanımı doğrudan kayıt
+    /// yoluna gider; kabuk/`cwd` ilkesi aynen işler, sunucu varsayılan kapalı
+    /// gelir.
+    @discardableResult
+    func installMarketplaceMCP(
+        _ entry: MCPMarketplaceEntry,
+        environment: [String: String] = [:],
+        cwd: String? = nil,
+        allowedDirectories: [String] = []
+    ) -> Bool {
+        var definition = entry.createDefinition()
+        if !environment.isEmpty {
+            definition.environment = environment
+        }
+        if let cwd {
+            definition.cwd = cwd
+        }
+        return addMCPServer(
+            name: entry.name,
+            definition: definition,
+            source: .marketplace(id: "mcp:\(entry.id)"),
+            allowedDirectories: allowedDirectories
+        )
+    }
+
+    /// Bekleyen betikli kurulumu onaylar: betik izniyle kaldığı yerden sürer.
+    func confirmPendingScriptApproval() async {
+        guard let pending = pendingScriptApproval else {
+            status = .failure("Onay bekleyen beceri kurulumu yok.")
+            return
+        }
+        pendingScriptApproval = nil
+        isWorking = true
+        defer { isWorking = false }
+
+        let record = await install(
+            skillNamed: pending.skillName,
+            from: pending.reference,
+            source: pending.source,
+            expectedSHA256: pending.expectedSHA256,
+            allowExecutableScripts: true
+        )
+        await applyToAgent()
+        if let record {
+            status = .info("“\(record.name)” installed.")
+        }
+    }
+
+    /// Bekleyen betikli kurulumdan vazgeçer: diske hiçbir şey yazılmadı.
+    func cancelPendingScriptApproval() {
+        guard let pending = pendingScriptApproval else {
+            return
+        }
+        pendingScriptApproval = nil
+        status = .info("“\(pending.skillName)” kurulumu iptal edildi; diske yazılmadı.")
     }
 
     /// Installs the skill a skills.sh entry points at.
@@ -516,7 +641,9 @@ final class ExtensionStore {
             source: .skillsSh(source: entry.source, skillID: entry.skillID)
         )
         await applyToAgent()
-        status = record.map { .info("“\($0.name)” installed from skills.sh.") }
+        if let record {
+            status = .info("“\(record.name)” installed from skills.sh.")
+        }
     }
 
     func setSkillEnabled(_ name: String, _ isEnabled: Bool) {
@@ -566,18 +693,39 @@ final class ExtensionStore {
     private func install(
         skillNamed name: String,
         from reference: GitHubRepositoryReference,
-        source: ExtensionSource
+        source: ExtensionSource,
+        expectedSHA256: String? = nil,
+        allowExecutableScripts: Bool = false
     ) async -> SkillRecord? {
+        // Kayıtlı pin sessiz kaymaya karşı korunur: çağıran pin vermediyse
+        // kayıttaki aranır; açık pin verildiyse o kazanır (bilinçli rotasyon).
+        let effectivePin = expectedSHA256 ?? registry.skills.first { $0.name == name }?.expectedSHA256
         do {
             let record = try await installer.install(
                 skillNamed: name,
                 from: reference,
-                source: source
+                source: source,
+                expectedSHA256: effectivePin,
+                allowExecutableScripts: allowExecutableScripts
             )
             registry.upsert(skill: record)
             persist()
             await discover()
             return record
+        } catch let error as SkillInstallSecurityError {
+            switch error {
+            case .scriptsRequireConfirmation(let skillName, let scriptPaths):
+                await stageScriptApproval(
+                    skillName: skillName,
+                    reference: reference,
+                    source: source,
+                    expectedSHA256: effectivePin,
+                    scriptPaths: scriptPaths,
+                    message: error.message
+                )
+            case .shaMismatch:
+                status = .failure(error.message)
+            }
         } catch let error as SkillManifestError {
             status = .failure(error.message)
         } catch let error as ExtensionFetchError {
@@ -587,6 +735,56 @@ final class ExtensionStore {
         }
 
         return nil
+    }
+
+    /// Betikli kurulumun açık onay yolu: önce mevcut onay kartı API'si
+    /// (`PermissionApprovalCenter`) denenir; bağlı değilse ya da soru
+    /// reddedilirse kurulum yazılmadan beklemeye alınır.
+    private func stageScriptApproval(
+        skillName: String,
+        reference: GitHubRepositoryReference,
+        source: ExtensionSource,
+        expectedSHA256: String?,
+        scriptPaths: [String],
+        message: String
+    ) async {
+        let pending = PendingScriptApproval(
+            skillName: skillName,
+            repository: reference.slug,
+            scriptPaths: scriptPaths,
+            expectedSHA256: expectedSHA256,
+            reference: reference,
+            source: source
+        )
+        if let center = await approvalCenterProvider() {
+            let request = OpenCodePermissionRequest(
+                id: UUID().uuidString,
+                remoteSessionID: "marketplace",
+                toolName: "skill_install",
+                patterns: scriptPaths,
+                alwaysPatterns: [],
+                detail: "“\(skillName)” (\(reference.slug)) çalıştırılabilir betik taşıyor: "
+                    + "\(scriptPaths.sorted().joined(separator: ", ")). İnceleyip kurulumu onaylayın.",
+                delegationTarget: nil
+            )
+            let reply = await center.submit(request)
+            guard reply == .once || reply == .always else {
+                pendingScriptApproval = pending
+                status = .failure(message + " Onaylanmadı; diske yazılmadı.")
+                return
+            }
+            // Onaylandı: betik izniyle kaldığı yerden sürer.
+            _ = await install(
+                skillNamed: skillName,
+                from: reference,
+                source: source,
+                expectedSHA256: expectedSHA256,
+                allowExecutableScripts: true
+            )
+            return
+        }
+        pendingScriptApproval = pending
+        status = .failure(message + " İnceleyip açıkça onaylayın.")
     }
 
     // MARK: - Persistence
@@ -625,10 +823,24 @@ extension ExtensionStore {
 
     /// Sondaki `@X.Y.Z` pini var mı (baştaki kapsam `@`i sayılmaz).
     private static func hasVersionPin(_ module: String) -> Bool {
+        versionPin(of: module) != nil
+    }
+
+    /// Sondaki `@sürüm` pinini döner; kapsam `@`i ve pinsiz ad `nil` verir.
+    static func versionPin(of module: String) -> String? {
         guard let at = module.lastIndex(of: "@"), at != module.startIndex else {
-            return false
+            return nil
         }
-        return true
+        let pin = String(module[module.index(after: at)...])
+        return pin.isEmpty ? nil : pin
+    }
+
+    /// Karşılaştırma anahtarı: sürüm pininden arınmış modül adı.
+    static func baseModuleName(of module: String) -> String {
+        guard let at = module.lastIndex(of: "@"), at != module.startIndex else {
+            return module
+        }
+        return String(module[..<at])
     }
 
     /// skills.sh girdisi ağa çıkmadan elenir: boşluk/newline/null/`..` yasaktır.

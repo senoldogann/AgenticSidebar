@@ -8,6 +8,9 @@ final class TerminalQueuedInput: @unchecked Sendable {
     private let queue: DispatchQueue
     private let lock = NSLock()
     private var isClosed = false
+    /// İlk G/Ç hatası bir kez loglanır ve yapışır: boru kırıldığında
+    /// (kabuk öldü) yazılar sessizce yutulmaz, terminale not düşer.
+    private var didReportIOError = false
 
     init(handle: FileHandle, queue: DispatchQueue) {
         self.handle = handle
@@ -24,7 +27,11 @@ final class TerminalQueuedInput: @unchecked Sendable {
             let shouldWrite = !isClosed
             lock.unlock()
             guard shouldWrite else { return }
-            try? handle.write(contentsOf: data)
+            do {
+                try handle.write(contentsOf: data)
+            } catch {
+                reportIOErrorOnce("Terminal input could not be written: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -37,7 +44,20 @@ final class TerminalQueuedInput: @unchecked Sendable {
         isClosed = true
         lock.unlock()
         queue.async { [self] in
-            try? handle.close()
+            do {
+                try handle.close()
+            } catch {
+                reportIOErrorOnce("Terminal input could not be closed: \(error.localizedDescription)")
+            }
         }
+    }
+
+    private func reportIOErrorOnce(_ message: String) {
+        lock.lock()
+        let shouldReport = !didReportIOError
+        didReportIOError = true
+        lock.unlock()
+        guard shouldReport else { return }
+        AppLog.panels.error("\(message, privacy: .public)")
     }
 }

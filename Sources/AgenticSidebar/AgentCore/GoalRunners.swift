@@ -255,6 +255,44 @@ struct GoalRunners: Sendable {
         return nil
     }
 
+    /// Yol listesindeki dosyaların ait olduğu projeler ve oy sayıları (azalan).
+    ///
+    /// Koşu sırasında ajan yeni bir proje iskeleti kurarsa (`/goal` "yeni
+    /// klasörde X yap" der) başlangıçtaki dizin bayatlar; doğrulama yanlış
+    /// projede koşar. Bu sayım işin gerçekte nerede olduğunu söyler: her yol
+    /// en yakın SwiftPM (yoksa Xcode) projesine indirgenir, var olmayan ya da
+    /// projesiz yollar sessizce düşer. Saf fonksiyondur, doğrudan test edilir.
+    nonisolated static func projectVotes(
+        for paths: [String],
+        fileManager: FileManager = .default
+    ) -> [(directory: URL, votes: Int)] {
+        var counts: [String: (url: URL, votes: Int)] = [:]
+        for path in paths {
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            let found =
+                enclosingSwiftPackage(for: trimmed, fileManager: fileManager)?.path
+                ?? enclosingXcodeProject(for: trimmed, fileManager: fileManager)?.path
+            guard let found else {
+                continue
+            }
+            if var entry = counts[found] {
+                entry.votes += 1
+                counts[found] = entry
+            } else {
+                counts[found] = (url: URL(fileURLWithPath: found, isDirectory: true), votes: 1)
+            }
+        }
+        return counts.values.sorted {
+            if $0.votes != $1.votes {
+                return $0.votes > $1.votes
+            }
+            return $0.url.path < $1.url.path
+        }.map { (directory: $0.url, votes: $0.votes) }
+    }
+
     /// Tam kapı: önce derleme, yeşilse testler. Derleme kırmızıysa testler
     /// koşulmaz (`tests == nil`); rapor bunu "atlandı" diye yazar.
     /// Komutlar proje türüne göre seçilir (SwiftPM ya da Xcode).
